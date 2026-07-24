@@ -36,6 +36,15 @@
 //! * [`daemon`] — `MockLlm` + `spawn_inert_mock` + `bring_up_daemon` — the
 //!   real-`kastellan`-daemon-under-the-supervisor bring-up shared by the
 //!   `cli_memory_l3*_run_daemon_e2e` tests.
+//! * [`scripted_llm`] — `ScriptedLlm` + `spawn_scripted_llm` + plan/embedding
+//!   envelope builders: the queued multi-shot mock LLM shared by the daemon
+//!   e2e tests that drive a scripted planner (lifted from `cli_ask_e2e.rs`).
+//! * [`mock_localmail`] — a plain-HTTP canned-response localmail `/v1` origin
+//!   for the mail-worker e2e tiers (real response shapes; pinned by the Mac-only
+//!   contract test).
+//! * [`egress_forcing`] — `short_scratch_root` / `minted_uds` /
+//!   `assert_connect_established` / `UDS_FILE_NAME`: the force-routing e2e
+//!   scaffolding shared by `egress_force_routing_e2e.rs` + `mail_e2e.rs`.
 //! * [`audit`] — `NoopAuditSink`, the no-Postgres `AuditSink` shared by the
 //!   `dispatch_with_sink`-based worker e2e tests.
 //!
@@ -47,12 +56,16 @@ pub mod audit;
 pub mod binaries;
 pub mod daemon;
 pub mod embedding;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod egress_forcing;
 pub mod env;
 pub mod guards;
 pub mod microvm;
+pub mod mock_localmail;
 pub mod pg;
 pub mod provisioning;
 pub mod sandbox;
+pub mod scripted_llm;
 pub mod serial;
 pub mod skip;
 pub mod temp;
