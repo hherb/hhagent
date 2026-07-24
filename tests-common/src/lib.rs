@@ -36,6 +36,9 @@
 //! * [`daemon`] — `MockLlm` + `spawn_inert_mock` + `bring_up_daemon` — the
 //!   real-`kastellan`-daemon-under-the-supervisor bring-up shared by the
 //!   `cli_memory_l3*_run_daemon_e2e` tests.
+//! * [`scripted_llm`] — `ScriptedLlm` + `spawn_scripted_llm` + plan/embedding
+//!   envelope builders: the queued multi-shot mock LLM shared by the daemon
+//!   e2e tests that drive a scripted planner (lifted from `cli_ask_e2e.rs`).
 //! * [`audit`] — `NoopAuditSink`, the no-Postgres `AuditSink` shared by the
 //!   `dispatch_with_sink`-based worker e2e tests.
 //!
@@ -53,6 +56,7 @@ pub mod microvm;
 pub mod pg;
 pub mod provisioning;
 pub mod sandbox;
+pub mod scripted_llm;
 pub mod serial;
 pub mod skip;
 pub mod temp;
