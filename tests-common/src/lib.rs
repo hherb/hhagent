@@ -39,6 +39,9 @@
 //! * [`scripted_llm`] — `ScriptedLlm` + `spawn_scripted_llm` + plan/embedding
 //!   envelope builders: the queued multi-shot mock LLM shared by the daemon
 //!   e2e tests that drive a scripted planner (lifted from `cli_ask_e2e.rs`).
+//! * [`mock_localmail`] — a plain-HTTP canned-response localmail `/v1` origin
+//!   for the mail-worker e2e tiers (real response shapes; pinned by the Mac-only
+//!   contract test).
 //! * [`audit`] — `NoopAuditSink`, the no-Postgres `AuditSink` shared by the
 //!   `dispatch_with_sink`-based worker e2e tests.
 //!
@@ -53,6 +56,7 @@ pub mod embedding;
 pub mod env;
 pub mod guards;
 pub mod microvm;
+pub mod mock_localmail;
 pub mod pg;
 pub mod provisioning;
 pub mod sandbox;
