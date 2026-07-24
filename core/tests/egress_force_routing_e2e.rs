@@ -27,48 +27,25 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
 use kastellan_core::tool_host::WorkerSpec;
 
-/// The sidecar binds its UDS at `<scratch>/egress.sock` (the crate-private
-/// `egress::spawn::UDS_FILE_NAME`, not reachable from this integration test).
-const UDS_FILE_NAME: &str = "egress.sock";
 use kastellan_sandbox::{Net, SandboxPolicy};
 use kastellan_tests_common::{
     backend, skip_if_sandbox_unavailable, unique_suffix, workspace_target_binary,
+};
+use kastellan_tests_common::egress_forcing::{
+    assert_connect_established, minted_uds, short_scratch_root,
 };
 
 /// Locate the built proxy binary; `[SKIP]` if absent (mirrors `egress_proxy_e2e`).
 fn proxy_binary_or_skip() -> Option<PathBuf> {
     let p = workspace_target_binary("kastellan-worker-egress-proxy");
     p.exists().then_some(p)
-}
-
-/// `spawn_forced_net_worker` mints a unique `egress-<pid>-<seq>/` subdir under
-/// the scratch root and the sidecar binds `<that>/egress.sock` in it. Exactly
-/// one such subdir exists per spawn here, so we resolve the UDS by finding it.
-fn minted_uds(scratch_root: &Path) -> PathBuf {
-    let sub = std::fs::read_dir(scratch_root)
-        .expect("read scratch root")
-        .filter_map(Result::ok)
-        .find(|e| e.file_name().to_string_lossy().starts_with("egress-"))
-        .expect("force-routed spawn must mint an egress-* scratch subdir");
-    sub.path().join(UDS_FILE_NAME)
-}
-
-/// Create a short `/tmp`-based scratch root and return it. Short on purpose:
-/// `spawn_forced_net_worker` nests `<root>/egress-<pid>-<seq>/egress.sock`, and
-/// that projected UDS path must fit the 104-byte macOS `sockaddr_un.sun_path`
-/// (the default `$TMPDIR` on macOS is ~50 chars deep and overflows once nested).
-/// `/tmp` exists on both Linux and macOS.
-fn short_scratch_root(tag: &str) -> PathBuf {
-    let root = PathBuf::from("/tmp").join(format!("kfr-{tag}"));
-    std::fs::create_dir_all(&root).unwrap();
-    root
 }
 
 /// A minimal force-routable worker policy: `Net::Allowlist` (the only net mode
@@ -82,17 +59,6 @@ fn allowlist_policy(hosts: &[&str]) -> SandboxPolicy {
     }
 }
 
-/// Read the proxy's full CONNECT 200 response head (39 bytes — same length the
-/// sibling `egress_proxy_e2e` pins) so subsequent reads see only tunnelled bytes.
-fn assert_connect_established(client: &mut UnixStream) {
-    let mut head = [0u8; 39];
-    client.read_exact(&mut head).expect("read CONNECT 200 head");
-    assert!(
-        std::str::from_utf8(&head).unwrap().starts_with("HTTP/1.1 200"),
-        "expected a 200 tunnel head, got {:?}",
-        std::str::from_utf8(&head)
-    );
-}
 
 /// (a) + (c) + ingest + 1:1 teardown, all through the production coupling.
 #[test]
