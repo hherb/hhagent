@@ -110,11 +110,19 @@ token file. Always-on (no `#[ignore]`):
   origin.
 - **1b — force-routed through a real sidecar (the egress leg).**
   `spawn_forced_net_worker` (production coupling; requires the egress-proxy
-  binary — skip if absent) brings up a per-worker sidecar, force-routes the mail
-  worker onto it, and the same `mail.search` round-trips via proxy-CONNECT.
-  Mirrors `egress_force_routing_e2e`'s cross-platform "allowlisted loopback
-  round-trips through the coupling's sidecar". Assert the decision reaches the
-  ingest sink and teardown is 1:1.
+  binary — skip if absent) brings up a per-worker sidecar from mail's **real**
+  `mail_entry(...).policy` and force-routes it. Assert, host-side on the proxy
+  (mirroring `egress_force_routing_e2e`): mail's derived endpoint `host:port` is
+  what the sidecar enforces, an off-allowlist CONNECT is blocked (403), each
+  decision reaches the ingest sink, and dropping the worker tears the sidecar
+  down 1:1. **A full mail-JSON round-trip through the tunnel is NOT tested here
+  and cannot be, hermetically:** the force-routed transport is HTTPS-only
+  (`proxy_connect.rs` rejects `http://`) and the proxy's MITM upstream trusts
+  webpki roots only (`build_upstream_client_config` — pins only strengthen, no
+  origin-CA knob), so neither a plain-HTTP nor a self-signed loopback origin is
+  reachable — the [[egress-proxy-upstream-trusts-webpki-only]] wall (#473). The
+  full round-trip is deferred to a real publicly-trusted-cert localmail,
+  documented in a code comment on this tier.
 - **1c — attachment delivery under the jail.** Apply the production Phase-A path
   `tool_host::apply_workspace_out(&mut policy, out_dir)` (pushes `fs_write` +
   `KASTELLAN_WORKER_OUT`); `dispatch(mail.get_attachment, {sha256})` → assert the
@@ -140,13 +148,12 @@ worker + `mock_localmail` origin, registered via the daemon's env
   `agent/plan.formulate` row, the `mail.search` dispatch row, and a successful
   `scheduler/plan.outcome`/task completion. Deterministic, CI-safe.
   **Force-routing note:** the supervised deployment turns
-  `KASTELLAN_EGRESS_FORCE_ROUTING` on by default (`core_service_spec`), so the
-  daemon-spawned mail worker is force-routed through a sidecar. A force-routed
-  worker reaching a plain-HTTP loopback origin through the proxy is exactly what
-  `egress_force_routing_e2e` tier (a) already proves, so this works when the
-  egress-proxy binary is present; if it is absent, the tier sets
-  `KASTELLAN_EGRESS_FORCE_ROUTING=0` in `extra_env` to take the direct path (the
-  plan picks one and states it).
+  `KASTELLAN_EGRESS_FORCE_ROUTING` on by default (`core_service_spec`). A
+  force-routed worker **cannot** reach the plain-HTTP mock (the transport is
+  HTTPS-only + the proxy's webpki-only MITM upstream — the same wall as tier 1b),
+  so tier 2a sets `KASTELLAN_EGRESS_FORCE_ROUTING=0` in `extra_env` and the
+  daemon-spawned worker takes the **direct** path to the mock. The force-routed
+  daemon path is covered structurally by tier 1b's coupling test.
 - **2b — live LLM, `#[ignore]`.** Real local LLM (DGX Ollama / Mac MLX) given a
   mail-ish question must select `mail.*` unprompted. Portable — the mock origin
   needs no localmail, so this runs on either host that has a local LLM. Asserts
@@ -197,7 +204,7 @@ worker + `mock_localmail` origin, registered via the daemon's env
 | Tier | Kind | Runs | Proves |
 |---|---|---|---|
 | 1a | hermetic | all hosts* | worker under real jail + direct transport reaches endpoint |
-| 1b | hermetic | all hosts | force-routed through real egress sidecar (egress leg) |
+| 1b | hermetic | all hosts | mail policy force-routes through the real sidecar; proxy enforces mail's derived allowlist (egress leg; full round-trip deferred — webpki wall) |
 | 1c | hermetic | all hosts | attachment delivery through the jail `fs_write` boundary |
 | 1d | hermetic | all hosts | allowlist derived to exactly the one endpoint |
 | 2a | hermetic | all hosts | daemon registers + advertises + dispatches `mail.*`, result completes |
@@ -213,3 +220,8 @@ worker + `mock_localmail` origin, registered via the daemon's env
 - A real-archive-through-the-jail `#[ignore]` tier (drive tiers 1a/2a against
   real localmail instead of the mock) — nice-to-have, largely covered by #487's
   stdio verification plus the Section-D contract test; add later if wanted.
+- **The full force-routed mail-JSON round-trip through the egress sidecar**
+  (tier 1b's deferred half): needs a real localmail served over HTTPS with a
+  **publicly-trusted** cert (the dev Mac's is self-signed → the proxy's webpki
+  upstream rejects it; the plain-HTTP→HTTPS shim #487 used would bypass the very
+  TLS path under test). File as a follow-up issue when such an origin exists.
