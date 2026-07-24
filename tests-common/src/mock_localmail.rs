@@ -51,9 +51,13 @@ pub async fn spawn_mock_localmail() -> MockLocalmail {
                 Ok(p) => p,
                 Err(_) => return,
             };
-            // Read until end-of-headers; localmail's search is a POST but its
-            // body is not needed to produce a canned page, so we do not wait for
-            // a body — the request line + headers are enough to route.
+            // Read until end-of-headers, THEN drain the declared Content-Length
+            // body. localmail's search is a POST; its body doesn't change the
+            // canned page, but we must consume it before responding+closing — a
+            // socket closed with unread inbound bytes is RST'd by the kernel,
+            // which can truncate the response the client is mid-read on (the
+            // sibling `scripted_llm` drains its body for exactly this reason).
+            // The request line + headers are all we route on.
             let mut buf = Vec::with_capacity(1024);
             let mut tmp = [0u8; 512];
             let head = loop {
@@ -63,7 +67,19 @@ pub async fn spawn_mock_localmail() -> MockLocalmail {
                 };
                 buf.extend_from_slice(&tmp[..n]);
                 if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break std::str::from_utf8(&buf[..i]).ok().map(str::to_owned);
+                    let header_str = match std::str::from_utf8(&buf[..i]) {
+                        Ok(s) => s.to_owned(),
+                        Err(_) => break None,
+                    };
+                    // Consume the body so the close is a clean FIN, not an RST.
+                    let want = (i + 4) + content_length(&header_str);
+                    while buf.len() < want && buf.len() <= 64 * 1024 {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    break Some(header_str);
                 }
                 if buf.len() > 64 * 1024 {
                     break None;
@@ -85,6 +101,19 @@ pub async fn spawn_mock_localmail() -> MockLocalmail {
     });
 
     MockLocalmail { base_url, join: Some(join) }
+}
+
+/// The request's `Content-Length` (0 when absent or unparseable). Used only to
+/// know how many body bytes to drain before closing the connection.
+fn content_length(head: &str) -> usize {
+    for line in head.lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                return value.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    0
 }
 
 /// Pure request-line/headers → (status, content-type, body). Asserts a

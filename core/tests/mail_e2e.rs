@@ -175,11 +175,17 @@ fn attachment_delivered_into_the_task_out_dir() {
         .expect("mail.get_attachment writes to the jailed out dir");
 
         let path = out["path"].as_str().expect("delivered path");
+        // Canonicalize both sides before the prefix check: on macOS the tempdir
+        // lives under `/var/folders/...` which is a symlink to `/private/var/...`,
+        // so a raw `starts_with` can spuriously fail if the delivered path was
+        // resolved through the symlink.
+        let delivered = std::fs::canonicalize(path).expect("canonicalize delivered path");
+        let out_root = std::fs::canonicalize(out_dir.path()).expect("canonicalize out dir");
         assert!(
-            std::path::Path::new(path).starts_with(out_dir.path()),
+            delivered.starts_with(&out_root),
             "delivered file must be under the task out dir: {path}"
         );
-        let bytes = std::fs::read(path).expect("read delivered file");
+        let bytes = std::fs::read(&delivered).expect("read delivered file");
         assert_eq!(bytes, CANNED_ATTACHMENT_BYTES, "delivered bytes must match the origin");
 
         let _ = sworker.close();
