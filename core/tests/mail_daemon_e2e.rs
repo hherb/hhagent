@@ -60,13 +60,15 @@ fn skip_prereqs() -> bool {
 }
 
 /// The live pieces a mail-daemon tier needs kept alive for its whole run. Field
-/// order matters for drop: the daemon (service) tears down before the cluster.
+/// order matters for drop (Rust drops fields top-to-bottom): the daemon guards
+/// (stop + uninstall the service) drop BEFORE `cluster` (stops PG), so the
+/// daemon tears down while its database is still up.
 struct MailDaemon {
-    cluster: PgCluster,
     daemon: DaemonHandle,
     _guards: DaemonGuards,
     _mock_mail: MockLocalmail,
     _token_dir: tempfile::TempDir,
+    cluster: PgCluster,
 }
 
 /// Bring up the per-test PG cluster + a plain-HTTP mock localmail + the real
@@ -108,6 +110,11 @@ fn bring_up_mail_daemon(
     let token_dir = tempfile::tempdir().unwrap();
     let token_file = token_dir.path().join("mail-token");
     std::fs::write(&token_file, b"test-bearer-token").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod token 0600");
+    }
 
     let mut extra_env = vec![
         ("KASTELLAN_MAIL_ENDPOINT".to_string(), mock_mail.base_url.clone()),
@@ -353,6 +360,13 @@ fn mock_localmail_shapes_match_real_localmail() {
     //    real attachment sha via list → message; skip this leg (printed note) if
     //    the archive carries no attachment.
     let (_h, list) = curl("GET", "/v1/messages?limit=50", None);
+    // list_messages must ALSO key rows under `results` (same drift surface as
+    // search). get_message's shape is exercised implicitly by the sha discovery
+    // below; get_attachment (raw bytes) is structurally simple and not JSON.
+    assert!(
+        list.as_ref().and_then(|v| v.get("results")).map(|r| r.is_array()).unwrap_or(false),
+        "real localmail /v1/messages must key rows under `results`: {list:?}"
+    );
     let mut sha: Option<String> = None;
     if let Some(rows) = list.as_ref().and_then(|v| v.get("results")).and_then(|r| r.as_array()) {
         for row in rows {

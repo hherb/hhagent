@@ -53,9 +53,12 @@ struct TestEnv {
 /// Write a 0600 token file into a fresh temp dir; return the dir (kept alive)
 /// and the file path (bound into the jail via the mail policy's fs_read).
 fn write_token_file() -> (tempfile::TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("mail-token");
     std::fs::write(&path, b"test-bearer-token").expect("write token");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod token 0600");
     (dir, path)
 }
 

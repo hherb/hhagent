@@ -238,7 +238,6 @@ fn header_content_length(headers: &str) -> Option<usize> {
     None
 }
 
-
 /// Wrap `plan_json` in an OpenAI-compatible chat-completion envelope.
 pub fn envelope_for(plan_json_string: &str) -> String {
     serde_json::json!({

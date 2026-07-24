@@ -108,6 +108,14 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
 
     let json = |s: String| ("200 OK", "application/json", s.into_bytes());
 
+    // /v1/messages/<id> exactly or with a query string — NOT a numeric prefix
+    // (so id 7 does not also match 70..=79). Bound here so the if-chain below
+    // stays a simple condition (clippy::blocks_in_conditions).
+    let is_message_by_id = {
+        let m = format!("/v1/messages/{CANNED_MESSAGE_ID}");
+        path == m || path.starts_with(&format!("{m}?"))
+    };
+
     // Order matters: the more specific attachment paths before /v1/messages.
     if path.starts_with("/v1/search") {
         json(serde_json::json!({
@@ -120,7 +128,7 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
         json(serde_json::json!({"text": CANNED_ATTACHMENT_TEXT}).to_string())
     } else if path.starts_with("/v1/attachments/") {
         ("200 OK", "application/pdf", CANNED_ATTACHMENT_BYTES.to_vec())
-    } else if path.starts_with(&format!("/v1/messages/{CANNED_MESSAGE_ID}")) {
+    } else if is_message_by_id {
         json(serde_json::json!({
             "id": CANNED_MESSAGE_ID,
             "subject": "invoice",
