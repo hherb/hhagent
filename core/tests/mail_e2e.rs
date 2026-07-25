@@ -505,3 +505,125 @@ fn force_routed_search_fails_without_upstream_extra_ca() {
         );
     });
 }
+
+/// Live #[ignore] DGX tier: the same MITM round-trip against the REAL localmail
+/// running on the DGX (self-signed cert), validating the extra-CA seam against a
+/// real cert + the real archive. Env-gated — skip-as-pass unless the operator
+/// sets all three live vars. Run on the DGX:
+///
+///   KASTELLAN_MAIL_LIVE_ENDPOINT=https://127.0.0.1:8443 \
+///   KASTELLAN_MAIL_LIVE_CA=$HOME/.config/localmail/tls/cert.pem \
+///   KASTELLAN_MAIL_LIVE_TOKEN=<bearer from POST /v1/auth/login> \
+///   cargo test -p kastellan-core --test mail_e2e -- --ignored --nocapture \
+///     force_routed_search_against_real_localmail
+///
+/// The endpoint host MUST match a SAN in the cert (inspect it on the DGX). Prefer
+/// 127.0.0.1 (loopback — dialable via the proxy's allowlisted-IP carve-out); a
+/// private LAN IP (10.0.0.3) may hit the SSRF block. Token is pre-obtained to keep
+/// the password out of the test process.
+#[test]
+#[ignore = "live DGX localmail; set KASTELLAN_MAIL_LIVE_ENDPOINT/CA/TOKEN"]
+fn force_routed_search_against_real_localmail() {
+    use std::sync::{Arc, Mutex};
+
+    use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
+    use kastellan_sandbox::Net;
+    use kastellan_tests_common::egress_forcing::short_scratch_root;
+    use kastellan_tests_common::egress_proxy_bin_or_skip;
+
+    let (Some(endpoint), Some(ca), Some(token)) = (
+        std::env::var("KASTELLAN_MAIL_LIVE_ENDPOINT").ok(),
+        std::env::var("KASTELLAN_MAIL_LIVE_CA").ok(),
+        std::env::var("KASTELLAN_MAIL_LIVE_TOKEN").ok(),
+    ) else {
+        eprintln!("\n[SKIP] live localmail vars unset (KASTELLAN_MAIL_LIVE_ENDPOINT/CA/TOKEN)\n");
+        return;
+    };
+    if skip_if_sandbox_unavailable() {
+        return;
+    }
+    let Some(proxy) = egress_proxy_bin_or_skip() else {
+        return;
+    };
+    let Some(bin_dir) = pg_bin_dir_or_skip() else {
+        return;
+    };
+    let worker_path = workspace_target_binary("kastellan-worker-mail");
+    if !worker_path.exists() {
+        eprintln!("\n[SKIP] mail worker binary not built\n");
+        return;
+    }
+
+    dispatch_runtime().block_on(async {
+        use std::os::unix::fs::PermissionsExt;
+        let token_dir = tempfile::tempdir().expect("token tempdir");
+        let token_file = token_dir.path().join("mail-token");
+        std::fs::write(&token_file, token.trim()).expect("write token");
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let ca_path = std::path::PathBuf::from(&ca);
+        assert!(ca_path.exists(), "KASTELLAN_MAIL_LIVE_CA does not exist: {ca}");
+
+        let suffix = unique_suffix();
+        let cluster = bring_up_pg_cluster(
+            &bin_dir,
+            "maillive-d",
+            "maillive-l",
+            &format!("kastellan-supervisor-test-pg-maillive-{suffix}"),
+        );
+        let pool = probe_and_pool(&cluster.conn_spec).await;
+
+        let mail_policy =
+            mail_entry(worker_path.clone(), &endpoint, &token_file.to_string_lossy()).policy;
+        let allowlist: Vec<String> = match &mail_policy.net {
+            Net::Allowlist(v) => v.clone(),
+            other => panic!("mail must be Net::Allowlist, got {other:?}"),
+        };
+
+        let scratch_root = short_scratch_root(&format!("maillive-{}", unique_suffix()));
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let rows = Arc::clone(&rows);
+            move |row: kastellan_core::egress::audit::EgressAuditRow| rows.lock().unwrap().push(row)
+        };
+
+        let worker_str = worker_path.to_string_lossy().into_owned();
+        let spec = WorkerSpec { policy: &mail_policy, program: &worker_str, args: &[], wall_clock_ms: None };
+        let backend = backend();
+        let params = NetWorkerSpawn {
+            backend: backend.as_ref(),
+            sidecar_backend: backend.as_ref(),
+            proxy_bin: &proxy,
+            spec: &spec,
+            allowlist: &allowlist,
+            worker_name: "mail",
+            secret_fingerprints: &[],
+            cert_pins_json: None,
+            disable_mitm: false,
+            upstream_extra_ca: Some(ca_path.as_path()),
+        };
+        let mut worker = spawn_forced_net_worker(&params, &scratch_root, sink)
+            .expect("force-routed mail worker + sidecar spawn");
+
+        let value = dispatch(
+            &pool,
+            &Vault::new(),
+            &mut worker,
+            "mail",
+            "mail.search",
+            serde_json::json!({"query": "invoice"}),
+        )
+        .await
+        .expect("live mail.search must round-trip through the MITM sidecar");
+        assert!(value["results"].is_array(), "expected results array, got {value}");
+        assert!(
+            rows.lock().unwrap().iter().any(|r| r.action == "egress.allowed"
+                && r.payload["tls_intercepted"] == serde_json::Value::Bool(true)),
+            "expected an MITM-intercepted allow decision against live localmail"
+        );
+
+        let _ = worker.close();
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&scratch_root);
+    });
+}
