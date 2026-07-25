@@ -26,6 +26,25 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+/// Generate a self-signed loopback cert with a `127.0.0.1` IP SAN. Returns
+/// `(cert_der, key_der, cert_pem)`. The leaf is its own trust anchor — a client
+/// trusting `cert_pem` validates a TLS session to `127.0.0.1:<port>`. Shared by
+/// the 204 origin here and the TLS localmail mock (#491).
+pub fn generate_loopback_cert() -> (
+    rustls_pki_types::CertificateDer<'static>,
+    rustls_pki_types::PrivateKeyDer<'static>,
+    String,
+) {
+    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+        .expect("generate self-signed cert");
+    let cert_pem = ck.cert.pem();
+    let cert_der = ck.cert.der().clone();
+    let key_der = rustls_pki_types::PrivateKeyDer::Pkcs8(
+        rustls_pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()),
+    );
+    (cert_der, key_der, cert_pem)
+}
+
 /// Spawn a multi-connection loopback rustls origin on `127.0.0.1:0` that answers
 /// any request with `HTTP/1.1 204 No Content`. Returns `(port, cert_pem)` — the
 /// caller writes `cert_pem` wherever its `extra_ca` needs to live (each net-demo
@@ -37,15 +56,7 @@ use tokio_rustls::TlsAcceptor;
 /// a slow/aborted probe never blocks the next. The self-signed cert carries a
 /// `127.0.0.1` IP SAN so rustls' server-name (IP) verification succeeds.
 pub fn spawn_loopback_tls_origin() -> (u16, String) {
-    // Self-signed cert with a 127.0.0.1 IP SAN so rustls' server-name (IP)
-    // verification against the origin succeeds.
-    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
-        .expect("generate self-signed cert");
-    let cert_pem = ck.cert.pem();
-    let cert_der = ck.cert.der().clone();
-    let key_der = rustls_pki_types::PrivateKeyDer::Pkcs8(
-        rustls_pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()),
-    );
+    let (cert_der, key_der, cert_pem) = generate_loopback_cert();
 
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
