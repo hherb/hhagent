@@ -51,56 +51,104 @@ pub async fn spawn_mock_localmail() -> MockLocalmail {
                 Ok(p) => p,
                 Err(_) => return,
             };
-            // Read until end-of-headers, THEN drain the declared Content-Length
-            // body. localmail's search is a POST; its body doesn't change the
-            // canned page, but we must consume it before responding+closing — a
-            // socket closed with unread inbound bytes is RST'd by the kernel,
-            // which can truncate the response the client is mid-read on (the
-            // sibling `scripted_llm` drains its body for exactly this reason).
-            // The request line + headers are all we route on.
-            let mut buf = Vec::with_capacity(1024);
-            let mut tmp = [0u8; 512];
-            let head = loop {
-                let n = match sock.read(&mut tmp).await {
-                    Ok(0) | Err(_) => break None,
-                    Ok(n) => n,
-                };
-                buf.extend_from_slice(&tmp[..n]);
-                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let header_str = match std::str::from_utf8(&buf[..i]) {
-                        Ok(s) => s.to_owned(),
-                        Err(_) => break None,
-                    };
-                    // Consume the body so the close is a clean FIN, not an RST.
-                    let want = (i + 4) + content_length(&header_str);
-                    while buf.len() < want && buf.len() <= 64 * 1024 {
-                        match sock.read(&mut tmp).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                        }
-                    }
-                    break Some(header_str);
-                }
-                if buf.len() > 64 * 1024 {
-                    break None;
-                }
-            };
-            let (status, ctype, body): (&str, &str, Vec<u8>) = match head.as_deref() {
-                Some(h) => route(h),
-                None => ("400 Bad Request", "text/plain", b"bad request".to_vec()),
-            };
-            let resp_head = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = sock.write_all(resp_head.as_bytes()).await;
-            let _ = sock.write_all(&body).await;
-            let _ = sock.flush().await;
-            let _ = sock.shutdown().await;
+            serve_localmail_conn(&mut sock).await;
         }
     });
 
     MockLocalmail { base_url, join: Some(join) }
+}
+
+/// Serve one localmail connection: read the request head (draining the declared
+/// body so the close is a clean FIN, not an RST that truncates the client's
+/// read), route it via [`route`], and write the response. Generic over the
+/// stream so the plain-TCP and TLS spawns share exactly one implementation.
+async fn serve_localmail_conn<S>(sock: &mut S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // Read until end-of-headers, THEN drain the declared Content-Length body.
+    // localmail's search is a POST; its body doesn't change the canned page,
+    // but we must consume it before responding+closing — a socket closed with
+    // unread inbound bytes is RST'd by the kernel, which can truncate the
+    // response the client is mid-read on (the sibling `scripted_llm` drains
+    // its body for exactly this reason). The request line + headers are all
+    // we route on.
+    let mut buf = Vec::with_capacity(1024);
+    let mut tmp = [0u8; 512];
+    let head = loop {
+        let n = match sock.read(&mut tmp).await {
+            Ok(0) | Err(_) => break None,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_str = match std::str::from_utf8(&buf[..i]) {
+                Ok(s) => s.to_owned(),
+                Err(_) => break None,
+            };
+            // Consume the body so the close is a clean FIN, not an RST.
+            let want = (i + 4) + content_length(&header_str);
+            while buf.len() < want && buf.len() <= 64 * 1024 {
+                match sock.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+            break Some(header_str);
+        }
+        if buf.len() > 64 * 1024 {
+            break None;
+        }
+    };
+    let (status, ctype, body): (&str, &str, Vec<u8>) = match head.as_deref() {
+        Some(h) => route(h),
+        None => ("400 Bad Request", "text/plain", b"bad request".to_vec()),
+    };
+    let resp_head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = sock.write_all(resp_head.as_bytes()).await;
+    let _ = sock.write_all(&body).await;
+    let _ = sock.flush().await;
+    let _ = sock.shutdown().await;
+}
+
+/// A live **self-signed-HTTPS** localmail mock at `https://127.0.0.1:<port>`.
+/// Returns the mock (aborts its listener on drop) and the cert PEM (the caller
+/// writes it wherever the egress proxy's upstream extra CA must live). Serves the
+/// identical `/v1` shapes as [`spawn_mock_localmail`] — the force-routed MITM path
+/// can reach it once the proxy is given this cert as its upstream extra CA (#491).
+pub async fn spawn_mock_localmail_tls() -> (MockLocalmail, String) {
+    let (cert_der, key_der, cert_pem) = crate::tls_origin::generate_loopback_cert();
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("build localmail tls server config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("https://127.0.0.1:{port}");
+
+    let join = tokio::spawn(async move {
+        loop {
+            let (tcp, _peer) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let mut tls = match acceptor.accept(tcp).await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                serve_localmail_conn(&mut tls).await;
+            });
+        }
+    });
+
+    (MockLocalmail { base_url, join: Some(join) }, cert_pem)
 }
 
 /// The request's `Content-Length` (0 when absent or unparseable). Used only to
@@ -239,5 +287,45 @@ mod tests {
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 401"), "no-bearer must 401, got: {resp}");
+    }
+
+    /// The TLS mock serves the same `/v1/search` `results` shape as the plain mock,
+    /// over TLS, to a client trusting only the returned cert — the exact trust path
+    /// the force-routed MITM e2e relies on (proxy upstream extra CA), without a sandbox.
+    #[test]
+    fn tls_mock_serves_search_results_over_tls() {
+        use rustls_pki_types::pem::PemObject;
+        use rustls_pki_types::{CertificateDer, ServerName};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+        use tokio_rustls::TlsConnector;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (mock, cert_pem) = spawn_mock_localmail_tls().await;
+            let port: u16 = mock.base_url.rsplit(':').next().unwrap().parse().unwrap();
+
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap()).unwrap();
+            let cfg = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(std::sync::Arc::new(cfg));
+
+            let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let sni = ServerName::IpAddress(std::net::Ipv4Addr::LOCALHOST.into());
+            let mut tls = connector.connect(sni, tcp).await.expect("tls handshake");
+            tls.write_all(
+                b"POST /v1/search HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer t\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+            ).await.unwrap();
+            let mut resp = Vec::new();
+            tls.read_to_end(&mut resp).await.unwrap();
+            let resp = String::from_utf8_lossy(&resp);
+            assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+            let body = resp.split("\r\n\r\n").nth(1).unwrap();
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert!(v["results"].is_array(), "expected results array, got {v}");
+        });
     }
 }
