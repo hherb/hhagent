@@ -88,11 +88,20 @@ fn main() -> anyhow::Result<()> {
         .join("secret_hashes.json");
 
     // Upstream trust for the re-origination leg: the REAL public roots, plus an
-    // optional operator-provided SPKI pin overlay for high-value origins (slice
-    // #4). A malformed pin set aborts startup (fail-closed) rather than silently
-    // disabling pinning. Unset ⇒ plain webpki, byte-identical to slice #3b.
+    // optional operator-provided SPKI pin overlay (slice #4) AND an optional
+    // operator-provided extra CA (#491, for a self-signed private origin like a
+    // personal localmail). Both are off by default; a malformed value aborts
+    // startup (fail-closed) rather than silently disabling protection.
+    let upstream_extra_ca = std::env::var("KASTELLAN_EGRESS_PROXY_UPSTREAM_EXTRA_CA").ok();
+    if let Some(ref p) = upstream_extra_ca {
+        eprintln!(
+            "[egress-proxy] WARN: trusting operator-provided upstream extra CA {p:?} on the \
+             re-origination leg (widens upstream trust beyond webpki roots)"
+        );
+    }
     let upstream_tls = pins::build_upstream_client_config(
         std::env::var("KASTELLAN_EGRESS_PROXY_PINS").ok().as_deref(),
+        upstream_extra_ca.as_deref().map(std::path::Path::new),
     )
     .map_err(|e| anyhow::anyhow!("build upstream TLS config: {e}"))?;
 

@@ -166,14 +166,14 @@ fn pinned_host_with_wrong_spki_is_rejected() {
 #[test]
 fn build_upstream_none_is_plain_webpki() {
     install_provider();
-    assert!(build_upstream_client_config(None).is_ok());
+    assert!(build_upstream_client_config(None, None).is_ok());
 }
 
 #[test]
 fn build_upstream_empty_string_is_plain_webpki() {
     install_provider();
-    assert!(build_upstream_client_config(Some("   ")).is_ok());
-    assert!(build_upstream_client_config(Some("{}")).is_ok());
+    assert!(build_upstream_client_config(Some("   "), None).is_ok());
+    assert!(build_upstream_client_config(Some("{}"), None).is_ok());
 }
 
 #[test]
@@ -181,11 +181,42 @@ fn build_upstream_valid_pins_builds() {
     install_provider();
     let pin = [0x33u8; 32];
     let json = format!(r#"{{"api.anthropic.com":["{}"]}}"#, pin_str(&pin));
-    assert!(build_upstream_client_config(Some(&json)).is_ok());
+    assert!(build_upstream_client_config(Some(&json), None).is_ok());
 }
 
 #[test]
 fn build_upstream_malformed_pins_is_err() {
     install_provider();
-    assert!(build_upstream_client_config(Some("{ this is not json")).is_err());
+    assert!(build_upstream_client_config(Some("{ this is not json"), None).is_err());
+}
+
+#[test]
+fn add_extra_ca_pem_adds_a_valid_cert() {
+    // A fresh CA PEM (reusing the proxy's own CA generator) is a valid certificate
+    // and must become a trust anchor.
+    let ca = crate::ca::generate_ca().expect("generate ca");
+    let mut roots = rustls::RootCertStore::empty();
+    assert!(roots.is_empty());
+    super::add_extra_ca_pem(&mut roots, ca.cert_pem().as_bytes()).expect("add valid ca");
+    assert!(!roots.is_empty(), "a valid extra CA becomes a trust anchor");
+}
+
+#[test]
+fn add_extra_ca_pem_rejects_pem_with_no_certificate() {
+    // Garbage and non-certificate PEM both yield zero certs → fail closed.
+    let mut roots = rustls::RootCertStore::empty();
+    assert!(super::add_extra_ca_pem(&mut roots, b"not a pem at all").is_err());
+    let key_only = "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n";
+    assert!(super::add_extra_ca_pem(&mut roots, key_only.as_bytes()).is_err());
+}
+
+#[test]
+fn build_upstream_config_missing_extra_ca_file_fails_closed() {
+    let r = build_upstream_client_config(None, Some(std::path::Path::new("/nonexistent/ca.pem")));
+    assert!(r.is_err(), "a set-but-unreadable extra CA must fail closed");
+}
+
+#[test]
+fn build_upstream_config_none_extra_ca_is_ok() {
+    assert!(build_upstream_client_config(None, None).is_ok());
 }

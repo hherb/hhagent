@@ -28,6 +28,8 @@ pub enum PinError {
     X509(String),
     /// rustls refused to build the inner webpki verifier from the roots.
     Verifier(String),
+    /// The operator-provided upstream extra CA could not be read or parsed.
+    ExtraCa(String),
 }
 
 impl std::fmt::Display for PinError {
@@ -40,6 +42,7 @@ impl std::fmt::Display for PinError {
             }
             PinError::X509(s) => write!(f, "certificate SPKI: {s}"),
             PinError::Verifier(s) => write!(f, "webpki verifier: {s}"),
+            PinError::ExtraCa(s) => write!(f, "upstream extra CA: {s}"),
         }
     }
 }
@@ -135,10 +138,12 @@ pub(crate) fn chain_pins_contains(pins: &HashSet<[u8; 32]>, hashes: &[[u8; 32]])
     hashes.iter().any(|h| pins.contains(h))
 }
 
+use std::path::Path;
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
 
@@ -222,6 +227,24 @@ impl ServerCertVerifier for PinningVerifier {
     }
 }
 
+/// Add every certificate in `pem` to `roots` as a trust anchor for the upstream
+/// re-origination leg. Fail-closed: an unparseable cert, or a PEM containing
+/// **zero** certificates, is an error — we never proceed with an extra CA the
+/// operator asked for but we could not load. Pure over its inputs (no
+/// filesystem), so the trust-widening logic is unit-testable directly.
+pub(crate) fn add_extra_ca_pem(roots: &mut RootCertStore, pem: &[u8]) -> Result<(), PinError> {
+    let mut added = 0usize;
+    for der in CertificateDer::pem_slice_iter(pem) {
+        let der = der.map_err(|e| PinError::ExtraCa(format!("parse: {e}")))?;
+        roots.add(der).map_err(|e| PinError::ExtraCa(format!("add: {e}")))?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err(PinError::ExtraCa("PEM contained no certificates".to_string()));
+    }
+    Ok(())
+}
+
 /// Build the upstream-leg `ClientConfig` for the MITM re-origination.
 ///
 /// * `None` / blank / `{}` ⇒ the plain webpki-roots config (byte-identical to
@@ -232,9 +255,19 @@ impl ServerCertVerifier for PinningVerifier {
 ///   never silently degrade to no-pinning).
 pub fn build_upstream_client_config(
     pins_env: Option<&str>,
+    extra_ca_path: Option<&Path>,
 ) -> Result<Arc<rustls::ClientConfig>, PinError> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // Operator-provided extra trust anchor for the re-origination leg (e.g. a
+    // self-signed personal localmail). Off by default ⇒ webpki-only, unchanged.
+    // Fail-closed: a set-but-unreadable/invalid/zero-cert PEM aborts startup.
+    if let Some(path) = extra_ca_path {
+        let pem = std::fs::read(path)
+            .map_err(|e| PinError::ExtraCa(format!("read {path:?}: {e}")))?;
+        add_extra_ca_pem(&mut roots, &pem)?;
+    }
 
     let pins = match pins_env.map(str::trim) {
         None | Some("") => PinSet::default(),
