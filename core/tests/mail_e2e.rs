@@ -349,3 +349,159 @@ fn pick_other_port(hostport: &str) -> u16 {
     let p: u16 = hostport.rsplit(':').next().unwrap().parse().unwrap();
     p ^ 1
 }
+
+/// Drive a force-routed `mail.search` through a real MITM egress sidecar to a
+/// self-signed HTTPS localmail mock. `with_extra_ca` toggles whether the proxy is
+/// given the mock's cert as its upstream extra CA. Returns the dispatch result
+/// (error mapped to String) and the captured egress decisions. Shared by the
+/// positive round-trip and the negative control so they differ only in the one
+/// variable under test.
+async fn run_forced_mail_search_over_tls(
+    proxy: &std::path::Path,
+    bin_dir: &std::path::Path,
+    with_extra_ca: bool,
+) -> (
+    Result<serde_json::Value, String>,
+    Vec<kastellan_core::egress::audit::EgressAuditRow>,
+) {
+    use std::sync::{Arc, Mutex};
+
+    use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
+    use kastellan_sandbox::Net;
+    use kastellan_tests_common::egress_forcing::short_scratch_root;
+    use kastellan_tests_common::mock_localmail::spawn_mock_localmail_tls;
+
+    let (mock, cert_pem) = spawn_mock_localmail_tls().await;
+    // Write the mock's cert where the sandboxed proxy can fs_read it.
+    let ca_dir = tempfile::tempdir().expect("ca tempdir");
+    let ca_path = ca_dir.path().join("localmail-ca.pem");
+    std::fs::write(&ca_path, &cert_pem).expect("write ca pem");
+
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        bin_dir,
+        "mailrt-d",
+        "mailrt-l",
+        &format!("kastellan-supervisor-test-pg-mailrt-{suffix}"),
+    );
+    let pool = probe_and_pool(&cluster.conn_spec).await;
+
+    let (_token_dir, token_file) = write_token_file();
+    let worker_path = workspace_target_binary("kastellan-worker-mail");
+    let mail_policy =
+        mail_entry(worker_path.clone(), &mock.base_url, &token_file.to_string_lossy()).policy;
+    let allowlist: Vec<String> = match &mail_policy.net {
+        Net::Allowlist(v) => v.clone(),
+        other => panic!("mail must be Net::Allowlist, got {other:?}"),
+    };
+
+    let scratch_root = short_scratch_root(&format!("mailrt-{}", unique_suffix()));
+    let rows = Arc::new(Mutex::new(Vec::new()));
+    let sink = {
+        let rows = Arc::clone(&rows);
+        move |row: kastellan_core::egress::audit::EgressAuditRow| rows.lock().unwrap().push(row)
+    };
+
+    let worker_str = worker_path.to_string_lossy().into_owned();
+    let spec = WorkerSpec { policy: &mail_policy, program: &worker_str, args: &[], wall_clock_ms: None };
+    let backend = backend();
+    let params = NetWorkerSpawn {
+        backend: backend.as_ref(),
+        sidecar_backend: backend.as_ref(),
+        proxy_bin: proxy,
+        spec: &spec,
+        allowlist: &allowlist,
+        worker_name: "mail",
+        secret_fingerprints: &[],
+        cert_pins_json: None,
+        disable_mitm: false, // MITM ON — mail's real posture
+        upstream_extra_ca: with_extra_ca.then_some(ca_path.as_path()),
+    };
+    let mut worker = spawn_forced_net_worker(&params, &scratch_root, sink)
+        .expect("force-routed mail worker + sidecar spawn");
+
+    let result = dispatch(
+        &pool,
+        &Vault::new(),
+        &mut worker,
+        "mail",
+        "mail.search",
+        serde_json::json!({"query": "invoice"}),
+    )
+    .await
+    .map_err(|e| e.to_string());
+
+    let _ = worker.close();
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let captured = std::mem::take(&mut *rows.lock().unwrap());
+    (result, captured)
+}
+
+/// Hermetic full round-trip: the REAL mail worker, force-routed in MITM mode,
+/// drives mail.search through the sidecar to a self-signed HTTPS localmail mock;
+/// the proxy MITM-terminates and re-originates TLS validated against the
+/// operator-provided upstream extra CA. Asserts the results round-trip AND
+/// tls_intercepted: true. The #491 deliverable tier 1b could not cover.
+#[test]
+fn force_routed_search_round_trips_through_mitm_sidecar() {
+    use kastellan_tests_common::egress_proxy_bin_or_skip;
+
+    if skip_if_sandbox_unavailable() {
+        return;
+    }
+    let Some(proxy) = egress_proxy_bin_or_skip() else {
+        return;
+    };
+    let Some(bin_dir) = pg_bin_dir_or_skip() else {
+        return;
+    };
+    if !workspace_target_binary("kastellan-worker-mail").exists() {
+        eprintln!("\n[SKIP] mail worker binary not built; run cargo build --workspace\n");
+        return;
+    }
+
+    dispatch_runtime().block_on(async {
+        let (result, rows) = run_forced_mail_search_over_tls(&proxy, &bin_dir, true).await;
+        let value = result.expect("mail.search must round-trip through the MITM sidecar");
+        assert!(value["results"].is_array(), "expected results array, got {value}");
+        assert!(
+            rows.iter().any(|r| r.action == "egress.allowed"
+                && r.payload["tls_intercepted"] == serde_json::Value::Bool(true)),
+            "expected an MITM-intercepted allow decision (tls_intercepted: true); got {:?}",
+            rows.iter().map(|r| (r.action.clone(), r.payload.clone())).collect::<Vec<_>>()
+        );
+    });
+}
+
+/// Negative control: the identical round-trip with NO upstream extra CA must
+/// FAIL — the proxy re-originates against webpki roots only and rejects the
+/// self-signed origin. Proves the extra-CA seam is load-bearing (the round-trip
+/// does not "accidentally" work without it).
+#[test]
+fn force_routed_search_fails_without_upstream_extra_ca() {
+    use kastellan_tests_common::egress_proxy_bin_or_skip;
+
+    if skip_if_sandbox_unavailable() {
+        return;
+    }
+    let Some(proxy) = egress_proxy_bin_or_skip() else {
+        return;
+    };
+    let Some(bin_dir) = pg_bin_dir_or_skip() else {
+        return;
+    };
+    if !workspace_target_binary("kastellan-worker-mail").exists() {
+        eprintln!("\n[SKIP] mail worker binary not built; run cargo build --workspace\n");
+        return;
+    }
+
+    dispatch_runtime().block_on(async {
+        let (result, _rows) = run_forced_mail_search_over_tls(&proxy, &bin_dir, false).await;
+        assert!(
+            result.is_err(),
+            "without the upstream extra CA the MITM re-origination must reject the \
+             self-signed origin; got Ok: {result:?}"
+        );
+    });
+}
