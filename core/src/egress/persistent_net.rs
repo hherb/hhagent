@@ -91,6 +91,7 @@ pub fn spawn_net_transport(
         None, // no cert pins
         true, // disable_mitm — transparent tunnel
         true, // long-lived: a channel sidecar outlives many dispatches (issue #395)
+        None, // upstream_extra_ca: prod wiring deferred (#491)
     )?;
     let stdout = sidecar.stdout();
     let uds = sidecar.uds_path.clone();

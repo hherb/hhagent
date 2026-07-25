@@ -270,6 +270,9 @@ pub(crate) fn spawn_worker_maybe_forced(
                 // Workers that do their own end-to-end TLS + can't trust our CA
                 // (browser, matrix) → their sidecar transparently tunnels.
                 disable_mitm: disable_mitm_for(worker_name),
+                // No operator extra CA wired to production yet (#491 prod
+                // wiring deferred).
+                upstream_extra_ca: None,
             };
             spawn_forced_net_worker(&params, &cfg.scratch_root, (cfg.make_sink)())
         }

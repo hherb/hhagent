@@ -124,6 +124,7 @@ fn forced_coupling_enforces_allowlist_and_ingests_decisions() {
         secret_fingerprints: &[],
         cert_pins_json: None,
         disable_mitm: false,
+        upstream_extra_ca: None,
     };
     let mut worker = spawn_forced_net_worker(&params, &scratch_root, sink)
         .expect("force-routed worker + sidecar spawn (fail-closed if the proxy is missing)");
@@ -235,6 +236,7 @@ fn forced_coupling_worker_has_no_direct_route() {
         secret_fingerprints: &[],
         cert_pins_json: None,
         disable_mitm: false,
+        upstream_extra_ca: None,
     };
     let worker = spawn_forced_net_worker(&params, &scratch_root, |_row| {})
         .expect("force-routed getent worker + sidecar spawn");
@@ -360,6 +362,7 @@ fn real_mitm_fetch_through_sidecar() {
         secret_fingerprints: &[],
         cert_pins_json: None,
         disable_mitm: false,
+        upstream_extra_ca: None,
     };
     let worker = spawn_forced_net_worker(&params, &scratch_root, |_row| {})
         .expect("force-routed worker + sidecar");

@@ -295,6 +295,7 @@ async fn render_in_jail_forced(
         secret_fingerprints: &[],
         cert_pins_json: None,
         disable_mitm: true,
+        upstream_extra_ca: None,
     };
     let decisions: std::sync::Arc<std::sync::Mutex<Vec<CapturedDecision>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

@@ -279,6 +279,7 @@ fn mail_policy_force_routes_and_enforces_its_endpoint_allowlist() {
             secret_fingerprints: &[],
             cert_pins_json: None,
             disable_mitm: false,
+            upstream_extra_ca: None,
         };
         let mut worker = spawn_forced_net_worker(&params, &scratch_root, sink)
             .expect("force-routed mail worker + sidecar spawn");

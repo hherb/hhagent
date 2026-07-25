@@ -48,6 +48,10 @@ pub struct NetWorkerSpawn<'a> {
     /// Put this worker's sidecar into no-MITM (transparent-tunnel) mode. Set for
     /// the browser, which does end-to-end TLS and can't trust our CA (slice #2).
     pub disable_mitm: bool,
+    /// Operator-provided extra CA to trust on the sidecar's re-origination
+    /// (upstream) leg, for a self-signed private origin (localmail, #491).
+    /// `None` ⇒ webpki-only (the production default — no prod wiring yet).
+    pub upstream_extra_ca: Option<&'a Path>,
 }
 
 /// Maximum byte length of a Unix-domain-socket path. `sockaddr_un.sun_path` is
@@ -209,6 +213,7 @@ where
         params.cert_pins_json,
         params.disable_mitm,
         false, // short-lived: 1:1 with a single tool-call dispatch (issue #395)
+        params.upstream_extra_ca,
     )
     .map_err(|e| ToolHostError::Io(std::io::Error::other(format!("egress sidecar: {e}"))))?;
     // Capture the proxy stdout for the ingest thread before the handle moves.

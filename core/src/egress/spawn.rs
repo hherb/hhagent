@@ -17,6 +17,10 @@ const ENV_PINS: &str = "KASTELLAN_EGRESS_PROXY_PINS";
 /// workers that do their own end-to-end TLS (the browser). Must match the read
 /// in `egress-proxy::main`.
 const ENV_DISABLE_MITM: &str = "KASTELLAN_EGRESS_PROXY_DISABLE_MITM";
+/// Env key pointing the sidecar at an operator-provided extra CA to trust on the
+/// re-origination (upstream) leg — for a self-signed private origin (localmail,
+/// #491). Must match the read in `egress-proxy::main`.
+const ENV_UPSTREAM_EXTRA_CA: &str = "KASTELLAN_EGRESS_PROXY_UPSTREAM_EXTRA_CA";
 
 /// Basename of the per-worker sidecar UDS under the scratch dir. Shared so the
 /// force-routing scratch-dir guard (`net_worker::make_worker_scratch_dir`) can
@@ -80,6 +84,7 @@ impl SidecarHandle {
 /// dispatch, so it gets a bounded [`SHORT_LIVED_SIDECAR_CPU_MS`] cap back —
 /// restoring the defense-in-depth that only mattered on macOS, where
 /// `RLIMIT_CPU` is the sole per-process CPU-governance primitive.
+#[allow(clippy::too_many_arguments)] // descriptor args for the sidecar's SandboxPolicy
 pub fn proxy_policy(
     binary: &Path,
     allowlist: &[String],
@@ -88,6 +93,7 @@ pub fn proxy_policy(
     cert_pins_json: Option<&str>,
     disable_mitm: bool,
     long_lived: bool,
+    upstream_extra_ca: Option<&Path>,
 ) -> SandboxPolicy {
     let uds = scratch.join(UDS_FILE_NAME);
     let allow_json = serde_json::to_string(allowlist).expect("Vec<String> serializes");
@@ -106,13 +112,24 @@ pub fn proxy_policy(
     if disable_mitm {
         env.push((ENV_DISABLE_MITM.to_string(), "1".to_string()));
     }
+    // Operator-provided extra CA for the re-origination leg (#491). Omit the key
+    // entirely when absent so the no-extra-CA path is byte-identical.
+    if let Some(ca) = upstream_extra_ca {
+        env.push((ENV_UPSTREAM_EXTRA_CA.to_string(), ca.to_string_lossy().into_owned()));
+    }
+    let mut fs_read = vec![
+        binary.to_path_buf(),
+        PathBuf::from("/etc/resolv.conf"),
+        PathBuf::from("/etc/hosts"),
+        PathBuf::from("/etc/nsswitch.conf"),
+    ];
+    // The proxy reads the extra CA at startup (before lock_down); it must be
+    // bound into the jail's fs_read to be openable.
+    if let Some(ca) = upstream_extra_ca {
+        fs_read.push(ca.to_path_buf());
+    }
     SandboxPolicy {
-        fs_read: vec![
-            binary.to_path_buf(),
-            PathBuf::from("/etc/resolv.conf"),
-            PathBuf::from("/etc/hosts"),
-            PathBuf::from("/etc/nsswitch.conf"),
-        ],
+        fs_read,
         fs_write: vec![scratch.to_path_buf()],
         net: Net::ProxyEgress,
         // CPU governance is lifetime-scoped (issue #395). A long-lived channel
@@ -151,6 +168,7 @@ pub fn spawn_sidecar(
     cert_pins_json: Option<&str>,
     disable_mitm: bool,
     long_lived: bool,
+    upstream_extra_ca: Option<&Path>,
 ) -> anyhow::Result<SidecarHandle> {
     let policy = proxy_policy(
         binary,
@@ -160,6 +178,7 @@ pub fn spawn_sidecar(
         cert_pins_json,
         disable_mitm,
         long_lived,
+        upstream_extra_ca,
     );
     let uds_path = scratch.join(UDS_FILE_NAME);
     let _ = std::fs::remove_file(&uds_path);
@@ -203,7 +222,7 @@ mod tests {
 
     #[test]
     fn policy_uses_proxy_egress_and_net_client() {
-        let p = proxy_policy(Path::new("/opt/proxy"), &["example.com".into()], Path::new("/scratch"), "web-fetch", None, false, false);
+        let p = proxy_policy(Path::new("/opt/proxy"), &["example.com".into()], Path::new("/scratch"), "web-fetch", None, false, false, None);
         assert!(matches!(p.net, Net::ProxyEgress));
         assert!(matches!(p.profile, Profile::WorkerNetClient));
         assert!(p.fs_read.contains(&PathBuf::from("/etc/resolv.conf")));
@@ -225,7 +244,7 @@ mod tests {
     /// this pins what that derivation must yield for the proxy's policy.
     #[test]
     fn derived_proxy_policy_carries_lockdown_env_for_dns() {
-        let p = proxy_policy(Path::new("/opt/proxy"), &["matrix.example.org:443".into()], Path::new("/scratch"), "matrix", None, true, true);
+        let p = proxy_policy(Path::new("/opt/proxy"), &["matrix.example.org:443".into()], Path::new("/scratch"), "matrix", None, true, true, None);
         let d = crate::tool_host::derive_lockdown_env(&p);
         let env: std::collections::HashMap<_, _> = d.env.into_iter().collect();
         assert_eq!(env["KASTELLAN_SECCOMP_PROFILE"], "net_client");
@@ -247,7 +266,7 @@ mod tests {
     fn proxy_policy_long_lived_has_no_cpu_cap() {
         let p = proxy_policy(
             Path::new("/opt/proxy"), &["matrix.example.org:443".into()],
-            Path::new("/scratch"), "matrix", None, true, true,
+            Path::new("/scratch"), "matrix", None, true, true, None,
         );
         assert_eq!(p.cpu_ms, 0, "long-lived sidecar must have no cumulative CPU cap");
     }
@@ -260,7 +279,7 @@ mod tests {
     fn proxy_policy_short_lived_keeps_bounded_cpu_cap() {
         let p = proxy_policy(
             Path::new("/opt/proxy"), &["example.com".into()],
-            Path::new("/scratch"), "web-fetch", None, false, false,
+            Path::new("/scratch"), "web-fetch", None, false, false, None,
         );
         assert_eq!(
             p.cpu_ms, SHORT_LIVED_SIDECAR_CPU_MS,
@@ -277,7 +296,7 @@ mod tests {
     fn derived_short_lived_policy_carries_cpu_ms_env() {
         let p = proxy_policy(
             Path::new("/opt/proxy"), &["example.com".into()],
-            Path::new("/scratch"), "web-fetch", None, false, false,
+            Path::new("/scratch"), "web-fetch", None, false, false, None,
         );
         let d = crate::tool_host::derive_lockdown_env(&p);
         let env: std::collections::HashMap<_, _> = d.env.into_iter().collect();
@@ -290,7 +309,7 @@ mod tests {
 
     #[test]
     fn proxy_policy_omits_pins_env_when_none() {
-        let p = proxy_policy(Path::new("/bin/proxy"), &["example.com".into()], Path::new("/scratch"), "web-fetch", None, false, false);
+        let p = proxy_policy(Path::new("/bin/proxy"), &["example.com".into()], Path::new("/scratch"), "web-fetch", None, false, false, None);
         let env: std::collections::HashMap<_, _> = p.env.into_iter().collect();
         assert!(!env.contains_key(ENV_PINS));
     }
@@ -298,7 +317,7 @@ mod tests {
     #[test]
     fn proxy_policy_includes_pins_env_when_set() {
         let pins = r#"{"api.anthropic.com":["sha256/AAAA"]}"#;
-        let p = proxy_policy(Path::new("/bin/proxy"), &["example.com".into()], Path::new("/scratch"), "web-fetch", Some(pins), false, false);
+        let p = proxy_policy(Path::new("/bin/proxy"), &["example.com".into()], Path::new("/scratch"), "web-fetch", Some(pins), false, false, None);
         let env: std::collections::HashMap<_, _> = p.env.into_iter().collect();
         assert_eq!(env[ENV_PINS], pins);
     }
@@ -307,7 +326,7 @@ mod tests {
     fn proxy_policy_sets_disable_mitm_env_when_requested() {
         let p = proxy_policy(
             Path::new("/bin/proxy"), &["example.com:443".into()],
-            Path::new("/scratch"), "browser-driver", None, true, false,
+            Path::new("/scratch"), "browser-driver", None, true, false, None,
         );
         let env: std::collections::HashMap<_, _> = p.env.into_iter().collect();
         assert_eq!(env[ENV_DISABLE_MITM], "1");
@@ -317,9 +336,32 @@ mod tests {
     fn proxy_policy_omits_disable_mitm_env_when_false() {
         let p = proxy_policy(
             Path::new("/bin/proxy"), &["example.com:443".into()],
-            Path::new("/scratch"), "web-fetch", None, false, false,
+            Path::new("/scratch"), "web-fetch", None, false, false, None,
         );
         let env: std::collections::HashMap<_, _> = p.env.into_iter().collect();
         assert!(!env.contains_key(ENV_DISABLE_MITM));
+    }
+
+    #[test]
+    fn proxy_policy_includes_upstream_extra_ca_env_and_fs_read_when_set() {
+        let ca = PathBuf::from("/etc/localmail/ca.pem");
+        let p = proxy_policy(
+            Path::new("/bin/proxy"), &["127.0.0.1:8443".into()],
+            Path::new("/scratch"), "mail", None, false, false, Some(&ca),
+        );
+        let env: std::collections::HashMap<_, _> = p.env.iter().cloned().collect();
+        assert_eq!(env[ENV_UPSTREAM_EXTRA_CA], "/etc/localmail/ca.pem");
+        assert!(p.fs_read.contains(&ca), "the extra CA must be bound into the proxy jail");
+    }
+
+    #[test]
+    fn proxy_policy_omits_upstream_extra_ca_when_none() {
+        let p = proxy_policy(
+            Path::new("/bin/proxy"), &["example.com".into()],
+            Path::new("/scratch"), "web-fetch", None, false, false, None,
+        );
+        let env: std::collections::HashMap<_, _> = p.env.iter().cloned().collect();
+        assert!(!env.contains_key(ENV_UPSTREAM_EXTRA_CA));
+        assert!(!p.fs_read.contains(&PathBuf::from("/etc/localmail/ca.pem")));
     }
 }
