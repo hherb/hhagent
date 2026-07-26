@@ -517,10 +517,14 @@ fn force_routed_search_fails_without_upstream_extra_ca() {
 ///   cargo test -p kastellan-core --test mail_e2e -- --ignored --nocapture \
 ///     force_routed_search_against_real_localmail
 ///
-/// The endpoint host MUST match a SAN in the cert (inspect it on the DGX). Prefer
-/// 127.0.0.1 (loopback — dialable via the proxy's allowlisted-IP carve-out); a
-/// private LAN IP (10.0.0.3) may hit the SSRF block. Token is pre-obtained to keep
-/// the password out of the test process.
+/// The endpoint host MUST match an IP/DNS SAN in the cert. On the DGX, localmail
+/// binds `10.0.0.3:8443` only (not loopback), so use `https://10.0.0.3:8443` — the
+/// proxy's allowlisted-IP carve-out dials that private literal (live-verified
+/// 2026-07-26, no SSRF block). The origin MUST serve a **non-CA leaf** cert:
+/// rustls-webpki (the proxy's re-origination validator) rejects a self-signed cert
+/// marked `basicConstraints CA:TRUE` with `CaUsedAsEndEntity`, even though openssl
+/// accepts it — a self-signed cert with `CA:FALSE` (like the hermetic mock)
+/// validates. Token is pre-obtained to keep the password out of the test process.
 #[test]
 #[ignore = "live DGX localmail; set KASTELLAN_MAIL_LIVE_ENDPOINT/CA/TOKEN"]
 fn force_routed_search_against_real_localmail() {
