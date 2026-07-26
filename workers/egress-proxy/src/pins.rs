@@ -253,6 +253,12 @@ pub(crate) fn add_extra_ca_pem(roots: &mut RootCertStore, pem: &[u8]) -> Result<
 ///   [`PinningVerifier`].
 /// * a set-but-unparseable value ⇒ `Err` (the caller aborts startup — fail loud,
 ///   never silently degrade to no-pinning).
+/// * `extra_ca_path`: `None` / absent ⇒ webpki-only, unchanged. `Some(path)` ⇒
+///   the PEM's certificate(s) are added as extra trust anchors for the upstream
+///   re-origination leg, **in addition to** webpki roots — for a self-signed
+///   private origin (e.g. a personal localmail). A set-but-unreadable, invalid,
+///   or zero-cert PEM ⇒ `Err` (fail-closed, aborts proxy startup, same as the
+///   pins case above).
 pub fn build_upstream_client_config(
     pins_env: Option<&str>,
     extra_ca_path: Option<&Path>,

@@ -1,12 +1,19 @@
-//! Plain-HTTP canned-response mock of localmail's `/v1` REST API, serving the
-//! six endpoints the mail worker hits in localmail's REAL response shapes (as
-//! #487 corrected them: search → `results`, attachment text → `application/json
-//! {"text": …}`). Plain HTTP is deliberate: it sidesteps the webpki-only TLS
-//! wall entirely (that only bites TLS), so the mail worker's DIRECT transport
-//! round-trips hermetically against it. It is NOT reachable via the force-routed
-//! transport (HTTPS-only) — see the mail e2e egress tier. Response SHAPES are
-//! pinned against real localmail by the Mac-only contract test in
-//! `core/tests/mail_daemon_e2e.rs`.
+//! Canned-response mock of localmail's `/v1` REST API, serving the six
+//! endpoints the mail worker hits in localmail's REAL response shapes (as #487
+//! corrected them: search → `results`, attachment text → `application/json
+//! {"text": …}`). Response SHAPES are pinned against real localmail by the
+//! Mac-only contract test in `core/tests/mail_daemon_e2e.rs`.
+//!
+//! Two spawn flavours, same request routing/response bodies, different
+//! transport:
+//! * [`spawn_mock_localmail`] — plain HTTP. Deliberate: it sidesteps the
+//!   webpki-only TLS wall entirely (that only bites TLS), so the mail worker's
+//!   DIRECT transport round-trips hermetically against it. It is NOT reachable
+//!   via the force-routed transport (HTTPS-only).
+//! * [`spawn_mock_localmail_tls`] — self-signed HTTPS, added for #491. It IS
+//!   reachable via the force-routed transport, once the egress proxy is handed
+//!   its cert as `upstream_extra_ca` (see `pins::build_upstream_client_config`)
+//!   so the MITM's upstream re-origination leg trusts it.
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
