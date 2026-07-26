@@ -259,6 +259,27 @@ pub(crate) fn add_extra_ca_pem(roots: &mut RootCertStore, pem: &[u8]) -> Result<
 ///   private origin (e.g. a personal localmail). A set-but-unreadable, invalid,
 ///   or zero-cert PEM ⇒ `Err` (fail-closed, aborts proxy startup, same as the
 ///   pins case above).
+///
+/// # Operator gotcha: the extra CA must not be a `CA:TRUE` self-signed *leaf*
+///
+/// Loading here only checks that the PEM parses as a certificate — it cannot
+/// check that the anchor will actually validate the origin. Two shapes work:
+/// a real CA that **signed** a separate origin leaf, or a self-signed leaf that
+/// is its own anchor and carries `basicConstraints CA:FALSE`. A self-signed cert
+/// used as both anchor and leaf while marked `CA:TRUE` does **not** work:
+/// rustls-webpki rejects it with `CaUsedAsEndEntity` at handshake time, even
+/// though `openssl verify` accepts it. That matters because `openssl req -x509`
+/// commonly produces exactly that shape, and the failure surfaces late and
+/// opaquely — as a `mitm_failed: …` egress decision, not as a startup error.
+///
+/// # Trust scope
+///
+/// The anchor lands in the sidecar's whole upstream root store, so it is trusted
+/// for **every** host that sidecar can reach — not only the private origin. The
+/// blast radius is bounded by one-sidecar-per-worker plus that worker's egress
+/// allowlist, so it is safe for a single-origin worker (mail). Do not point it at
+/// a worker whose allowlist mixes a private origin with public hosts: the extra
+/// CA could then impersonate those public hosts. See #492.
 pub fn build_upstream_client_config(
     pins_env: Option<&str>,
     extra_ca_path: Option<&Path>,

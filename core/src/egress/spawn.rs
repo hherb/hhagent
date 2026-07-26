@@ -113,7 +113,10 @@ pub fn proxy_policy(
         env.push((ENV_DISABLE_MITM.to_string(), "1".to_string()));
     }
     // Operator-provided extra CA for the re-origination leg (#491). Omit the key
-    // entirely when absent so the no-extra-CA path is byte-identical.
+    // entirely when absent so the no-extra-CA path is byte-identical. The env
+    // value is `to_string_lossy` (as ENV_UDS above is) while the fs_read bind
+    // below keeps the exact bytes, so a non-UTF-8 path would disagree — the
+    // proxy then can't open the mangled path and startup fails closed.
     if let Some(ca) = upstream_extra_ca {
         env.push((ENV_UPSTREAM_EXTRA_CA.to_string(), ca.to_string_lossy().into_owned()));
     }

@@ -432,6 +432,24 @@ async fn run_forced_mail_search_over_tls(
     .map_err(|e| e.to_string());
 
     let _ = worker.close();
+    // The decision-ingest thread is deliberately DETACHED (see `EgressSidecar`),
+    // so `close()` only *starts* its drain: the proxy dies, the thread sees EOF on
+    // its stdout, flushes the decision lines still buffered, and exits. Reading
+    // `rows` straight after the close would race that drain — which matters most
+    // for the LAST decision of a connection (the negative control's
+    // `mitm_failed: …`, emitted only after the upstream handshake fails). Poll to
+    // quiescence instead: the count must hold steady across two consecutive polls.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (mut last_len, mut stable) = (usize::MAX, 0u8);
+    while std::time::Instant::now() < deadline && stable < 2 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let len = rows.lock().unwrap().len();
+        if len == last_len && len > 0 {
+            stable += 1;
+        } else {
+            (last_len, stable) = (len, 0);
+        }
+    }
     pool.close().await;
     let _ = std::fs::remove_dir_all(&scratch_root);
     let captured = std::mem::take(&mut *rows.lock().unwrap());
@@ -441,8 +459,15 @@ async fn run_forced_mail_search_over_tls(
 /// Hermetic full round-trip: the REAL mail worker, force-routed in MITM mode,
 /// drives mail.search through the sidecar to a self-signed HTTPS localmail mock;
 /// the proxy MITM-terminates and re-originates TLS validated against the
-/// operator-provided upstream extra CA. Asserts the results round-trip AND
-/// tls_intercepted: true. The #491 deliverable tier 1b could not cover.
+/// operator-provided upstream extra CA. The #491 deliverable tier 1b could not cover.
+///
+/// The load-bearing assertion is `results` round-tripping: bytes only reach the
+/// worker if the proxy's upstream handshake against the self-signed origin
+/// validated. `tls_intercepted: true` is asserted as well, but note it is a
+/// *weaker* signal than it looks — the proxy emits that decision when it takes
+/// the MITM branch, BEFORE `run_mitm` performs the upstream handshake (see
+/// `egress-proxy::proxy`), so on its own it proves only "not transparently
+/// tunnelled", not "re-origination succeeded".
 #[test]
 fn force_routed_search_round_trips_through_mitm_sidecar() {
     use kastellan_tests_common::egress_proxy_bin_or_skip;
@@ -478,6 +503,13 @@ fn force_routed_search_round_trips_through_mitm_sidecar() {
 /// FAIL — the proxy re-originates against webpki roots only and rejects the
 /// self-signed origin. Proves the extra-CA seam is load-bearing (the round-trip
 /// does not "accidentally" work without it).
+///
+/// `is_err()` alone would be satisfied by ANY failure (worker crash, PG hiccup,
+/// dispatch timeout), so the control would silently stop being a control the day
+/// something upstream of TLS broke. So we also pin the failure to the
+/// re-origination leg: on an upstream handshake failure the proxy emits an
+/// allowed-but-failed decision whose reason is `mitm_failed: …`
+/// (`classify_mitm_error`), which the host maps into the audit row's payload.
 #[test]
 fn force_routed_search_fails_without_upstream_extra_ca() {
     use kastellan_tests_common::egress_proxy_bin_or_skip;
@@ -497,11 +529,21 @@ fn force_routed_search_fails_without_upstream_extra_ca() {
     }
 
     dispatch_runtime().block_on(async {
-        let (result, _rows) = run_forced_mail_search_over_tls(&proxy, &bin_dir, false).await;
+        let (result, rows) = run_forced_mail_search_over_tls(&proxy, &bin_dir, false).await;
         assert!(
             result.is_err(),
             "without the upstream extra CA the MITM re-origination must reject the \
              self-signed origin; got Ok: {result:?}"
+        );
+        // Pin the failure to the re-origination leg, not to any incidental error.
+        assert!(
+            rows.iter().any(|r| r.payload["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("mitm_failed:"))),
+            "the failure must be the proxy's upstream handshake rejecting the \
+             self-signed origin (a `mitm_failed: …` decision), not an incidental \
+             error; got {:?}",
+            rows.iter().map(|r| (r.action.clone(), r.payload.clone())).collect::<Vec<_>>()
         );
     });
 }

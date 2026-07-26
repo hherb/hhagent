@@ -126,6 +126,12 @@ where
 /// writes it wherever the egress proxy's upstream extra CA must live). Serves the
 /// identical `/v1` shapes as [`spawn_mock_localmail`] — the force-routed MITM path
 /// can reach it once the proxy is given this cert as its upstream extra CA (#491).
+///
+/// Unlike the plain flavour, which serves connections sequentially in its accept
+/// loop, this one spawns a task per connection (a stalled TLS handshake must not
+/// wedge the next client). `MockLocalmail`'s drop aborts only the accept loop, so
+/// an in-flight connection task can briefly outlive the mock — harmless for tests,
+/// but don't assume the two flavours have identical teardown semantics.
 pub async fn spawn_mock_localmail_tls() -> (MockLocalmail, String) {
     let (cert_der, key_der, cert_pem) = crate::tls_origin::generate_loopback_cert();
     let server_config = rustls::ServerConfig::builder()

@@ -96,7 +96,11 @@ fn main() -> anyhow::Result<()> {
     if let Some(ref p) = upstream_extra_ca {
         eprintln!(
             "[egress-proxy] WARN: trusting operator-provided upstream extra CA {p:?} on the \
-             re-origination leg (widens upstream trust beyond webpki roots)"
+             re-origination leg (widens upstream trust beyond webpki roots, for EVERY host \
+             this sidecar may reach). The cert must be a real CA that signed the origin's \
+             leaf, or a self-signed leaf with basicConstraints CA:FALSE — a CA:TRUE \
+             self-signed leaf is rejected at handshake time (CaUsedAsEndEntity) and shows \
+             up as a `mitm_failed: …` decision, not as a startup error."
         );
     }
     let upstream_tls = pins::build_upstream_client_config(

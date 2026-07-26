@@ -35,3 +35,7 @@ libc         = "0.2"
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 sha2      = "0.10"
 base64    = "0.22"
+
+[dev-dependencies]
+# Real on-disk PEM for the upstream extra-CA read path (#491). MIT OR Apache-2.0.
+tempfile = "3"

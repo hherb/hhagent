@@ -39,9 +39,10 @@
 //! * [`scripted_llm`] — `ScriptedLlm` + `spawn_scripted_llm` + plan/embedding
 //!   envelope builders: the queued multi-shot mock LLM shared by the daemon
 //!   e2e tests that drive a scripted planner (lifted from `cli_ask_e2e.rs`).
-//! * [`mock_localmail`] — a plain-HTTP canned-response localmail `/v1` origin
-//!   for the mail-worker e2e tiers (real response shapes; pinned by the Mac-only
-//!   contract test).
+//! * [`mock_localmail`] — a canned-response localmail `/v1` origin for the
+//!   mail-worker e2e tiers (real response shapes; pinned by the Mac-only contract
+//!   test), in a plain-HTTP flavour (direct transport) and a self-signed-HTTPS one
+//!   (the force-routed MITM tier, via the proxy's upstream extra CA).
 //! * [`egress_forcing`] — `short_scratch_root` / `minted_uds` /
 //!   `assert_connect_established` / `UDS_FILE_NAME`: the force-routing e2e
 //!   scaffolding shared by `egress_force_routing_e2e.rs` + `mail_e2e.rs`.

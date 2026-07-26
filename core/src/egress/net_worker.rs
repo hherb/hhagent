@@ -51,6 +51,14 @@ pub struct NetWorkerSpawn<'a> {
     /// Operator-provided extra CA to trust on the sidecar's re-origination
     /// (upstream) leg, for a self-signed private origin (localmail, #491).
     /// `None` ⇒ webpki-only (the production default — no prod wiring yet).
+    ///
+    /// Must be an **absolute** path: it is bound into the proxy jail via
+    /// `SandboxPolicy.fs_read`, which rejects relative paths (so a relative path
+    /// fails closed at spawn, with a less obvious error). Only meaningful when
+    /// `disable_mitm` is false — a transparent tunnel has no re-origination leg.
+    /// The anchor is trusted for every host THIS sidecar may reach, so it suits a
+    /// single-origin worker; see `egress-proxy::pins::build_upstream_client_config`
+    /// for the trust-scope and `CA:FALSE` constraints.
     pub upstream_extra_ca: Option<&'a Path>,
 }
 

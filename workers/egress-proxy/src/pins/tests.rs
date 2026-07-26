@@ -220,3 +220,41 @@ fn build_upstream_config_missing_extra_ca_file_fails_closed() {
 fn build_upstream_config_none_extra_ca_is_ok() {
     assert!(build_upstream_client_config(None, None).is_ok());
 }
+
+/// The whole `Some(path)` composition — filesystem read → PEM parse → root store
+/// → `ClientConfig` — against a REAL on-disk PEM. The pure `add_extra_ca_pem`
+/// tests above cover the parse alone and the sandbox-gated mail e2e covers the
+/// deployed path, so without this the fs-read-and-build seam has no coverage on
+/// a host where the sandbox tiers skip (macOS).
+#[test]
+fn build_upstream_config_with_valid_extra_ca_file_builds() {
+    install_provider();
+    let ca = crate::ca::generate_ca().expect("generate ca");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("extra-ca.pem");
+    std::fs::write(&path, ca.cert_pem()).expect("write ca pem");
+
+    assert!(
+        build_upstream_client_config(None, Some(&path)).is_ok(),
+        "a readable, valid extra-CA PEM must build the upstream config"
+    );
+    // Composes with a pin overlay: extra CA widens the roots, pins narrow the
+    // accepted leaves; neither disables the other.
+    let pin = [0x44u8; 32];
+    let json = format!(r#"{{"api.anthropic.com":["{}"]}}"#, pin_str(&pin));
+    assert!(build_upstream_client_config(Some(&json), Some(&path)).is_ok());
+}
+
+/// A file that exists and parses as PEM but carries no certificate must fail
+/// closed through the public entry point too, not just via `add_extra_ca_pem`.
+#[test]
+fn build_upstream_config_with_certless_extra_ca_file_fails_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("key-only.pem");
+    std::fs::write(&path, "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n")
+        .expect("write key-only pem");
+    assert!(
+        build_upstream_client_config(None, Some(&path)).is_err(),
+        "a zero-certificate PEM must fail closed"
+    );
+}
