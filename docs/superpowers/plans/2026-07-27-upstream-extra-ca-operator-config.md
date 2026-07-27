@@ -41,8 +41,12 @@ Branch `feat/492-upstream-extra-ca-wiring`. All slices done.
   disabling the refusal — whose failure message, `io: egress sidecar: spawn
   egress-proxy sidecar: backend error`, is itself the evidence for finding 4:
   the backstop's wording names neither the env var nor the worker).
-* **DGX (authoritative):** full-workspace `cargo test` + `clippy --all-targets
-  -D warnings` — see HANDOVER for the recorded figure.
+* **DGX (authoritative), post-review at `8992f17c`:** `cargo test --workspace --
+  --nocapture` = **2748 / 0 / 53**, exit 0 (+40 over the 2708 `main` baseline =
+  exactly the new tests); `clippy --workspace --all-targets -- -D warnings`
+  clean, exit 0; 4 `[SKIP]`, all the env-gated `KASTELLAN_GLINER_RELEX_ENABLE`
+  tier — **no sandbox tier skipped**. The two `error[E…]` blocks in the log are
+  the expected output of pre-existing `compile_fail` doctests, both `... ok`.
 
 ## Follow-ups not taken here
 
