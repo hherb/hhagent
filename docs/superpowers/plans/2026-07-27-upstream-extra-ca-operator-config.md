@@ -27,8 +27,20 @@ Branch `feat/492-upstream-extra-ca-wiring`. All slices done.
 
 ## Verification
 
-* **Mac:** `cargo test -p kastellan-core --lib` **1303 / 0 / 1**;
+* **Mac (pre-review):** `cargo test -p kastellan-core --lib` **1303 / 0 / 1**;
   `cargo clippy -p kastellan-core --lib --tests -- -D warnings` clean.
+* **Mac (post-review fixes):** `cargo test -p kastellan-core --lib` **1308 / 0 /
+  1**, exit 0 — +5 = exactly the net new tests; clippy `-D warnings` clean, exit 0.
+* **#479 house rule, re-run for the new assertions.** All five fail against
+  deliberately weakened code, then pass restored: the three parse-time origin
+  rules (weakened by falling back to a lowercased key instead of refusing),
+  `a_selected_extra_ca_reaches_the_sidecar_policy_env_and_fs_read` (weakened by
+  hardcoding `upstream_extra_ca: None` in the params — the failure output shows
+  the sidecar env genuinely lacking the key, so the assertion is not vacuous),
+  and `spawn_refuses_an_extra_ca_for_a_transparent_tunnel_worker` (weakened by
+  disabling the refusal — whose failure message, `io: egress sidecar: spawn
+  egress-proxy sidecar: backend error`, is itself the evidence for finding 4:
+  the backstop's wording names neither the env var nor the worker).
 * **DGX (authoritative):** full-workspace `cargo test` + `clippy --all-targets
   -D warnings` — see HANDOVER for the recorded figure.
 
