@@ -38,6 +38,26 @@ impl SandboxBackend for RecordingBackend {
     }
 }
 
+/// A backend that captures the full [`SandboxPolicy`] of each spawn attempt and
+/// then fails. Lets a test assert what was *in* the policy a spawn path built —
+/// the env keys and `fs_read` binds — without a real child process. (The policy
+/// captured is the post-`derive_lockdown_env` one, which is a clone of the
+/// original plus the lockdown env keys, so both survive.)
+struct PolicyCapturingBackend {
+    policies: Arc<Mutex<Vec<SandboxPolicy>>>,
+}
+impl SandboxBackend for PolicyCapturingBackend {
+    fn spawn_under_policy(
+        &self,
+        policy: &SandboxPolicy,
+        _program: &str,
+        _args: &[&str],
+    ) -> Result<std::process::Child, SandboxError> {
+        self.policies.lock().expect("capture mutex poisoned").push(policy.clone());
+        Err(SandboxError::Backend("test: spawn refused".into()))
+    }
+}
+
 /// Backend whose spawn always fails. The point of these tests is *which*
 /// spawn path runs, told apart by the error variant: the plain
 /// `spawn_worker` path surfaces `ToolHostError::Sandbox`, while the
@@ -634,4 +654,226 @@ fn no_broker_requested_is_passthrough() {
         matches!(res, Err(ToolHostError::Sandbox(_))),
         "no-broker path must be byte-identical to spawn_worker_maybe_forced"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Upstream extra-CA operator config (#492)
+// ---------------------------------------------------------------------------
+
+/// A `ForceRoutingConfig` carrying an extra-CA map, for the selection tests.
+fn config_with_upstream_cas(json: &str) -> ForceRoutingConfig {
+    config_with_upstream_cas_in(json, PathBuf::from("/tmp"))
+}
+
+/// As [`config_with_upstream_cas`], with an explicit scratch root — needed by
+/// the test that lets the sidecar spawn actually be attempted.
+fn config_with_upstream_cas_in(json: &str, scratch_root: PathBuf) -> ForceRoutingConfig {
+    let cas = parse_upstream_cas_env(Some(json)).expect("valid extra-CA config");
+    config_with(scratch_root).with_upstream_cas(cas)
+}
+
+#[test]
+fn parse_upstream_cas_env_handles_absent_blank_and_empty() {
+    assert!(parse_upstream_cas_env(None).unwrap().is_none());
+    assert!(parse_upstream_cas_env(Some("")).unwrap().is_none());
+    assert!(parse_upstream_cas_env(Some("   ")).unwrap().is_none());
+    // `{}` is a *present but empty* config; it normalizes to "no extra anchors"
+    // so the upstream path stays byte-identical.
+    assert!(parse_upstream_cas_env(Some("{}")).unwrap().is_none());
+}
+
+#[test]
+fn parse_upstream_cas_env_parses_valid_map() {
+    let got = parse_upstream_cas_env(Some(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#))
+        .expect("valid config")
+        .expect("non-empty config is Some");
+    let entries: Vec<(&str, &Path)> = got.entries().collect();
+    assert_eq!(entries, vec![("10.0.0.3", Path::new("/etc/localmail/ca.pem"))]);
+}
+
+#[test]
+fn parse_upstream_cas_env_fails_closed_on_malformed() {
+    // A relative path would fail much later, inside the sandbox's fs_read
+    // validation, naming the sandbox rather than this config.
+    let err = parse_upstream_cas_env(Some(r#"{"10.0.0.3":"ca.pem"}"#)).unwrap_err();
+    assert!(matches!(err, UpstreamCaError::RelativePath { .. }), "got {err:?}");
+}
+
+#[test]
+fn upstream_ca_for_is_none_when_unconfigured() {
+    let cfg = config_with(PathBuf::from("/tmp"));
+    assert_eq!(cfg.upstream_ca_for(&["10.0.0.3:8443".to_string()]).unwrap(), None);
+}
+
+#[test]
+fn upstream_ca_for_selects_the_single_private_origin() {
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    let got = cfg.upstream_ca_for(&["10.0.0.3:8443".to_string()]).unwrap();
+    assert_eq!(got, Some(Path::new("/etc/localmail/ca.pem")));
+}
+
+#[test]
+fn upstream_ca_for_is_none_when_worker_does_not_touch_the_origin() {
+    // Every other worker in the deployment must be unaffected.
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    assert_eq!(cfg.upstream_ca_for(&["api.example.com:443".to_string()]).unwrap(), None);
+}
+
+#[test]
+fn upstream_ca_for_refuses_a_mixed_allowlist() {
+    // THE security assertion at this layer: the anchor is added to the whole
+    // upstream root store of that sidecar, so a worker that can also reach a
+    // public host must not get one.
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    let allow = vec!["10.0.0.3:8443".to_string(), "api.example.com:443".to_string()];
+    let err = cfg.upstream_ca_for(&allow).unwrap_err();
+    assert!(matches!(err, UpstreamCaSelectError::MixedAllowlist { .. }), "got {err:?}");
+}
+
+#[test]
+fn spawn_refuses_before_touching_the_backend_on_a_bad_extra_ca_selection() {
+    // A refusal must be reported as a config problem and must not proceed to a
+    // spawn: FailBackend would otherwise surface `ToolHostError::Sandbox`, and
+    // the force-routed path surfaces `Io` for sidecar failures — so an `Io`
+    // whose message names the env var proves we stopped at the config check.
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    let policy = SandboxPolicy {
+        net: Net::Allowlist(vec!["10.0.0.3:8443".into(), "api.example.com:443".into()]),
+        ..SandboxPolicy::default()
+    };
+    // `SupervisedWorker` is not `Debug`, so unwrap the error by hand.
+    let msg = match spawn_worker_maybe_forced(
+        Some(&cfg),
+        &FailBackend,
+        &FailBackend,
+        &spec_for(&policy),
+        "mail",
+    ) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a mixed allowlist must refuse the spawn"),
+    };
+    assert!(msg.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"), "error must name the config: {msg}");
+    assert!(msg.contains("mail"), "error must name the worker: {msg}");
+}
+
+#[test]
+fn spawn_is_unaffected_when_no_extra_ca_matches_the_worker() {
+    // Regression guard for the byte-identical default: a configured origin that
+    // this worker never dials must leave the old spawn path untouched (the
+    // sidecar spawn then fails on the nonexistent proxy binary → Io).
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    let policy = SandboxPolicy {
+        net: Net::Allowlist(vec!["api.example.com:443".into()]),
+        ..SandboxPolicy::default()
+    };
+    let msg = match spawn_worker_maybe_forced(
+        Some(&cfg),
+        &FailBackend,
+        &FailBackend,
+        &spec_for(&policy),
+        "web-fetch",
+    ) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("the nonexistent proxy binary still fails the sidecar spawn"),
+    };
+    assert!(
+        !msg.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"),
+        "an unrelated worker must not be refused by the extra-CA check: {msg}"
+    );
+}
+
+/// The positive half of the wiring: a *selected* anchor must actually reach the
+/// sidecar. Asserted at the far end of the chain — `ForceRoutingConfig` →
+/// `NetWorkerSpawn` → `spawn_sidecar` → `proxy_policy` — by capturing the policy
+/// the sidecar backend is handed, so no link in it can be quietly dropped
+/// (`upstream_ca_for` returning the right path proves only the first link).
+#[test]
+fn a_selected_extra_ca_reaches_the_sidecar_policy_env_and_fs_read() {
+    let ca = PathBuf::from("/etc/localmail/ca.pem");
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let cfg = config_with_upstream_cas_in(
+        r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#,
+        scratch.path().to_path_buf(),
+    );
+    let policy = SandboxPolicy {
+        net: Net::Allowlist(vec!["10.0.0.3:8443".into()]),
+        ..SandboxPolicy::default()
+    };
+    let policies = Arc::new(Mutex::new(Vec::new()));
+    let sidecar = PolicyCapturingBackend { policies: Arc::clone(&policies) };
+    // Spawn fails (the capturing backend refuses), but the policy is recorded.
+    let _ = spawn_worker_maybe_forced(
+        Some(&cfg),
+        &FailBackend,
+        &sidecar,
+        &spec_for(&policy),
+        "mail",
+    );
+    let captured = policies.lock().expect("capture mutex poisoned");
+    let sidecar_policy = captured.first().expect("the sidecar spawn must have been attempted");
+    assert!(
+        sidecar_policy
+            .env
+            .iter()
+            .any(|(k, v)| k == "KASTELLAN_EGRESS_PROXY_UPSTREAM_EXTRA_CA" && v == "/etc/localmail/ca.pem"),
+        "the selected CA must reach the proxy's env: {:?}",
+        sidecar_policy.env
+    );
+    assert!(
+        sidecar_policy.fs_read.contains(&ca),
+        "the CA must be bound into the proxy jail or the proxy cannot open it: {:?}",
+        sidecar_policy.fs_read
+    );
+}
+
+/// A transparent-tunnel worker never re-originates TLS, so an anchor there would
+/// be inert. `spawn::check_upstream_extra_ca` is the backstop, but its message
+/// names neither the env var nor the worker — so the refusal is raised in
+/// `spawn_worker_maybe_forced`, where both are in scope.
+#[test]
+fn spawn_refuses_an_extra_ca_for_a_transparent_tunnel_worker() {
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    let policy = SandboxPolicy {
+        net: Net::Allowlist(vec!["10.0.0.3:8443".into()]),
+        ..SandboxPolicy::default()
+    };
+    let msg = match spawn_worker_maybe_forced(
+        Some(&cfg),
+        &FailBackend,
+        &FailBackend,
+        &spec_for(&policy),
+        MATRIX_TOOL,
+    ) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("an anchor for a no-MITM worker must refuse the spawn"),
+    };
+    assert!(msg.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"), "error must name the config: {msg}");
+    assert!(msg.contains(MATRIX_TOOL), "error must name the worker: {msg}");
+    assert!(msg.contains("transparent-tunnel"), "error must say why: {msg}");
+}
+
+#[test]
+fn validate_upstream_cas_accepts_a_pem_holding_a_certificate() {
+    let map = parse_upstream_cas_env(Some(r#"{"10.0.0.3":"/etc/ca.pem"}"#)).unwrap().unwrap();
+    let read = |_p: &Path| {
+        Ok("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n".to_string())
+    };
+    assert!(validate_upstream_cas(&map, &read).is_ok());
+}
+
+#[test]
+fn validate_upstream_cas_fails_closed_on_an_unreadable_file() {
+    let map = parse_upstream_cas_env(Some(r#"{"10.0.0.3":"/etc/ca.pem"}"#)).unwrap().unwrap();
+    let read = |_p: &Path| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"));
+    let err = validate_upstream_cas(&map, &read).unwrap_err();
+    assert!(matches!(err, UpstreamCaFileError::Unreadable { .. }), "got {err:?}");
+}
+
+#[test]
+fn validate_upstream_cas_fails_closed_on_a_file_with_no_certificate() {
+    // The realistic version of this is pasting the private key by mistake.
+    let map = parse_upstream_cas_env(Some(r#"{"10.0.0.3":"/etc/ca.pem"}"#)).unwrap().unwrap();
+    let read = |_p: &Path| Ok("-----BEGIN PRIVATE KEY-----\nAAA\n".to_string());
+    let err = validate_upstream_cas(&map, &read).unwrap_err();
+    assert!(matches!(err, UpstreamCaFileError::NoCertificate { .. }), "got {err:?}");
 }

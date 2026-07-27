@@ -116,6 +116,57 @@ pub fn ensure_v1_suffix(url: &str) -> String {
     }
 }
 
+/// Render the commented `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` help block (#492).
+///
+/// Split out as a pure function so the operator-facing wording — in particular
+/// the two traps below — is unit-testable and cannot silently drift from the
+/// rules `crate::egress::upstream_ca` enforces.
+///
+/// The two traps are the whole reason this block is more than one line:
+///
+/// 1. **`CA:TRUE` self-signed leaf.** `openssl req -x509` (the command everyone
+///    reaches for) produces a self-signed certificate marked
+///    `basicConstraints CA:TRUE`. If the origin then serves that same
+///    certificate as its leaf, the proxy's rustls upstream validator rejects it
+///    with `CaUsedAsEndEntity` — *even though `openssl verify` accepts it*. The
+///    failure appears late, as a `mitm_failed` egress decision, not at startup.
+/// 2. **Trust scope.** The anchor goes into that sidecar's whole upstream root
+///    store, so it is trusted for every host that sidecar can reach. The daemon
+///    therefore refuses to hand it to any worker that can reach more than the
+///    one private origin — and, because keying is per-host, the operator has to
+///    be told that co-located services on one address share the anchor.
+pub fn render_upstream_ca_help() -> String {
+    // One raw literal rather than a push_str chain: the block is prose, and it
+    // is much easier to re-wrap and diff when it looks like what it renders.
+    // The `help_block_is_entirely_commented_out` test guards the leading `#`s.
+    r#"# Extra TLS trust anchor for a force-routed worker whose origin is PRIVATE and
+# self-signed (e.g. a personal localmail on your LAN). JSON: origin -> PEM path.
+# Unset (the default) = the egress proxy trusts only the public webpki roots.
+# Only read when force-routing is enabled; on a host without it, this is inert.
+# Rules, all enforced fail-closed at daemon startup or spawn:
+#   * The origin MUST be a private/loopback IP LITERAL with NO port (10.x,
+#     192.168.x, 127.0.0.1, fd00::/8 ...). A hostname is refused: the proxy's SSRF
+#     guard blocks names that resolve into private ranges anyway, so it would be
+#     unreachable regardless. A bad origin fails the daemon at startup.
+#   * The PEM path must be ABSOLUTE and readable by the daemon.
+#   * The worker's egress allowlist must contain ONLY that origin. The anchor is
+#     trusted for every host that worker's sidecar can reach, so mixing a private
+#     origin with a public one would let this CA impersonate the public host.
+#   * CAVEAT: keying is per-HOST, not per-service. Every service sharing this
+#     address is one origin to the rule above, so a second worker allowlisted to
+#     e.g. 127.0.0.1:8888 also receives this anchor and trusts it for that port.
+#     Give co-located private services distinct addresses if that matters.
+#   * TRAP: the origin must serve a leaf certificate signed BY this CA, or a
+#     self-signed leaf marked `basicConstraints CA:FALSE`. A self-signed cert marked
+#     CA:TRUE and served as its own leaf is REJECTED at handshake time (rustls
+#     `CaUsedAsEndEntity`) even though `openssl verify` accepts it — and
+#     `openssl req -x509` produces exactly that shape by default. Check with:
+#       openssl x509 -in <cert.pem> -noout -text | grep -A1 'Basic Constraints'
+# KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA={"10.0.0.3":"/home/me/.config/localmail/tls/cert.pem"}
+"#
+    .to_string()
+}
+
 /// Render the `kastellan.env` EnvironmentFile contents.
 pub fn render_env_file(args: &InstallArgs, layout: &Layout) -> String {
     let mut s = String::new();
@@ -141,6 +192,13 @@ pub fn render_env_file(args: &InstallArgs, layout: &Layout) -> String {
     // reached" errors for the queries it couldn't reach rather than losing the
     // whole batch.
     s.push_str("# KASTELLAN_WEB_SEARCH_MAX_BATCH_QUERIES=8\n");
+    // Upstream extra CA for a force-routed worker whose origin is PRIVATE and
+    // self-signed (#492) — e.g. a personal localmail on the LAN. Commented out:
+    // unset means the egress proxy validates every re-originated connection
+    // against the public webpki roots only, which is what you want unless you
+    // run such an origin yourself. See render_upstream_ca_help for the traps
+    // this doc block warns about; they are the ones that actually bite.
+    s.push_str(&render_upstream_ca_help());
     if let (Some(hs), Some(user)) =
         (args.matrix_homeserver_url.as_deref(), args.matrix_user.as_deref())
     {
@@ -542,5 +600,42 @@ mod tests {
         assert!(!is_local_ollama("http://127.0.0.1:114340"));         // not port 11434
         assert!(!is_local_ollama("http://127.0.0.1:11434x"));         // not numeric port 11434
         assert!(is_local_ollama("http://[::1]:11434"));               // ipv6 loopback
+    }
+
+    /// Every line of the help block must be a comment. If the example line ever
+    /// lost its leading `#`, a fresh install would silently widen the egress
+    /// proxy's upstream trust to a path that does not exist on that host — a
+    /// setting no operator asked for, in the one file they will not re-read.
+    #[test]
+    fn help_block_is_entirely_commented_out() {
+        for line in render_upstream_ca_help().lines() {
+            assert!(
+                line.starts_with('#'),
+                "help block must stay inert; this line would be read as config: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_block_names_the_env_var_and_both_traps() {
+        let help = render_upstream_ca_help();
+        assert!(help.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"), "{help}");
+        // Trap 1: the CA:TRUE self-signed leaf, which fails late and opaquely.
+        assert!(help.contains("CA:FALSE"), "must state the working cert shape: {help}");
+        assert!(help.contains("CaUsedAsEndEntity"), "must name the rustls error: {help}");
+        // Trap 2: the trust scope that motivates the single-origin rule.
+        assert!(help.contains("impersonate"), "must state the trust-scope hazard: {help}");
+        // The private-literal rule, which is the most surprising refusal.
+        assert!(help.contains("LITERAL"), "must state the IP-literal rule: {help}");
+        // The per-host (not per-service) keying granularity: an operator running
+        // two private services on one address has to know the anchor is shared.
+        assert!(help.contains("per-HOST"), "must state the keying granularity: {help}");
+    }
+
+    #[test]
+    fn env_file_includes_the_help_block() {
+        let args = test_args("m", "http://h:1", None);
+        let layout = layout();
+        assert!(render_env_file(&args, &layout).contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"));
     }
 }

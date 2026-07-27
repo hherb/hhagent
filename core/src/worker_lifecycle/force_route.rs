@@ -23,6 +23,10 @@ use kastellan_sandbox::{Net, SandboxBackend, SandboxPolicy};
 
 use crate::egress::audit::EgressAuditRow;
 use crate::egress::cert_pins::{parse_cert_pins, select_pins_for_allowlist, CertPinError, CertPinMap};
+use crate::egress::upstream_ca::{
+    check_ca_pem_contents, parse_upstream_cas, select_ca_for_allowlist, UpstreamCaError,
+    UpstreamCaFileError, UpstreamCaMap, UpstreamCaSelectError,
+};
 use crate::egress::net_worker::{pg_decision_sink, spawn_forced_net_worker};
 use crate::broker::{spawn_broker, BrokerConfigs, BrokerKind, BrokerSpec};
 use crate::tool_host::{spawn_worker, SupervisedWorker, ToolHostError, WorkerSpec};
@@ -42,6 +46,14 @@ const ENV_SCRATCH_DIR: &str = "KASTELLAN_EGRESS_SCRATCH_DIR";
 /// `{host:["sha256/<b64>"]}` JSON the egress-proxy sidecar enforces. Validated
 /// fail-closed at startup; selected per worker by allowlist host.
 const ENV_CERT_PINS: &str = "KASTELLAN_EGRESS_CERT_PINS";
+/// Optional operator upstream extra-CA config for force-routed workers (#492).
+/// JSON `{"<private-ip-literal>":"/abs/path/ca.pem"}` naming, per origin, the
+/// extra trust anchor that origin's sidecar may use on its **re-origination
+/// (upstream) leg** — the leg that reaches a self-signed private origin such as
+/// a personal localmail. Validated fail-closed at startup and selected per
+/// worker; see [`crate::egress::upstream_ca`] for the (deliberately strict)
+/// single-private-origin rule.
+const ENV_UPSTREAM_EXTRA_CA: &str = "KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA";
 
 /// Factory that mints a fresh decision sink for each force-routed worker. Each
 /// sidecar gets its own `FnMut` so its decision-ingest thread owns an
@@ -71,6 +83,13 @@ pub struct ForceRoutingConfig {
     /// Selected per worker by allowlist host in [`ForceRoutingConfig::pins_for`]
     /// and handed to the sidecar via `cert_pins_json`.
     pub(crate) cert_pins: Option<CertPinMap>,
+    /// Operator upstream extra-CA config (#492). `Some` ⇒ non-empty (an
+    /// empty/`{}` config normalizes to `None` in [`from_env`]). Selected per
+    /// worker in [`ForceRoutingConfig::upstream_ca_for`] and handed to the
+    /// sidecar via `upstream_extra_ca`. `None` (the default, and the only value
+    /// any test or e2e constructs) keeps the webpki-only upstream path
+    /// byte-identical.
+    pub(crate) upstream_cas: Option<UpstreamCaMap>,
 }
 
 impl ForceRoutingConfig {
@@ -78,13 +97,27 @@ impl ForceRoutingConfig {
     /// [`resolve_force_routing`], which adds the enable-gate + fail-closed
     /// discovery semantics; this is the bare constructor the resolver and the
     /// tests share.
+    /// Deliberately does NOT take the upstream extra-CA config: that is set with
+    /// the [`ForceRoutingConfig::with_upstream_cas`] builder instead, so the
+    /// (many) existing callers keep a 4-argument constructor and the default
+    /// stays "no extra anchor". See [#494] on why this file resists growing more
+    /// positional parameters.
+    ///
+    /// [#494]: https://github.com/hherb/kastellan/issues/494
     pub fn new(
         proxy_bin: PathBuf,
         scratch_root: PathBuf,
         make_sink: DecisionSinkFactory,
         cert_pins: Option<CertPinMap>,
     ) -> Self {
-        Self { proxy_bin, scratch_root, make_sink, cert_pins }
+        Self { proxy_bin, scratch_root, make_sink, cert_pins, upstream_cas: None }
+    }
+
+    /// Attach the operator upstream extra-CA config (#492). Builder rather than
+    /// a `new` parameter — see [`ForceRoutingConfig::new`].
+    pub fn with_upstream_cas(mut self, upstream_cas: Option<UpstreamCaMap>) -> Self {
+        self.upstream_cas = upstream_cas;
+        self
     }
 
     /// The pin JSON to hand a force-routed worker's sidecar, given the worker's
@@ -92,6 +125,26 @@ impl ForceRoutingConfig {
     /// allowlisted hosts are pinned (→ byte-identical no-pin path).
     pub(crate) fn pins_for(&self, allowlist: &[String]) -> Option<String> {
         self.cert_pins.as_ref().and_then(|m| select_pins_for_allowlist(m, allowlist))
+    }
+
+    /// The upstream extra CA to hand a force-routed worker's sidecar, given the
+    /// worker's allowlist (#492).
+    ///
+    /// `Ok(None)` — no config, or none of this worker's allowlisted hosts has a
+    /// CA configured (→ byte-identical webpki-only upstream). `Ok(Some(path))` —
+    /// the single configured private origin this worker talks to. `Err(_)` — the
+    /// config and this worker's allowlist disagree; the caller must refuse the
+    /// spawn rather than drop the anchor silently, because an operator who
+    /// configured an anchor and got neither it nor an error would believe a
+    /// self-signed origin is reachable when it is not.
+    pub(crate) fn upstream_ca_for(
+        &self,
+        allowlist: &[String],
+    ) -> Result<Option<&Path>, UpstreamCaSelectError> {
+        match self.upstream_cas.as_ref() {
+            None => Ok(None),
+            Some(m) => select_ca_for_allowlist(m, allowlist),
+        }
     }
 
     /// Best-effort startup reclaim of per-worker egress scratch dirs left under
@@ -131,6 +184,21 @@ pub enum ForceRoutingError {
         #[from]
         source: CertPinError,
     },
+    /// The upstream extra-CA JSON was malformed (#492).
+    #[error("invalid {env} config: {source}", env = ENV_UPSTREAM_EXTRA_CA)]
+    UpstreamCas {
+        #[from]
+        source: UpstreamCaError,
+    },
+    /// The upstream extra-CA JSON parsed, but a file it names is unusable.
+    /// Checked at startup so the operator learns now rather than on the first
+    /// force-routed dispatch. Worded distinctly from [`Self::UpstreamCas`] so
+    /// the two are told apart at a glance in the daemon's startup failure.
+    #[error("unusable {env} certificate file: {source}", env = ENV_UPSTREAM_EXTRA_CA)]
+    UpstreamCaFile {
+        #[from]
+        source: UpstreamCaFileError,
+    },
 }
 
 /// Pure: turn the raw `KASTELLAN_EGRESS_CERT_PINS` env value into an optional
@@ -142,6 +210,58 @@ fn parse_cert_pins_env(value: Option<&str>) -> Result<Option<CertPinMap>, CertPi
     };
     let map = parse_cert_pins(raw)?;
     Ok(if map.is_empty() { None } else { Some(map) })
+}
+
+/// Pure: turn the raw [`ENV_UPSTREAM_EXTRA_CA`] env value into an optional
+/// parsed map (#492). Unset, blank, or `{}` → `None` (no extra anchors, the
+/// byte-identical default); a non-empty valid map → `Some(map)`; malformed →
+/// `Err` (the daemon fails closed at startup).
+fn parse_upstream_cas_env(value: Option<&str>) -> Result<Option<UpstreamCaMap>, UpstreamCaError> {
+    let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let map = parse_upstream_cas(raw)?;
+    Ok(if map.is_empty() { None } else { Some(map) })
+}
+
+/// Validate every configured extra-CA file at daemon startup, and log what the
+/// operator has widened trust for (#492).
+///
+/// Reading the PEM only proves it *is* a certificate file — it cannot prove the
+/// anchor will validate the origin, so the WARN spells out the one trap that
+/// bites in practice (see the message body). `read_file` is injected so the
+/// whole function is unit-testable without touching the filesystem.
+///
+/// Fail-closed: an unreadable or certificate-less file aborts startup.
+fn validate_upstream_cas(
+    map: &UpstreamCaMap,
+    read_file: &dyn Fn(&Path) -> std::io::Result<String>,
+) -> Result<(), UpstreamCaFileError> {
+    for (host, path) in map.entries() {
+        let contents = read_file(path).map_err(|e| UpstreamCaFileError::Unreadable {
+            host: host.to_string(),
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        let certs = check_ca_pem_contents(host, path, &contents)?;
+        tracing::warn!(
+            origin = host,
+            ca_path = %path.display(),
+            certificates = certs,
+            "egress: operator config ({ENV_UPSTREAM_EXTRA_CA}) WILL WIDEN upstream TLS trust for \
+             the sidecar of whichever force-routed worker dials this origin (no sidecar exists \
+             yet at startup, and a configured origin no worker dials is simply never used). The \
+             anchor is trusted for every host that sidecar can reach, which is why it is \
+             permitted only for a single private origin — and, since keying is per-host, for \
+             every service sharing this address. NOTE: the \
+             origin must serve a leaf certificate this CA signed, OR a self-signed leaf marked \
+             `basicConstraints CA:FALSE` — a self-signed certificate marked CA:TRUE and served \
+             as its own leaf is REJECTED at handshake time (rustls `CaUsedAsEndEntity`) even \
+             though `openssl verify` accepts it, and `openssl req -x509` commonly produces \
+             exactly that shape. It would surface late, as a `mitm_failed` egress decision."
+        );
+    }
+    Ok(())
 }
 
 /// Pure: is this worker's `net` policy one the egress proxy fronts?
@@ -254,6 +374,33 @@ pub(crate) fn spawn_worker_maybe_forced(
                 _ => return spawn_worker(backend, spec),
             };
             let pins_json = cfg.pins_for(&allowlist);
+            // #492: the operator's extra trust anchor for this worker's private
+            // origin, if any. A selection error REFUSES the spawn — dropping the
+            // anchor silently would leave the operator believing a self-signed
+            // origin is reachable when it is not, and widening trust beyond a
+            // single private origin is the hazard the rule exists to prevent.
+            let upstream_extra_ca = cfg.upstream_ca_for(&allowlist).map_err(|e| {
+                ToolHostError::Io(std::io::Error::other(format!(
+                    "worker {worker_name:?}: refusing to spawn — {ENV_UPSTREAM_EXTRA_CA}: {e}"
+                )))
+            })?;
+            // Workers that do their own end-to-end TLS + can't trust our CA
+            // (browser, matrix) → their sidecar transparently tunnels.
+            let disable_mitm = disable_mitm_for(worker_name);
+            // A tunnel never re-originates TLS, so an anchor there is inert.
+            // `spawn::check_upstream_extra_ca` is the backstop that enforces
+            // this, but its message names only the path and `disable_mitm` —
+            // reading like an internal wiring bug. Catch it here, where the env
+            // var and the worker name are both in scope, so the operator is
+            // pointed at the config line they actually have to change.
+            if disable_mitm && upstream_extra_ca.is_some() {
+                return Err(ToolHostError::Io(std::io::Error::other(format!(
+                    "worker {worker_name:?}: refusing to spawn — {ENV_UPSTREAM_EXTRA_CA} names an \
+                     extra trust anchor for this worker's origin, but this worker's sidecar runs \
+                     in transparent-tunnel (no-MITM) mode and never re-originates TLS, so the \
+                     anchor would be silently inert. Remove that entry."
+                ))));
+            }
             let params = crate::egress::net_worker::NetWorkerSpawn {
                 backend,
                 // The egress-proxy sidecar is the real-network egress boundary,
@@ -267,12 +414,9 @@ pub(crate) fn spawn_worker_maybe_forced(
                 worker_name,
                 secret_fingerprints: &[],
                 cert_pins_json: pins_json.as_deref(),
-                // Workers that do their own end-to-end TLS + can't trust our CA
-                // (browser, matrix) → their sidecar transparently tunnels.
-                disable_mitm: disable_mitm_for(worker_name),
-                // No operator extra CA wired to production yet (#491 prod
-                // wiring deferred).
-                upstream_extra_ca: None,
+                disable_mitm,
+                // #492 — always `None` when `disable_mitm`, rejected above.
+                upstream_extra_ca,
             };
             spawn_forced_net_worker(&params, &cfg.scratch_root, (cfg.make_sink)())
         }
@@ -440,6 +584,13 @@ pub fn env_flag_enabled(value: Option<String>) -> bool {
 /// enabled flag with no resolvable proxy binary returns `Err(ProxyBinaryNotFound)`
 /// so the daemon refuses to start rather than run net workers unrouted.
 ///
+/// Two optional operator configs are read here, and **both fail the daemon
+/// closed** rather than being silently dropped: [`ENV_CERT_PINS`] (slice #4 SPKI
+/// pins) and [`ENV_UPSTREAM_EXTRA_CA`] (#492 upstream trust anchors for private
+/// self-signed origins). The extra-CA files are read *now*, at startup, so an
+/// operator typo is reported here rather than surfacing much later as a sidecar
+/// bring-up failure on the first force-routed dispatch.
+///
 /// `handle` is the runtime handle the sidecar decision-ingest threads use to
 /// drive the async `audit_log` insert; capture it once at startup
 /// (`tokio::runtime::Handle::current()`) and pass it in.
@@ -452,13 +603,21 @@ pub fn from_env(
         return Ok(None);
     }
     let cert_pins = parse_cert_pins_env(std::env::var(ENV_CERT_PINS).ok().as_deref())?;
+    // #492: parse, then read every named PEM now, so a typo fails the daemon at
+    // startup instead of surfacing as a sidecar bring-up failure on the first
+    // force-routed dispatch. Also logs the trust-widening WARN.
+    let upstream_cas = parse_upstream_cas_env(std::env::var(ENV_UPSTREAM_EXTRA_CA).ok().as_deref())?;
+    if let Some(map) = upstream_cas.as_ref() {
+        validate_upstream_cas(map, &|p| std::fs::read_to_string(p))?;
+    }
     let proxy_bin = discover_egress_proxy_bin(exe_dir);
     let scratch_root = std::env::var_os(ENV_SCRATCH_DIR)
         .map(PathBuf::from)
         .unwrap_or_else(default_egress_scratch_root);
     let make_sink: DecisionSinkFactory =
         Box::new(move || Box::new(pg_decision_sink(pool.clone(), handle.clone())));
-    Ok(resolve_force_routing(true, proxy_bin, scratch_root, make_sink, cert_pins)?.map(Arc::new))
+    Ok(resolve_force_routing(true, proxy_bin, scratch_root, make_sink, cert_pins)?
+        .map(|cfg| Arc::new(cfg.with_upstream_cas(upstream_cas))))
 }
 
 /// Default per-worker sidecar scratch root (when `KASTELLAN_EGRESS_SCRATCH_DIR`

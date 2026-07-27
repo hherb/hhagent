@@ -31,6 +31,10 @@ kastellan-protocol   = { path = "../protocol", version = "0.2.0" }
 kastellan-db         = { path = "../db", version = "0.2.0" }
 kastellan-llm-router = { path = "../llm-router", version = "0.2.0" }
 kastellan-leak-scan  = { path = "../leak-scan", version = "0.2.0" }
+# Pure IP-range predicate. Core uses it to enforce that an operator-configured
+# upstream extra CA (#492) names a PRIVATE origin — the same range list the
+# egress proxy's SSRF guard denies, so the two cannot drift.
+kastellan-net-classify = { path = "../net-classify", version = "0.2.0" }
 kastellan-matrix-wire = { path = "../workers/matrix-wire", version = "0.2.0" }
 
 tokio              = { workspace = true }

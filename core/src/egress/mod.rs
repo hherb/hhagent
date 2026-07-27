@@ -9,6 +9,10 @@
 //!     [`net_worker::rewrite_worker_policy`].
 //!   - [`cert_pins`]: parse the operator `KASTELLAN_EGRESS_CERT_PINS` config and
 //!     select the per-worker pin subset handed to each sidecar (slice #4).
+//!   - [`upstream_ca`]: parse the operator `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA`
+//!     config and select the one extra trust anchor a force-routed worker's
+//!     sidecar may use on its re-origination leg (#492) — fail-closed, and only
+//!     for a single private origin.
 //!
 //! The proxy never touches Postgres (core-only-DB invariant); decisions flow
 //! proxy → core stdout-ingest → PG.
@@ -20,3 +24,4 @@ pub mod net_worker;
 pub mod persistent_net;
 pub mod scratch_sweep;
 pub mod spawn;
+pub mod upstream_ca;
