@@ -52,10 +52,12 @@ pub struct NetWorkerSpawn<'a> {
     /// (upstream) leg, for a self-signed private origin (localmail, #491).
     /// `None` ⇒ webpki-only (the production default — no prod wiring yet).
     ///
-    /// Must be an **absolute** path: it is bound into the proxy jail via
-    /// `SandboxPolicy.fs_read`, which rejects relative paths (so a relative path
-    /// fails closed at spawn, with a less obvious error). Only meaningful when
-    /// `disable_mitm` is false — a transparent tunnel has no re-origination leg.
+    /// Must be an **absolute** path (it is bound into the proxy jail via
+    /// `SandboxPolicy.fs_read`) and must not be paired with `disable_mitm` (a
+    /// transparent tunnel has no re-origination leg to widen trust on, so an
+    /// anchor there would be silently inert). Both are rejected up front by
+    /// `spawn::check_upstream_extra_ca`, before anything is spawned.
+    ///
     /// The anchor is trusted for every host THIS sidecar may reach, so it suits a
     /// single-origin worker; see `egress-proxy::pins::build_upstream_client_config`
     /// for the trust-scope and `CA:FALSE` constraints.

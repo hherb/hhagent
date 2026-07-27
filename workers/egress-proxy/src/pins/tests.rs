@@ -212,6 +212,10 @@ fn add_extra_ca_pem_rejects_pem_with_no_certificate() {
 
 #[test]
 fn build_upstream_config_missing_extra_ca_file_fails_closed() {
+    // Installed even though the error returns before the ClientConfig builder:
+    // otherwise the test would silently depend on that internal ordering and
+    // start panicking (no process crypto provider) the day it changed.
+    install_provider();
     let r = build_upstream_client_config(None, Some(std::path::Path::new("/nonexistent/ca.pem")));
     assert!(r.is_err(), "a set-but-unreadable extra CA must fail closed");
 }
@@ -249,6 +253,7 @@ fn build_upstream_config_with_valid_extra_ca_file_builds() {
 /// closed through the public entry point too, not just via `add_extra_ca_pem`.
 #[test]
 fn build_upstream_config_with_certless_extra_ca_file_fails_closed() {
+    install_provider(); // see `build_upstream_config_missing_extra_ca_file_fails_closed`
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("key-only.pem");
     std::fs::write(&path, "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n")

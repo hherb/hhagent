@@ -14,6 +14,7 @@ use std::os::unix::net::UnixStream;
 
 use kastellan_core::egress::audit::decision_to_audit;
 use kastellan_core::egress::spawn::spawn_sidecar;
+use kastellan_tests_common::egress_forcing::short_scratch_root;
 use kastellan_tests_common::{
     backend, bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_sandbox_unavailable, unique_suffix,
     workspace_target_binary,
@@ -129,6 +130,71 @@ fn real_host_round_trips_through_sidecar() {
     );
 
     handle.shutdown();
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A set-but-unreadable upstream extra CA must fail the sidecar bring-up CLOSED,
+/// **fast**, and with the proxy's own reason in the error.
+///
+/// A nonexistent path survives the sandbox layer by design (`canonicalize_one`
+/// tolerates `NotFound`; the Linux bind is `--ro-bind-try`), so the authority on
+/// the PEM is the proxy itself: it aborts at startup rather than degrading to
+/// webpki-only. Three properties are asserted, and together they are what make
+/// the failure diagnosable instead of misleading:
+/// * `spawn_sidecar` returns `Err` at all — which holds only because the proxy
+///   validates the upstream TLS config BEFORE publishing the readiness signal
+///   (the UDS + `ca.pem`). Reorder those in `egress-proxy::main` and the host
+///   hands back a healthy handle for a proxy that is already dying, so this is
+///   the regression guard for that ordering;
+/// * the error carries `build upstream TLS config` — the proxy's own account,
+///   which reaches the host only because `spawn_sidecar` drains the sidecar's
+///   stderr and folds the tail into the message;
+/// * it arrives well inside `READY_TIMEOUT` — i.e. via the `try_wait` exit check,
+///   not via the readiness timeout, whose message would blame the UDS bind.
+#[test]
+fn sidecar_with_unreadable_extra_ca_fails_fast_with_reason() {
+    if skip_if_sandbox_unavailable() {
+        return;
+    }
+    let Some(binary) = proxy_binary_or_skip() else {
+        eprintln!("[SKIP] egress-proxy binary not built");
+        return;
+    };
+    // `short_scratch_root`, not `temp_dir()`: on macOS `$TMPDIR` is already long
+    // enough that a descriptive prefix pushes `<scratch>/egress.sock` past
+    // `sockaddr_un.sun_path`, and the sidecar then dies of SUN_LEN before it ever
+    // reads the CA — a green-looking failure for the wrong reason.
+    let scratch = short_scratch_root(&format!("badca-{}", unique_suffix()));
+    // Absolute (so it passes the host-side precondition) but nonexistent.
+    let missing_ca = scratch.join("does-not-exist-ca.pem");
+    assert!(!missing_ca.exists());
+
+    let allowlist = vec!["127.0.0.1".to_string()];
+    let backend = backend();
+    let started = std::time::Instant::now();
+    let err = spawn_sidecar(
+        backend.as_ref(),
+        &binary,
+        &allowlist,
+        &scratch,
+        "mail",
+        None,
+        false,
+        false,
+        Some(&missing_ca),
+    )
+    .expect_err("an unreadable upstream extra CA must fail the bring-up closed");
+    let elapsed = started.elapsed();
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("build upstream TLS config"),
+        "the error must carry the proxy's own fail-closed reason; got: {msg}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "the startup abort must be caught by try_wait, not by the readiness timeout; took {elapsed:?}"
+    );
     let _ = std::fs::remove_dir_all(&scratch);
 }
 

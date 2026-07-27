@@ -35,6 +35,13 @@ pub(crate) const CA_FILE_NAME: &str = "ca.pem";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL: Duration = Duration::from_millis(25);
 
+/// How long a bring-up failure waits for the stderr drain thread to flush before
+/// reporting. `try_wait` can observe the exit before the drain thread has read
+/// the bytes the proxy wrote on its way out, so snapshotting the tail
+/// immediately would drop the very message we want (the fail-closed reason).
+/// Only ever paid on a path that is already failing.
+const STDERR_SETTLE: Duration = Duration::from_millis(250);
+
 /// Cumulative CPU budget (ms → ceil-div RLIMIT_CPU seconds) for a **short-lived**
 /// per-tool-call sidecar. Matches the web-fetch worker's own `cpu_ms` (the
 /// sidecar lives 1:1 with that single dispatch), and restores the CPU
@@ -84,6 +91,12 @@ impl SidecarHandle {
 /// dispatch, so it gets a bounded [`SHORT_LIVED_SIDECAR_CPU_MS`] cap back —
 /// restoring the defense-in-depth that only mattered on macOS, where
 /// `RLIMIT_CPU` is the sole per-process CPU-governance primitive.
+///
+/// This function is a pure descriptor builder and validates nothing: the
+/// preconditions on `upstream_extra_ca` (absolute, and not paired with
+/// `disable_mitm`) are enforced by [`check_upstream_extra_ca`], which
+/// [`spawn_sidecar`] calls before it builds the policy. Callers reaching for
+/// `proxy_policy` directly must uphold them themselves.
 #[allow(clippy::too_many_arguments)] // descriptor args for the sidecar's SandboxPolicy
 pub fn proxy_policy(
     binary: &Path,
@@ -155,8 +168,76 @@ pub fn proxy_policy(
     }
 }
 
+/// Reject an `upstream_extra_ca` that cannot do what the caller intends, before
+/// anything is spawned:
+///
+/// * A **relative** path. The CA is bound into the proxy jail via
+///   `SandboxPolicy.fs_read`, and both backends reject relative `fs_read`
+///   entries — so the failure would name the sandbox rather than the
+///   misconfigured field. (A *nonexistent* absolute path is deliberately NOT
+///   rejected here: `canonicalize_one` tolerates `NotFound` and the Linux bind is
+///   `--ro-bind-try`, leaving the proxy — the authority on the PEM's content —
+///   to fail closed on it at startup.)
+/// * A path paired with `disable_mitm`. A transparent tunnel never re-originates
+///   TLS, so it never consults the upstream root store. Accepting the pair would
+///   leave an operator believing a private self-signed origin is reachable when
+///   in fact the sidecar validates no upstream certificate at all — exactly the
+///   false "the force-routed path reaches it" belief #491 was opened to correct.
+///   Fail loud instead.
+///
+/// Split out as a pure function so both preconditions are unit-testable without
+/// a sandbox or a built proxy binary.
+fn check_upstream_extra_ca(
+    disable_mitm: bool,
+    upstream_extra_ca: Option<&Path>,
+) -> anyhow::Result<()> {
+    let Some(ca) = upstream_extra_ca else {
+        return Ok(());
+    };
+    if !ca.is_absolute() {
+        anyhow::bail!(
+            "upstream extra CA path must be absolute (it is bound into the proxy jail via \
+             fs_read, which rejects relative paths): {ca:?}"
+        );
+    }
+    if disable_mitm {
+        anyhow::bail!(
+            "upstream extra CA {ca:?} was given to a transparent-tunnel (disable_mitm) sidecar, \
+             which never re-originates TLS and so would never use it"
+        );
+    }
+    Ok(())
+}
+
+/// One-line stderr summary for a sidecar bring-up failure, waiting up to
+/// [`STDERR_SETTLE`] for the drain thread to flush.
+///
+/// The proxy's fail-closed startup aborts (a malformed pin set, an unreadable
+/// upstream extra CA) are reported only as `Err` out of `main`, i.e. on its
+/// stderr — a pipe the host drains to `debug` and nothing else reads. Without
+/// folding it into the error, a mistyped operator CA path surfaces as a bare
+/// readiness timeout that blames the UDS bind.
+fn stderr_note(tail: Option<&crate::worker_stderr::StderrTail>) -> String {
+    let Some(tail) = tail else {
+        return "no stderr captured".to_string();
+    };
+    let deadline = Instant::now() + STDERR_SETTLE;
+    let mut lines = tail.snapshot();
+    while lines.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(READY_POLL);
+        lines = tail.snapshot();
+    }
+    if lines.is_empty() {
+        "no stderr captured".to_string()
+    } else {
+        format!("recent stderr: {}", lines.join(" | "))
+    }
+}
+
 /// Spawn the proxy under `backend` and wait (bounded) for its UDS to appear.
-/// Fail-closed: returns `Err` on spawn failure or bind timeout.
+/// Fail-closed: returns `Err` on a failed precondition
+/// ([`check_upstream_extra_ca`]), on spawn failure, on the proxy exiting before
+/// it is ready, or on the readiness timeout.
 ///
 /// `long_lived` scopes the sidecar's CPU cap — see [`proxy_policy`]. Pass `true`
 /// for a channel sidecar that outlives many dispatches (matrix), `false` for a
@@ -173,6 +254,19 @@ pub fn spawn_sidecar(
     long_lived: bool,
     upstream_extra_ca: Option<&Path>,
 ) -> anyhow::Result<SidecarHandle> {
+    check_upstream_extra_ca(disable_mitm, upstream_extra_ca)?;
+    if let Some(ca) = upstream_extra_ca {
+        // Operator-visible record that this sidecar's upstream trust is wider
+        // than webpki. The proxy logs its own WARN, but only to its stderr —
+        // drained to `debug` below — so without this the daemon log would never
+        // carry the fact at a level an operator reads.
+        tracing::warn!(
+            worker,
+            extra_ca = %ca.display(),
+            "egress sidecar trusts an operator-provided upstream extra CA on its re-origination \
+             leg (widens trust beyond webpki for EVERY host this sidecar may reach)"
+        );
+    }
     let policy = proxy_policy(
         binary,
         allowlist,
@@ -196,9 +290,20 @@ pub fn spawn_sidecar(
     // the hermetic suites stayed green while real-hostname egress was broken.
     let derived = crate::tool_host::derive_lockdown_env(&policy);
     let program = binary.to_string_lossy();
-    let child = backend
+    let mut child = backend
         .spawn_under_policy(&derived, &program, &[])
         .map_err(|e| anyhow::anyhow!("spawn egress-proxy sidecar: {e}"))?;
+
+    // Drain the sidecar's piped stderr on a detached thread — same reason
+    // `tool_host::spawn_worker` drains a worker's: the backends pipe stderr but
+    // nothing here reads it, so a proxy writing past the ~64 KiB pipe buffer
+    // would block on write. The tail-retaining variant additionally lets a
+    // bring-up failure below report the proxy's OWN account of what went wrong.
+    let pid = child.id();
+    let stderr_tail = child
+        .stderr
+        .take()
+        .map(|stderr| crate::worker_stderr::spawn_drain_with_tail(pid, stderr));
 
     // Slice #3a: the sidecar also exports its per-instance MITM CA next to the
     // UDS. Wait for BOTH so the host never binds a worker before the CA it must
@@ -206,12 +311,25 @@ pub fn spawn_sidecar(
     let ca_path = scratch.join(CA_FILE_NAME);
     let deadline = Instant::now() + READY_TIMEOUT;
     while !(uds_path.exists() && ca_path.exists()) {
+        // The proxy fails CLOSED on bad operator config (a malformed pin set, an
+        // unreadable/certless upstream extra CA) by aborting at startup. Catch
+        // that exit as soon as it happens: otherwise it only ever surfaces as the
+        // READY_TIMEOUT below — a five-second wait whose message blames the UDS
+        // bind rather than the config that actually failed.
+        if let Ok(Some(status)) = child.try_wait() {
+            anyhow::bail!(
+                "egress-proxy sidecar exited before becoming ready ({status}); {}",
+                stderr_note(stderr_tail.as_ref())
+            );
+        }
         if Instant::now() >= deadline {
             let mut handle = SidecarHandle { child, uds_path: uds_path.clone() };
             handle.child.kill().ok();
             handle.child.wait().ok();
             anyhow::bail!(
-                "egress-proxy sidecar did not bind {uds_path:?} + write {ca_path:?} within {READY_TIMEOUT:?}"
+                "egress-proxy sidecar did not bind {uds_path:?} + write {ca_path:?} within \
+                 {READY_TIMEOUT:?}; {}",
+                stderr_note(stderr_tail.as_ref())
             );
         }
         std::thread::sleep(READY_POLL);
@@ -366,5 +484,63 @@ mod tests {
         let env: std::collections::HashMap<_, _> = p.env.iter().cloned().collect();
         assert!(!env.contains_key(ENV_UPSTREAM_EXTRA_CA));
         assert!(!p.fs_read.contains(&PathBuf::from("/etc/localmail/ca.pem")));
+    }
+
+    /// The default (no extra CA) must stay unconditionally spawnable, in either
+    /// MITM posture — the precondition check may not gate the existing paths.
+    #[test]
+    fn check_upstream_extra_ca_accepts_absent_ca_in_either_posture() {
+        assert!(check_upstream_extra_ca(false, None).is_ok());
+        assert!(check_upstream_extra_ca(true, None).is_ok());
+    }
+
+    #[test]
+    fn check_upstream_extra_ca_accepts_absolute_path_under_mitm() {
+        let ca = PathBuf::from("/etc/localmail/ca.pem");
+        assert!(check_upstream_extra_ca(false, Some(&ca)).is_ok());
+    }
+
+    /// A relative path would be rejected far downstream by the Linux backend's
+    /// `fs_read` validation, naming the sandbox instead of the field. Catch it
+    /// here, before anything is spawned.
+    #[test]
+    fn check_upstream_extra_ca_rejects_relative_path() {
+        let ca = PathBuf::from("certs/ca.pem");
+        let err = check_upstream_extra_ca(false, Some(&ca)).expect_err("relative path must fail");
+        assert!(err.to_string().contains("absolute"), "unhelpful error: {err}");
+    }
+
+    /// A transparent tunnel never re-originates TLS, so an extra upstream anchor
+    /// can do nothing. Silently ignoring it would leave the operator believing a
+    /// self-signed private origin is reachable — fail loud instead.
+    #[test]
+    fn check_upstream_extra_ca_rejects_pairing_with_disable_mitm() {
+        let ca = PathBuf::from("/etc/localmail/ca.pem");
+        let err =
+            check_upstream_extra_ca(true, Some(&ca)).expect_err("disable_mitm pairing must fail");
+        assert!(err.to_string().contains("disable_mitm"), "unhelpful error: {err}");
+    }
+
+    /// With no drain thread there is nothing to report, and the note must say so
+    /// rather than claim a clean startup. (The populated case is covered by the
+    /// sandbox-gated `sidecar_with_unreadable_extra_ca_fails_fast_with_reason`
+    /// in `core/tests/egress_proxy_e2e.rs`, which needs a real proxy binary.)
+    #[test]
+    fn stderr_note_without_a_tail_says_nothing_was_captured() {
+        assert_eq!(stderr_note(None), "no stderr captured");
+    }
+
+    /// A tail that already has lines is reported immediately — the settle poll
+    /// must not delay the common case where the drain already flushed.
+    #[test]
+    fn stderr_note_reports_captured_lines() {
+        let tail = crate::worker_stderr::StderrTail::new(4);
+        crate::worker_stderr::drain_reader(
+            0,
+            std::io::Cursor::new(b"Error: build upstream TLS config: upstream extra CA: read\n"),
+            Some(&tail),
+        );
+        let note = stderr_note(Some(&tail));
+        assert!(note.contains("upstream extra CA"), "note lost the reason: {note}");
     }
 }

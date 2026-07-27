@@ -63,6 +63,36 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("KASTELLAN_EGRESS_PROXY_ALLOWLIST is not a JSON array: {e}"))?;
     let allow = HostAllowlist::from_endpoints(&entries);
 
+    // Upstream trust for the re-origination leg: the REAL public roots, plus an
+    // optional operator-provided SPKI pin overlay (slice #4) AND an optional
+    // operator-provided extra CA (#491, for a self-signed private origin like a
+    // personal localmail). Both are off by default; a malformed value aborts
+    // startup (fail-closed) rather than silently disabling protection.
+    //
+    // Built BEFORE the UDS bind + CA export below, and that ordering is
+    // load-bearing: those two files ARE the readiness signal `spawn_sidecar`
+    // waits on. Validating afterwards let a fail-closed abort happen with the
+    // signal already published, so the host returned a healthy `SidecarHandle`
+    // for a dead proxy and the misconfiguration resurfaced as a connection
+    // refused on the worker's first CONNECT. Nothing here needs the listener or
+    // the CA, so the check belongs in front of them.
+    let upstream_extra_ca = std::env::var("KASTELLAN_EGRESS_PROXY_UPSTREAM_EXTRA_CA").ok();
+    if let Some(ref p) = upstream_extra_ca {
+        eprintln!(
+            "[egress-proxy] WARN: trusting operator-provided upstream extra CA {p:?} on the \
+             re-origination leg (widens upstream trust beyond webpki roots, for EVERY host \
+             this sidecar may reach). The cert must be a real CA that signed the origin's \
+             leaf, or a self-signed leaf with basicConstraints CA:FALSE — a CA:TRUE \
+             self-signed leaf is rejected at handshake time (CaUsedAsEndEntity) and shows \
+             up as a `mitm_failed: …` decision, not as a startup error."
+        );
+    }
+    let upstream_tls = pins::build_upstream_client_config(
+        std::env::var("KASTELLAN_EGRESS_PROXY_PINS").ok().as_deref(),
+        upstream_extra_ca.as_deref().map(std::path::Path::new),
+    )
+    .map_err(|e| anyhow::anyhow!("build upstream TLS config: {e}"))?;
+
     // Bind the UDS *before* lock-down (Landlock will forbid fs mutation after).
     let _ = std::fs::remove_file(&uds);
     let listener = UnixListener::bind(&uds)?;
@@ -86,28 +116,6 @@ fn main() -> anyhow::Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("UDS path has no parent dir"))?
         .join("secret_hashes.json");
-
-    // Upstream trust for the re-origination leg: the REAL public roots, plus an
-    // optional operator-provided SPKI pin overlay (slice #4) AND an optional
-    // operator-provided extra CA (#491, for a self-signed private origin like a
-    // personal localmail). Both are off by default; a malformed value aborts
-    // startup (fail-closed) rather than silently disabling protection.
-    let upstream_extra_ca = std::env::var("KASTELLAN_EGRESS_PROXY_UPSTREAM_EXTRA_CA").ok();
-    if let Some(ref p) = upstream_extra_ca {
-        eprintln!(
-            "[egress-proxy] WARN: trusting operator-provided upstream extra CA {p:?} on the \
-             re-origination leg (widens upstream trust beyond webpki roots, for EVERY host \
-             this sidecar may reach). The cert must be a real CA that signed the origin's \
-             leaf, or a self-signed leaf with basicConstraints CA:FALSE — a CA:TRUE \
-             self-signed leaf is rejected at handshake time (CaUsedAsEndEntity) and shows \
-             up as a `mitm_failed: …` decision, not as a startup error."
-        );
-    }
-    let upstream_tls = pins::build_upstream_client_config(
-        std::env::var("KASTELLAN_EGRESS_PROXY_PINS").ok().as_deref(),
-        upstream_extra_ca.as_deref().map(std::path::Path::new),
-    )
-    .map_err(|e| anyhow::anyhow!("build upstream TLS config: {e}"))?;
 
     // Worker-side defense-in-depth (Linux Landlock+seccomp; no-op on macOS,
     // where the parent Seatbelt profile contains us). Outbound socket(2) +
