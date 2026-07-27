@@ -635,3 +635,149 @@ fn no_broker_requested_is_passthrough() {
         "no-broker path must be byte-identical to spawn_worker_maybe_forced"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Upstream extra-CA operator config (#492)
+// ---------------------------------------------------------------------------
+
+/// A `ForceRoutingConfig` carrying an extra-CA map, for the selection tests.
+fn config_with_upstream_cas(json: &str) -> ForceRoutingConfig {
+    let cas = parse_upstream_cas_env(Some(json)).expect("valid extra-CA config");
+    config_with(PathBuf::from("/tmp")).with_upstream_cas(cas)
+}
+
+#[test]
+fn parse_upstream_cas_env_handles_absent_blank_and_empty() {
+    assert!(parse_upstream_cas_env(None).unwrap().is_none());
+    assert!(parse_upstream_cas_env(Some("")).unwrap().is_none());
+    assert!(parse_upstream_cas_env(Some("   ")).unwrap().is_none());
+    // `{}` is a *present but empty* config; it normalizes to "no extra anchors"
+    // so the upstream path stays byte-identical.
+    assert!(parse_upstream_cas_env(Some("{}")).unwrap().is_none());
+}
+
+#[test]
+fn parse_upstream_cas_env_parses_valid_map() {
+    let got = parse_upstream_cas_env(Some(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#))
+        .expect("valid config")
+        .expect("non-empty config is Some");
+    let entries: Vec<(&str, &Path)> = got.entries().collect();
+    assert_eq!(entries, vec![("10.0.0.3", Path::new("/etc/localmail/ca.pem"))]);
+}
+
+#[test]
+fn parse_upstream_cas_env_fails_closed_on_malformed() {
+    // A relative path would fail much later, inside the sandbox's fs_read
+    // validation, naming the sandbox rather than this config.
+    let err = parse_upstream_cas_env(Some(r#"{"10.0.0.3":"ca.pem"}"#)).unwrap_err();
+    assert!(matches!(err, UpstreamCaError::RelativePath { .. }), "got {err:?}");
+}
+
+#[test]
+fn upstream_ca_for_is_none_when_unconfigured() {
+    let cfg = config_with(PathBuf::from("/tmp"));
+    assert_eq!(cfg.upstream_ca_for(&["10.0.0.3:8443".to_string()]).unwrap(), None);
+}
+
+#[test]
+fn upstream_ca_for_selects_the_single_private_origin() {
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    let got = cfg.upstream_ca_for(&["10.0.0.3:8443".to_string()]).unwrap();
+    assert_eq!(got, Some(Path::new("/etc/localmail/ca.pem")));
+}
+
+#[test]
+fn upstream_ca_for_is_none_when_worker_does_not_touch_the_origin() {
+    // Every other worker in the deployment must be unaffected.
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    assert_eq!(cfg.upstream_ca_for(&["api.example.com:443".to_string()]).unwrap(), None);
+}
+
+#[test]
+fn upstream_ca_for_refuses_a_mixed_allowlist() {
+    // THE security assertion at this layer: the anchor is added to the whole
+    // upstream root store of that sidecar, so a worker that can also reach a
+    // public host must not get one.
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    let allow = vec!["10.0.0.3:8443".to_string(), "api.example.com:443".to_string()];
+    let err = cfg.upstream_ca_for(&allow).unwrap_err();
+    assert!(matches!(err, UpstreamCaSelectError::MixedAllowlist { .. }), "got {err:?}");
+}
+
+#[test]
+fn spawn_refuses_before_touching_the_backend_on_a_bad_extra_ca_selection() {
+    // A refusal must be reported as a config problem and must not proceed to a
+    // spawn: FailBackend would otherwise surface `ToolHostError::Sandbox`, and
+    // the force-routed path surfaces `Io` for sidecar failures — so an `Io`
+    // whose message names the env var proves we stopped at the config check.
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    let policy = SandboxPolicy {
+        net: Net::Allowlist(vec!["10.0.0.3:8443".into(), "api.example.com:443".into()]),
+        ..SandboxPolicy::default()
+    };
+    // `SupervisedWorker` is not `Debug`, so unwrap the error by hand.
+    let msg = match spawn_worker_maybe_forced(
+        Some(&cfg),
+        &FailBackend,
+        &FailBackend,
+        &spec_for(&policy),
+        "mail",
+    ) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a mixed allowlist must refuse the spawn"),
+    };
+    assert!(msg.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"), "error must name the config: {msg}");
+    assert!(msg.contains("mail"), "error must name the worker: {msg}");
+}
+
+#[test]
+fn spawn_is_unaffected_when_no_extra_ca_matches_the_worker() {
+    // Regression guard for the byte-identical default: a configured origin that
+    // this worker never dials must leave the old spawn path untouched (the
+    // sidecar spawn then fails on the nonexistent proxy binary → Io).
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    let policy = SandboxPolicy {
+        net: Net::Allowlist(vec!["api.example.com:443".into()]),
+        ..SandboxPolicy::default()
+    };
+    let msg = match spawn_worker_maybe_forced(
+        Some(&cfg),
+        &FailBackend,
+        &FailBackend,
+        &spec_for(&policy),
+        "web-fetch",
+    ) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("the nonexistent proxy binary still fails the sidecar spawn"),
+    };
+    assert!(
+        !msg.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"),
+        "an unrelated worker must not be refused by the extra-CA check: {msg}"
+    );
+}
+
+#[test]
+fn validate_upstream_cas_accepts_a_pem_holding_a_certificate() {
+    let map = parse_upstream_cas_env(Some(r#"{"10.0.0.3":"/etc/ca.pem"}"#)).unwrap().unwrap();
+    let read = |_p: &Path| {
+        Ok("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n".to_string())
+    };
+    assert!(validate_upstream_cas(&map, &read).is_ok());
+}
+
+#[test]
+fn validate_upstream_cas_fails_closed_on_an_unreadable_file() {
+    let map = parse_upstream_cas_env(Some(r#"{"10.0.0.3":"/etc/ca.pem"}"#)).unwrap().unwrap();
+    let read = |_p: &Path| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"));
+    let err = validate_upstream_cas(&map, &read).unwrap_err();
+    assert!(matches!(err, UpstreamCaFileError::Unreadable { .. }), "got {err:?}");
+}
+
+#[test]
+fn validate_upstream_cas_fails_closed_on_a_file_with_no_certificate() {
+    // The realistic version of this is pasting the private key by mistake.
+    let map = parse_upstream_cas_env(Some(r#"{"10.0.0.3":"/etc/ca.pem"}"#)).unwrap().unwrap();
+    let read = |_p: &Path| Ok("-----BEGIN PRIVATE KEY-----\nAAA\n".to_string());
+    let err = validate_upstream_cas(&map, &read).unwrap_err();
+    assert!(matches!(err, UpstreamCaFileError::NoCertificate { .. }), "got {err:?}");
+}
