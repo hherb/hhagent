@@ -110,9 +110,12 @@ A self-signed certificate marked `basicConstraints CA:TRUE` **and served as its
 own end-entity certificate** is rejected by rustls-webpki at handshake time with
 `CaUsedAsEndEntity`, even though `openssl verify` accepts it. `openssl req
 -x509` produces exactly that shape by default, and **the live DGX localmail cert
-is this shape** — the #491 live tier reached the origin (the SSRF carve-out
+was this shape** — the #491 live tier reached the origin (the SSRF carve-out
 dialled the private literal, the worker↔proxy MITM leg was fine) and failed only
-on re-origination.
+on re-origination. It was regenerated as a `CA:FALSE` leaf on 2026-07-26 and the
+live tier then passed; localmail's own `serve/tls.py` now emits non-CA leaves
+with correctly-typed SANs, so a fresh deployment is proxy-compatible with no
+manual step.
 
 It fails **late and opaquely**, as a `mitm_failed: …` egress decision rather
 than a startup error, so it is written down in the three places an operator
@@ -121,10 +124,11 @@ looks: `build_upstream_client_config` (#491), the startup WARN, and now
 real CA that signed a separate origin leaf, or a self-signed leaf with
 `CA:FALSE`.
 
-**Consequence for deployment:** this slice makes the deployed path *possible*;
-reaching the DGX localmail end-to-end additionally requires the operator to
-regenerate that cert as a `CA:FALSE` leaf. That is an operator action, recorded
-in HANDOVER.
+**Consequence for deployment:** none outstanding. With the cert already
+`CA:FALSE`, a deployed force-routed mail worker reaches the DGX localmail once
+the operator sets `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` and restarts the daemon.
+The trap is documented not because it blocks us but because the next operator to
+generate a self-signed origin cert will hit it, and it fails opaquely.
 
 ## 7. Why a builder, not a 5th constructor parameter
 
@@ -156,5 +160,7 @@ re-read.
 * Requiring a cert pin alongside an extra CA, so the widened anchor cannot be
   used for anything unpinned. Redundant while §4's single-private-origin rule
   holds; worth revisiting if that rule is ever relaxed.
-* A live DGX tier driving `from_env` against the real localmail. Blocked on the
-  §6 cert regeneration, not on code.
+* A live DGX tier driving `from_env` end-to-end against the real localmail. Not
+  blocked — the #491 live tier already passes against that origin through the
+  direct seam, so this is config-and-run: set the env var, restart, dispatch a
+  `mail.search`. Left out of this PR to keep it to the config layer.

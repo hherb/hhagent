@@ -24,8 +24,9 @@ Branch `feat/492-upstream-extra-ca-wiring`. All slices done.
 
 * Per-host (SNI-selected) upstream root sets — the most correct scoping, most
   work; §4's single-private-origin rule reaches the same safety property today.
-* A live DGX tier through `from_env` against the real localmail. Blocked on an
-  **operator action**, not code: the deployed localmail certificate is a
-  self-signed `CA:TRUE` leaf, which rustls rejects as `CaUsedAsEndEntity`. It
-  must be regenerated as a `CA:FALSE` leaf (or as a leaf signed by a small local
-  CA, with that CA given here) before the end-to-end path can succeed.
+* A live DGX tier through `from_env` against the real localmail. **Not blocked:**
+  the deployed cert was regenerated `CA:FALSE` on 2026-07-26 (the #491 live tier
+  passes against it), so this is config-and-run — set
+  `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA={"10.0.0.3":"…/cert.pem"}`, restart the
+  daemon, dispatch a `mail.search`. Kept out of this PR to hold it to the config
+  layer.
