@@ -48,6 +48,20 @@ pub struct NetWorkerSpawn<'a> {
     /// Put this worker's sidecar into no-MITM (transparent-tunnel) mode. Set for
     /// the browser, which does end-to-end TLS and can't trust our CA (slice #2).
     pub disable_mitm: bool,
+    /// Operator-provided extra CA to trust on the sidecar's re-origination
+    /// (upstream) leg, for a self-signed private origin (localmail, #491).
+    /// `None` ⇒ webpki-only (the production default — no prod wiring yet).
+    ///
+    /// Must be an **absolute** path (it is bound into the proxy jail via
+    /// `SandboxPolicy.fs_read`) and must not be paired with `disable_mitm` (a
+    /// transparent tunnel has no re-origination leg to widen trust on, so an
+    /// anchor there would be silently inert). Both are rejected up front by
+    /// `spawn::check_upstream_extra_ca`, before anything is spawned.
+    ///
+    /// The anchor is trusted for every host THIS sidecar may reach, so it suits a
+    /// single-origin worker; see `egress-proxy::pins::build_upstream_client_config`
+    /// for the trust-scope and `CA:FALSE` constraints.
+    pub upstream_extra_ca: Option<&'a Path>,
 }
 
 /// Maximum byte length of a Unix-domain-socket path. `sockaddr_un.sun_path` is
@@ -209,6 +223,7 @@ where
         params.cert_pins_json,
         params.disable_mitm,
         false, // short-lived: 1:1 with a single tool-call dispatch (issue #395)
+        params.upstream_extra_ca,
     )
     .map_err(|e| ToolHostError::Io(std::io::Error::other(format!("egress sidecar: {e}"))))?;
     // Capture the proxy stdout for the ingest thread before the handle moves.

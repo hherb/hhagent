@@ -166,14 +166,14 @@ fn pinned_host_with_wrong_spki_is_rejected() {
 #[test]
 fn build_upstream_none_is_plain_webpki() {
     install_provider();
-    assert!(build_upstream_client_config(None).is_ok());
+    assert!(build_upstream_client_config(None, None).is_ok());
 }
 
 #[test]
 fn build_upstream_empty_string_is_plain_webpki() {
     install_provider();
-    assert!(build_upstream_client_config(Some("   ")).is_ok());
-    assert!(build_upstream_client_config(Some("{}")).is_ok());
+    assert!(build_upstream_client_config(Some("   "), None).is_ok());
+    assert!(build_upstream_client_config(Some("{}"), None).is_ok());
 }
 
 #[test]
@@ -181,11 +181,85 @@ fn build_upstream_valid_pins_builds() {
     install_provider();
     let pin = [0x33u8; 32];
     let json = format!(r#"{{"api.anthropic.com":["{}"]}}"#, pin_str(&pin));
-    assert!(build_upstream_client_config(Some(&json)).is_ok());
+    assert!(build_upstream_client_config(Some(&json), None).is_ok());
 }
 
 #[test]
 fn build_upstream_malformed_pins_is_err() {
     install_provider();
-    assert!(build_upstream_client_config(Some("{ this is not json")).is_err());
+    assert!(build_upstream_client_config(Some("{ this is not json"), None).is_err());
+}
+
+#[test]
+fn add_extra_ca_pem_adds_a_valid_cert() {
+    // A fresh CA PEM (reusing the proxy's own CA generator) is a valid certificate
+    // and must become a trust anchor.
+    let ca = crate::ca::generate_ca().expect("generate ca");
+    let mut roots = rustls::RootCertStore::empty();
+    assert!(roots.is_empty());
+    super::add_extra_ca_pem(&mut roots, ca.cert_pem().as_bytes()).expect("add valid ca");
+    assert!(!roots.is_empty(), "a valid extra CA becomes a trust anchor");
+}
+
+#[test]
+fn add_extra_ca_pem_rejects_pem_with_no_certificate() {
+    // Garbage and non-certificate PEM both yield zero certs → fail closed.
+    let mut roots = rustls::RootCertStore::empty();
+    assert!(super::add_extra_ca_pem(&mut roots, b"not a pem at all").is_err());
+    let key_only = "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n";
+    assert!(super::add_extra_ca_pem(&mut roots, key_only.as_bytes()).is_err());
+}
+
+#[test]
+fn build_upstream_config_missing_extra_ca_file_fails_closed() {
+    // Installed even though the error returns before the ClientConfig builder:
+    // otherwise the test would silently depend on that internal ordering and
+    // start panicking (no process crypto provider) the day it changed.
+    install_provider();
+    let r = build_upstream_client_config(None, Some(std::path::Path::new("/nonexistent/ca.pem")));
+    assert!(r.is_err(), "a set-but-unreadable extra CA must fail closed");
+}
+
+#[test]
+fn build_upstream_config_none_extra_ca_is_ok() {
+    assert!(build_upstream_client_config(None, None).is_ok());
+}
+
+/// The whole `Some(path)` composition — filesystem read → PEM parse → root store
+/// → `ClientConfig` — against a REAL on-disk PEM. The pure `add_extra_ca_pem`
+/// tests above cover the parse alone and the sandbox-gated mail e2e covers the
+/// deployed path, so without this the fs-read-and-build seam has no coverage on
+/// a host where the sandbox tiers skip (macOS).
+#[test]
+fn build_upstream_config_with_valid_extra_ca_file_builds() {
+    install_provider();
+    let ca = crate::ca::generate_ca().expect("generate ca");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("extra-ca.pem");
+    std::fs::write(&path, ca.cert_pem()).expect("write ca pem");
+
+    assert!(
+        build_upstream_client_config(None, Some(&path)).is_ok(),
+        "a readable, valid extra-CA PEM must build the upstream config"
+    );
+    // Composes with a pin overlay: extra CA widens the roots, pins narrow the
+    // accepted leaves; neither disables the other.
+    let pin = [0x44u8; 32];
+    let json = format!(r#"{{"api.anthropic.com":["{}"]}}"#, pin_str(&pin));
+    assert!(build_upstream_client_config(Some(&json), Some(&path)).is_ok());
+}
+
+/// A file that exists and parses as PEM but carries no certificate must fail
+/// closed through the public entry point too, not just via `add_extra_ca_pem`.
+#[test]
+fn build_upstream_config_with_certless_extra_ca_file_fails_closed() {
+    install_provider(); // see `build_upstream_config_missing_extra_ca_file_fails_closed`
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("key-only.pem");
+    std::fs::write(&path, "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n")
+        .expect("write key-only pem");
+    assert!(
+        build_upstream_client_config(None, Some(&path)).is_err(),
+        "a zero-certificate PEM must fail closed"
+    );
 }

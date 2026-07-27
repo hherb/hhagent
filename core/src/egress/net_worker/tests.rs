@@ -125,6 +125,7 @@ fn spawn_net_worker_fails_closed_when_sidecar_unavailable() {
         secret_fingerprints: &[], // none for this fail-closed test
         cert_pins_json: None,
         disable_mitm: false,
+        upstream_extra_ca: None,
     };
     let res = spawn_net_worker(&params, Path::new("/tmp/kastellan-net-worker-test"), |_row| {});
     assert!(res.is_err(), "no proxy => no net worker (fail-closed)");
@@ -159,6 +160,7 @@ fn spawn_forced_net_worker_fails_closed_when_sidecar_unavailable() {
         secret_fingerprints: &[], // none for this fail-closed test
         cert_pins_json: None,
         disable_mitm: false,
+        upstream_extra_ca: None,
     };
     let res = spawn_forced_net_worker(&params, scratch_root.path(), |_row| {});
     assert!(res.is_err(), "no proxy => no net worker (fail-closed)");
@@ -201,6 +203,7 @@ fn spawn_forced_net_worker_cleans_scratch_on_failure() {
         secret_fingerprints: &[],
         cert_pins_json: None,
         disable_mitm: false,
+        upstream_extra_ca: None,
     };
     let _ = spawn_forced_net_worker(&params, scratch_root.path(), |_row| {});
     let leftovers: Vec<_> = std::fs::read_dir(scratch_root.path())
@@ -232,6 +235,7 @@ fn net_worker_spawn_struct_carries_pins_field() {
         secret_fingerprints: &[],
         cert_pins_json: Some(r#"{"api.anthropic.com":["sha256/AAAA"]}"#),
         disable_mitm: false,
+        upstream_extra_ca: None,
     };
     let scratch = tempfile::tempdir().unwrap();
     let res = spawn_net_worker(&params, scratch.path(), |_row| {});
@@ -309,6 +313,7 @@ fn spawn_net_worker_spawns_sidecar_under_sidecar_backend() {
         secret_fingerprints: &[],
         cert_pins_json: None,
         disable_mitm: false,
+        upstream_extra_ca: None,
     };
     let scratch = tempfile::tempdir().unwrap();
     let res = spawn_net_worker(&params, scratch.path(), |_row| {});

@@ -382,6 +382,7 @@ async fn brokered_vm_worker_ranks_hybrid_over_vsock_with_zero_embed_egress() {
         secret_fingerprints: &[],
         cert_pins_json: None,
         disable_mitm: false, // MITM: deliver the per-instance CA into the VM
+        upstream_extra_ca: None,
     };
     // Print each egress decision (allow/deny + host) so a live-tier failure is
     // diagnosable — which CONNECTs the proxy saw and whether any were blocked.
