@@ -54,14 +54,27 @@ public host.
 
 The PR #493 review asked for this to be *enforced* rather than documented, on
 the grounds that "safe because of how we happen to use it" stops being true the
-moment the thing becomes operator-settable. `select_ca_for_allowlist` therefore
-hands out an anchor only when **all** of these hold, and refuses otherwise:
+moment the thing becomes operator-settable. An anchor is therefore handed out
+only when **all** of these hold, and refused otherwise:
 
-| Rule | Refusal | Why |
-| --- | --- | --- |
-| Exactly one configured origin appears in the worker's allowlist | `MultipleKeyedHosts` | A sidecar takes at most one anchor; choosing silently would be arbitrary. |
-| That origin is the **only** host in the allowlist | `MixedAllowlist` | The anchor is trusted for every host the sidecar can reach. |
-| The origin is a **private/loopback IP literal** | `NotPrivateOrigin` | See below. |
+| Rule | Refusal | Decided | Why |
+| --- | --- | --- | --- |
+| The origin is a **private/loopback IP literal**, bare (no port) | `UpstreamCaError::NotPrivateOrigin` | `parse_upstream_cas`, at daemon startup | See below. |
+| Exactly one configured origin appears in the worker's allowlist | `MultipleKeyedHosts` | `select_ca_for_allowlist`, at spawn | A sidecar takes at most one anchor; choosing silently would be arbitrary. |
+| That origin is the **only** host in the allowlist | `MixedAllowlist` | `select_ca_for_allowlist`, at spawn | The anchor is trusted for every host the sidecar can reach. |
+
+**Where each rule is decided matters.** Privateness is a property of the config
+*alone*, so it is settled at parse time and becomes a construction invariant of
+`UpstreamCaMap` — a non-private key can never reach selection. Deciding it later
+would have made a whole family of typos fail silently or late instead of loudly
+at startup: a key carrying a port (`"10.0.0.3:8443"` — the likeliest mistake of
+all, since the allowlist entries it is matched against *are* `host:port`), a
+hostname key, an untrimmed key, or a non-canonical IPv6 spelling would each have
+produced a silent no-match. Parse therefore also **trims** the key and stores the
+address's canonical `Display` form, and selection renders allowlist hosts the
+same way, so `fd00:0:0:0:0:0:0:1` and `[fd00::1]:8443` are one origin. The two
+remaining rules genuinely need a specific worker's allowlist, so they stay at
+spawn.
 
 **Why an IP literal specifically.** Two independent reasons converge:
 
@@ -75,12 +88,40 @@ hands out an anchor only when **all** of these hold, and refuses otherwise:
 
 Privateness is decided by `kastellan_net_classify::is_denied_range` — the same
 predicate the proxy's SSRF guard uses, so the two cannot drift. This is core's
-first use of that crate; it is a pure in-workspace dependency.
+first use of that crate; it is a pure in-workspace dependency. Note that it is a
+*deny* list, not a "private" list: it also spans unspecified, broadcast,
+multicast and class-E space. Those extras are nonsensical as an origin rather
+than dangerous (nothing would allowlist them), and narrowing the predicate
+locally would reintroduce the very drift the shared crate prevents, so they are
+accepted and the wording says "a range the proxy would otherwise deny".
 
 **A refusal fails the spawn.** `spawn_worker_maybe_forced` maps a selection
 error to `ToolHostError::Io` naming the env var and the worker. Silently
 dropping the anchor was rejected: the operator would then have configured an
-anchor, received no error, and still be unable to reach their origin.
+anchor, received no error, and still be unable to reach their origin. The same
+call site also refuses an anchor selected for a **transparent-tunnel** worker
+(`disable_mitm_for` — browser, matrix). `spawn::check_upstream_extra_ca` is the
+backstop for that, but its message names only the path and `disable_mitm`, which
+reads like an internal wiring bug; raising it in `spawn_worker_maybe_forced`
+puts the env var and the worker name in the message instead.
+
+### 4a. Known limitation: keying is per-host, not per-service
+
+The rules above bound the anchor to one *host*. They do not tell apart distinct
+**services sharing one private address**. With localmail on `127.0.0.1:8443` and
+SearxNG on `127.0.0.1:8888`, a `{"127.0.0.1": …}` entry satisfies every rule for
+both workers — each has a single private-literal host — so the search worker's
+sidecar also receives localmail's anchor and trusts it for SearxNG. This is not
+hypothetical: those two services already share loopback on the DGX.
+
+Closing it would mean keying on `host:port`, which diverges from the sibling
+`KASTELLAN_EGRESS_CERT_PINS` shape and interacts badly with the bare-host
+all-port allowlist grant, or a per-host rustls verifier — an explicit non-goal
+(§2). The limitation is instead **documented where it is actionable** (module
+docs, the startup WARN, and the `kastellan.env` help block) and **pinned by a
+test** (`co_located_services_on_one_address_share_the_anchor`) so it cannot
+silently change shape. The mitigation is operational: give co-located private
+services distinct addresses.
 
 ## 5. Startup validation
 

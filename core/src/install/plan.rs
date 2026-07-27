@@ -133,28 +133,38 @@ pub fn ensure_v1_suffix(url: &str) -> String {
 /// 2. **Trust scope.** The anchor goes into that sidecar's whole upstream root
 ///    store, so it is trusted for every host that sidecar can reach. The daemon
 ///    therefore refuses to hand it to any worker that can reach more than the
-///    one private origin.
+///    one private origin — and, because keying is per-host, the operator has to
+///    be told that co-located services on one address share the anchor.
 pub fn render_upstream_ca_help() -> String {
-    let mut s = String::new();
-    s.push_str("# Extra TLS trust anchor for a force-routed worker whose origin is PRIVATE and\n");
-    s.push_str("# self-signed (e.g. a personal localmail on your LAN). JSON: origin -> PEM path.\n");
-    s.push_str("# Unset (the default) = the egress proxy trusts only the public webpki roots.\n");
-    s.push_str("# Rules, all enforced fail-closed at daemon startup or spawn:\n");
-    s.push_str("#   * The origin MUST be a private/loopback IP LITERAL (10.x, 192.168.x, 127.0.0.1,\n");
-    s.push_str("#     fd00::/8 ...). A hostname is refused: the proxy's SSRF guard blocks names that\n");
-    s.push_str("#     resolve into private ranges anyway, so it would be unreachable regardless.\n");
-    s.push_str("#   * The PEM path must be ABSOLUTE and readable by the daemon.\n");
-    s.push_str("#   * The worker's egress allowlist must contain ONLY that origin. The anchor is\n");
-    s.push_str("#     trusted for every host that worker's sidecar can reach, so mixing a private\n");
-    s.push_str("#     origin with a public one would let this CA impersonate the public host.\n");
-    s.push_str("#   * TRAP: the origin must serve a leaf certificate signed BY this CA, or a\n");
-    s.push_str("#     self-signed leaf marked `basicConstraints CA:FALSE`. A self-signed cert marked\n");
-    s.push_str("#     CA:TRUE and served as its own leaf is REJECTED at handshake time (rustls\n");
-    s.push_str("#     `CaUsedAsEndEntity`) even though `openssl verify` accepts it — and\n");
-    s.push_str("#     `openssl req -x509` produces exactly that shape by default. Check with:\n");
-    s.push_str("#       openssl x509 -in <cert.pem> -noout -text | grep -A1 'Basic Constraints'\n");
-    s.push_str("# KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA={\"10.0.0.3\":\"/home/me/.config/localmail/tls/cert.pem\"}\n");
-    s
+    // One raw literal rather than a push_str chain: the block is prose, and it
+    // is much easier to re-wrap and diff when it looks like what it renders.
+    // The `help_block_is_entirely_commented_out` test guards the leading `#`s.
+    r#"# Extra TLS trust anchor for a force-routed worker whose origin is PRIVATE and
+# self-signed (e.g. a personal localmail on your LAN). JSON: origin -> PEM path.
+# Unset (the default) = the egress proxy trusts only the public webpki roots.
+# Only read when force-routing is enabled; on a host without it, this is inert.
+# Rules, all enforced fail-closed at daemon startup or spawn:
+#   * The origin MUST be a private/loopback IP LITERAL with NO port (10.x,
+#     192.168.x, 127.0.0.1, fd00::/8 ...). A hostname is refused: the proxy's SSRF
+#     guard blocks names that resolve into private ranges anyway, so it would be
+#     unreachable regardless. A bad origin fails the daemon at startup.
+#   * The PEM path must be ABSOLUTE and readable by the daemon.
+#   * The worker's egress allowlist must contain ONLY that origin. The anchor is
+#     trusted for every host that worker's sidecar can reach, so mixing a private
+#     origin with a public one would let this CA impersonate the public host.
+#   * CAVEAT: keying is per-HOST, not per-service. Every service sharing this
+#     address is one origin to the rule above, so a second worker allowlisted to
+#     e.g. 127.0.0.1:8888 also receives this anchor and trusts it for that port.
+#     Give co-located private services distinct addresses if that matters.
+#   * TRAP: the origin must serve a leaf certificate signed BY this CA, or a
+#     self-signed leaf marked `basicConstraints CA:FALSE`. A self-signed cert marked
+#     CA:TRUE and served as its own leaf is REJECTED at handshake time (rustls
+#     `CaUsedAsEndEntity`) even though `openssl verify` accepts it — and
+#     `openssl req -x509` produces exactly that shape by default. Check with:
+#       openssl x509 -in <cert.pem> -noout -text | grep -A1 'Basic Constraints'
+# KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA={"10.0.0.3":"/home/me/.config/localmail/tls/cert.pem"}
+"#
+    .to_string()
 }
 
 /// Render the `kastellan.env` EnvironmentFile contents.
@@ -617,6 +627,9 @@ mod tests {
         assert!(help.contains("impersonate"), "must state the trust-scope hazard: {help}");
         // The private-literal rule, which is the most surprising refusal.
         assert!(help.contains("LITERAL"), "must state the IP-literal rule: {help}");
+        // The per-host (not per-service) keying granularity: an operator running
+        // two private services on one address has to know the anchor is shared.
+        assert!(help.contains("per-HOST"), "must state the keying granularity: {help}");
     }
 
     #[test]

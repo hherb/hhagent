@@ -192,8 +192,9 @@ pub enum ForceRoutingError {
     },
     /// The upstream extra-CA JSON parsed, but a file it names is unusable.
     /// Checked at startup so the operator learns now rather than on the first
-    /// force-routed dispatch.
-    #[error("invalid {env} config: {source}", env = ENV_UPSTREAM_EXTRA_CA)]
+    /// force-routed dispatch. Worded distinctly from [`Self::UpstreamCas`] so
+    /// the two are told apart at a glance in the daemon's startup failure.
+    #[error("unusable {env} certificate file: {source}", env = ENV_UPSTREAM_EXTRA_CA)]
     UpstreamCaFile {
         #[from]
         source: UpstreamCaFileError,
@@ -247,9 +248,12 @@ fn validate_upstream_cas(
             origin = host,
             ca_path = %path.display(),
             certificates = certs,
-            "egress: upstream TLS trust WIDENED for this origin's sidecar by operator config \
-             ({ENV_UPSTREAM_EXTRA_CA}). The anchor is trusted for every host that sidecar can \
-             reach, which is why it is permitted only for a single private origin. NOTE: the \
+            "egress: operator config ({ENV_UPSTREAM_EXTRA_CA}) WILL WIDEN upstream TLS trust for \
+             the sidecar of whichever force-routed worker dials this origin (no sidecar exists \
+             yet at startup, and a configured origin no worker dials is simply never used). The \
+             anchor is trusted for every host that sidecar can reach, which is why it is \
+             permitted only for a single private origin — and, since keying is per-host, for \
+             every service sharing this address. NOTE: the \
              origin must serve a leaf certificate this CA signed, OR a self-signed leaf marked \
              `basicConstraints CA:FALSE` — a self-signed certificate marked CA:TRUE and served \
              as its own leaf is REJECTED at handshake time (rustls `CaUsedAsEndEntity`) even \
@@ -380,6 +384,23 @@ pub(crate) fn spawn_worker_maybe_forced(
                     "worker {worker_name:?}: refusing to spawn — {ENV_UPSTREAM_EXTRA_CA}: {e}"
                 )))
             })?;
+            // Workers that do their own end-to-end TLS + can't trust our CA
+            // (browser, matrix) → their sidecar transparently tunnels.
+            let disable_mitm = disable_mitm_for(worker_name);
+            // A tunnel never re-originates TLS, so an anchor there is inert.
+            // `spawn::check_upstream_extra_ca` is the backstop that enforces
+            // this, but its message names only the path and `disable_mitm` —
+            // reading like an internal wiring bug. Catch it here, where the env
+            // var and the worker name are both in scope, so the operator is
+            // pointed at the config line they actually have to change.
+            if disable_mitm && upstream_extra_ca.is_some() {
+                return Err(ToolHostError::Io(std::io::Error::other(format!(
+                    "worker {worker_name:?}: refusing to spawn — {ENV_UPSTREAM_EXTRA_CA} names an \
+                     extra trust anchor for this worker's origin, but this worker's sidecar runs \
+                     in transparent-tunnel (no-MITM) mode and never re-originates TLS, so the \
+                     anchor would be silently inert. Remove that entry."
+                ))));
+            }
             let params = crate::egress::net_worker::NetWorkerSpawn {
                 backend,
                 // The egress-proxy sidecar is the real-network egress boundary,
@@ -393,13 +414,8 @@ pub(crate) fn spawn_worker_maybe_forced(
                 worker_name,
                 secret_fingerprints: &[],
                 cert_pins_json: pins_json.as_deref(),
-                // Workers that do their own end-to-end TLS + can't trust our CA
-                // (browser, matrix) → their sidecar transparently tunnels.
-                disable_mitm: disable_mitm_for(worker_name),
-                // #492. NB a transparent-tunnel worker (browser, matrix) that
-                // somehow had a CA selected is rejected by
-                // `spawn::check_upstream_extra_ca` — a tunnel never
-                // re-originates TLS, so the anchor would be silently inert.
+                disable_mitm,
+                // #492 — always `None` when `disable_mitm`, rejected above.
                 upstream_extra_ca,
             };
             spawn_forced_net_worker(&params, &cfg.scratch_root, (cfg.make_sink)())

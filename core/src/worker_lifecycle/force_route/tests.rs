@@ -38,6 +38,26 @@ impl SandboxBackend for RecordingBackend {
     }
 }
 
+/// A backend that captures the full [`SandboxPolicy`] of each spawn attempt and
+/// then fails. Lets a test assert what was *in* the policy a spawn path built —
+/// the env keys and `fs_read` binds — without a real child process. (The policy
+/// captured is the post-`derive_lockdown_env` one, which is a clone of the
+/// original plus the lockdown env keys, so both survive.)
+struct PolicyCapturingBackend {
+    policies: Arc<Mutex<Vec<SandboxPolicy>>>,
+}
+impl SandboxBackend for PolicyCapturingBackend {
+    fn spawn_under_policy(
+        &self,
+        policy: &SandboxPolicy,
+        _program: &str,
+        _args: &[&str],
+    ) -> Result<std::process::Child, SandboxError> {
+        self.policies.lock().expect("capture mutex poisoned").push(policy.clone());
+        Err(SandboxError::Backend("test: spawn refused".into()))
+    }
+}
+
 /// Backend whose spawn always fails. The point of these tests is *which*
 /// spawn path runs, told apart by the error variant: the plain
 /// `spawn_worker` path surfaces `ToolHostError::Sandbox`, while the
@@ -642,8 +662,14 @@ fn no_broker_requested_is_passthrough() {
 
 /// A `ForceRoutingConfig` carrying an extra-CA map, for the selection tests.
 fn config_with_upstream_cas(json: &str) -> ForceRoutingConfig {
+    config_with_upstream_cas_in(json, PathBuf::from("/tmp"))
+}
+
+/// As [`config_with_upstream_cas`], with an explicit scratch root — needed by
+/// the test that lets the sidecar spawn actually be attempted.
+fn config_with_upstream_cas_in(json: &str, scratch_root: PathBuf) -> ForceRoutingConfig {
     let cas = parse_upstream_cas_env(Some(json)).expect("valid extra-CA config");
-    config_with(PathBuf::from("/tmp")).with_upstream_cas(cas)
+    config_with(scratch_root).with_upstream_cas(cas)
 }
 
 #[test]
@@ -754,6 +780,76 @@ fn spawn_is_unaffected_when_no_extra_ca_matches_the_worker() {
         !msg.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"),
         "an unrelated worker must not be refused by the extra-CA check: {msg}"
     );
+}
+
+/// The positive half of the wiring: a *selected* anchor must actually reach the
+/// sidecar. Asserted at the far end of the chain — `ForceRoutingConfig` →
+/// `NetWorkerSpawn` → `spawn_sidecar` → `proxy_policy` — by capturing the policy
+/// the sidecar backend is handed, so no link in it can be quietly dropped
+/// (`upstream_ca_for` returning the right path proves only the first link).
+#[test]
+fn a_selected_extra_ca_reaches_the_sidecar_policy_env_and_fs_read() {
+    let ca = PathBuf::from("/etc/localmail/ca.pem");
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let cfg = config_with_upstream_cas_in(
+        r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#,
+        scratch.path().to_path_buf(),
+    );
+    let policy = SandboxPolicy {
+        net: Net::Allowlist(vec!["10.0.0.3:8443".into()]),
+        ..SandboxPolicy::default()
+    };
+    let policies = Arc::new(Mutex::new(Vec::new()));
+    let sidecar = PolicyCapturingBackend { policies: Arc::clone(&policies) };
+    // Spawn fails (the capturing backend refuses), but the policy is recorded.
+    let _ = spawn_worker_maybe_forced(
+        Some(&cfg),
+        &FailBackend,
+        &sidecar,
+        &spec_for(&policy),
+        "mail",
+    );
+    let captured = policies.lock().expect("capture mutex poisoned");
+    let sidecar_policy = captured.first().expect("the sidecar spawn must have been attempted");
+    assert!(
+        sidecar_policy
+            .env
+            .iter()
+            .any(|(k, v)| k == "KASTELLAN_EGRESS_PROXY_UPSTREAM_EXTRA_CA" && v == "/etc/localmail/ca.pem"),
+        "the selected CA must reach the proxy's env: {:?}",
+        sidecar_policy.env
+    );
+    assert!(
+        sidecar_policy.fs_read.contains(&ca),
+        "the CA must be bound into the proxy jail or the proxy cannot open it: {:?}",
+        sidecar_policy.fs_read
+    );
+}
+
+/// A transparent-tunnel worker never re-originates TLS, so an anchor there would
+/// be inert. `spawn::check_upstream_extra_ca` is the backstop, but its message
+/// names neither the env var nor the worker — so the refusal is raised in
+/// `spawn_worker_maybe_forced`, where both are in scope.
+#[test]
+fn spawn_refuses_an_extra_ca_for_a_transparent_tunnel_worker() {
+    let cfg = config_with_upstream_cas(r#"{"10.0.0.3":"/etc/localmail/ca.pem"}"#);
+    let policy = SandboxPolicy {
+        net: Net::Allowlist(vec!["10.0.0.3:8443".into()]),
+        ..SandboxPolicy::default()
+    };
+    let msg = match spawn_worker_maybe_forced(
+        Some(&cfg),
+        &FailBackend,
+        &FailBackend,
+        &spec_for(&policy),
+        MATRIX_TOOL,
+    ) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("an anchor for a no-MITM worker must refuse the spawn"),
+    };
+    assert!(msg.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"), "error must name the config: {msg}");
+    assert!(msg.contains(MATRIX_TOOL), "error must name the worker: {msg}");
+    assert!(msg.contains("transparent-tunnel"), "error must say why: {msg}");
 }
 
 #[test]

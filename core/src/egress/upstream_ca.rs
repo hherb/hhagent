@@ -26,10 +26,30 @@
 //! a worker's allowlist ever mixed a private origin with a public one, the
 //! operator's CA could impersonate that public host.
 //!
-//! Rather than document that hazard and hope, [`select_ca_for_allowlist`]
-//! **enforces** it: an extra CA is handed out only when the worker's allowlist
-//! resolves to a single private origin, written as an IP literal. Anything else
-//! fails closed and refuses the spawn. See that function for the full rule.
+//! Rather than document that hazard and hope, the rule is **enforced** in two
+//! places: [`parse_upstream_cas`] rejects any key that is not a private IP
+//! literal (so the daemon refuses to start), and [`select_ca_for_allowlist`]
+//! hands out an anchor only when that origin is the *only* host the worker may
+//! dial. Anything else fails closed. See those two functions for the full rule.
+//!
+//! # Known limitation: keying is per-host, not per-service
+//!
+//! An entry is keyed by host, and the allowlist match strips the port — a single
+//! origin published on `h:80` and `h:443` is deliberately one origin. The flip
+//! side is that **distinct services sharing one private address are not told
+//! apart**. If localmail is on `127.0.0.1:8443` and a SearxNG instance is on
+//! `127.0.0.1:8888`, a `{"127.0.0.1": …}` entry satisfies every rule below for
+//! *both* workers: each has a single private-literal host in its allowlist, so
+//! the search worker's sidecar would also receive localmail's anchor and trust
+//! it for SearxNG.
+//!
+//! This is not closed here. Doing so would mean keying on `host:port` — which
+//! diverges from the sibling `KASTELLAN_EGRESS_CERT_PINS` shape and interacts
+//! badly with the bare-host all-port allowlist grant — or a per-host rustls
+//! verifier, an explicit non-goal of #492. The mitigation is operational: give
+//! co-located private services distinct addresses, or accept that an anchor
+//! keyed on a shared address is trusted across everything on it. The operator
+//! help block in `crate::install::plan::render_upstream_ca_help` says so.
 //!
 //! # Layering
 //!
@@ -54,11 +74,20 @@ use super::cert_pins::host_of_endpoint;
 /// startup sanity probe; the proxy does the real parse.
 const PEM_CERT_MARKER: &str = "-----BEGIN CERTIFICATE-----";
 
-/// A parsed, structurally-valid operator extra-CA config: lowercased origin host
-/// → the absolute path of the PEM file to trust for it.
+/// A parsed, structurally-valid operator extra-CA config: canonical private-IP
+/// origin → the absolute path of the PEM file to trust for it.
 ///
-/// Invariant: every path is absolute and non-empty (both enforced by
-/// [`parse_upstream_cas`]).
+/// Invariants, all enforced by [`parse_upstream_cas`] — the only constructor
+/// besides an empty `Default`:
+/// * every key parses as an [`IpAddr`] in a range the proxy's SSRF guard denies
+///   (i.e. an address on the operator's own network), and is stored in that
+///   address's **canonical** `Display` form, so `fd00:0:0:0:0:0:0:1` and
+///   `fd00::1` are the same key;
+/// * every path is absolute and non-empty.
+///
+/// Because privateness is a construction invariant rather than a selection-time
+/// check, a public or hostname key can never reach [`select_ca_for_allowlist`]:
+/// it fails the daemon at startup instead.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UpstreamCaMap(BTreeMap<String, PathBuf>);
 
@@ -89,14 +118,40 @@ pub enum UpstreamCaError {
     /// path would fail later, naming the sandbox instead of this config.
     #[error("host {host:?} CA path {path:?} must be absolute (it is bound into the proxy jail)")]
     RelativePath { host: String, path: String },
+    /// The key is not a private/loopback **IP literal**.
+    ///
+    /// Checked here, at startup, rather than when a worker is selected, because
+    /// such a key is *dead config in every case*: it can never yield an anchor,
+    /// only a silent no-match or a late spawn refusal. Catching it here also
+    /// catches the neighbouring typo classes with one message — a key that
+    /// carries a port (`"10.0.0.3:8443"`, an easy mistake since the allowlist
+    /// entries this is matched against are `host:port`), a hostname, or a
+    /// non-canonical literal.
+    ///
+    /// Two independent reasons the key must be a literal in a private range:
+    /// widening trust is only defensible for an origin the operator physically
+    /// controls; and the egress proxy denies any *hostname* that resolves into a
+    /// private range (its SSRF guard), allowing only operator-allowlisted IP
+    /// literals through the carve-out — so a name-keyed private origin would be
+    /// unreachable regardless.
+    #[error(
+        "extra-CA origin {0:?} is not a private/loopback IP literal; an extra trust anchor \
+         is supported only for an origin you control, written as a bare literal address with \
+         NO port (e.g. 10.0.0.3 or 127.0.0.1) — the egress proxy's SSRF guard blocks hostnames \
+         that resolve into private ranges anyway"
+    )]
+    NotPrivateOrigin(String),
 }
 
-/// Parse + structurally validate the operator extra-CA JSON.
+/// Parse + fully validate the operator extra-CA JSON.
 ///
-/// Accepts a JSON object mapping an origin host to an absolute PEM path, e.g.
-/// `{"10.0.0.3":"/home/me/.config/localmail/tls/cert.pem"}`. Host keys are
-/// lowercased (DNS is case-insensitive, and the allowlist match below is done on
-/// lowercased hosts).
+/// Accepts a JSON object mapping a **private IP literal** to an absolute PEM
+/// path, e.g. `{"10.0.0.3":"/home/me/.config/localmail/tls/cert.pem"}`.
+///
+/// Every rule that can be decided from the config alone is decided *here*, so a
+/// typo fails the daemon at startup rather than surfacing as a silent no-match
+/// or a late spawn refusal. What is left to [`select_ca_for_allowlist`] is only
+/// what needs a specific worker's allowlist to decide.
 pub fn parse_upstream_cas(json: &str) -> Result<UpstreamCaMap, UpstreamCaError> {
     // serde rejects any non-object / non-string-valued shape for us.
     let raw: BTreeMap<String, String> =
@@ -111,7 +166,12 @@ pub fn parse_upstream_cas(json: &str) -> Result<UpstreamCaMap, UpstreamCaError> 
         if !path_buf.is_absolute() {
             return Err(UpstreamCaError::RelativePath { host, path: trimmed.to_string() });
         }
-        out.insert(host.to_ascii_lowercase(), path_buf);
+        // Trim the key too (a stray space would otherwise be a silent no-match)
+        // and store the address's canonical form, so an operator writing
+        // `fd00:0:0:0:0:0:0:1` still matches an allowlist entry `[fd00::1]`.
+        let key = private_literal_key(host.trim())
+            .ok_or_else(|| UpstreamCaError::NotPrivateOrigin(host.clone()))?;
+        out.insert(key, path_buf);
     }
     Ok(UpstreamCaMap(out))
 }
@@ -138,30 +198,42 @@ pub enum UpstreamCaSelectError {
          extra CA, and a single-origin worker is the only supported shape"
     )]
     MultipleKeyedHosts(Vec<String>),
-    /// The keyed origin is not a private/loopback **IP literal**.
-    ///
-    /// Two independent reasons this must be a literal in a private range:
-    /// widening trust is only defensible for an origin the operator physically
-    /// controls; and the egress proxy denies any *hostname* that resolves into a
-    /// private range (its SSRF guard), allowing only operator-allowlisted IP
-    /// literals through the carve-out — so a name-keyed private origin would be
-    /// unreachable regardless.
-    #[error(
-        "extra-CA origin {0:?} is not a private/loopback IP literal; an extra trust anchor \
-         is supported only for an origin you control, written as a literal address \
-         (e.g. 10.0.0.3 or 127.0.0.1) — the egress proxy's SSRF guard blocks hostnames \
-         that resolve into private ranges anyway"
-    )]
-    NotPrivateOrigin(String),
 }
 
-/// Pure: is this allowlist host an origin we may widen trust for?
+/// Pure: the canonical map key for an origin we may widen trust for, or `None`
+/// if this string is not one.
 ///
-/// True only for an IP literal inside a range the proxy's SSRF guard would
-/// otherwise deny (private, loopback, link-local, ULA, CGNAT, …) — i.e. an
-/// address on the operator's own network rather than a public one.
-fn is_private_literal(host: &str) -> bool {
-    host.parse::<IpAddr>().map(is_denied_range).unwrap_or(false)
+/// `Some` only for an IP literal inside a range [`is_denied_range`] covers — the
+/// egress proxy's own SSRF predicate, reused so the two cannot drift. That
+/// predicate is a *deny* list rather than a "private" list: besides the ranges
+/// that matter here (loopback, RFC1918, link-local, ULA, CGNAT) it also spans
+/// unspecified, broadcast, multicast and class-E space. Those extras are
+/// nonsensical as an origin rather than dangerous — nothing would allowlist
+/// them — and narrowing the predicate locally would reintroduce exactly the
+/// drift the shared crate exists to prevent, so they are accepted.
+///
+/// The returned key is the address's canonical `Display` form, which is how
+/// [`select_ca_for_allowlist`] renders allowlist hosts too — so the two match
+/// regardless of which textual spelling the operator used.
+fn private_literal_key(host: &str) -> Option<String> {
+    let ip: IpAddr = host.parse().ok()?;
+    is_denied_range(ip).then(|| ip.to_string())
+}
+
+/// Pure: render an allowlist endpoint's host in the same canonical form
+/// [`parse_upstream_cas`] stores keys in.
+///
+/// Lowercased (DNS is case-insensitive), then — when the host is an IP literal —
+/// replaced by that address's canonical `Display` form, so an allowlist entry
+/// `[FD00:0:0:0:0:0:0:1]:8443` and a config key `fd00::1` are the same host.
+/// Non-literal hosts pass through lowercased; they can never match a key, since
+/// every key is a literal.
+fn canonical_allowlist_host(endpoint: &str) -> String {
+    let host = host_of_endpoint(endpoint).to_ascii_lowercase();
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => host,
+    }
 }
 
 /// Select the extra CA for a worker, given its egress allowlist.
@@ -171,14 +243,16 @@ fn is_private_literal(host: &str) -> bool {
 ///   the worker's sidecar gets no extra anchor and the path stays byte-identical
 ///   to the webpki-only default. This is the case for every worker today except
 ///   a deliberately configured one.
-/// * `Ok(Some(path))` — exactly one configured origin is in the allowlist, that
-///   origin is the *only* host in the allowlist, and it is a private IP literal.
+/// * `Ok(Some(path))` — exactly one configured origin is in the allowlist and
+///   that origin is the *only* host in the allowlist. (Privateness needs no
+///   check here: it is a construction invariant of [`UpstreamCaMap`].)
 /// * `Err(_)` — the config and the worker disagree in a way that would either
 ///   widen trust too far or leave the operator with a false belief. The caller
 ///   must refuse the spawn (fail closed).
 ///
 /// `allowlist` entries are `host:port` (the shape the proxy and web-common use);
-/// matching is on the host alone, lowercased.
+/// matching is on the host alone, canonicalized by [`canonical_allowlist_host`].
+/// Note the per-host (not per-service) granularity documented on this module.
 pub fn select_ca_for_allowlist<'m>(
     map: &'m UpstreamCaMap,
     allowlist: &[String],
@@ -186,10 +260,8 @@ pub fn select_ca_for_allowlist<'m>(
     // Distinct hosts this worker may dial. A single origin published on two
     // ports (`h:80`, `h:443`) is still ONE host, which is why this is a set of
     // hosts rather than a count of allowlist entries.
-    let hosts: BTreeSet<String> = allowlist
-        .iter()
-        .map(|ep| host_of_endpoint(ep).to_ascii_lowercase())
-        .collect();
+    let hosts: BTreeSet<String> =
+        allowlist.iter().map(|ep| canonical_allowlist_host(ep)).collect();
 
     let matched: Vec<(&String, &PathBuf)> =
         map.0.iter().filter(|(host, _)| hosts.contains(*host)).collect();
@@ -209,10 +281,6 @@ pub fn select_ca_for_allowlist<'m>(
     let others: Vec<String> = hosts.iter().filter(|h| *h != host).cloned().collect();
     if !others.is_empty() {
         return Err(UpstreamCaSelectError::MixedAllowlist { host: host.clone(), others });
-    }
-
-    if !is_private_literal(host) {
-        return Err(UpstreamCaSelectError::NotPrivateOrigin(host.clone()));
     }
 
     Ok(Some(path.as_path()))
@@ -242,6 +310,11 @@ pub enum UpstreamCaFileError {
 /// PEM) fail at daemon startup with a clear message instead of surfacing much
 /// later as a sidecar bring-up failure on the first force-routed dispatch.
 ///
+/// Not a completeness check: it counts BEGIN markers without requiring a
+/// matching `-----END CERTIFICATE-----`, so a truncated PEM passes here and
+/// fails in the proxy. Widening it would mean parsing X.509, which is the
+/// explicit non-goal (see the module docs on layering).
+///
 /// Returns the number of certificate blocks found (always ≥ 1 on `Ok`).
 pub fn check_ca_pem_contents(
     host: &str,
@@ -269,11 +342,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_valid_map_and_lowercases_hosts() {
-        let m = map(r#"{"MyHost.Local":"/etc/ca.pem"}"#);
+    fn parses_valid_map() {
+        let m = map(r#"{"10.0.0.3":"/etc/ca.pem"}"#);
         assert!(!m.is_empty());
-        assert_eq!(m.0.get("myhost.local"), Some(&PathBuf::from("/etc/ca.pem")));
-        assert_eq!(m.0.get("MyHost.Local"), None);
+        assert_eq!(m.0.get("10.0.0.3"), Some(&PathBuf::from("/etc/ca.pem")));
+    }
+
+    #[test]
+    fn canonicalizes_and_trims_the_host_key() {
+        // A non-canonical IPv6 spelling and a stray space would both be silent
+        // no-matches if stored verbatim; both must normalize onto one key.
+        let m = map(r#"{" FD00:0:0:0:0:0:0:1 ":"/etc/ca.pem"}"#);
+        assert_eq!(m.0.get("fd00::1"), Some(&PathBuf::from("/etc/ca.pem")));
+        // ...and the canonical key is what the allowlist match then finds.
+        assert!(select_ca_for_allowlist(&m, &["[fd00::1]:8443".to_string()]).unwrap().is_some());
     }
 
     #[test]
@@ -291,6 +373,32 @@ mod tests {
                 path: "ca.pem".to_string()
             }
         );
+    }
+
+    // ---- parse-time origin rules (dead config fails the daemon) ----------
+
+    #[test]
+    fn rejects_a_public_literal_origin_at_parse_time() {
+        // 93.184.216.34 is a public address: widening trust there would let the
+        // operator CA impersonate a host they do not control.
+        let err = parse_upstream_cas(r#"{"93.184.216.34":"/etc/ca.pem"}"#).unwrap_err();
+        assert_eq!(err, UpstreamCaError::NotPrivateOrigin("93.184.216.34".to_string()));
+    }
+
+    #[test]
+    fn rejects_a_hostname_origin_even_if_it_sounds_local() {
+        // The proxy's SSRF guard denies hostnames resolving into private ranges,
+        // so a name-keyed private origin is unreachable regardless of trust.
+        let err = parse_upstream_cas(r#"{"localmail.lan":"/etc/ca.pem"}"#).unwrap_err();
+        assert_eq!(err, UpstreamCaError::NotPrivateOrigin("localmail.lan".to_string()));
+    }
+
+    #[test]
+    fn rejects_a_key_that_carries_a_port() {
+        // The likeliest typo of all: allowlist entries ARE `host:port`, so an
+        // operator copying one across would otherwise get a silent no-match.
+        let err = parse_upstream_cas(r#"{"10.0.0.3:8443":"/etc/ca.pem"}"#).unwrap_err();
+        assert_eq!(err, UpstreamCaError::NotPrivateOrigin("10.0.0.3:8443".to_string()));
     }
 
     #[test]
@@ -395,37 +503,24 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_public_literal_origin() {
-        // 93.184.216.34 is a public address: widening trust there would let the
-        // operator CA impersonate a host they do not control.
-        let m = map(r#"{"93.184.216.34":"/etc/ca.pem"}"#);
-        let err =
-            select_ca_for_allowlist(&m, &["93.184.216.34:443".to_string()]).unwrap_err();
-        assert_eq!(
-            err,
-            UpstreamCaSelectError::NotPrivateOrigin("93.184.216.34".to_string())
-        );
+    fn a_hostname_allowlist_entry_never_matches_a_literal_key() {
+        // Every key is a literal (a construction invariant), so a worker that
+        // only dials names simply gets no anchor.
+        let m = map(r#"{"10.0.0.3":"/etc/ca.pem"}"#);
+        assert!(select_ca_for_allowlist(&m, &["MyHost.Local:8443".to_string()]).unwrap().is_none());
     }
 
+    /// The documented per-host (not per-service) granularity, pinned so the
+    /// limitation cannot silently change shape: two different services on one
+    /// private address are ONE origin to this rule, and the second worker gets
+    /// the first's anchor. See the module docs.
     #[test]
-    fn refuses_a_hostname_origin_even_if_it_sounds_local() {
-        // The proxy's SSRF guard denies hostnames resolving into private ranges,
-        // so a name-keyed private origin is unreachable regardless of trust.
-        let m = map(r#"{"localmail.lan":"/etc/ca.pem"}"#);
-        let err = select_ca_for_allowlist(&m, &["localmail.lan:8443".to_string()]).unwrap_err();
-        assert_eq!(
-            err,
-            UpstreamCaSelectError::NotPrivateOrigin("localmail.lan".to_string())
-        );
-    }
-
-    #[test]
-    fn selection_is_case_insensitive_on_host() {
-        let m = map(r#"{"myhost":"/etc/ca.pem"}"#);
-        // Case-folding happens before the private-literal check, so this still
-        // fails on privateness rather than silently missing the match.
-        let err = select_ca_for_allowlist(&m, &["MYHOST:8443".to_string()]).unwrap_err();
-        assert_eq!(err, UpstreamCaSelectError::NotPrivateOrigin("myhost".to_string()));
+    fn co_located_services_on_one_address_share_the_anchor() {
+        let m = map(r#"{"127.0.0.1":"/etc/localmail/ca.pem"}"#);
+        let mail = select_ca_for_allowlist(&m, &["127.0.0.1:8443".to_string()]).unwrap();
+        let search = select_ca_for_allowlist(&m, &["127.0.0.1:8888".to_string()]).unwrap();
+        assert_eq!(mail, search, "keying is per-host, so a shared address shares the anchor");
+        assert!(mail.is_some());
     }
 
     // ---- startup PEM sanity probe ---------------------------------------

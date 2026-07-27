@@ -7,11 +7,23 @@ Branch `feat/492-upstream-extra-ca-wiring`. All slices done.
 | - | ----- | ------- |
 | 0 | Docs reconcile — HANDOVER/ROADMAP still said PR #493 was open | `82fa33a9`. HANDOVER 509 → 447 lines, 176 KB → ~110 KB; pre-prune snapshot archived. |
 | 1 | Pure `core/src/egress/upstream_ca.rs` (parse / select / PEM probe) + tests | 20 unit tests. Sibling of `cert_pins.rs`; reuses its `host_of_endpoint`. |
-| 2 | Enforce the trust-scope rule in selection | `MixedAllowlist` / `MultipleKeyedHosts` / `NotPrivateOrigin`, via `kastellan-net-classify::is_denied_range` (core's first use of that crate). |
+| 2 | Enforce the trust-scope rule | `MixedAllowlist` / `MultipleKeyedHosts` at selection; `NotPrivateOrigin` at *parse* (a construction invariant of `UpstreamCaMap`), via `kastellan-net-classify::is_denied_range` (core's first use of that crate). |
 | 3 | Wire `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` into `from_env` + startup PEM read + trust-widening WARN | Fail-closed on unreadable / certificate-less. `with_upstream_cas` builder rather than a 5th positional arg to `new` (leaves the 5 e2e call sites untouched). |
 | 4 | Select per worker in `spawn_worker_maybe_forced`; a selection error refuses the spawn | Error names the env var + the worker, and fires before the backend is touched. |
 | 5 | `kastellan.env` operator docs (`render_upstream_ca_help`) | Both traps documented; a test pins that every line stays commented. |
 | 6 | Prove the security assertions | All six fail against deliberately weakened code (trust-scope + private-origin rules deleted), then restored. |
+| 7 | Review pass (self-review of this PR) | Six findings, all fixed in-branch — see below. |
+
+## Review findings, and what changed
+
+| # | Finding | Fix |
+| - | ------- | --- |
+| 1 | Keying is per-host, so co-located services on one private address share the anchor — the "single origin" claim didn't hold at service granularity | Documented as a known limitation in module docs / startup WARN / `kastellan.env`, and **pinned by a test** so it can't silently change shape. Per-`host:port` keying rejected (diverges from the cert-pins shape, fights the bare-host all-port grant). §4a. |
+| 2 | Key shape validated only at selection, so a port-carrying key, hostname key, untrimmed key or non-canonical IPv6 spelling was silent or late dead config | `NotPrivateOrigin` moved to `parse_upstream_cas`; keys trimmed + stored canonically, allowlist hosts canonicalized the same way. `UpstreamCaSelectError::NotPrivateOrigin` deleted — unreachable by construction. |
+| 3 | `is_denied_range` is a deny list, not a "private" list (spans multicast / broadcast / class-E), while the doc claimed "the operator's own network" | Wording corrected in code + spec; predicate deliberately left shared to prevent drift. |
+| 4 | The `disable_mitm` + anchor refusal named neither the env var nor the worker, reading like an internal wiring bug | Refused in `spawn_worker_maybe_forced`, where both are in scope; `spawn::check_upstream_extra_ca` stays as backstop. |
+| 5 | No test proved a *selected* anchor actually reaches the sidecar — only the refusal paths were covered | `a_selected_extra_ca_reaches_the_sidecar_policy_env_and_fs_read`: captures the sidecar's `SandboxPolicy` and asserts both the proxy env key and the jail `fs_read` bind. |
+| 6 | Smaller: identical `Display` prefixes on two `ForceRoutingError` variants; startup WARN overstated ("trust WIDENED" before any sidecar exists); `push_str` chain; undocumented END-marker gap | All fixed / documented. |
 
 ## Verification
 
