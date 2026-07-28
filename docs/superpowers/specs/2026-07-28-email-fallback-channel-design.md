@@ -42,7 +42,7 @@ Two facts that post-date the 2026-06-12 design reshape the solution:
 | D2 | A gated email becomes a **normal channel task** | This is what makes it a real fallback. The 2026-06-12 "never commands" constraint is honoured as *never commands from an unauthenticated sender* — the per-pairing token is precisely the mechanism that design added to close that gap. |
 | D3 | Outbound is a **separate SMTP worker** | Forced by #492: one worker cannot hold both a private self-signed origin (needs the extra-CA anchor) and a public SMTP host, because that is `MixedAllowlist` and fails the spawn. Two single-origin workers is also plain least privilege. |
 | D4 | Scoping via a **dedicated localmail account + api-user grant** | `/v1/changes` is filtered server-side by localmail's existing `user_accounts` ACL. The channel reads one mailbox, not the 37k-message archive; nothing to filter, and nothing to get wrong, in kastellan. |
-| D5 | The token lives in a new **`pairings.token_sha256`** column, minted by `kastellan-cli pair issue --channel email` | Reuses the pairing lifecycle: hash-only storage, printed once, revocable, audited. Nullable, so Matrix rows keep NULL and Matrix behaviour is byte-identical. |
+| D5 | The token lives in a new **`pairings.token_sha256`** column, minted by `kastellan-cli pair issue-token --channel email --peer <addr>` | Reuses the pairing lifecycle: hash-only storage, printed once, revocable, audited. Nullable, so Matrix rows keep NULL and Matrix behaviour is byte-identical. A **separate subcommand**, not flags on `pair issue`: that mints a single-use code for an in-channel handshake, and one command meaning two different things depending on flags is a footgun. |
 | D6 | **Security decisions stay pure and in core**; the worker returns raw material | `channel/mod.rs` states every rejected message lands in `audit_log`. A gate inside the worker, or inside `parse_poll`, could not audit and would silently break that invariant. |
 | D7 | The inbound **cursor is localmail's**, via a server-side subscription | See §5. localmail may own non-security state; it must not make security decisions. |
 | D8 | Email pairing is **operator-only, out of band** | Falls out of D5: the token lives on the pairing row, so an unpaired sender can never present a valid one and the in-channel pairing carve-out is unreachable over email *by construction*. Removing an unauthenticated brute-force target on a spoofable transport is the right posture, and it needs no new per-channel config. |
@@ -83,7 +83,7 @@ smtp submission ◀──send── kastellan-worker-email-out │              
 | `workers/email-out` (`kastellan-worker-email-out`) | `email.send` over `lettre` **0.11 (MIT — verified 2026-07-28, AGPL-compatible)** SMTP submission. Slice 2. |
 | `core/src/channel/email/` | `wire.rs` (`EMAIL_POLLED_SPEC` + pure codecs), `gate.rs` (pure DMARC + token), `policy.rs` (`SandboxPolicy` builders), `config.rs` (env-gated parsing), parent (`EmailChannel`, `spawn_email_worker`). Each file under the 500-LOC cap. |
 | migration `0022` | `ALTER TABLE pairings ADD COLUMN token_sha256 TEXT` (nullable). |
-| `kastellan-cli pair issue --channel email --peer <addr>` | Creates the pairing row, mints a long-lived random token, stores only its SHA-256, prints the plaintext once. Audited via the existing `pairing.code_issued` path. |
+| `kastellan-cli pair issue-token --channel email --peer <addr>` | Creates the pairing row, mints a long-lived random token, stores only its SHA-256, prints the plaintext once. Audited as `pairing.token_issued` (hash only). The peer is lowercased at mint time to match the channel's normalization of a `From` header. |
 
 ### 4.2 Changes to shared code
 
@@ -229,8 +229,8 @@ grant, `kastellan.env`), plus the `#[ignore]` live tier.
 
 1. A dedicated mail account in localmail for the agent's address, and a channel
    api-user granted **only** that account.
-2. `kastellan-cli pair issue --channel email --peer <your-address>` — record the
-   printed token; it is shown once.
+2. `kastellan-cli pair issue-token --channel email --peer <your-address>` —
+   record the printed token; it is shown once.
 3. `kastellan.env`: localmail endpoint, subscription name, the agent address,
    the **authserv-id of your MX**, and (slice 2) the SMTP submission host and
    credentials.
