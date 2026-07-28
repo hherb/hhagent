@@ -151,14 +151,26 @@ fn parse_issue_token_args(args: &[String]) -> Result<(String, String), String> {
             other => return Err(format!("unexpected argument {other}")),
         }
     }
-    let channel = channel.ok_or("--channel is required")?;
+    let channel = channel.ok_or("--channel is required")?.trim().to_string();
     // Lowercased to match the channel's own normalization of a From address;
     // a case-mismatched pairing row would silently never authorize.
     let peer = peer.ok_or("--peer is required")?.trim().to_ascii_lowercase();
-    if channel.trim().is_empty() || peer.is_empty() {
+    if channel.is_empty() || peer.is_empty() {
         return Err("--channel and --peer must be non-empty".to_string());
     }
     Ok((channel, peer))
+}
+
+/// True if a `token_hash_for` lookup means `(channel, peer)` already has an
+/// active pairing. This is the *primary* duplicate-pairing check in
+/// `pair_issue_token`, run before attempting the insert: `token_hash_for`
+/// returns `Ok(Some(_))` (outer `Some`) whenever an active pairing row
+/// exists, whether or not that row itself carries a token — `Some(None)`
+/// for an active pairing with no token (e.g. Matrix, which authenticates
+/// its own peers), `Some(Some(hash))` for one that has one. Only `Ok(None)`
+/// means no active pairing at all.
+fn already_paired(hash_lookup: &Option<Option<String>>) -> bool {
+    hash_lookup.is_some()
 }
 
 /// True if `msg` — the `Display` of a `DbError` returned by
@@ -166,16 +178,33 @@ fn parse_issue_token_args(args: &[String]) -> Result<(String, String), String> {
 /// `pairings_active_uniq` partial unique index, i.e. this channel/peer
 /// already has an active pairing.
 ///
-/// Unlike `insert_pairing`, `insert_pairing_with_token` has no `ON CONFLICT`
-/// guard (see db crate), so a repeat call surfaces a raw Postgres
-/// unique-violation error. We turn that into an actionable operator message
-/// instead of dumping SQL at them or silently minting a second token that
-/// nothing will ever check (the active row still has the *first* token's
-/// hash). Matching on the constraint name rather than the SQLSTATE code
-/// keeps this from false-positiving on an unrelated unique violation (e.g.
-/// `pairing_codes_pkey`).
+/// This is a **backstop only**, for the TOCTOU race between the
+/// `already_paired`/`token_hash_for` pre-check in `pair_issue_token` and the
+/// insert that follows it (another operator or process could pair the same
+/// channel/peer in the gap between the two). It is not the primary
+/// detection path — do not delete the pre-check and rely on this alone, it
+/// depends on `sqlx::Error`'s `Display` continuing to embed the raw
+/// Postgres constraint name, which is not a committed API contract of the
+/// db crate. Unlike `insert_pairing`, `insert_pairing_with_token` has no
+/// `ON CONFLICT` guard (see db crate), so a repeat call surfaces a raw
+/// Postgres unique-violation error here; we turn that into the same
+/// actionable operator message instead of dumping SQL at them or silently
+/// minting a second token that nothing will ever check (the active row
+/// still has the *first* token's hash). Matching on the constraint name
+/// rather than the SQLSTATE code keeps this from false-positiving on an
+/// unrelated unique violation (e.g. `pairing_codes_pkey`).
 fn is_duplicate_pairing_error(msg: &str) -> bool {
     msg.contains("pairings_active_uniq")
+}
+
+/// The actionable "already paired" operator message shared by the pre-check
+/// and the insert-error backstop in `pair_issue_token`.
+fn print_already_paired(channel: &str, peer: &str) {
+    eprintln!(
+        "pair issue-token: {channel}/{peer} already has an active pairing.\n\
+         Revoke it first, then re-issue a new token:\n\
+         \n    kastellan-cli pair revoke {channel} {peer}\n    kastellan-cli pair issue-token --channel {channel} --peer {peer}"
+    );
 }
 
 async fn pair_issue_token(args: &[String]) -> ExitCode {
@@ -204,6 +233,21 @@ async fn pair_issue_token(args: &[String]) -> ExitCode {
         }
     };
 
+    // Primary duplicate-pairing check: ask directly via the purpose-built
+    // three-state query rather than depending on the shape of an error
+    // message. See `already_paired`'s doc comment.
+    match kastellan_db::pairings::token_hash_for(&pool, &channel, &peer).await {
+        Ok(hash_lookup) if already_paired(&hash_lookup) => {
+            print_already_paired(&channel, &peer);
+            return ExitCode::from(1);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("pair issue-token: {e}");
+            return ExitCode::from(1);
+        }
+    }
+
     let token = generate_code();
     let hash = kastellan_core::channel::ingest::sha256_hex(token.as_bytes());
 
@@ -213,12 +257,10 @@ async fn pair_issue_token(args: &[String]) -> ExitCode {
         Ok(id) => id,
         Err(e) => {
             let msg = e.to_string();
+            // Backstop for the pre-check/insert TOCTOU race — see
+            // `is_duplicate_pairing_error`'s doc comment.
             if is_duplicate_pairing_error(&msg) {
-                eprintln!(
-                    "pair issue-token: {channel}/{peer} already has an active pairing.\n\
-                     Revoke it first, then re-issue a new token:\n\
-                     \n    kastellan-cli pair revoke {channel} {peer}\n    kastellan-cli pair issue-token --channel {channel} --peer {peer}"
-                );
+                print_already_paired(&channel, &peer);
             } else {
                 eprintln!("pair issue-token: {msg}");
             }
@@ -402,6 +444,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_issue_token_trims_channel_whitespace() {
+        let args = vec![
+            "--channel".to_string(), "  email  ".to_string(),
+            "--peer".to_string(), "me@example.org".to_string(),
+        ];
+        let (channel, peer) = parse_issue_token_args(&args).unwrap();
+        assert_eq!(channel, "email");
+        assert_eq!(peer, "me@example.org");
+    }
+
+    #[test]
     fn generated_tokens_are_hex_and_unique() {
         let a = generate_code();
         let b = generate_code();
@@ -420,5 +473,16 @@ mod tests {
             "postgres query failed: error returned from database: duplicate key value \
              violates unique constraint \"pairing_codes_pkey\""
         ));
+    }
+
+    #[test]
+    fn already_paired_detects_active_pairing_regardless_of_existing_token() {
+        // Outer `Some` means an active pairing row exists; the primary
+        // pre-check in `pair_issue_token` relies on this being true even
+        // when the existing row has no token (e.g. a non-email channel).
+        assert!(already_paired(&Some(None)));
+        assert!(already_paired(&Some(Some("deadbeef".to_string()))));
+        // `None` (no row found at all) is the only "not paired" case.
+        assert!(!already_paired(&None));
     }
 }
