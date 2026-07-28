@@ -20,6 +20,7 @@
 
 pub mod auth;
 pub mod bus;
+pub mod email;
 pub mod ingest;
 pub mod matrix;
 pub mod pairing;
