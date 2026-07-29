@@ -274,12 +274,19 @@ fn describe_email_error(e: &EmailError) -> String {
 /// **Known residual, accepted:** `Transport(_)` also covers a JSON decode
 /// failure and a response exceeding `JSON_MAX_BYTES`, which are in practice
 /// permanent for that message and will therefore be retried forever, holding
-/// the cursor. That is the *safe* direction (nothing is lost, the operator
-/// sees the same transient log line every poll) and the alternative —
+/// the cursor. That is the *safe* direction (nothing is lost) and the
+/// alternative —
 /// classifying decode failures as permanent — would ack away a message merely
 /// because localmail hiccuped mid-body. A cap/decode-specific error variant
 /// is the clean fix and belongs with the body-size cap already filed for a
 /// later slice.
+///
+/// **Observability caveat (do not misread the line above):** a transient
+/// failure produces NO `audit_log` row and only a worker-stderr line that the
+/// daemon relays at `debug`, so at the default `info` verbosity it is
+/// **invisible**. A message stuck in the retry loop above is therefore silent
+/// unless the operator raises the log level. Giving transient skips an audit
+/// row is filed as a follow-up.
 fn is_permanent(e: &EmailError) -> bool {
     match e {
         EmailError::BadParams(_) => true,

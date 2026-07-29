@@ -219,7 +219,7 @@ channel.
 |---|---|
 | Worker dies | `PersistentWorker` respawns with backoff; **nothing lost** — the unacked cursor is localmail's |
 | localmail down | Poll errors; driver logs the down/up transition once and retries; no loss |
-| One message's `message_detail` fails **transiently** (5xx, 408, 429, transport) | Omitted from **both** `events` and `skipped`, so nothing acks it and localmail's monotonic cursor stays put — redelivered next poll. The rest of the batch still processes (`workers/email-in`'s `is_permanent`) |
+| One message's `message_detail` fails **transiently** (5xx, 408, 429, transport) | Omitted from **both** `events` and `skipped`, so *nothing in that message's own path* acks it — redelivered next poll. The rest of the batch still processes (`workers/email-in`'s `is_permanent`). **Known residual, accepted:** the cursor is shared and monotonic (`GREATEST`), so a *later* message in the same poll that succeeds can still drag it past this hole. Closing that needs a per-message ack contract with localmail; it is strictly better than the previous behaviour, where every failure was acked away |
 | One message's `message_detail` fails **permanently** (4xx other than 408/429) | Recorded in `skipped`, acked + audited `channel.skipped_ack_only`, so one poisoned message cannot wedge the channel forever |
 | Malformed poll result | Batch skipped + logged (existing driver behaviour) and left *unacked*, so it retries |
 | Gate fails | Dropped, audited `channel.rejected_unauthentic` with the `UnauthenticReason` label (`dmarc_fail` / `no_evidence` / `no_token` / `token_mismatch` / `pairing_has_no_token`) — reason code only, never the body, never the token |
