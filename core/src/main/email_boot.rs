@@ -40,6 +40,31 @@ use kastellan_core::channel::{ChannelBus, ChannelId};
 use kastellan_core::worker_lifecycle::force_route::ForceRoutingConfig;
 use kastellan_sandbox::{SandboxBackend, SandboxBackends};
 
+/// Cap on `reason`'s length before it becomes a durable `audit_log` payload
+/// value. `reason` originates from the worker's `skipped[].reason`
+/// (`workers/email-in/src/handler.rs::describe_email_error`), which already
+/// truncates an upstream (localmail) HTTP error body to 200 chars — but
+/// `polled_driver::run`, which hands it to this sink, is DB-free by design
+/// and applies no cap of its own. Defence in depth: this sink must not trust
+/// a future worker change (or a compromised worker) to keep bounding it
+/// before it lands permanently in `audit_log`. Comfortably above the
+/// worker's own 200-char cap so today's values pass through untouched.
+const AUDIT_REASON_CAP_CHARS: usize = 256;
+
+/// Truncate `reason` to [`AUDIT_REASON_CAP_CHARS`] on a `char` boundary
+/// (never mid-UTF-8-codepoint — `reason` may echo arbitrary upstream text).
+/// A no-op for anything at or under the cap, which covers every value the
+/// worker emits today.
+fn cap_reason(reason: &str) -> String {
+    if reason.chars().count() <= AUDIT_REASON_CAP_CHARS {
+        reason.to_string()
+    } else {
+        let mut capped: String = reason.chars().take(AUDIT_REASON_CAP_CHARS).collect();
+        capped.push_str("...(truncated)");
+        capped
+    }
+}
+
 /// Build the [`AckOnlyAudit`] closure `spawn_email_worker` invokes for every
 /// message id it acks without that id ever becoming a bus event (localmail's
 /// `skipped` list — an unattributable `From`, an unfetchable detail fetch,
@@ -48,17 +73,20 @@ use kastellan_sandbox::{SandboxBackend, SandboxBackends};
 /// them is DB-free by design.
 ///
 /// Payload carries the message id and the reason ONLY — never a body, never
-/// headers. Shape mirrors `crate::egress::net_worker::pg_decision_sink`
-/// exactly: capture a cloned `PgPool` + `tokio::runtime::Handle`, then
-/// `block_on` the async insert from inside a closure that itself is called
-/// synchronously from `polled_driver::run`'s background thread (not a tokio
-/// task), so `Handle::block_on` — rather than `.await` — is the only way in.
+/// headers — and `reason` is capped via [`cap_reason`] before it is written
+/// (see that function's docs for why this sink applies its own bound rather
+/// than trusting the worker's). Shape otherwise mirrors
+/// `crate::egress::net_worker::pg_decision_sink` exactly: capture a cloned
+/// `PgPool` + `tokio::runtime::Handle`, then `block_on` the async insert from
+/// inside a closure that itself is called synchronously from
+/// `polled_driver::run`'s background thread (not a tokio task), so
+/// `Handle::block_on` — rather than `.await` — is the only way in.
 fn email_skipped_audit_sink(pool: PgPool, handle: tokio::runtime::Handle) -> AckOnlyAudit {
     Box::new(move |message_id: &str, reason: &str| {
         let payload = serde_json::json!({
             "channel": "email",
             "message_id": message_id,
-            "reason": reason,
+            "reason": cap_reason(reason),
         });
         let res = handle.block_on(kastellan_db::audit::insert(
             &pool,
@@ -71,6 +99,7 @@ fn email_skipped_audit_sink(pool: PgPool, handle: tokio::runtime::Handle) -> Ack
         }
     })
 }
+
 
 /// Spawn the email channel bus if `KASTELLAN_EMAIL_ENDPOINT` is set.
 ///
@@ -157,5 +186,42 @@ pub(crate) async fn spawn_email_channel(
             error!(error = %e, "email: PgCompletedTasks::connect failed; channel not started");
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_reason_passes_short_input_through_unchanged() {
+        assert_eq!(cap_reason("no usable From address"), "no usable From address");
+    }
+
+    #[test]
+    fn cap_reason_passes_input_at_exactly_the_cap_through_unchanged() {
+        let at_cap = "a".repeat(AUDIT_REASON_CAP_CHARS);
+        assert_eq!(cap_reason(&at_cap), at_cap);
+    }
+
+    #[test]
+    fn cap_reason_truncates_an_oversized_upstream_error_body() {
+        // Simulates `describe_email_error`'s `localmail {status}: {body}` shape
+        // with a body well past its own 200-char worker-side cap — this sink
+        // must not rely on that cap holding.
+        let huge = format!("localmail 500: {}", "x".repeat(5_000));
+        let capped = cap_reason(&huge);
+        assert!(capped.chars().count() <= AUDIT_REASON_CAP_CHARS + "...(truncated)".len());
+        assert!(capped.ends_with("...(truncated)"), "{capped}");
+        assert!(huge.len() > capped.len(), "must actually shrink an oversized reason");
+    }
+
+    #[test]
+    fn cap_reason_truncates_on_a_char_boundary_not_mid_utf8_codepoint() {
+        // Multi-byte chars (e.g. from a non-ASCII upstream error message)
+        // straddling the cap must not panic or produce an invalid `String`.
+        let multibyte = "€".repeat(AUDIT_REASON_CAP_CHARS + 10);
+        let capped = cap_reason(&multibyte); // would panic on a mid-codepoint byte slice
+        assert!(capped.starts_with('€'));
     }
 }

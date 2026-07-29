@@ -188,10 +188,19 @@ pub fn render_upstream_ca_help() -> String {
 ///    `docs/superpowers/specs/2026-07-28-email-fallback-channel-design.md`'s
 ///    D8: an unpaired sender's `Rejected` outcome deliberately skips the
 ///    carve-out for any transport that supplies evidence.
-/// 3. **The localmail origin needs the #492 upstream-CA seam.** It is a
-///    private IP literal with a self-signed cert, so
-///    `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` must key it, and per #492 the
-///    worker's allowlist must resolve to that single private origin.
+/// 3. **This channel's force-routed sidecar cannot reach a self-signed
+///    localmail today.** `channel::email::spawn_email_worker`'s force-routed
+///    path (`egress::persistent_net::spawn_net_transport`) is a
+///    TRANSPARENT TUNNEL — it hardcodes `disable_mitm: true` and
+///    `upstream_extra_ca: None` — so `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` has
+///    no effect on it; there is no MITM re-origination leg for it to widen
+///    trust on. A self-signed origin is refused by the worker's own
+///    webpki-only TLS client, force-routed or not. That env var DOES apply
+///    to the separate `kastellan-worker-mail` TOOL, whose force-routed
+///    sidecar does MITM (`egress::net_worker::spawn_net_worker`) — and per
+///    #492 ITS allowlist must then resolve to a single private origin. The
+///    two must not be conflated even though they may point at the same
+///    localmail address.
 pub fn render_email_help() -> String {
     r#"# --- Email fallback channel (Phase 2 slice #5) -------------------------------
 # Inbound only in this slice: the agent can receive and act on email, but
@@ -216,12 +225,17 @@ pub fn render_email_help() -> String {
 # The printed token must appear in the BODY of every message from that peer.
 # There is no in-channel pairing over email by design.
 #
-# TRAP 3: localmail is a private IP literal with a self-signed cert, so
-# KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA (above) must key that literal, and per
-# issue #492 this worker's egress allowlist must resolve to that SINGLE
-# private origin (no mixing with a public host). The egress sidecar is a
-# transparent tunnel by default — reaching a self-signed origin needs the
-# MITM + upstream-extra-CA path, not the tunnel alone.
+# TRAP 3: a self-signed localmail is NOT reachable by this channel today,
+# even force-routed. Its force-routed sidecar is a plain transparent tunnel (no
+# MITM leg), so KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA above has NO EFFECT on it
+# — there is nothing for it to widen trust on. A self-signed origin is
+# refused by the worker's own webpki-only TLS client, force-routed or not;
+# localmail must present a PUBLICLY-TRUSTED certificate for this channel to
+# reach it until a later slice extends the tunnel with MITM + extra-CA
+# support. KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA DOES apply to the SEPARATE
+# kastellan-worker-mail tool, whose force-routed sidecar does MITM — and per
+# issue #492 ITS egress allowlist must then resolve to a SINGLE private
+# origin. Don't conflate the two, even when they point at the same address.
 "#
     .to_string()
 }
@@ -729,9 +743,28 @@ mod tests {
         // Trap 2: pairing is operator-only, never in-channel.
         assert!(help.contains("pair issue-token"), "must name the pairing command: {help}");
         assert!(help.contains("in-channel pairing"), "must state there is no in-channel pairing: {help}");
-        // Trap 3: single private origin + the upstream extra-CA seam, #492.
+        // Trap 3: the force-routed sidecar for THIS channel is a transparent
+        // tunnel with no MITM leg, so KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA has
+        // no effect on it and a self-signed localmail is not reachable by it
+        // today — must say so plainly, not imply the var fixes it.
         assert!(help.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"), "{help}");
+        assert!(help.contains("NO EFFECT"), "must state the var does nothing on this path: {help}");
+        assert!(
+            help.contains("not reachable") || help.contains("NOT reachable"),
+            "must state a self-signed localmail is unreachable by this channel today: {help}"
+        );
+        assert!(
+            help.contains("transparent tunnel"),
+            "must name why: the force-routed sidecar has no MITM leg: {help}"
+        );
+        // The #492 single-origin rule is real, but it governs the SEPARATE
+        // kastellan-worker-mail tool (which does MITM), not this channel —
+        // must say so to avoid conflating the two.
         assert!(help.contains("#492"), "must reference the constraining issue: {help}");
+        assert!(
+            help.contains("kastellan-worker-mail"),
+            "must name which worker #492's rule actually governs: {help}"
+        );
     }
 
     #[test]

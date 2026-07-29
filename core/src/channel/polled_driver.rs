@@ -368,10 +368,19 @@ fn run(
                                         "discarding a message that never became an event; acking it \
                                          so the worker's cursor advances"
                                     );
-                                    // Best-effort audit trail: never blocks or
-                                    // fails the ack itself (see AckOnlyAudit's
-                                    // docs — `None` when the caller has no
-                                    // durable sink to write to).
+                                    // Best-effort audit trail: never FAILS the
+                                    // ack itself — a real hook only logs on its
+                                    // own insert error (see AckOnlyAudit's docs
+                                    // — `None` when the caller has no durable
+                                    // sink to write to). It CAN block this
+                                    // thread for the duration of the write: a
+                                    // production hook (e.g. the daemon's)
+                                    // typically `Handle::block_on`s an async DB
+                                    // insert, same as `pg_decision_sink`. That
+                                    // is fine here — this is a dedicated
+                                    // background thread (`thread::spawn` in
+                                    // `PolledWorkerDriver::spawn`), never a
+                                    // tokio worker thread.
                                     if let Some(audit) = &audit_ack_only {
                                         audit(&id, &reason);
                                     }
