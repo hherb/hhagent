@@ -8,6 +8,8 @@ use tracing::info;
 // bare `mod bootstrap;` would resolve to `src/bootstrap.rs`, not `src/main/`.
 #[path = "main/bootstrap.rs"]
 mod bootstrap;
+#[path = "main/email_boot.rs"]
+mod email_boot;
 #[path = "main/matrix_boot.rs"]
 mod matrix_boot;
 
@@ -485,11 +487,23 @@ async fn main() -> Result<()> {
     // `main/matrix_boot.rs`.
     let matrix_bus = matrix_boot::spawn_matrix_channel(&pool, &sandboxes, &force_routing).await;
 
+    // ── Channel bus (Phase 2 slice #5 — email fallback). ──
+    // Gated on KASTELLAN_EMAIL_ENDPOINT (checked inside): unset ⇒ `Ok(None)`,
+    // and the daemon is byte-identical to an email-less build. Unlike Matrix,
+    // a set-but-partial config or a worker spawn failure ABORTS startup here
+    // (`?`) rather than logging and continuing — a half-configured email
+    // channel would reject every message closed and look like a delivery bug
+    // rather than the misconfiguration it is. See `main/email_boot.rs`.
+    let email_bus = email_boot::spawn_email_channel(&pool, &sandboxes, &force_routing).await?;
+
     bootstrap::wait_for_shutdown().await?;
 
-    // Stop the channel bus first so no further inbound messages are enqueued and
-    // the worker's stdin closes (clean worker exit).
+    // Stop the channel buses first so no further inbound messages are enqueued
+    // and each worker's stdin closes (clean worker exit).
     if let Some(bus) = matrix_bus {
+        bus.shutdown().await;
+    }
+    if let Some(bus) = email_bus {
         bus.shutdown().await;
     }
 

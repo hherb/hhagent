@@ -431,3 +431,38 @@ async fn skipped_ids_are_acked_even_though_they_never_become_a_task() {
     h.bus.shutdown().await;
     let _ = std::fs::remove_file(&h.ack_log);
 }
+
+// ── Task 10: daemon config gate ────────────────────────────────────────────
+//
+// The whole byte-identical-when-unset guarantee, plus the "partial config
+// aborts startup, never a silent skip" rule — see
+// `core/src/channel/email/config.rs`'s module docs for why a half-configured
+// channel is worse than no channel at all (a missing authserv-id would fail
+// every message closed, which looks exactly like a delivery bug).
+
+use kastellan_tests_common::env::{env_lock, EnvVarGuard};
+
+#[test]
+fn unset_email_config_yields_no_channel() {
+    let _lock = env_lock();
+    let _e = EnvVarGuard::unset("KASTELLAN_EMAIL_ENDPOINT");
+    let _s = EnvVarGuard::unset("KASTELLAN_EMAIL_SUBSCRIPTION");
+    let _a = EnvVarGuard::unset("KASTELLAN_EMAIL_ADDRESS");
+    let _i = EnvVarGuard::unset("KASTELLAN_EMAIL_AUTHSERV_ID");
+    let _t = EnvVarGuard::unset("KASTELLAN_EMAIL_TOKEN_FILE");
+    let cfg = kastellan_core::channel::email::config::EmailConfig::from_env().unwrap();
+    assert!(cfg.is_none(), "no email env must mean no email channel");
+}
+
+#[test]
+fn partial_email_config_is_an_error_not_a_silent_skip() {
+    let _lock = env_lock();
+    let _s = EnvVarGuard::unset("KASTELLAN_EMAIL_SUBSCRIPTION");
+    let _a = EnvVarGuard::unset("KASTELLAN_EMAIL_ADDRESS");
+    // authserv-id missing: starting without it would fail every message closed
+    // and look like a delivery bug rather than a misconfiguration.
+    let _i = EnvVarGuard::unset("KASTELLAN_EMAIL_AUTHSERV_ID");
+    let _t = EnvVarGuard::unset("KASTELLAN_EMAIL_TOKEN_FILE");
+    let _e = EnvVarGuard::set("KASTELLAN_EMAIL_ENDPOINT", "https://10.0.0.3:8443");
+    assert!(kastellan_core::channel::email::config::EmailConfig::from_env().is_err());
+}

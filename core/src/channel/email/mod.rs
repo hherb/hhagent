@@ -33,7 +33,7 @@ use tokio::sync::mpsc as tok_mpsc;
 
 use kastellan_sandbox::SandboxBackend;
 
-use crate::channel::polled_driver::PolledWorkerDriver;
+use crate::channel::polled_driver::{AckOnlyAudit, PolledWorkerDriver};
 use crate::egress::persistent_net::{spawn_net_transport, NetTransportSpawn};
 use crate::worker_lifecycle::force_route::ForceRoutingConfig;
 use crate::worker_lifecycle::persistent::{
@@ -160,12 +160,22 @@ fn email_backoff() -> RestartBackoff {
 /// the driver, so the very first `email.poll` result is parsed against the
 /// correct trust root.
 ///
+/// `audit_ack_only` is the same optional-hook shape as `egress`: `None` when
+/// the caller has no durable sink to write to (e.g. a `kastellan-cli email
+/// probe` diagnostic), `Some` to record every acked-but-never-an-event id
+/// (localmail's `skipped` list) as an `audit_log` row via
+/// [`crate::channel::polled_driver::AckOnlyAudit`] — see that type's docs for
+/// why it is a boxed closure rather than a `PgPool` parameter (this module
+/// stays DB-free; the daemon wiring supplies the closure, following
+/// `crate::egress::net_worker::pg_decision_sink`'s pattern).
+///
 /// [`SandboxPolicy`]: kastellan_sandbox::SandboxPolicy
 pub fn spawn_email_worker(
     backend: Arc<dyn SandboxBackend>,
     id: ChannelId,
     cfg: &EmailConfig,
     egress: Option<EmailEgress>,
+    audit_ack_only: Option<AckOnlyAudit>,
 ) -> anyhow::Result<SpawnedEmailWorker> {
     let (host, port) = crate::channel::matrix::host_port_from_url(&cfg.endpoint)?;
 
@@ -252,16 +262,10 @@ pub fn spawn_email_worker(
         wire::encode_email_send,
         Some(wire::encode_email_ack),
         Some(wire::parse_email_skipped),
-        // No durable audit sink reachable from here yet — this function has
-        // no `PgPool`/`tokio::runtime::Handle` (neither is part of this
-        // slice's config; daemon wiring is a follow-up). A skipped id is
-        // still LOGGED (driver `tracing::warn!`, id + reason, never body) —
-        // this only controls whether it ALSO becomes a durable `audit_log`
-        // row. When that wiring lands, plug in a closure built exactly like
-        // `crate::egress::net_worker::pg_decision_sink` (capture a cloned
-        // `PgPool` + `Handle`, `handle.block_on(kastellan_db::audit::insert(...))`
-        // inside the closure) instead of `None` here.
-        None,
+        // A skipped id is always LOGGED (driver `tracing::warn!`, id + reason,
+        // never body) regardless of this hook — `audit_ack_only` only
+        // controls whether it ALSO becomes a durable `audit_log` row.
+        audit_ack_only,
         id.clone(),
     )?;
     Ok(SpawnedEmailWorker { channel: EmailChannel::from_driver(id, driver), identity })
@@ -311,7 +315,7 @@ mod tests {
     fn egress_none_calls_the_worker_backend_directly_with_the_expected_allowlist() {
         let backend = Arc::new(PolicyCapturingBackend { policies: Mutex::new(Vec::new()) });
         let cfg = test_cfg();
-        let err = match spawn_email_worker(backend.clone(), ChannelId("email".into()), &cfg, None) {
+        let err = match spawn_email_worker(backend.clone(), ChannelId("email".into()), &cfg, None, None) {
             Err(e) => e,
             Ok(_) => panic!("PolicyCapturingBackend always refuses to spawn"),
         };

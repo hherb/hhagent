@@ -121,4 +121,11 @@ pub mod actions {
     /// A message failed transport authenticity (DMARC and/or token) — dropped
     /// before authorization, so it never reaches the pairing carve-out.
     pub const REJECTED_UNAUTHENTIC: &str = "channel.rejected_unauthentic";
+    /// A raw id was acked without ever becoming a [`super::IncomingMessage`]
+    /// at all — e.g. email's `skipped` list (unattributable `From`, an
+    /// unfetchable detail fetch). These are messages the agent silently
+    /// never saw, so they must stay traceable even though the driver that
+    /// acks them (`polled_driver::run`) is DB-free by design. See
+    /// [`super::polled_driver::AckOnlyAudit`].
+    pub const SKIPPED_ACK_ONLY: &str = "channel.skipped_ack_only";
 }

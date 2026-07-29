@@ -167,6 +167,65 @@ pub fn render_upstream_ca_help() -> String {
     .to_string()
 }
 
+/// Render the commented email-fallback-channel help block (Phase 2 slice #5).
+///
+/// Purely informational — none of the five `KASTELLAN_EMAIL_*` vars is set by
+/// this slice's install flow (no `--email-*` flags), so unlike the Matrix
+/// block below this one is unconditional and entirely commented out, same
+/// posture as [`render_upstream_ca_help`]. Split out as its own pure function
+/// for the identical reason: the three operator traps below are
+/// unit-tested wording, not free-floating prose that can silently drift from
+/// what `channel::email::gate` and `channel::email::config` actually enforce.
+///
+/// The three traps are the whole reason this is more than one line:
+///
+/// 1. **authserv-id must match exactly.** `gate::trusted_dmarc_pass` only
+///    trusts the TOPMOST `Authentication-Results` header, and only when it
+///    names this exact id — anyone can forge their own such header in a
+///    message they send, so a wrong id here fails every message closed.
+/// 2. **Pairing is operator-only.** There is no in-channel pairing over
+///    email by design (`kastellan-cli pair issue-token`) — see
+///    `docs/superpowers/specs/2026-07-28-email-fallback-channel-design.md`'s
+///    D8: an unpaired sender's `Rejected` outcome deliberately skips the
+///    carve-out for any transport that supplies evidence.
+/// 3. **The localmail origin needs the #492 upstream-CA seam.** It is a
+///    private IP literal with a self-signed cert, so
+///    `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` must key it, and per #492 the
+///    worker's allowlist must resolve to that single private origin.
+pub fn render_email_help() -> String {
+    r#"# --- Email fallback channel (Phase 2 slice #5) -------------------------------
+# Inbound only in this slice: the agent can receive and act on email, but
+# replies still go out over Matrix until slice 2 ships the SMTP worker.
+#
+# All five are required together once you set the first one — a partial
+# config aborts daemon startup rather than silently skipping the channel.
+#KASTELLAN_EMAIL_ENDPOINT=https://10.0.0.3:8443
+#KASTELLAN_EMAIL_SUBSCRIPTION=kastellan
+#KASTELLAN_EMAIL_ADDRESS=kastellan@example.org
+#KASTELLAN_EMAIL_TOKEN_FILE=/home/hherb/.config/kastellan/localmail-channel.token
+#
+# TRAP 1: KASTELLAN_EMAIL_AUTHSERV_ID must be your own MX's identifier
+# EXACTLY as it appears in the Authentication-Results headers it writes.
+# Only the TOPMOST such header is consulted — anyone can write their own
+# Authentication-Results lines into a message they send. Get this wrong and
+# every message fails closed (silently rejected, never delivered).
+#KASTELLAN_EMAIL_AUTHSERV_ID=mx.example.net
+#
+# TRAP 2: pairing is operator-only, never in-channel:
+#   kastellan-cli pair issue-token --channel email --peer you@example.org
+# The printed token must appear in the BODY of every message from that peer.
+# There is no in-channel pairing over email by design.
+#
+# TRAP 3: localmail is a private IP literal with a self-signed cert, so
+# KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA (above) must key that literal, and per
+# issue #492 this worker's egress allowlist must resolve to that SINGLE
+# private origin (no mixing with a public host). The egress sidecar is a
+# transparent tunnel by default — reaching a self-signed origin needs the
+# MITM + upstream-extra-CA path, not the tunnel alone.
+"#
+    .to_string()
+}
+
 /// Render the `kastellan.env` EnvironmentFile contents.
 pub fn render_env_file(args: &InstallArgs, layout: &Layout) -> String {
     let mut s = String::new();
@@ -212,6 +271,11 @@ pub fn render_env_file(args: &InstallArgs, layout: &Layout) -> String {
         s.push_str(&format!("KASTELLAN_MATRIX_USER={user}\n"));
         s.push_str("KASTELLAN_MATRIX_ENFORCE_SANDBOX=1\n");
     }
+    // Email fallback channel (Phase 2 slice #5) — commented informational
+    // block only; unlike Matrix above, this slice has no `--email-*` install
+    // flags, so the five KASTELLAN_EMAIL_* vars are never set here. See
+    // render_email_help for the three operator traps.
+    s.push_str(&render_email_help());
     s
 }
 
@@ -637,5 +701,45 @@ mod tests {
         let args = test_args("m", "http://h:1", None);
         let layout = layout();
         assert!(render_env_file(&args, &layout).contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"));
+    }
+
+    /// Same guard as `help_block_is_entirely_commented_out`, for the email
+    /// block: a stray uncommented example line would silently start the email
+    /// channel against a placeholder endpoint on the operator's next daemon
+    /// restart, polling a config nobody configured.
+    #[test]
+    fn email_help_block_is_entirely_commented_out() {
+        for line in render_email_help().lines() {
+            assert!(
+                line.starts_with('#'),
+                "help block must stay inert; this line would be read as config: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn email_help_block_names_the_env_var_and_traps() {
+        let help = render_email_help();
+        assert!(help.contains("KASTELLAN_EMAIL_ENDPOINT"), "{help}");
+        assert!(help.contains("KASTELLAN_EMAIL_AUTHSERV_ID"), "{help}");
+        // Trap 1: the authserv-id must match the MX's own header value exactly,
+        // and only the topmost Authentication-Results header is trusted.
+        assert!(help.contains("EXACTLY"), "must state the exact-match rule: {help}");
+        assert!(help.contains("TOPMOST"), "must state only the topmost header is trusted: {help}");
+        // Trap 2: pairing is operator-only, never in-channel.
+        assert!(help.contains("pair issue-token"), "must name the pairing command: {help}");
+        assert!(help.contains("in-channel pairing"), "must state there is no in-channel pairing: {help}");
+        // Trap 3: single private origin + the upstream extra-CA seam, #492.
+        assert!(help.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"), "{help}");
+        assert!(help.contains("#492"), "must reference the constraining issue: {help}");
+    }
+
+    #[test]
+    fn env_file_includes_the_email_help_block() {
+        let args = test_args("m", "http://h:1", None);
+        let layout = layout();
+        let s = render_env_file(&args, &layout);
+        assert!(s.contains("KASTELLAN_EMAIL_ENDPOINT"), "{s}");
+        assert!(s.contains("KASTELLAN_EMAIL_AUTHSERV_ID"), "{s}");
     }
 }
