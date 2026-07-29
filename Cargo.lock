@@ -2427,6 +2427,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kastellan-worker-email-in"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "kastellan-protocol",
+ "kastellan-worker-prelude",
+ "kastellan-worker-web-common",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "kastellan-worker-embed-broker"
 version = "0.2.0"
 dependencies = [

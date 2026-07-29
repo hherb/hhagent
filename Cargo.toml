@@ -12,6 +12,7 @@ members = [
     "tests-common",
     "workers/prelude",
     "workers/mail",
+    "workers/email-in",
     "workers/python-exec",
     "workers/shell-exec",
     "workers/web-common",
