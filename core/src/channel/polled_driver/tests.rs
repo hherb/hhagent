@@ -110,7 +110,7 @@ const TEST_SPEC: PolledWorkerSpec = PolledWorkerSpec {
 fn spawn_test_driver(
     calls: Box<dyn WorkerCalls>,
 ) -> (PolledWorkerDriver, Value) {
-    PolledWorkerDriver::spawn(TEST_SPEC, calls, test_parse, test_encode, None, ChannelId("t".into()))
+    PolledWorkerDriver::spawn(TEST_SPEC, calls, test_parse, test_encode, None, None, ChannelId("t".into()))
         .expect("driver spawn")
 }
 
@@ -191,6 +191,7 @@ fn init_failure_fails_spawn() {
         calls,
         test_parse,
         test_encode,
+        None,
         None,
         ChannelId("t".into()),
     );
@@ -303,6 +304,7 @@ fn ack_is_called_after_the_event_reaches_the_bus() {
         test_parse,
         test_encode,
         Some(encode_test_ack),
+        None,
         ChannelId("email".into()),
     )
     .unwrap();
@@ -333,6 +335,7 @@ fn no_ack_method_means_no_ack_call() {
         test_parse,
         test_encode,
         None,
+        None,
         ChannelId("matrix".into()),
     )
     .unwrap();
@@ -360,6 +363,7 @@ fn an_event_without_an_ack_token_is_not_acked() {
         test_parse,
         test_encode,
         Some(encode_test_ack),
+        None,
         ChannelId("email".into()),
     )
     .unwrap();
@@ -387,6 +391,7 @@ fn ack_failure_is_non_fatal_and_the_driver_keeps_polling() {
         test_parse,
         test_encode,
         Some(encode_test_ack),
+        None,
         ChannelId("email".into()),
     )
     .unwrap();
@@ -411,4 +416,120 @@ fn ack_failure_is_non_fatal_and_the_driver_keeps_polling() {
         .blocking_recv()
         .expect("driver must keep polling after a failed ack, not die");
     assert_eq!(second.body, "second");
+}
+
+/// Extract `skipped[].message_id` from a poll result shaped like email-in's —
+/// the fixture `ParseAckOnly` these tests use.
+fn test_parse_ack_only(v: &Value) -> Vec<String> {
+    v.get("skipped")
+        .and_then(|s| s.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.get("message_id").and_then(|m| m.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn skipped_ids_are_acked_even_though_they_never_become_events() {
+    // A poll result with an EMPTY events list but a non-empty `skipped` list
+    // (email-in's real shape when every message in a batch was unattributable)
+    // must still ack every skipped id — otherwise the worker's server-side
+    // cursor wedges on the first one forever, since nothing else will ever
+    // ack an id nobody ever saw as an event.
+    let (st, calls) = fake();
+    st.polls.lock().unwrap().push_back(json!({
+        "events": [],
+        "skipped": [
+            {"message_id": "10", "reason": "no usable From address"},
+            {"message_id": "11", "reason": "localmail 404: not found"}
+        ]
+    }));
+    let (_driver, _identity) = PolledWorkerDriver::spawn(
+        spec_with_ack(),
+        calls,
+        test_parse,
+        test_encode,
+        Some(encode_test_ack),
+        Some(test_parse_ack_only),
+        ChannelId("email".into()),
+    )
+    .unwrap();
+
+    wait_until(|| st.log.lock().unwrap().iter().filter(|(m, _)| m == "email.ack").count() >= 2);
+    let log = st.log.lock().unwrap();
+    let acked: Vec<&str> = log
+        .iter()
+        .filter(|(m, _)| m == "email.ack")
+        .map(|(_, p)| p["cursor"].as_str().unwrap())
+        .collect();
+    assert!(acked.contains(&"10"), "acked = {acked:?}");
+    assert!(acked.contains(&"11"), "acked = {acked:?}");
+}
+
+#[test]
+fn skipped_ids_alongside_real_events_are_both_acked() {
+    // Realistic mixed batch: one usable event (acked via its own ack_token,
+    // the existing per-event path) plus one unattributable message in
+    // `skipped` (acked via the new ParseAckOnly path). Neither path must
+    // starve the other.
+    let (st, calls) = fake();
+    st.polls.lock().unwrap().push_back(json!({
+        "events": [
+            {"peer": "me@example.org", "conversation": "<a>", "body": "hi", "ack_token": "5"}
+        ],
+        "skipped": [{"message_id": "6", "reason": "no usable From address"}]
+    }));
+    let (mut driver, _identity) = PolledWorkerDriver::spawn(
+        spec_with_ack(),
+        calls,
+        test_parse,
+        test_encode,
+        Some(encode_test_ack),
+        Some(test_parse_ack_only),
+        ChannelId("email".into()),
+    )
+    .unwrap();
+
+    let msg = driver.inbound_rx.blocking_recv().expect("the one real event");
+    assert_eq!(msg.body, "hi");
+
+    wait_until(|| st.log.lock().unwrap().iter().filter(|(m, _)| m == "email.ack").count() >= 2);
+    let log = st.log.lock().unwrap();
+    let acked: Vec<&str> = log
+        .iter()
+        .filter(|(m, _)| m == "email.ack")
+        .map(|(_, p)| p["cursor"].as_str().unwrap())
+        .collect();
+    assert!(acked.contains(&"5"), "the real event's own ack_token must still be acked: {acked:?}");
+    assert!(acked.contains(&"6"), "the skipped id must also be acked: {acked:?}");
+}
+
+#[test]
+fn no_ack_method_means_skipped_ids_are_never_acked_either() {
+    // Symmetry with `no_ack_method_means_no_ack_call`: a spec without
+    // ack_method (Matrix's shape) must never call ack, regardless of whether
+    // a `parse_ack_only` happens to be wired — the ack_method gate covers
+    // both ack paths, not just the per-event one.
+    let (st, calls) = fake();
+    st.polls.lock().unwrap().push_back(json!({
+        "events": [],
+        "skipped": [{"message_id": "99", "reason": "no usable From address"}]
+    }));
+    let (_driver, _identity) = PolledWorkerDriver::spawn(
+        spec_without_ack(),
+        calls,
+        test_parse,
+        test_encode,
+        None,
+        Some(test_parse_ack_only),
+        ChannelId("matrix".into()),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !st.log.lock().unwrap().iter().any(|(m, _)| m.ends_with(".ack")),
+        "ack_method: None must suppress the skipped-id ack path too"
+    );
 }

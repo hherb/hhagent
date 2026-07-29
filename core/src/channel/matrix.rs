@@ -336,6 +336,7 @@ pub fn spawn_matrix_worker(
         parse_matrix_poll,
         encode_matrix_send,
         None, // Matrix has no ack cursor — MATRIX_POLLED_SPEC.ack_method is None too.
+        None, // No skipped-id extraction either: parse_matrix_poll never drops anything.
         id.clone(),
     )?;
     Ok(SpawnedMatrixWorker { channel: MatrixChannel::from_driver(id, driver), identity })

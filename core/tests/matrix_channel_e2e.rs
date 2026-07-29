@@ -110,6 +110,7 @@ fn spawn_matrix_channel(sent_file: &Path, peer: &str) -> Option<MatrixChannel> {
         parse_matrix_poll,
         encode_matrix_send,
         None, // Matrix has no ack cursor — MATRIX_POLLED_SPEC.ack_method is None too.
+        None, // No skipped-id extraction either: parse_matrix_poll never drops anything.
         ChannelId("matrix".into()),
     )
     .expect("polled driver spawn");

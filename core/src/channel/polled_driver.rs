@@ -36,6 +36,21 @@
 //! equivalent case, logging "channel enqueue failed; message dropped") — this
 //! driver does not invent a receipt protocol to close that gap for one
 //! channel.
+//!
+//! ## Acking ids that never become an event
+//!
+//! Some polled workers report a second list alongside their events: messages
+//! they could not turn into a [`PolledEvent`] at all (email-in's `skipped` —
+//! no usable `From`, a failed per-message detail fetch). Those ids still sit
+//! behind the worker's server-side cursor; if nothing ever acks them the
+//! cursor wedges on the first one forever and the channel goes permanently
+//! silent. Threading them through as bogus `PolledEvent`s would be worse (a
+//! fabricated inbound message with no real content reaching the bus), so
+//! [`ParseAckOnly`] is a second, optional extractor run against the *same*
+//! raw poll [`serde_json::Value`] `parse_poll` sees, purely to list ids to
+//! ack — `parse_poll` itself stays a pure, events-only decode. `None`
+//! (Matrix's case) means this extraction step never runs at all: no extra
+//! RPC, byte-identical to before this existed.
 
 use std::collections::VecDeque;
 use std::sync::mpsc as std_mpsc;
@@ -110,6 +125,13 @@ pub type EncodeSend = fn(&OutgoingMessage) -> serde_json::Value;
 /// and the event's own `ack_token` are present — see `run`.
 pub type EncodeAck = fn(&str) -> serde_json::Value;
 
+/// Extract ids to acknowledge that never became a [`PolledEvent`] at all —
+/// see the module docs' "Acking ids that never become an event". Run against
+/// the raw poll [`serde_json::Value`], independent of (and in addition to)
+/// `parse_poll`. Only ever invoked when `PolledWorkerSpec::ack_method` and an
+/// `EncodeAck` are both present too — see `run`.
+pub type ParseAckOnly = fn(&serde_json::Value) -> Vec<String>;
+
 /// Seam over "something that can call the worker" so the driver is unit-tested
 /// without a supervisor or a process. Production is [`PersistentHandle`].
 pub trait WorkerCalls: Send + 'static {
@@ -140,12 +162,14 @@ impl PolledWorkerDriver {
     /// driver thread. Fails when init fails: the caller gets no half-alive
     /// channel. The worker process itself is parented to the SUPERVISOR's
     /// persistent thread (PDEATHSIG-safe, #348) — this call only issues RPCs.
+    #[allow(clippy::too_many_arguments)] // one descriptor arg per wire concern; grouping would obscure call sites
     pub fn spawn(
         spec: PolledWorkerSpec,
         calls: Box<dyn WorkerCalls>,
         parse_poll: ParsePoll,
         encode_send: EncodeSend,
         encode_ack: Option<EncodeAck>,
+        parse_ack_only: Option<ParseAckOnly>,
         cid: ChannelId,
     ) -> anyhow::Result<(Self, serde_json::Value)> {
         let identity = calls
@@ -154,7 +178,17 @@ impl PolledWorkerDriver {
         let (inbound_tx, inbound_rx) = tok_mpsc::channel::<IncomingMessage>(INBOUND_BUFFER);
         let (outbound_tx, outbound_rx) = std_mpsc::channel::<OutgoingMessage>();
         let join = thread::spawn(move || {
-            run(calls, spec, parse_poll, encode_send, encode_ack, inbound_tx, outbound_rx, cid)
+            run(
+                calls,
+                spec,
+                parse_poll,
+                encode_send,
+                encode_ack,
+                parse_ack_only,
+                inbound_tx,
+                outbound_rx,
+                cid,
+            )
         });
         Ok((Self { inbound_rx, outbound_tx, join }, identity))
     }
@@ -176,6 +210,7 @@ fn run(
     parse_poll: ParsePoll,
     encode_send: EncodeSend,
     encode_ack: Option<EncodeAck>,
+    parse_ack_only: Option<ParseAckOnly>,
     inbound_tx: tok_mpsc::Sender<IncomingMessage>,
     outbound_rx: std_mpsc::Receiver<OutgoingMessage>,
     cid: ChannelId,
@@ -226,6 +261,9 @@ fn run(
                         tracing::info!(label = spec.label, "worker back up; polled driver resumed");
                         down = false;
                     }
+                    // Extracted BEFORE `parse_poll` consumes `v` by value —
+                    // both extractors see the identical raw poll result.
+                    let ack_only_ids = parse_ack_only.map(|f| f(&v)).unwrap_or_default();
                     match parse_poll(v) {
                         Ok(events) => {
                             for ev in events {
@@ -272,6 +310,32 @@ fn run(
                             // A malformed poll result is a worker bug, not a
                             // death — log + skip the batch, keep polling.
                             tracing::warn!(label = spec.label, error = %e, "poll result decode failed; batch skipped");
+                        }
+                    }
+
+                    // Ack ids that never became a `PolledEvent` at all (e.g.
+                    // email's `skipped` list) — see the module docs' "Acking
+                    // ids that never become an event". Runs regardless of
+                    // whether the events batch above decoded cleanly: the two
+                    // lists are independent. Only when the spec actually
+                    // supports acking at all; a `None` `parse_ack_only`
+                    // (Matrix) means `ack_only_ids` is always empty, so this
+                    // loop never runs for Matrix — byte-identical.
+                    if let (Some(method), Some(enc)) = (spec.ack_method, encode_ack) {
+                        for id in ack_only_ids {
+                            tracing::info!(
+                                label = spec.label,
+                                message_id = %id,
+                                "acking a skipped id that never became an event"
+                            );
+                            if let Err(e) = calls.call(method, enc(&id)) {
+                                tracing::warn!(
+                                    label = spec.label,
+                                    error = %e,
+                                    message_id = %id,
+                                    "ack of skipped id failed; will retry next poll"
+                                );
+                            }
                         }
                     }
                 }
