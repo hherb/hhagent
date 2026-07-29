@@ -5,6 +5,15 @@
 //! the only place a rejection is decided AND audited. Tests live in
 //! `handler/tests.rs` (kept in a separate file so this one stays under the
 //! project's 500-LOC guideline, mirroring core's `bus.rs`/`bus/tests.rs` split).
+//!
+//! `email.poll`'s result carries two lists, never silently dropping a
+//! message: `events` (usable, handed to the bus) and `skipped`
+//! (`{"message_id", "reason"}` — unattributable or unfetchable, left for a
+//! later task to ack+audit; see the module docs on `build_event` and
+//! `poll` for the full reasoning, and `task-7-report.md`'s "Fix round 1"
+//! section for the review findings this addresses).
+
+use std::collections::HashSet;
 
 use kastellan_protocol::{codes, server::Handler, RpcError};
 
@@ -44,11 +53,33 @@ impl EmailInHandler {
     }
 
     /// `email.poll {timeout_ms}` — long-polls: call `changes`, and if it
-    /// comes back empty, sleep in short slices (capped at 250ms, and further
-    /// capped at whatever remains of the budget) until `timeout_ms` elapses,
-    /// then return an empty event list. Every new message gets a
-    /// `message_detail` fetch and is converted to a raw event via
-    /// `build_event` — never filtered or judged here.
+    /// comes back empty (or every message in it turns out unattributable /
+    /// unfetchable), sleep in short slices (capped at 250ms, and further
+    /// capped at whatever remains of the budget) until `timeout_ms` elapses.
+    ///
+    /// **Must honour `timeout_ms` in every case, not just when `changes`
+    /// itself is empty.** An earlier version returned the instant a batch's
+    /// messages were all unattributable, even with most of the budget left —
+    /// since `PolledWorkerDriver` only sleeps on a hard error (see
+    /// `core/src/channel/polled_driver.rs::run`), that made a single stuck,
+    /// unattributable message (e.g. `From: <>`) a remote-triggerable tight
+    /// spin between this worker and the driver. Returning early is now
+    /// reserved for when there is a real event to deliver; everything else
+    /// waits out the full long-poll window like an ordinary empty poll would.
+    ///
+    /// A message that can't become an event is never silently dropped: it is
+    /// recorded in the `skipped` list (`{"message_id", "reason"}`) and
+    /// logged to stderr, so core can later ack+audit it instead of the
+    /// subscription cursor wedging on it forever (it would otherwise never
+    /// advance, since nothing ever acks an id nobody ever saw). This worker
+    /// does not ack skipped ids itself — ack ownership stays in core (spec
+    /// D6): only the separate `email.ack` RPC ever calls `client.ack`.
+    ///
+    /// `seen` deduplicates within one `poll()` call: while the subscription
+    /// cursor is unmoved, `changes` keeps returning the same stuck message on
+    /// every internal retry slice, and re-fetching/re-skipping it every
+    /// ~250ms would pointlessly hammer localmail and pile up duplicate
+    /// `skipped` entries for one id.
     fn poll(&self, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         #[derive(serde::Deserialize)]
         struct P {
@@ -58,6 +89,10 @@ impl EmailInHandler {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(p.timeout_ms);
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+        let mut events = Vec::new();
+        let mut skipped = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
         loop {
             let changes = self.client.changes(&self.subscription).map_err(email_err_to_rpc)?;
             let new_messages = changes
@@ -66,23 +101,29 @@ impl EmailInHandler {
                 .cloned()
                 .unwrap_or_default();
 
-            if !new_messages.is_empty() {
-                let mut events = Vec::with_capacity(new_messages.len());
-                for m in &new_messages {
-                    let Some(message_id) = m.get("message_id").and_then(|v| v.as_str()) else {
-                        continue; // Malformed entry — skip rather than fail the whole batch.
-                    };
-                    let detail = self.client.message_detail(message_id).map_err(email_err_to_rpc)?;
-                    if let Some(event) = build_event(&detail, message_id) {
-                        events.push(event);
-                    }
+            for m in &new_messages {
+                let Some(message_id) = m.get("message_id").and_then(|v| v.as_str()) else {
+                    continue; // Malformed changes entry (no id at all) — nothing to key a skip on.
+                };
+                if !seen.insert(message_id.to_string()) {
+                    continue; // Already resolved (event or skip) earlier in this same poll() call.
                 }
-                return Ok(serde_json::json!({ "events": events }));
+                match self.client.message_detail(message_id) {
+                    Ok(detail) => match build_event(&detail, message_id) {
+                        Some(event) => events.push(event),
+                        None => record_skip(&mut skipped, message_id, "no usable From address"),
+                    },
+                    Err(e) => record_skip(&mut skipped, message_id, &describe_email_error(&e)),
+                }
+            }
+
+            if !events.is_empty() {
+                return Ok(serde_json::json!({ "events": events, "skipped": skipped }));
             }
 
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Ok(serde_json::json!({ "events": [] }));
+                return Ok(serde_json::json!({ "events": events, "skipped": skipped }));
             }
             std::thread::sleep(POLL_INTERVAL.min(deadline - now));
         }
@@ -138,6 +179,32 @@ fn email_err_to_rpc(e: EmailError) -> RpcError {
     }
 }
 
+/// Human-readable reason string for a `skipped` entry — unlike
+/// `email_err_to_rpc`, this never aborts anything; it only labels one
+/// message's `message_detail` failure so the batch can carry on (fix for
+/// review finding I3: a single 404/timeout on one message must not stall
+/// the whole inbound channel behind a misleading "worker died" log).
+fn describe_email_error(e: &EmailError) -> String {
+    match e {
+        EmailError::BadParams(m) => format!("bad request: {m}"),
+        EmailError::Upstream { status, body } => {
+            let snippet: String = body.chars().take(200).collect();
+            format!("localmail {status}: {snippet}")
+        }
+        EmailError::Transport(m) => format!("transport: {m}"),
+    }
+}
+
+/// Record one message as unable to become an event — logged to stderr AND
+/// appended to `skipped`, never silently dropped (review finding C2b: a
+/// dropped-with-no-trace message meant the subscription cursor could never
+/// advance past it, since nothing ever acks an id nobody ever saw). This
+/// worker never acks a skipped id itself; that stays a core decision.
+fn record_skip(skipped: &mut Vec<serde_json::Value>, message_id: &str, reason: &str) {
+    eprintln!("kastellan-worker-email-in: skipping message {message_id}: {reason}");
+    skipped.push(serde_json::json!({ "message_id": message_id, "reason": reason }));
+}
+
 /// Build one event from a localmail message detail
 /// (`GET /v1/messages/{id}?headers=full`). Pure so it is unit-testable
 /// without a transport. Returns `None` when the detail has no usable From
@@ -163,10 +230,28 @@ fn email_err_to_rpc(e: EmailError) -> RpcError {
 /// would let a sender who passes the gate redirect the agent's reply to a
 /// third party by simply setting a Reply-To header.
 ///
-/// `auth_results` is every `Authentication-Results` header value, in wire
-/// order — this worker never inspects them, because core's gate
-/// (`core/src/channel/email/gate.rs`) decides which one counts, consulting
-/// only the first, and needs the untouched wire order to do that safely.
+/// `auth_results` is every `Authentication-Results` header value, in the
+/// best order this worker can establish — this worker never inspects their
+/// content, because core's gate (`core/src/channel/email/gate.rs`) decides
+/// which one counts, consulting only the first.
+///
+/// `auth_results_order_known` is the CRITICAL signal that makes the above
+/// safe: `true` when at most one exact-cased spelling of
+/// `authentication-results` appears as an object key (the realistic case —
+/// a two-milter Postfix emits two headers with the SAME literal name, and
+/// localmail groups them into one JSON array, whose order is the true wire
+/// order — see `header_values`'s doc). `false` when 2+ *distinct-cased*
+/// spellings are present as separate object keys: this workspace's
+/// `serde_json` has no `preserve_order` feature, so iterating a
+/// `Value::Object` (a `BTreeMap`) visits keys in byte/alphabetical order,
+/// NOT wire order. Concretely, `AUTHENTICATION-RESULTS` (`'A'` = 0x41) sorts
+/// before `authentication-results` (`'a'` = 0x61) regardless of which one the
+/// MX actually wrote first — so an attacker-forged all-caps header would
+/// silently win element 0 of `auth_results`, which is exactly the element
+/// `trusted_dmarc_pass` consults. This function does NOT resolve that
+/// ambiguity itself (spec D6 — no security decisions here); it only signals
+/// it, still returning every value it found, so core can fail closed on
+/// `false` instead of trusting a coin-flip order.
 pub fn build_event(detail: &serde_json::Value, message_id: &str) -> Option<serde_json::Value> {
     let from = detail
         .get("from")
@@ -199,15 +284,33 @@ pub fn build_event(detail: &serde_json::Value, message_id: &str) -> Option<serde
         .map(String::from)
         .collect();
 
+    let auth_results_order_known = headers
+        .map(|h| header_key_variant_count(h, "Authentication-Results") <= 1)
+        .unwrap_or(true);
+
     let body = detail.get("body_text").and_then(|b| b.as_str()).unwrap_or("").to_string();
+    let subject = detail.get("subject").and_then(|s| s.as_str()).map(str::to_string);
+    let date = detail.get("date").and_then(|d| d.as_str()).map(str::to_string);
 
     Some(serde_json::json!({
         "peer": from,
         "conversation": conversation,
+        "subject": subject,
+        "date": date,
         "body": body,
         "ack_token": message_id,
         "auth_results": auth_results,
+        "auth_results_order_known": auth_results_order_known,
     }))
+}
+
+/// Count of distinct object keys that case-insensitively equal `name`. 0 or
+/// 1 ⇒ a single array (or nothing) — order is fully known. 2+ ⇒ "the same"
+/// header spelled with different cases landed in separate JSON keys, and
+/// this side cannot tell which one the MX actually wrote first (see
+/// `build_event`'s `auth_results_order_known` doc for why that matters).
+fn header_key_variant_count(headers: &serde_json::Map<String, serde_json::Value>, name: &str) -> usize {
+    headers.keys().filter(|k| k.eq_ignore_ascii_case(name)).count()
 }
 
 /// Every value under every header-map key that case-insensitively equals

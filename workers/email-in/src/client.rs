@@ -64,10 +64,24 @@ impl EmailClient {
         Self { base, token, transport }
     }
 
-    fn url(&self, path: &str) -> Result<Url, EmailError> {
-        self.base
-            .join(path)
-            .map_err(|e| EmailError::BadParams(format!("bad path {path}: {e}")))
+    /// Build a URL by APPENDING `segments` to the configured endpoint's own
+    /// path, percent-encoding each segment. Deliberately not `Url::join`:
+    /// joining an absolute path (`"/v1/changes"`) replaces the ENTIRE path,
+    /// silently dropping any prefix the operator's `KASTELLAN_EMAIL_ENDPOINT`
+    /// might carry (e.g. `https://host/proxy/`). `path_segments_mut` instead
+    /// extends whatever path is already there, and percent-encodes every
+    /// segment it's given — which is also what makes a message id safe to
+    /// interpolate into a path segment without hand-rolled escaping.
+    fn url(&self, segments: &[&str]) -> Result<Url, EmailError> {
+        let mut url = self.base.clone();
+        {
+            let mut ps = url.path_segments_mut().map_err(|_| {
+                EmailError::BadParams("KASTELLAN_EMAIL_ENDPOINT cannot be a base URL".to_string())
+            })?;
+            ps.pop_if_empty();
+            ps.extend(segments);
+        }
+        Ok(url)
     }
 
     /// Reject a non-2xx upstream response, clamping the echoed body — same
@@ -99,15 +113,17 @@ impl EmailClient {
     /// returns `new_messages: []` deliberately (localmail starts it at the
     /// tip, not the backlog).
     pub fn changes(&self, subscription: &str) -> Result<serde_json::Value, EmailError> {
-        let mut url = self.url("/v1/changes")?;
+        let mut url = self.url(&["v1", "changes"])?;
         url.query_pairs_mut().append_pair("subscription", subscription);
         self.get_json_at(url)
     }
 
     /// `GET /v1/messages/{id}?headers=full` — full headers, needed for
-    /// `Authentication-Results` and `Message-ID`.
+    /// `Authentication-Results` and `Message-ID`. `id` is percent-encoded as
+    /// a path segment by `url()` — it is localmail-supplied (always decimal
+    /// digits in practice), but never trusted to be safe to interpolate raw.
     pub fn message_detail(&self, id: &str) -> Result<serde_json::Value, EmailError> {
-        let mut url = self.url(&format!("/v1/messages/{id}"))?;
+        let mut url = self.url(&["v1", "messages", id])?;
         url.query_pairs_mut().append_pair("headers", "full");
         self.get_json_at(url)
     }
@@ -116,7 +132,7 @@ impl EmailClient {
     /// the server-side cursor. 204 empty body on success; never parsed as
     /// JSON (there is nothing to parse).
     pub fn ack(&self, subscription: &str, cursor: &str) -> Result<(), EmailError> {
-        let url = self.url("/v1/changes/ack")?;
+        let url = self.url(&["v1", "changes", "ack"])?;
         let body = serde_json::json!({ "subscription": subscription, "cursor": cursor });
         let raw = serde_json::to_vec(&body).map_err(|e| EmailError::BadParams(e.to_string()))?;
         let resp = self
@@ -256,5 +272,68 @@ mod tests {
             Err(EmailError::Upstream { status: 403, .. }) => {}
             other => panic!("expected Upstream 403, got {other:?}"),
         }
+    }
+
+    /// A configured endpoint with its own path prefix must keep that prefix
+    /// — `Url::join` with a leading `/` would silently replace it and reach
+    /// the wrong origin path (minor finding from the task-7 review).
+    struct FakePrefixPreserved;
+    impl HttpGet for FakePrefixPreserved {
+        fn get(&self, _u: &Url) -> Result<RawResponse, String> {
+            unreachable!()
+        }
+        fn transport_kind(&self) -> &'static str {
+            "fake"
+        }
+        fn get_authed(&self, url: &Url, _bearer: &str, _max: usize) -> Result<RawResponse, String> {
+            assert_eq!(url.path(), "/proxy/v1/changes", "endpoint path prefix must survive");
+            Ok(RawResponse {
+                status: 200,
+                location: None,
+                content_type: "application/json".into(),
+                body: br#"{"new_messages":[],"next_cursor":"0"}"#.to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn endpoint_path_prefix_is_preserved() {
+        let c = EmailClient::for_test(
+            Url::parse("http://127.0.0.1:8443/proxy").unwrap(),
+            "t".into(),
+            Box::new(FakePrefixPreserved),
+        );
+        c.changes("sub").unwrap();
+    }
+
+    /// A message id containing characters unsafe in a bare path segment must
+    /// come out percent-encoded, not interpolated raw (minor finding).
+    struct FakePercentEncoded;
+    impl HttpGet for FakePercentEncoded {
+        fn get(&self, _u: &Url) -> Result<RawResponse, String> {
+            unreachable!()
+        }
+        fn transport_kind(&self) -> &'static str {
+            "fake"
+        }
+        fn get_authed(&self, url: &Url, _bearer: &str, _max: usize) -> Result<RawResponse, String> {
+            assert_eq!(url.path(), "/v1/messages/weird%20id%2Fx", "id must be percent-encoded, path-safe");
+            Ok(RawResponse {
+                status: 200,
+                location: None,
+                content_type: "application/json".into(),
+                body: br#"{"id":"weird id/x"}"#.to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn message_detail_percent_encodes_the_id() {
+        let c = EmailClient::for_test(
+            Url::parse("http://127.0.0.1:8443").unwrap(),
+            "t".into(),
+            Box::new(FakePercentEncoded),
+        );
+        c.message_detail("weird id/x").unwrap();
     }
 }

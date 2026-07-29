@@ -34,15 +34,51 @@ fn reply_to_is_never_used_as_the_peer() {
 
 #[test]
 fn auth_results_are_returned_verbatim_and_in_order() {
+    // NOTE: this fixture puts both values under ONE JSON key (a single
+    // "Authentication-Results" spelling) — that only exercises the trivial
+    // fact that a JSON array preserves its own element order. It does NOT
+    // exercise cross-key wire-order preservation; the harder property (two
+    // DIFFERENT-cased spellings, order NOT reconstructible) is covered by
+    // `mixed_case_auth_results_headers_mark_order_unknown` below.
     let mut h = handler_with_auth_results(vec![
         "mx.example.net; dmarc=pass".to_string(),
         "evil.example.com; dmarc=pass".to_string(),
     ]);
     let out = h.call("email.poll", serde_json::json!({"timeout_ms": 10})).unwrap();
-    let ar = out["events"][0]["auth_results"].as_array().unwrap();
+    let ev = &out["events"][0];
+    let ar = ev["auth_results"].as_array().unwrap();
     assert_eq!(ar.len(), 2, "every header is surfaced; core decides which counts");
-    assert_eq!(ar[0], "mx.example.net; dmarc=pass", "wire order must be preserved");
-    assert_eq!(ar[1], "evil.example.com; dmarc=pass", "wire order must be preserved");
+    assert_eq!(ar[0], "mx.example.net; dmarc=pass", "single-key JSON array order is preserved (trivial)");
+    assert_eq!(ar[1], "evil.example.com; dmarc=pass", "single-key JSON array order is preserved (trivial)");
+    assert_eq!(ev["auth_results_order_known"], true, "a single exact-cased header key means order IS fully known");
+}
+
+#[test]
+fn mixed_case_auth_results_headers_mark_order_unknown() {
+    // Two DISTINCT-cased spellings of the same logical header land in two
+    // separate JSON object keys (confirmed against localmail's own parser —
+    // see task-7-report.md). Iterating them via serde_json's BTreeMap-backed
+    // `Value::Object` is alphabetical, not wire order, so this worker cannot
+    // tell which header the MX actually wrote first — it must say so rather
+    // than silently pick the BTreeMap's order (the exploitable gate bypass
+    // from the task-7 review: an attacker's all-caps forgery would otherwise
+    // always sort first and win element 0).
+    let mut h = handler_with_mixed_case_auth_results();
+    let out = h.call("email.poll", serde_json::json!({"timeout_ms": 10})).unwrap();
+    let ev = &out["events"][0];
+    assert_eq!(
+        ev["auth_results_order_known"], false,
+        "two distinct-cased Authentication-Results keys cannot be ordered against each other"
+    );
+    let ar = ev["auth_results"].as_array().unwrap();
+    assert_eq!(ar.len(), 2, "both occurrences are still surfaced; nothing is silently dropped");
+}
+
+#[test]
+fn conversation_falls_back_to_localmail_id_when_message_id_header_absent() {
+    let mut h = handler_with_no_message_id_header();
+    let out = h.call("email.poll", serde_json::json!({"timeout_ms": 10})).unwrap();
+    assert_eq!(out["events"][0]["conversation"], "localmail:7");
 }
 
 #[test]
@@ -50,6 +86,45 @@ fn empty_changes_yields_no_events() {
     let mut h = handler_with_empty_changes();
     let out = h.call("email.poll", serde_json::json!({"timeout_ms": 10})).unwrap();
     assert_eq!(out["events"].as_array().unwrap().len(), 0);
+    assert_eq!(out["skipped"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn poll_honours_timeout_when_batch_yields_no_events() {
+    // Regression test for the tight-spin bug: a batch that resolves to zero
+    // EVENTS (everything skipped) must not return before timeout_ms elapses
+    // — `PolledWorkerDriver` only sleeps on a hard error, so returning early
+    // here would make an unattributable message a remote-triggerable tight
+    // poll loop between the driver and this worker.
+    let mut h = handler_with_unattributable_message();
+    let start = std::time::Instant::now();
+    let out = h.call("email.poll", serde_json::json!({"timeout_ms": 50})).unwrap();
+    let elapsed = start.elapsed();
+    assert!(elapsed >= std::time::Duration::from_millis(40), "poll returned too early: {elapsed:?}");
+    assert_eq!(out["events"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn unattributable_message_lands_in_skipped_not_vanishing() {
+    let mut h = handler_with_unattributable_message();
+    let out = h.call("email.poll", serde_json::json!({"timeout_ms": 10})).unwrap();
+    assert_eq!(out["events"].as_array().unwrap().len(), 0, "no usable From ⇒ no event");
+    let skipped = out["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "the message must be reported, not silently dropped");
+    assert_eq!(skipped[0]["message_id"], "7");
+    assert!(skipped[0]["reason"].as_str().unwrap().contains("From"));
+}
+
+#[test]
+fn failed_message_detail_for_one_message_does_not_abort_the_batch() {
+    let mut h = handler_with_one_good_one_failing_detail();
+    let out = h.call("email.poll", serde_json::json!({"timeout_ms": 10})).unwrap();
+    let events = out["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "the good message still becomes an event");
+    assert_eq!(events[0]["ack_token"], "7");
+    let skipped = out["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "the failing message is recorded, not silently lost");
+    assert_eq!(skipped[0]["message_id"], "8");
 }
 
 #[test]
@@ -235,6 +310,102 @@ fn handler_with_empty_changes() -> crate::handler::EmailInHandler {
         empty_changes_resp(),
         detail_resp("me@example.org", None, None, &[]),
     );
+    crate::handler::EmailInHandler::with_client(
+        client_with(transport),
+        "sub".to_string(),
+        "agent@example.org".to_string(),
+    )
+}
+
+fn handler_with_no_message_id_header() -> crate::handler::EmailInHandler {
+    let transport = fake_with(
+        changes_resp(&["7"]),
+        detail_resp("me@example.org", None, None, &[]),
+    );
+    crate::handler::EmailInHandler::with_client(
+        client_with(transport),
+        "sub".to_string(),
+        "agent@example.org".to_string(),
+    )
+}
+
+/// A detail response with TWO distinct-cased `authentication-results`
+/// object keys — `detail_resp` only ever builds one exact-cased key, so this
+/// is a dedicated raw builder for the mixed-case scenario.
+fn mixed_case_auth_results_detail() -> RawResponse {
+    let mut headers = serde_json::Map::new();
+    headers.insert("From".to_string(), serde_json::json!(["me@example.org"]));
+    headers.insert("Message-ID".to_string(), serde_json::json!(["<mid-1@example.org>"]));
+    headers.insert("Authentication-Results".to_string(), serde_json::json!(["mx.example.net; dmarc=pass"]));
+    headers.insert("AUTHENTICATION-RESULTS".to_string(), serde_json::json!(["forged.example; dmarc=pass"]));
+    json_resp(&serde_json::json!({
+        "id": "7",
+        "subject": "s",
+        "from": {"address": "me@example.org", "name": serde_json::Value::Null},
+        "body_text": "body",
+        "body_html": serde_json::Value::Null,
+        "headers": headers,
+    }))
+}
+
+fn handler_with_mixed_case_auth_results() -> crate::handler::EmailInHandler {
+    let transport = fake_with(changes_resp(&["7"]), mixed_case_auth_results_detail());
+    crate::handler::EmailInHandler::with_client(
+        client_with(transport),
+        "sub".to_string(),
+        "agent@example.org".to_string(),
+    )
+}
+
+fn handler_with_unattributable_message() -> crate::handler::EmailInHandler {
+    // Empty From address ⇒ build_event returns None ⇒ the message is
+    // unattributable and must land in `skipped`, never vanish.
+    let transport = fake_with(
+        changes_resp(&["7"]),
+        detail_resp("", Some("<mid-1@example.org>"), None, &[]),
+    );
+    crate::handler::EmailInHandler::with_client(
+        client_with(transport),
+        "sub".to_string(),
+        "agent@example.org".to_string(),
+    )
+}
+
+/// Fake transport: `/v1/changes` returns two new message ids ("7", "8");
+/// `/v1/messages/7` succeeds, `/v1/messages/8` fails (404) — proves one
+/// message's `message_detail` failure does not abort the rest of the batch.
+struct PartialFailureFake {
+    changes: RawResponse,
+    good_detail: RawResponse,
+}
+impl HttpGet for PartialFailureFake {
+    fn get(&self, _u: &Url) -> Result<RawResponse, String> {
+        unreachable!("client uses get_authed")
+    }
+    fn transport_kind(&self) -> &'static str {
+        "fake"
+    }
+    fn get_authed(&self, url: &Url, _bearer: &str, _max: usize) -> Result<RawResponse, String> {
+        if url.path().starts_with("/v1/changes") {
+            Ok(self.changes.clone())
+        } else if url.path() == "/v1/messages/8" {
+            Ok(RawResponse {
+                status: 404,
+                location: None,
+                content_type: "text/plain".into(),
+                body: b"not found".to_vec(),
+            })
+        } else {
+            Ok(self.good_detail.clone())
+        }
+    }
+}
+
+fn handler_with_one_good_one_failing_detail() -> crate::handler::EmailInHandler {
+    let transport: Box<dyn HttpGet> = Box::new(PartialFailureFake {
+        changes: changes_resp(&["7", "8"]),
+        good_detail: detail_resp("me@example.org", Some("<mid-1@example.org>"), None, &[]),
+    });
     crate::handler::EmailInHandler::with_client(
         client_with(transport),
         "sub".to_string(),
