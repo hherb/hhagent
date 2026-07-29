@@ -180,4 +180,30 @@ mod tests {
         assert_eq!(a.authorize(&ch(), &PeerId("@me:srv".into()), Some(&ev)).await,
                    AuthDecision::Recognised);
     }
+
+    // ---- constant_time_eq: pure, so plain (non-tokio) #[test]s. These pin the
+    // function's actual comparison behaviour so a broken implementation (e.g.
+    // one that always returns `true`, or that drops the length check) is
+    // caught here rather than only showing up as an admitted forged token in
+    // `DbPeerAuthorizer`, several layers away. ----
+
+    #[test]
+    fn constant_time_eq_true_for_identical_inputs() {
+        assert!(constant_time_eq(b"0123456789abcdef", b"0123456789abcdef"));
+    }
+
+    #[test]
+    fn constant_time_eq_false_when_first_byte_differs() {
+        assert!(!constant_time_eq(b"X123456789abcdef", b"0123456789abcdef"));
+    }
+
+    #[test]
+    fn constant_time_eq_false_when_last_byte_differs() {
+        assert!(!constant_time_eq(b"0123456789abcdeX", b"0123456789abcdef"));
+    }
+
+    #[test]
+    fn constant_time_eq_false_for_different_lengths() {
+        assert!(!constant_time_eq(b"short", b"a much longer string"));
+    }
 }

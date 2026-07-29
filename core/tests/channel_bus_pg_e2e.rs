@@ -9,11 +9,14 @@ use std::collections::HashMap;
 
 use tokio::sync::mpsc;
 
-use kastellan_core::channel::auth::StaticPairings;
+use kastellan_core::channel::auth::{AuthDecision, DbPeerAuthorizer, PeerAuthorizer, StaticPairings};
 use kastellan_core::channel::bus::{
     handle_completed, handle_inbound, CompletedTasks, PgChannelEvents, PgCompletedTasks,
 };
-use kastellan_core::channel::{actions, ChannelId, ConversationId, IncomingMessage, OutgoingMessage, PeerId};
+use kastellan_core::channel::ingest::sha256_hex;
+use kastellan_core::channel::{
+    actions, ChannelId, ConversationId, IncomingMessage, OutgoingMessage, PeerEvidence, PeerId,
+};
 use kastellan_db::tasks::{self, Lane};
 use kastellan_tests_common::{
     bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_no_supervisor, unique_suffix,
@@ -130,4 +133,140 @@ async fn channel_inbound_enqueues_and_completion_routes_a_reply() {
     // returned, so a listener still in scope at close-time deadlocks the test.
     drop(completed);
     pool.close().await;
+}
+
+/// Exercises `DbPeerAuthorizer::authorize` — the REAL production authorizer,
+/// not the `TokenAuthorizer` fake in `bus.rs`'s unit tests — against a live
+/// `pairings` table, covering all five decision arms
+/// (`token_hash_for`'s `Ok(None)` / `Ok(Some(None))` / `Ok(Some(Some(_)))`
+/// split three ways).
+///
+/// Seeding uses the ADMIN pool (`connect_admin_pool`), same rationale as
+/// `db/tests/pairings_e2e.rs`'s token round-trip test: not because
+/// `insert_pairing_with_token` itself needs it (migration 0018 grants
+/// `kastellan_runtime` INSERT on `pairings`), but to keep every fixture-setup
+/// call site in this suite using one consistent, deliberately-superuser
+/// connection, matching the operator-only mental model pairing rows are
+/// supposed to have. The authorizer itself is built over a **runtime** pool,
+/// exactly like production (`main::matrix_boot` passes the daemon-scoped
+/// runtime pool into `DbPeerAuthorizer::new`) — `token_hash_for` is a SELECT,
+/// which the runtime role does have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn db_peer_authorizer_covers_all_evidence_arms_against_a_real_pairing_table() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let Some(bin_dir) = pg_bin_dir_or_skip() else {
+        return; // skip-as-pass
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "dpa-d",
+        "dpa-l",
+        &format!("kastellan-supervisor-test-pg-dpa-{suffix}"),
+    );
+    kastellan_db::probe::run(
+        &cluster.conn_spec,
+        "core",
+        "startup",
+        serde_json::json!({"version": "test", "purpose": "db-peer-authorizer-e2e"}),
+    )
+    .await
+    .expect("probe run");
+
+    let admin = kastellan_db::pool::connect_admin_pool(&cluster.conn_spec)
+        .await
+        .expect("admin pool");
+    let runtime = kastellan_db::pool::connect_runtime_pool(&cluster.conn_spec)
+        .await
+        .expect("runtime pool");
+    let authorizer = DbPeerAuthorizer::new(runtime.clone());
+
+    // ---- 1. No active pairing at all → Rejected. ----
+    let no_row = ChannelId("email".into());
+    let nobody = PeerId("nobody@example.org".into());
+    assert_eq!(
+        authorizer.authorize(&no_row, &nobody, None).await,
+        AuthDecision::Rejected,
+        "an address with no pairings row at all must be Rejected"
+    );
+
+    // ---- 2. Paired, token_sha256 IS NULL (the Matrix shape) → Recognised,
+    //         with evidence genuinely IGNORED (not just absent). This is the
+    //         Matrix-parity pin, on the REAL authorizer. ----
+    let matrix_ch = ChannelId("matrix".into());
+    let matrix_peer = PeerId("matrix-shape@example.org".into());
+    kastellan_db::pairings::insert_pairing_with_token(
+        &admin,
+        &matrix_ch.0,
+        &matrix_peer.0,
+        "code",
+        None,
+    )
+    .await
+    .expect("seed NULL-token pairing");
+    assert_eq!(
+        authorizer.authorize(&matrix_ch, &matrix_peer, None).await,
+        AuthDecision::Recognised,
+        "a NULL token_sha256 row must admit with no evidence at all (Matrix)"
+    );
+    let hostile_evidence =
+        PeerEvidence { dmarc_pass: false, presented_token: Some("wrong".into()) };
+    assert_eq!(
+        authorizer.authorize(&matrix_ch, &matrix_peer, Some(&hostile_evidence)).await,
+        AuthDecision::Recognised,
+        "a NULL token_sha256 row must admit even when evidence is present and BAD — \
+         proving evidence is ignored, not coincidentally satisfied"
+    );
+
+    // ---- 3-6. Paired WITH a token (the email shape): four evidence arms. ----
+    let email_ch = ChannelId("email".into());
+    let email_peer = PeerId("token-required@example.org".into());
+    let good_token = "e2e-good-token";
+    let good_hash = sha256_hex(good_token.as_bytes());
+    kastellan_db::pairings::insert_pairing_with_token(
+        &admin,
+        &email_ch.0,
+        &email_peer.0,
+        "operator",
+        Some(&good_hash),
+    )
+    .await
+    .expect("seed token-required pairing");
+
+    // 3. Correct token + dmarc_pass → Recognised.
+    let good = PeerEvidence { dmarc_pass: true, presented_token: Some(good_token.into()) };
+    assert_eq!(
+        authorizer.authorize(&email_ch, &email_peer, Some(&good)).await,
+        AuthDecision::Recognised,
+        "correct token + DMARC pass must admit"
+    );
+
+    // 4. Correct token but dmarc_pass == false → RejectedUnauthentic.
+    let bad_dmarc = PeerEvidence { dmarc_pass: false, presented_token: Some(good_token.into()) };
+    assert_eq!(
+        authorizer.authorize(&email_ch, &email_peer, Some(&bad_dmarc)).await,
+        AuthDecision::RejectedUnauthentic,
+        "a correct token with a failed DMARC verdict must not admit"
+    );
+
+    // 5. Wrong token (DMARC otherwise fine) → RejectedUnauthentic.
+    let wrong_token =
+        PeerEvidence { dmarc_pass: true, presented_token: Some("not-the-token".into()) };
+    assert_eq!(
+        authorizer.authorize(&email_ch, &email_peer, Some(&wrong_token)).await,
+        AuthDecision::RejectedUnauthentic,
+        "a wrong token must not admit even with a good DMARC verdict"
+    );
+
+    // 6. Token required but the transport supplied no evidence → RejectedUnauthentic.
+    assert_eq!(
+        authorizer.authorize(&email_ch, &email_peer, None).await,
+        AuthDecision::RejectedUnauthentic,
+        "a token-required pairing with no evidence at all must not admit"
+    );
+
+    admin.close().await;
+    runtime.close().await;
 }
