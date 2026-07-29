@@ -3,15 +3,29 @@
 //! Two independent checks, neither sufficient alone:
 //! * [`trusted_dmarc_pass`] — did OUR MX say DMARC passed? Anyone can write
 //!   `Authentication-Results` lines into a message they send, so only the
-//!   topmost header bearing our configured authserv-id is evidence.
+//!   TOPMOST such header decides — see that function's docs for why looking
+//!   any further is unsafe even when the topmost header's authserv-id looks
+//!   wrong.
 //! * [`extract_token`] — did the sender include the per-pairing shared secret?
 //!   Defence in depth against a misconfigured or compromised MX.
 //!
 //! Everything here is deliberately paranoid about the input: an
 //! `Authentication-Results` header is attacker-controlled wire data (RFC 8601
-//! §5 spells out exactly this risk), and an email body is attacker-controlled
-//! Unicode text of arbitrary shape. Parse defensively; never trust a byte
-//! offset to line up with a char boundary; never assume ASCII.
+//! §5 spells out exactly this risk) that can legally embed RFC 5322 quoted
+//! strings and comments — including a literal `;`, `(`, or `)` INSIDE one —
+//! so naive delimiter splitting is unsafe. [`top_level_segments`] (in the
+//! sibling `authres_parse` module — split out purely to keep this file
+//! under the project's LOC guidance) is the ONE scanner both the authserv-id
+//! check and the verdict lookup in [`trusted_dmarc_pass`] are built on,
+//! specifically so they can never disagree about what counts as a segment
+//! boundary: an earlier version used two different, inconsistent splits for
+//! the two purposes, and that inconsistency was itself an exploitable bug (a
+//! `;` inside a comment attached to the authserv-id broke the id/resinfo
+//! split). An email body is attacker-controlled Unicode text of arbitrary
+//! shape: parse defensively, never trust a byte offset to line up with a
+//! char boundary, never assume ASCII.
+
+use super::authres_parse::{authserv_id_of, method_result_of, top_level_segments};
 
 /// Line prefix carrying the per-pairing token, e.g.
 /// `kastellan-token: 9f2a…`. Matched case-insensitively.
@@ -20,155 +34,136 @@ pub const TOKEN_PREFIX: &str = "kastellan-token:";
 /// Header the MX writes its authentication verdict into (RFC 8601).
 const AUTH_RESULTS: &str = "authentication-results";
 
-/// True iff the **topmost** `Authentication-Results` header whose authserv-id
-/// equals `authserv_id` reports `dmarc=pass`.
+/// True iff the FIRST `Authentication-Results` header (wire order) has an
+/// authserv-id that exactly (case-insensitively) equals `authserv_id` AND
+/// its first `dmarc=` verdict is `pass`.
 ///
-/// Fails closed: no matching header (or no headers at all) ⇒ `false`. Only the
-/// first match is consulted — a sender may prepend a header claiming our
-/// authserv-id, but our own MX prepends its header on receipt, so ours is the
-/// topmost one. `headers` must be in wire order, topmost first.
+/// **Only the first `Authentication-Results` header is ever consulted** —
+/// not "the first one whose id matches", the very first one, full stop. If
+/// its authserv-id does not match `authserv_id` (a typo in configuration, an
+/// intermediate relay's own header arriving before ours, anything at all),
+/// this returns `false` immediately; it does NOT keep looking further down
+/// for a header that happens to match. Two facts make this safe rather than
+/// merely paranoid: (1) the receiving MX ALWAYS prepends its own verdict on
+/// receipt, so in a correctly configured deployment the genuine header is
+/// always topmost; (2) anyone at all — the sender, a malicious relay — can
+/// write an `Authentication-Results` header with any content, including one
+/// naming our own authserv-id. Falling through past a topmost mismatch to
+/// scan further would let a misconfigured (or simply differently-named) MX
+/// verdict be silently replaced by a forgery below it — the operator would
+/// never notice the gate had gone from "genuinely checking" to "trusting
+/// whatever's furthest down that happens to match". **Operational
+/// consequence:** `authserv_id` MUST be configured to exactly the
+/// authserv-id string written by whichever mail server is the last hop
+/// before this code runs. Get that wrong and every message fails closed —
+/// loudly (every message rejected), not silently (some messages admitted on
+/// a forged basis).
+///
+/// Also fails closed: no `Authentication-Results` header at all, an
+/// empty/unconfigured `authserv_id`, a malformed header value (unterminated
+/// quoted-string or unbalanced comment — see [`top_level_segments`]), or no
+/// `dmarc=` verdict anywhere in the header.
 pub fn trusted_dmarc_pass(headers: &[(String, String)], authserv_id: &str) -> bool {
     let want = authserv_id.trim().to_ascii_lowercase();
     if want.is_empty() {
         return false; // Unconfigured authserv-id must never admit.
     }
-    for (name, value) in headers {
-        if !name.trim().eq_ignore_ascii_case(AUTH_RESULTS) {
-            continue;
+    let value = match headers
+        .iter()
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case(AUTH_RESULTS))
+    {
+        Some((_, value)) => value,
+        None => return false,
+    };
+    let segments = match top_level_segments(value) {
+        Some(segments) => segments,
+        None => return false, // Unterminated quote / unbalanced comment.
+    };
+    // top_level_segments always yields at least one segment (see its docs),
+    // so indexing segment 0 here never panics.
+    if authserv_id_of(segments[0]) != want {
+        return false;
+    }
+    // The FIRST segment whose method is "dmarc" decides. Do NOT use `.any()`
+    // over all segments: "dmarc=fail; dmarc=pass" in the same header must
+    // read as fail — that IS the real verdict our own MX computed; a second,
+    // later "dmarc=pass" in the same header is not something a compliant MX
+    // would ever emit, and trusting it is exactly the forgery this exists
+    // to prevent.
+    for segment in &segments[1..] {
+        if let Some((method, result)) = method_result_of(segment) {
+            if method == "dmarc" {
+                return result == "pass";
+            }
         }
-        // Everything up to the first ';' is the authserv-id (optionally
-        // followed by a version number / CFWS comment, handled below); the
-        // rest is the ';'-separated resinfo list.
-        let (id_part, rest) = match value.split_once(';') {
-            Some((id_part, rest)) => (id_part, rest),
-            None => continue, // No resinfo at all — not a usable verdict.
-        };
-        if authserv_id_of(id_part) != want {
-            continue; // Not our MX — a forged or upstream header. Ignore it.
-        }
-        // Topmost match decides, pass or fail. Do NOT keep looking: falling
-        // through to a later header is exactly how a forged "dmarc=pass"
-        // beneath our MX's "dmarc=fail" would win.
-        return has_method_result(rest, "dmarc", "pass");
     }
     false
 }
 
-/// Extracts the authserv-id from the text preceding the first `;` of an
-/// `Authentication-Results` value, lower-cased for comparison.
+/// Split a body into `(presented_token, body_with_every_occurrence_removed)`.
 ///
-/// Per RFC 8601 §2.2, the authserv-id may legally be followed by CFWS (which
-/// includes a `(comment)`) and/or a version number before the first `;` —
-/// e.g. `mx.example.net (amavisd-new)` or `mx.example.net 1`. Both must still
-/// identify as `mx.example.net`: comparing the whole pre-`;` text verbatim
-/// would silently reject a compliant header, and the loop above would then
-/// fall through to whatever forged header comes next. So: strip any
-/// (possibly nested) parenthesised comments first, then take the FIRST
-/// whitespace-delimited token as the id. This stays an EXACT match (not a
-/// prefix) — `mx.example.net.evil.com` must still not match `mx.example.net`.
-fn authserv_id_of(id_part: &str) -> String {
-    let mut without_comments = String::with_capacity(id_part.len());
-    let mut depth = 0u32;
-    for c in id_part.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => without_comments.push(c),
-            _ => {} // Inside a comment — drop it.
-        }
-    }
-    without_comments
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase()
-}
-
-/// Whether the `;`-separated resinfo list `resinfo` contains a
-/// `method=result` pair (e.g. `dmarc=pass`), as a whole token.
+/// Finds EVERY case-insensitive occurrence of [`TOKEN_PREFIX`] anywhere in
+/// the body — not just at the start of a line — and removes from the start
+/// of each occurrence through the end of that line. The FIRST occurrence
+/// supplies the presented token. This deliberately does not special-case
+/// `>`, `|`, `}`, `:`, or any other quote marker, and does not require the
+/// prefix to be the first thing on its line: one rule subsumes a quoted
+/// reply, a bulleted/braced quote style, and an inline "On Tue, you wrote:
+/// ..." quotation, instead of enumerating markers one at a time.
 ///
-/// Per RFC 8601 §2.2 each resinfo segment is `method=result` FIRST,
-/// optionally followed by whitespace-separated `ptype.property=value`
-/// pairs (e.g. `dmarc=pass header.from=example.com`) or a trailing
-/// `(comment)`. Only the FIRST whitespace-delimited token of each segment is
-/// ever a method=result pair — anything after it is a property spec or
-/// comment and must never be mistaken for one. Splitting the whole segment on
-/// whitespace (instead of taking only its first token) would let an attacker
-/// smuggle `dmarc=pass` into a *property value*, e.g.
-/// `spf=pass smtp.mailfrom="x dmarc=pass y"@evil.com`, and have it read back
-/// as a real verdict — this is exactly the bug that must not recur.
-fn has_method_result(resinfo: &str, method: &str, result: &str) -> bool {
-    resinfo
-        .split(';')
-        .filter_map(|segment| segment.split_whitespace().next())
-        .filter_map(|token| token.split_once('='))
-        .any(|(k, v)| {
-            k.trim().eq_ignore_ascii_case(method)
-                // The result may carry a directly-attached comment with no
-                // separating space, e.g. `pass(policy)`.
-                && v.trim()
-                    .split('(')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case(result)
-        })
-}
-
-/// Strips leading whitespace and any run of `>` quote markers (with
-/// whitespace between them), e.g. `"> > kastellan-token: x"` →
-/// `"kastellan-token: x"`.
+/// A leading UTF-8 BOM (U+FEFF) is stripped before scanning: it is not
+/// Unicode whitespace, so nothing downstream can be relied on to remove it
+/// as a side effect.
 ///
-/// A mail client quotes the original message in a reply, so a token line the
-/// gate itself sent (or an attacker's decoy) can come back prefixed with `>`.
-/// Detection must see through that prefix, or a quoted token line is neither
-/// recognised NOR stripped — leaking the secret straight into the LLM
-/// instruction, contradicting the whole point of this function.
-fn strip_quote_markers(mut s: &str) -> &str {
-    loop {
-        s = s.trim_start();
-        match s.strip_prefix('>') {
-            Some(rest) => s = rest,
-            None => return s,
-        }
-    }
-}
-
-/// Split a body into `(presented_token, body_without_any_token_line)`.
+/// GUARANTEE, precisely stated: every COMPLETE occurrence of the prefix,
+/// together with the rest of its line, is removed from the returned body.
+/// This is deliberately narrower than "the secret can never appear in the
+/// returned body" — that stronger claim cannot be made in general. A token
+/// split across two lines by mail transport line-wrapping is not a single
+/// occurrence and is not detected. Treat `TOKEN_PREFIX` as sensitive at
+/// every layer above this one too; this function is defence in depth, not a
+/// proof.
 ///
-/// The FIRST token line supplies the presented token; **every** token line is
-/// removed — quoted or not — so the shared secret never reaches a task
-/// payload, an LLM prompt, or a quoted reply, including a decoy second line
-/// an attacker might add.
-///
-/// `body` is untrusted, arbitrary Unicode: an attacker chooses every byte,
-/// including where the multi-byte characters fall. `TOKEN_PREFIX` is ASCII,
-/// but a line need not be — indexing `line[..TOKEN_PREFIX.len()]` panics
-/// whenever that byte offset lands inside a multi-byte character, which an
-/// attacker can trivially arrange. `str::get` returns `None` instead of
-/// panicking when the range isn't a valid char boundary (or the string is
-/// shorter than it), so it is the only safe way to inspect a fixed-width
-/// prefix of untrusted text.
+/// Implementation note on safety: the scan below indexes `body` at BYTE
+/// offsets found by comparing raw bytes against the (pure-ASCII)
+/// `TOKEN_PREFIX`. A match can only succeed where every compared byte is
+/// itself ASCII (`eq_ignore_ascii_case` never turns a non-ASCII byte into an
+/// ASCII one, so a non-ASCII byte can never equal one), and ASCII bytes
+/// never occur as UTF-8 continuation bytes — so every offset this function
+/// ever slices `body` at is provably a valid char boundary. The byte-scan
+/// loop itself never slices `&str` at all — only the boundary-agnostic
+/// `&[u8]` — so intermediate positions never risk a panic either.
 pub fn extract_token(body: &str) -> (Option<String>, String) {
+    let body = body.strip_prefix('\u{FEFF}').unwrap_or(body);
+    let prefix_len = TOKEN_PREFIX.len();
+    let prefix_bytes = TOKEN_PREFIX.as_bytes();
+    let bytes = body.as_bytes();
     let mut token: Option<String> = None;
-    let mut kept: Vec<&str> = Vec::new();
-    for line in body.lines() {
-        let candidate = strip_quote_markers(line);
-        let is_token_line = match candidate.get(..TOKEN_PREFIX.len()) {
-            Some(prefix) if prefix.eq_ignore_ascii_case(TOKEN_PREFIX) => {
-                let value = candidate[TOKEN_PREFIX.len()..].trim();
-                if token.is_none() && !value.is_empty() {
+    let mut removed: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i + prefix_len <= bytes.len() {
+        if bytes[i..i + prefix_len].eq_ignore_ascii_case(prefix_bytes) {
+            let line_end = body[i..].find('\n').map(|off| i + off).unwrap_or(body.len());
+            if token.is_none() {
+                let value = body[i + prefix_len..line_end].trim();
+                if !value.is_empty() {
                     token = Some(value.to_string());
                 }
-                true
             }
-            _ => false,
-        };
-        if !is_token_line {
-            kept.push(line); // Not a token line — keep verbatim (incl. any '>').
+            removed.push((i, line_end));
+            i = line_end;
+        } else {
+            i += 1;
         }
     }
-    (token, kept.join("\n").trim().to_string())
+    let mut kept = String::with_capacity(body.len());
+    let mut cursor = 0usize;
+    for (start, end) in removed {
+        kept.push_str(&body[cursor..start]);
+        cursor = end;
+    }
+    kept.push_str(&body[cursor..]);
+    (token, kept.trim().to_string())
 }
 
 #[cfg(test)]
@@ -192,24 +187,34 @@ mod tests {
     }
 
     #[test]
-    fn forged_header_from_another_authserv_is_ignored() {
-        // THE attack: an attacker's own mail server can write ANY
-        // Authentication-Results header it likes, including one naming a
-        // different authserv-id. Put the attacker's header ON TOP (the worst
-        // case — don't rely on ordering assumptions to save us) and ours,
-        // correctly reporting failure, below: only a header whose
-        // authserv-id truly equals ours may ever decide the verdict.
+    fn only_the_first_header_decides_not_a_later_matching_one() {
+        // Only the FIRST Authentication-Results header is ever consulted.
+        // The second header here has BOTH a matching authserv-id AND a pass
+        // verdict — a "first header whose id matches" rule would find it and
+        // return true; the actual rule ("only the very first header, full
+        // stop") must never reach it, so this must still be false.
         let headers = vec![
             h("Authentication-Results", "evil.example.com; dmarc=pass"),
-            h("Authentication-Results", "mx.example.net; dmarc=fail"),
+            h("Authentication-Results", "mx.example.net; dmarc=pass"),
         ];
         assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
     }
 
     #[test]
-    fn only_the_topmost_matching_header_counts() {
-        // A sender can prepend a header claiming our authserv-id, but our MX
-        // prepends ITS header last, so ours is topmost. Index 0 wins.
+    fn only_the_first_header_decides_even_if_a_correct_one_follows() {
+        // The F2 residual scenario: a misconfigured (e.g. typo'd)
+        // authserv_id must fail CLOSED and loud, not silently fall through
+        // to a header below that happens to have the right id and a
+        // pass verdict.
+        let headers = vec![
+            h("Authentication-Results", "typo.mx.example.net; dmarc=fail"),
+            h("Authentication-Results", "mx.example.net; dmarc=pass"),
+        ];
+        assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    #[test]
+    fn only_the_topmost_header_counts_when_both_share_the_configured_id() {
         let headers = vec![
             h("Authentication-Results", "mx.example.net; dmarc=fail"),
             h("Authentication-Results", "mx.example.net; dmarc=pass"),
@@ -243,54 +248,73 @@ mod tests {
         assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
     }
 
-    // --- F1: dmarc=fail must not be smuggled as pass via a property value ---
+    // --- F1 (residual): the ';' segmenter must be quote- and comment-aware,
+    // and the dmarc lookup must be first-match-wins, not `.any()`. These are
+    // the review's exact acceptance-criteria bypass strings. ---
 
     #[test]
-    fn dmarc_fail_is_not_smuggled_as_pass_via_a_quoted_property_value() {
-        // The exploit: splitting the whole resinfo blob on whitespace (not
-        // just the first token per ';'-segment) lets a `dmarc=pass` sitting
-        // inside an unrelated, attacker-controlled property value (here,
-        // inside a quoted smtp.mailfrom local-part) get read back as if it
-        // were a real method=result pair — even though our MX's real verdict,
-        // later in the same segment, is dmarc=fail.
+    fn dmarc_fail_is_not_smuggled_via_a_semicolon_inside_a_quoted_property_value() {
         let headers = vec![h(
             "Authentication-Results",
-            "mx.example.net; spf=pass smtp.mailfrom=\"x dmarc=pass y\"@evil.com; dmarc=fail",
+            "mx.example.net; spf=pass smtp.mailfrom=\"a; dmarc=pass b\"@evil.com; dmarc=fail",
         )];
         assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
     }
 
-    // --- F2: a legal authserv-id form must not be skipped ---
-
     #[test]
-    fn authserv_id_with_trailing_version_number_is_still_matched_and_wins_topmost() {
-        // RFC 8601 allows an optional version number after the authserv-id.
-        let headers = vec![
-            h("Authentication-Results", "mx.example.net 1; dmarc=fail"),
-            h("Authentication-Results", "mx.example.net; dmarc=pass"),
-        ];
+    fn dmarc_fail_is_not_smuggled_via_a_semicolon_inside_a_quoted_reason() {
+        let headers = vec![h(
+            "Authentication-Results",
+            "mx.example.net; dmarc=fail reason=\"x; dmarc=pass y\"",
+        )];
         assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
     }
 
     #[test]
-    fn authserv_id_with_trailing_comment_is_still_matched_and_wins_topmost() {
-        // RFC 8601 allows a CFWS comment after the authserv-id.
-        let headers = vec![
-            h("Authentication-Results", "mx.example.net (amavisd-new); dmarc=fail"),
-            h("Authentication-Results", "mx.example.net; dmarc=pass"),
-        ];
+    fn dmarc_fail_is_not_smuggled_via_a_semicolon_inside_a_comment() {
+        let headers = vec![h(
+            "Authentication-Results",
+            "mx.example.net; dmarc=fail (p=reject; dmarc=pass ok)",
+        )];
         assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
     }
 
-    // --- F7: additional properties with no prior coverage ---
+    #[test]
+    fn first_dmarc_segment_wins_not_any_matching_segment() {
+        let headers = vec![h("Authentication-Results", "mx.example.net; dmarc=fail; dmarc=pass")];
+        assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    #[test]
+    fn dmarc_fail_is_not_smuggled_via_a_semicolon_inside_the_authserv_id_comment() {
+        // The regression the F2 comment-stripping fix introduced: the
+        // id/resinfo split must ALSO be comment-aware, or this ';' (inside
+        // the authserv-id's own comment) is mistaken for the boundary.
+        let headers = vec![h(
+            "Authentication-Results",
+            "mx.example.net (a; dmarc=pass b); dmarc=fail",
+        )];
+        assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    // --- F2 (fixed earlier): a legal authserv-id form must not be skipped ---
+
+    #[test]
+    fn authserv_id_with_trailing_version_number_is_still_matched() {
+        let headers = vec![h("Authentication-Results", "mx.example.net 1; dmarc=pass")];
+        assert!(trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    #[test]
+    fn authserv_id_with_trailing_comment_is_still_matched() {
+        let headers = vec![h("Authentication-Results", "mx.example.net (amavisd-new); dmarc=pass")];
+        assert!(trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    // --- additional coverage ---
 
     #[test]
     fn unconfigured_authserv_id_fails_closed_even_against_a_header_with_no_id() {
-        // If the empty-authserv_id guard were removed, a header with an
-        // empty/malformed authserv-id (nothing before the ';') would
-        // spuriously "match" an unconfigured gate and its dmarc=pass would be
-        // trusted. A plain "authserv_id is empty" check with a normal header
-        // wouldn't catch this — the header below is what makes it load-bearing.
         let headers = vec![h("Authentication-Results", "; dmarc=pass")];
         assert!(!trusted_dmarc_pass(&headers, ""));
     }
@@ -303,9 +327,6 @@ mod tests {
 
     #[test]
     fn arc_authentication_results_header_is_not_treated_as_authentication_results() {
-        // ARC-Authentication-Results is a DIFFERENT header (RFC 8617) that
-        // relays use to record what THEY saw; it is not our own MX's verdict
-        // and any sender/relay can write one.
         let headers = vec![h("ARC-Authentication-Results", "mx.example.net; dmarc=pass")];
         assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
     }
@@ -318,10 +339,23 @@ mod tests {
 
     #[test]
     fn dmarc_pass_with_a_directly_attached_trailing_comment_is_still_recognised() {
-        // No space before the comment — legal, and only caught by stripping
-        // a trailing "(...)" from the result value itself.
         let headers = vec![h("Authentication-Results", "mx.example.net; dmarc=pass(policy)")];
         assert!(trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    #[test]
+    fn unbalanced_comment_in_the_header_fails_closed() {
+        let headers = vec![h("Authentication-Results", "mx.example.net; dmarc=pass (unterminated")];
+        assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    #[test]
+    fn unterminated_quote_in_the_header_fails_closed() {
+        let headers = vec![h(
+            "Authentication-Results",
+            "mx.example.net; reason=\"unterminated; dmarc=fail",
+        )];
+        assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
     }
 
     #[test]
@@ -360,14 +394,14 @@ mod tests {
         assert_eq!(tok.as_deref(), Some("abc123"));
     }
 
-    // --- F5: a quoted reply must not resurrect the secret ---
+    // --- F5 (residual): occurrence-anywhere, not line-anchored / marker list ---
 
     #[test]
     fn quoted_token_line_is_detected_and_stripped() {
         let (tok, body) = extract_token("> kastellan-token: S3CRET\nwhat is 17*23?");
         assert_eq!(tok.as_deref(), Some("S3CRET"));
-        assert_eq!(body.trim(), "what is 17*23?");
         assert!(!body.contains("S3CRET"), "the secret must not survive a quoted reply");
+        assert!(body.contains("what is 17*23?"));
     }
 
     #[test]
@@ -377,13 +411,46 @@ mod tests {
         assert!(!body.contains("S3CRET"));
     }
 
+    #[test]
+    fn pipe_prefixed_token_line_no_longer_leaks() {
+        let (tok, body) = extract_token("| kastellan-token: S3CRET\nhi");
+        assert_eq!(tok.as_deref(), Some("S3CRET"));
+        assert!(!body.contains("S3CRET"));
+    }
+
+    #[test]
+    fn brace_prefixed_token_line_no_longer_leaks() {
+        let (tok, body) = extract_token("} kastellan-token: S3CRET\nhi");
+        assert_eq!(tok.as_deref(), Some("S3CRET"));
+        assert!(!body.contains("S3CRET"));
+    }
+
+    #[test]
+    fn colon_prefixed_token_line_no_longer_leaks() {
+        let (tok, body) = extract_token(": kastellan-token: S3CRET\nhi");
+        assert_eq!(tok.as_deref(), Some("S3CRET"));
+        assert!(!body.contains("S3CRET"));
+    }
+
+    #[test]
+    fn inline_mid_line_token_no_longer_leaks() {
+        let (tok, body) = extract_token("On Tue, you wrote: kastellan-token: S3CRET\nhi");
+        assert_eq!(tok.as_deref(), Some("S3CRET"));
+        assert!(!body.contains("S3CRET"));
+    }
+
+    #[test]
+    fn leading_bom_is_stripped_and_does_not_defeat_detection() {
+        let (tok, body) = extract_token("\u{FEFF}kastellan-token: S3CRET\nhello");
+        assert_eq!(tok.as_deref(), Some("S3CRET"));
+        assert!(!body.contains("S3CRET"));
+        assert!(!body.contains('\u{FEFF}'), "a leading BOM must not survive into the instruction");
+    }
+
     // --- F6: a multi-byte body must never panic ---
 
     #[test]
     fn extract_token_does_not_panic_on_a_cjk_only_body() {
-        // 6 x U+65E5 = 18 bytes; byte offset TOKEN_PREFIX.len() (16) lands
-        // mid-character, not on a char boundary — the exact shape that made
-        // the old `line[..TOKEN_PREFIX.len()]` slice panic.
         let (tok, body) = extract_token("日日日日日日");
         assert_eq!(tok, None);
         assert_eq!(body, "日日日日日日");
@@ -391,8 +458,6 @@ mod tests {
 
     #[test]
     fn extract_token_does_not_panic_on_an_emoji_body() {
-        // "abc" (3 bytes) + 4 x 4-byte emoji = 19 bytes; offset 16 again
-        // lands inside the 4th emoji's UTF-8 encoding, not on a boundary.
         let body_text = "abc\u{1F600}\u{1F600}\u{1F600}\u{1F600}";
         let (tok, body) = extract_token(body_text);
         assert_eq!(tok, None);

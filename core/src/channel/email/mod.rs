@@ -8,4 +8,5 @@
 //! Both are computed by pure functions in [`gate`] — in core, not in the
 //! worker, so every rejection still lands in `audit_log`.
 
+mod authres_parse;
 pub mod gate;
