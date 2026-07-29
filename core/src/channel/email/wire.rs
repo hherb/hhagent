@@ -37,16 +37,17 @@
 //! detail fetch). Core never sees these as `PolledEvent`s, so nothing would
 //! ever ack them under the ordinary per-event path — the localmail
 //! subscription cursor would stay pinned on the first one forever, wedging
-//! the channel permanently. [`parse_email_skipped_ids`] is a second, separate
+//! the channel permanently. [`parse_email_skipped`] is a second, separate
 //! pure extractor over the SAME raw poll `Value`
 //! [`parse_email_poll_with`] sees, kept deliberately apart from it: folding a
 //! skipped id into `parse_email_poll_with`'s output as a fabricated
 //! `PolledEvent` would enqueue a bogus task onto the bus, which is worse than
 //! not acking at all. `spawn_email_worker` instead wires
-//! `parse_email_skipped_ids` into `PolledWorkerDriver::spawn`'s new
+//! `parse_email_skipped` into `PolledWorkerDriver::spawn`'s
 //! `parse_ack_only` parameter (see `core/src/channel/polled_driver.rs`),
 //! which acks each id directly — no event, no bus, just the ack RPC — and
-//! logs every id it acks.
+//! logs every id it acks (plus, when a real audit sink is wired in, records
+//! it via `AckOnlyAudit`).
 
 use std::sync::OnceLock;
 
@@ -91,7 +92,7 @@ pub fn parse_email_poll(v: serde_json::Value) -> anyhow::Result<Vec<PolledEvent>
 
 /// Pure core: decode one `email.poll` result's `events` array into driver
 /// events, computing evidence and stripping the token from every body. Never
-/// looks at `skipped` — that is [`parse_email_skipped_ids`]'s job, kept
+/// looks at `skipped` — that is [`parse_email_skipped`]'s job, kept
 /// separate on purpose (see the module docs).
 ///
 /// Fails closed on a missing/non-array `events` field (a malformed poll
@@ -107,7 +108,14 @@ pub fn parse_email_poll_with(
         .ok_or_else(|| anyhow::anyhow!("poll result missing 'events' array"))?;
     let mut out = Vec::with_capacity(events.len());
     for e in events {
-        let peer = str_field(e, "peer")?;
+        // Lowercase defensively even though `email-in::build_event` already
+        // lowercases the From address before putting it on the wire: the
+        // pairing lookup this feeds into (`pair issue-token`'s stored peer)
+        // is an exact-case-sensitive match, so a worker regression that
+        // stopped lowercasing would silently turn into "every message from a
+        // legitimately paired address is rejected as unpaired" — cheap
+        // insurance against trusting the worker's own claim of normalization.
+        let peer = str_field(e, "peer")?.to_ascii_lowercase();
         let conversation = str_field(e, "conversation")?;
         let raw_body = str_field(e, "body")?;
         let ack_token = e.get("ack_token").and_then(|t| t.as_str()).map(String::from);
@@ -153,23 +161,36 @@ fn str_field(v: &serde_json::Value, key: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("poll event missing '{key}'"))
 }
 
-/// Extract every `skipped[].message_id` from a raw `email.poll` result — the
-/// `ParseAckOnly` extractor `spawn_email_worker` wires into
-/// `PolledWorkerDriver::spawn` so these ids get acked even though they never
-/// became a `PolledEvent` (see the module docs' "The `skipped` list"). A
-/// missing/non-array `skipped` field yields no ids rather than an error:
+/// Extract every `skipped[].(message_id, reason)` pair from a raw
+/// `email.poll` result — the `ParseAckOnly` extractor `spawn_email_worker`
+/// wires into `PolledWorkerDriver::spawn` so these ids get acked even though
+/// they never became a `PolledEvent` (see the module docs' "The `skipped`
+/// list"). `reason` travels alongside the id purely for observability: the
+/// driver logs it and, when a caller supplies an `AckOnlyAudit`, hands it
+/// straight to that too — it is `email-in`'s own short diagnostic (e.g. "no
+/// usable From address"), NEVER the message body or any header value.
+///
+/// A missing/non-array `skipped` field yields no pairs rather than an error:
 /// unlike a missing `events` array, an absent `skipped` list is not a
 /// malformed poll result — it just means nothing was skipped this poll.
 /// Malformed individual entries (no `message_id` string) are silently
-/// dropped rather than aborting the whole extraction; each id that IS
-/// returned is logged by the driver as it acks it.
-pub fn parse_email_skipped_ids(v: &serde_json::Value) -> Vec<String> {
+/// dropped rather than aborting the whole extraction; a missing `reason`
+/// falls back to a fixed placeholder so an id is never dropped just because
+/// its reason string was absent.
+pub fn parse_email_skipped(v: &serde_json::Value) -> Vec<(String, String)> {
     v.get("skipped")
         .and_then(|s| s.as_array())
         .map(|a| {
             a.iter()
-                .filter_map(|entry| entry.get("message_id").and_then(|m| m.as_str()))
-                .map(String::from)
+                .filter_map(|entry| {
+                    let id = entry.get("message_id").and_then(|m| m.as_str())?.to_string();
+                    let reason = entry
+                        .get("reason")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("(no reason given)")
+                        .to_string();
+                    Some((id, reason))
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -223,6 +244,17 @@ mod tests {
         let evidence = ev.evidence.as_ref().expect("email always supplies evidence");
         assert!(evidence.dmarc_pass);
         assert_eq!(evidence.presented_token.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn peer_is_lowercased_defensively_even_if_the_worker_did_not() {
+        // Core must not blindly trust the worker's claim of normalization —
+        // the pairing lookup this feeds is an exact-case match.
+        let mut e = event(vec!["mx.example.net; dmarc=pass"], true, "hi");
+        e["peer"] = serde_json::json!("Me@Example.ORG");
+        let v = poll_result(vec![e]);
+        let events = parse_email_poll_with(v, "mx.example.net").unwrap();
+        assert_eq!(events[0].peer, "me@example.org");
     }
 
     #[test]
@@ -305,7 +337,7 @@ mod tests {
     // --- `skipped` extraction (separate from `parse_email_poll_with`) ---
 
     #[test]
-    fn skipped_ids_are_extracted_for_the_ack_only_path() {
+    fn skipped_pairs_are_extracted_for_the_ack_only_path() {
         let v = serde_json::json!({
             "events": [],
             "skipped": [
@@ -313,18 +345,32 @@ mod tests {
                 {"message_id": "11", "reason": "localmail 404: not found"}
             ]
         });
-        assert_eq!(parse_email_skipped_ids(&v), vec!["10".to_string(), "11".to_string()]);
+        assert_eq!(
+            parse_email_skipped(&v),
+            vec![
+                ("10".to_string(), "no usable From address".to_string()),
+                ("11".to_string(), "localmail 404: not found".to_string()),
+            ]
+        );
     }
 
     #[test]
-    fn missing_skipped_list_yields_no_ids_not_an_error() {
-        assert_eq!(parse_email_skipped_ids(&serde_json::json!({"events": []})), Vec::<String>::new());
+    fn missing_reason_falls_back_to_a_placeholder_rather_than_dropping_the_id() {
+        let v = serde_json::json!({ "events": [], "skipped": [{"message_id": "5"}] });
+        let pairs = parse_email_skipped(&v);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "5");
+    }
+
+    #[test]
+    fn missing_skipped_list_yields_no_pairs_not_an_error() {
+        assert_eq!(parse_email_skipped(&serde_json::json!({"events": []})), Vec::<(String, String)>::new());
     }
 
     #[test]
     fn parse_email_poll_with_never_folds_skipped_into_events() {
         // parse_email_poll_with only ever turns `events` into PolledEvents;
-        // `skipped` is parse_email_skipped_ids's job, never a fabricated
+        // `skipped` is parse_email_skipped's job, never a fabricated
         // event — see the module docs on why that split matters.
         let v = serde_json::json!({
             "events": [],

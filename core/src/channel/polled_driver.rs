@@ -51,6 +51,19 @@
 //! ack — `parse_poll` itself stays a pure, events-only decode. `None`
 //! (Matrix's case) means this extraction step never runs at all: no extra
 //! RPC, byte-identical to before this existed.
+//!
+//! **The ack calls themselves only fire once the same batch's `events`
+//! decoded successfully** (i.e. inside `parse_poll`'s `Ok` arm), even though
+//! the *extraction* runs unconditionally on the raw value beforehand. This is
+//! not a stylistic choice: the worker's ack advances one MONOTONIC
+//! high-water-mark cursor shared by every message in the poll result —
+//! `events` and `skipped` are two views over positions on that same cursor,
+//! not two independent counters. Acking a `skipped` id from a batch whose
+//! `events` failed to decode would drag that shared cursor past whatever
+//! those undecoded events were, and unlike a failed ack (which just leaves
+//! the cursor short, redelivering everything behind it), an advanced cursor
+//! can never be wound back — the messages are gone for good, not merely
+//! delayed.
 
 use std::collections::VecDeque;
 use std::sync::mpsc as std_mpsc;
@@ -125,12 +138,30 @@ pub type EncodeSend = fn(&OutgoingMessage) -> serde_json::Value;
 /// and the event's own `ack_token` are present — see `run`.
 pub type EncodeAck = fn(&str) -> serde_json::Value;
 
-/// Extract ids to acknowledge that never became a [`PolledEvent`] at all —
-/// see the module docs' "Acking ids that never become an event". Run against
-/// the raw poll [`serde_json::Value`], independent of (and in addition to)
-/// `parse_poll`. Only ever invoked when `PolledWorkerSpec::ack_method` and an
-/// `EncodeAck` are both present too — see `run`.
-pub type ParseAckOnly = fn(&serde_json::Value) -> Vec<String>;
+/// Extract `(id, reason)` pairs to acknowledge that never became a
+/// [`PolledEvent`] at all — see the module docs' "Acking ids that never
+/// become an event". Run against the raw poll [`serde_json::Value`], in
+/// addition to (and before) `parse_poll` consumes it. Extraction itself is
+/// unconditional, but `run` only actually *acks* the resulting ids when the
+/// same batch's `parse_poll` call also succeeded — see `run` and the module
+/// docs' monotonic-cursor note. Only ever invoked when
+/// `PolledWorkerSpec::ack_method` and an `EncodeAck` are both present too.
+/// `reason` is a short, static-ish diagnostic (never message content) — it is
+/// only ever used for a log line and, when supplied, an [`AckOnlyAudit`] call.
+pub type ParseAckOnly = fn(&serde_json::Value) -> Vec<(String, String)>;
+
+/// Best-effort side channel for a caller to record "this id was discarded
+/// without ever becoming a bus event" somewhere durable (e.g. an
+/// `audit_log` row) — called once per skipped id actually acked, as
+/// `audit(message_id, reason)`. The driver itself stays DB-free by design
+/// (see the module docs); this is a boxed closure rather than a bare `fn`
+/// pointer specifically so a caller CAN capture state (a `PgPool` +
+/// `tokio::runtime::Handle`, following the exact pattern
+/// `crate::egress::net_worker::pg_decision_sink` already uses to drive an
+/// async DB insert from a synchronous background thread). `None` means no
+/// audit call is ever made — the default, and Matrix's case (it never
+/// supplies a `parse_ack_only` either, so this is moot for it).
+pub type AckOnlyAudit = Box<dyn Fn(&str, &str) + Send + 'static>;
 
 /// Seam over "something that can call the worker" so the driver is unit-tested
 /// without a supervisor or a process. Production is [`PersistentHandle`].
@@ -170,6 +201,7 @@ impl PolledWorkerDriver {
         encode_send: EncodeSend,
         encode_ack: Option<EncodeAck>,
         parse_ack_only: Option<ParseAckOnly>,
+        audit_ack_only: Option<AckOnlyAudit>,
         cid: ChannelId,
     ) -> anyhow::Result<(Self, serde_json::Value)> {
         let identity = calls
@@ -185,6 +217,7 @@ impl PolledWorkerDriver {
                 encode_send,
                 encode_ack,
                 parse_ack_only,
+                audit_ack_only,
                 inbound_tx,
                 outbound_rx,
                 cid,
@@ -211,6 +244,7 @@ fn run(
     encode_send: EncodeSend,
     encode_ack: Option<EncodeAck>,
     parse_ack_only: Option<ParseAckOnly>,
+    audit_ack_only: Option<AckOnlyAudit>,
     inbound_tx: tok_mpsc::Sender<IncomingMessage>,
     outbound_rx: std_mpsc::Receiver<OutgoingMessage>,
     cid: ChannelId,
@@ -305,37 +339,63 @@ fn run(
                                     }
                                 }
                             }
+
+                            // Ack ids that never became a `PolledEvent` at all
+                            // (e.g. email's `skipped` list) — see the module
+                            // docs' "Acking ids that never become an event".
+                            // Deliberately INSIDE the `Ok(events)` arm, not
+                            // after the whole `match`: the worker's polling
+                            // cursor is a single MONOTONIC high-water mark
+                            // shared by both lists (localmail's `GREATEST`
+                            // cursor), not two independent counters. Acking a
+                            // skipped id after a batch whose `events` FAILED
+                            // to decode would advance that shared cursor past
+                            // messages the bus never saw, permanently losing
+                            // them (they can never be redelivered once the
+                            // cursor has passed them) — so this only ever
+                            // runs once the events in the SAME batch are
+                            // confirmed handed to the bus. Only when the spec
+                            // actually supports acking at all; a `None`
+                            // `parse_ack_only` (Matrix) means `ack_only_ids`
+                            // is always empty, so this loop never runs for
+                            // Matrix — byte-identical.
+                            if let (Some(method), Some(enc)) = (spec.ack_method, encode_ack) {
+                                for (id, reason) in ack_only_ids {
+                                    tracing::warn!(
+                                        label = spec.label,
+                                        message_id = %id,
+                                        reason = %reason,
+                                        "discarding a message that never became an event; acking it \
+                                         so the worker's cursor advances"
+                                    );
+                                    // Best-effort audit trail: never blocks or
+                                    // fails the ack itself (see AckOnlyAudit's
+                                    // docs — `None` when the caller has no
+                                    // durable sink to write to).
+                                    if let Some(audit) = &audit_ack_only {
+                                        audit(&id, &reason);
+                                    }
+                                    if let Err(e) = calls.call(method, enc(&id)) {
+                                        tracing::warn!(
+                                            label = spec.label,
+                                            error = %e,
+                                            message_id = %id,
+                                            "ack of skipped id failed; will retry next poll"
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             // A malformed poll result is a worker bug, not a
-                            // death — log + skip the batch, keep polling.
+                            // death — log + skip the batch, keep polling. The
+                            // skipped ids from THIS batch are deliberately NOT
+                            // acked here (see the comment above the ack-only
+                            // loop): they share the worker's one monotonic
+                            // cursor with the events that just failed to
+                            // decode, and acking them would silently drag
+                            // that cursor past messages nobody ever saw.
                             tracing::warn!(label = spec.label, error = %e, "poll result decode failed; batch skipped");
-                        }
-                    }
-
-                    // Ack ids that never became a `PolledEvent` at all (e.g.
-                    // email's `skipped` list) — see the module docs' "Acking
-                    // ids that never become an event". Runs regardless of
-                    // whether the events batch above decoded cleanly: the two
-                    // lists are independent. Only when the spec actually
-                    // supports acking at all; a `None` `parse_ack_only`
-                    // (Matrix) means `ack_only_ids` is always empty, so this
-                    // loop never runs for Matrix — byte-identical.
-                    if let (Some(method), Some(enc)) = (spec.ack_method, encode_ack) {
-                        for id in ack_only_ids {
-                            tracing::info!(
-                                label = spec.label,
-                                message_id = %id,
-                                "acking a skipped id that never became an event"
-                            );
-                            if let Err(e) = calls.call(method, enc(&id)) {
-                                tracing::warn!(
-                                    label = spec.label,
-                                    error = %e,
-                                    message_id = %id,
-                                    "ack of skipped id failed; will retry next poll"
-                                );
-                            }
                         }
                     }
                 }
