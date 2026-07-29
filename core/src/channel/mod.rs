@@ -57,6 +57,24 @@ pub struct IncomingMessage {
     pub conversation: ConversationId,
     /// The plaintext user message body. Treated as fully untrusted input.
     pub body: String,
+    /// Transport-supplied authenticity evidence, or `None` when the transport
+    /// already authenticates its own peers (Matrix). See [`PeerEvidence`].
+    pub evidence: Option<PeerEvidence>,
+}
+
+/// Transport-supplied evidence that an inbound message really came from the
+/// claimed peer.
+///
+/// `IncomingMessage.evidence` is `None` when the transport authenticates its
+/// own peers (Matrix: E2E + homeserver auth) — the bus then applies no extra
+/// check, which is what keeps Matrix behaviour byte-identical. `Some` means the
+/// transport cannot vouch for the sender and the bus must decide.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerEvidence {
+    /// Our own MX reported `dmarc=pass` (see `email::gate::trusted_dmarc_pass`).
+    pub dmarc_pass: bool,
+    /// The per-pairing token the sender presented, already stripped from the body.
+    pub presented_token: Option<String>,
 }
 
 /// A reply the bus asks a [`Channel`] to deliver back to the originating peer +
@@ -100,4 +118,7 @@ pub mod actions {
     pub const INJECTION_BLOCKED: &str = "channel.injection_blocked";
     /// A reply was delivered back to a peer.
     pub const REPLIED: &str = "channel.replied";
+    /// A message failed transport authenticity (DMARC and/or token) — dropped
+    /// before authorization, so it never reaches the pairing carve-out.
+    pub const REJECTED_UNAUTHENTIC: &str = "channel.rejected_unauthentic";
 }

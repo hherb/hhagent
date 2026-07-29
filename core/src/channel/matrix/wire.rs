@@ -36,7 +36,15 @@ pub fn parse_matrix_poll(v: serde_json::Value) -> anyhow::Result<Vec<PolledEvent
     Ok(pr
         .events
         .into_iter()
-        .map(|e| PolledEvent { peer: e.peer, conversation: e.conversation, body: e.body })
+        .map(|e| PolledEvent {
+            peer: e.peer,
+            conversation: e.conversation,
+            body: e.body,
+            // Matrix authenticates its own peers (E2E + homeserver auth); the
+            // bus applies no extra evidence check for this transport.
+            evidence: None,
+            ack_token: None,
+        })
         .collect())
 }
 

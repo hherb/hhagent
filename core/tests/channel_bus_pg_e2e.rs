@@ -62,6 +62,7 @@ async fn channel_inbound_enqueues_and_completion_routes_a_reply() {
         peer: PeerId("@me:srv".into()),
         conversation: ConversationId("!room:srv".into()),
         body: "what's on my calendar?".into(),
+        evidence: None,
     };
     handle_inbound(&authorizer, None, &events, &msg).await;
 

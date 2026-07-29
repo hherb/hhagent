@@ -19,7 +19,7 @@ use tokio::sync::mpsc as tok_mpsc;
 
 use crate::worker_lifecycle::persistent::PersistentHandle;
 
-use super::{ChannelId, ConversationId, IncomingMessage, OutgoingMessage, PeerId};
+use super::{ChannelId, ConversationId, IncomingMessage, OutgoingMessage, PeerEvidence, PeerId};
 
 /// Bounded depth of the inbound buffer between the driver thread and the bus.
 /// Matches the Matrix channel's historical value; a single-user channel never
@@ -55,6 +55,14 @@ pub struct PolledEvent {
     pub peer: String,
     pub conversation: String,
     pub body: String,
+    /// Transport-supplied authenticity evidence, carried straight through to
+    /// the [`IncomingMessage`] the driver builds. `None` for transports that
+    /// authenticate their own peers (Matrix — see `matrix::wire::parse_matrix_poll`).
+    pub evidence: Option<PeerEvidence>,
+    /// A per-message acknowledgement token some polled transports need echoed
+    /// back on their next send (e.g. an email fallback worker's delivery ack).
+    /// Unused by Matrix.
+    pub ack_token: Option<String>,
 }
 
 /// Decode one poll RESULT into events. A decode error marks the batch as a
@@ -183,6 +191,7 @@ fn run(
                                     peer: PeerId(ev.peer),
                                     conversation: ConversationId(ev.conversation),
                                     body: ev.body,
+                                    evidence: ev.evidence,
                                 };
                                 if inbound_tx.blocking_send(msg).is_err() {
                                     tracing::info!(label = spec.label, "inbound receiver closed; polled driver exiting");

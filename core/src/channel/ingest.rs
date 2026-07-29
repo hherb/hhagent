@@ -86,6 +86,7 @@ mod tests {
             peer: PeerId("@me:srv".into()),
             conversation: ConversationId("!room:srv".into()),
             body: body.into(),
+            evidence: None,
         }
     }
     fn allow(_b: &str) -> (InjectionDecision, f32, Vec<String>) {

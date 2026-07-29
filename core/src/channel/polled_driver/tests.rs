@@ -66,6 +66,8 @@ fn test_parse(v: Value) -> anyhow::Result<Vec<PolledEvent>> {
                     .ok_or_else(|| anyhow::anyhow!("bad event"))?
                     .into(),
                 body: e["body"].as_str().ok_or_else(|| anyhow::anyhow!("bad event"))?.into(),
+                evidence: None,
+                ack_token: None,
             })
         })
         .collect()

@@ -115,11 +115,19 @@ impl CompletedTasks for PgCompletedTasks {
 }
 
 /// Handle one inbound message. Order is security-load-bearing:
-///   1. **authorize** (`(channel, peer)`); on `Rejected`, consult the pairing
-///      carve-out (compare-only) — a valid code binds the peer + returns an ack
-///      `OutgoingMessage` the caller sends back; otherwise the message is dropped
-///      + audited and never reaches the agent;
-///   2. on `Recognised`, **screen** (injection guard) and enqueue or block.
+///   1. **authorize** (`(channel, peer, evidence)`), yielding three distinct
+///      outcomes:
+///      - `RejectedUnauthentic` — the transport-supplied evidence didn't check
+///        out (bad DMARC / token). Dropped + audited immediately, BEFORE and
+///        WITHOUT the pairing carve-out: that carve-out compares unpaired
+///        input against a live single-use code, and a transport that cannot
+///        authenticate its sender must never get to attempt that;
+///      - `Rejected` — no active pairing at all; consult the pairing carve-out
+///        (compare-only) — a valid code binds the peer + returns an ack
+///        `OutgoingMessage` the caller sends back; otherwise the message is
+///        dropped + audited and never reaches the agent;
+///      - `Recognised` — proceed to step 2.
+///   2. **screen** (injection guard) and enqueue or block.
 ///
 /// Returns `Some(ack)` only on a successful pairing (the per-channel task delivers
 /// it via the same channel).
@@ -129,32 +137,50 @@ pub async fn handle_inbound(
     events: &dyn ChannelEvents,
     msg: &IncomingMessage,
 ) -> Option<OutgoingMessage> {
-    if authorizer.authorize(&msg.channel, &msg.peer).await == AuthDecision::Rejected {
-        // Pairing carve-out: the ONLY place unpaired input is touched, and only
-        // ever compared against an operator-issued code (never enqueued/echoed).
-        if let Some(p) = pairing {
-            if p.try_pair(&msg.channel, &msg.peer, &msg.body).await == PairingOutcome::Paired {
-                events
-                    .audit(
-                        actions::PAIRED,
-                        serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
-                    )
-                    .await;
-                return Some(OutgoingMessage {
-                    channel: msg.channel.clone(),
-                    peer: msg.peer.clone(),
-                    conversation: msg.conversation.clone(),
-                    body: PAIRED_ACK_BODY.to_string(),
-                });
-            }
+    match authorizer.authorize(&msg.channel, &msg.peer, msg.evidence.as_ref()).await {
+        AuthDecision::Recognised => {}
+        AuthDecision::RejectedUnauthentic => {
+            // Deliberately BEFORE and WITHOUT the pairing carve-out: the carve-out
+            // compares unpaired input against a live code, and a transport that
+            // cannot authenticate its sender must not get to attempt that.
+            // Payload carries the channel + peer only — never the body, never
+            // the token.
+            events
+                .audit(
+                    actions::REJECTED_UNAUTHENTIC,
+                    serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
+                )
+                .await;
+            return None;
         }
-        events
-            .audit(
-                actions::REJECTED_UNPAIRED,
-                serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
-            )
-            .await;
-        return None;
+        AuthDecision::Rejected => {
+            // Pairing carve-out: the ONLY place unpaired input is touched, and
+            // only ever compared against an operator-issued code (never
+            // enqueued/echoed).
+            if let Some(p) = pairing {
+                if p.try_pair(&msg.channel, &msg.peer, &msg.body).await == PairingOutcome::Paired {
+                    events
+                        .audit(
+                            actions::PAIRED,
+                            serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
+                        )
+                        .await;
+                    return Some(OutgoingMessage {
+                        channel: msg.channel.clone(),
+                        peer: msg.peer.clone(),
+                        conversation: msg.conversation.clone(),
+                        body: PAIRED_ACK_BODY.to_string(),
+                    });
+                }
+            }
+            events
+                .audit(
+                    actions::REJECTED_UNPAIRED,
+                    serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
+                )
+                .await;
+            return None;
+        }
     }
 
     match screen_and_classify(msg) {
@@ -309,13 +335,13 @@ impl ChannelBus {
 mod tests {
     use super::*;
     use crate::channel::auth::StaticPairings;
-    use crate::channel::{ChannelId, ConversationId, IncomingMessage, PeerId};
+    use crate::channel::{ChannelId, ConversationId, IncomingMessage, PeerEvidence, PeerId};
     use std::sync::Mutex;
 
     #[derive(Default)]
     struct FakeEvents {
         enqueued: Mutex<Vec<(Lane, Value)>>,
-        audits: Mutex<Vec<(String, Value)>>,
+        audited: Mutex<Vec<(String, Value)>>,
     }
     #[async_trait::async_trait]
     impl ChannelEvents for FakeEvents {
@@ -324,7 +350,7 @@ mod tests {
             Ok(1)
         }
         async fn audit(&self, action: &str, payload: Value) {
-            self.audits.lock().unwrap().push((action.to_string(), payload));
+            self.audited.lock().unwrap().push((action.to_string(), payload));
         }
     }
 
@@ -334,6 +360,7 @@ mod tests {
             peer: PeerId(peer.into()),
             conversation: ConversationId("!room:srv".into()),
             body: body.into(),
+            evidence: None,
         }
     }
 
@@ -358,7 +385,7 @@ mod tests {
         let ack = handle_inbound(&auth, None, &ev, &msg("@me:srv", "summarise my mail")).await;
         assert!(ack.is_none());
         assert_eq!(ev.enqueued.lock().unwrap().len(), 1);
-        assert_eq!(ev.audits.lock().unwrap()[0].0, actions::RECEIVED);
+        assert_eq!(ev.audited.lock().unwrap()[0].0, actions::RECEIVED);
     }
 
     #[tokio::test]
@@ -368,7 +395,7 @@ mod tests {
         let ack = handle_inbound(&auth, None, &ev, &msg("@stranger:srv", "anything")).await;
         assert!(ack.is_none());
         assert!(ev.enqueued.lock().unwrap().is_empty());
-        assert_eq!(ev.audits.lock().unwrap()[0].0, actions::REJECTED_UNPAIRED);
+        assert_eq!(ev.audited.lock().unwrap()[0].0, actions::REJECTED_UNPAIRED);
     }
 
     #[tokio::test]
@@ -381,7 +408,7 @@ mod tests {
         assert_eq!(ack.peer, PeerId("@new:srv".into()));
         assert_eq!(ack.body, PAIRED_ACK_BODY);
         assert!(ev.enqueued.lock().unwrap().is_empty(), "pairing must not enqueue a task");
-        assert_eq!(ev.audits.lock().unwrap()[0].0, actions::PAIRED);
+        assert_eq!(ev.audited.lock().unwrap()[0].0, actions::PAIRED);
     }
 
     #[tokio::test]
@@ -392,7 +419,7 @@ mod tests {
         let ack = handle_inbound(&auth, Some(&pairing), &ev, &msg("@new:srv", "guess")).await;
         assert!(ack.is_none());
         assert!(ev.enqueued.lock().unwrap().is_empty());
-        assert_eq!(ev.audits.lock().unwrap()[0].0, actions::REJECTED_UNPAIRED);
+        assert_eq!(ev.audited.lock().unwrap()[0].0, actions::REJECTED_UNPAIRED);
     }
 
     #[tokio::test]
@@ -407,7 +434,7 @@ mod tests {
         )
         .await;
         assert!(ev.enqueued.lock().unwrap().is_empty());
-        let (action, payload) = ev.audits.lock().unwrap()[0].clone();
+        let (action, payload) = ev.audited.lock().unwrap()[0].clone();
         assert_eq!(action, actions::INJECTION_BLOCKED);
         assert_eq!(payload["sha256"].as_str().unwrap().len(), 64);
         assert!(payload.get("body").is_none(), "must never audit the raw body");
@@ -448,7 +475,7 @@ mod tests {
         assert_eq!(out.body, "done");
         let delivered = rx.recv().await.unwrap();
         assert_eq!(delivered.peer, PeerId("@me:srv".into()));
-        assert_eq!(ev.audits.lock().unwrap()[0].0, actions::REPLIED);
+        assert_eq!(ev.audited.lock().unwrap()[0].0, actions::REPLIED);
     }
 
     #[tokio::test]
@@ -462,6 +489,90 @@ mod tests {
         let completed = FakeCompleted { ids: Mutex::new(vec![9]), rows };
         let senders = HashMap::new();
         assert!(handle_completed(&completed, &ev, &senders, 9).await.is_none());
-        assert!(ev.audits.lock().unwrap().is_empty()); // no reply audit for non-channel
+        assert!(ev.audited.lock().unwrap().is_empty()); // no reply audit for non-channel
+    }
+
+    /// Authorizer that mimics DbPeerAuthorizer's evidence rule without a DB.
+    struct TokenAuthorizer {
+        expected: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerAuthorizer for TokenAuthorizer {
+        async fn authorize(
+            &self,
+            _c: &ChannelId,
+            _p: &PeerId,
+            evidence: Option<&PeerEvidence>,
+        ) -> AuthDecision {
+            match evidence {
+                Some(e) if e.dmarc_pass
+                    && e.presented_token.as_deref() == Some(self.expected) => AuthDecision::Recognised,
+                Some(_) => AuthDecision::RejectedUnauthentic,
+                None => AuthDecision::Rejected,
+            }
+        }
+    }
+
+    fn email_msg(body: &str, dmarc_pass: bool, token: Option<&str>) -> IncomingMessage {
+        IncomingMessage {
+            channel: ChannelId("email".into()),
+            peer: PeerId("me@example.org".into()),
+            conversation: ConversationId("<mid@example.org>".into()),
+            body: body.to_string(),
+            evidence: Some(PeerEvidence {
+                dmarc_pass,
+                presented_token: token.map(|s| s.to_string()),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthentic_email_audits_its_own_action_and_never_enqueues() {
+        let auth = TokenAuthorizer { expected: "good-token" };
+        let ev = FakeEvents::default();
+        let out = handle_inbound(&auth, None, &ev, &email_msg("hi", false, Some("good-token"))).await;
+        assert!(out.is_none());
+        assert!(ev.enqueued.lock().unwrap().is_empty(), "a DMARC failure must not enqueue");
+        let actions = ev.audited.lock().unwrap().clone();
+        assert!(actions.iter().any(|(a, _)| a == actions::REJECTED_UNAUTHENTIC),
+                "must audit rejected_unauthentic, got {actions:?}");
+    }
+
+    #[tokio::test]
+    async fn unauthentic_email_never_reaches_the_pairing_carve_out() {
+        // The carve-out compares an unpaired body against a live code. A spoofable
+        // transport must not get to attempt that.
+        let auth = TokenAuthorizer { expected: "good-token" };
+        let pairing = FakePairing { code: Some("SECRET-CODE") };
+        let ev = FakeEvents::default();
+        let out = handle_inbound(
+            &auth, Some(&pairing), &ev, &email_msg("SECRET-CODE", false, None),
+        ).await;
+        assert!(out.is_none(), "an unauthentic message must not be able to pair");
+        let actions = ev.audited.lock().unwrap().clone();
+        assert!(!actions.iter().any(|(a, _)| a == actions::PAIRED),
+                "carve-out must be unreachable for unauthentic input");
+    }
+
+    #[tokio::test]
+    async fn unauthentic_audit_payload_carries_no_body_and_no_token() {
+        let auth = TokenAuthorizer { expected: "good-token" };
+        let ev = FakeEvents::default();
+        let secret_body = "my private question";
+        handle_inbound(&auth, None, &ev, &email_msg(secret_body, false, Some("good-token"))).await;
+        let audited = ev.audited.lock().unwrap().clone();
+        let (_, payload) = audited.iter().find(|(a, _)| a == actions::REJECTED_UNAUTHENTIC).unwrap();
+        let rendered = payload.to_string();
+        assert!(!rendered.contains(secret_body), "audit must never carry the body");
+        assert!(!rendered.contains("good-token"), "audit must never carry the token");
+    }
+
+    #[tokio::test]
+    async fn authentic_email_enqueues_normally() {
+        let auth = TokenAuthorizer { expected: "good-token" };
+        let ev = FakeEvents::default();
+        handle_inbound(&auth, None, &ev, &email_msg("what is 17*23?", true, Some("good-token"))).await;
+        assert_eq!(ev.enqueued.lock().unwrap().len(), 1, "a gated-pass email must become a task");
     }
 }
