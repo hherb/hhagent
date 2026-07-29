@@ -518,6 +518,19 @@ applies to a From header, so a case mismatch cannot silently fail to authorize."
 
 ---
 
+> ⚠️ **The code in this task was WRONG and has been superseded in-branch.** Review
+> found three Criticals in it, all originating here, not in the implementation:
+> (1) the `Authentication-Results` parse was blind to quoted strings and comments,
+> so `dmarc=fail` could be read as pass via a crafted property value — `;` is legal
+> inside an RFC 5321 quoted local-part; (2) a legal authserv-id carrying a version
+> or comment was skipped, letting a forged header below it decide; (3)
+> `trimmed[..TOKEN_PREFIX.len()]` byte-sliced without a char-boundary check, so a
+> CJK/emoji body panicked — and release builds are `panic = "abort"`, making it an
+> unauthenticated remote DoS. Two Importants followed: a quoted reply leaked the
+> token, and the "topmost *matching* header" rule let a typo'd authserv-id hand the
+> decision to a forgery. **The shipped implementation is the authority**; the rules
+> it follows are recorded in §4.3 of the design spec. Read the code, not this task.
+
 ### Task 4: pure gate — DMARC verdict + token extraction
 
 **Files:**

@@ -45,7 +45,7 @@ Two facts that post-date the 2026-06-12 design reshape the solution:
 | D5 | The token lives in a new **`pairings.token_sha256`** column, minted by `kastellan-cli pair issue-token --channel email --peer <addr>` | Reuses the pairing lifecycle: hash-only storage, printed once, revocable, audited. Nullable, so Matrix rows keep NULL and Matrix behaviour is byte-identical. A **separate subcommand**, not flags on `pair issue`: that mints a single-use code for an in-channel handshake, and one command meaning two different things depending on flags is a footgun. |
 | D6 | **Security decisions stay pure and in core**; the worker returns raw material | `channel/mod.rs` states every rejected message lands in `audit_log`. A gate inside the worker, or inside `parse_poll`, could not audit and would silently break that invariant. |
 | D7 | The inbound **cursor is localmail's**, via a server-side subscription | See §5. localmail may own non-security state; it must not make security decisions. |
-| D8 | Email pairing is **operator-only, out of band** | Falls out of D5: the token lives on the pairing row, so an unpaired sender can never present a valid one and the in-channel pairing carve-out is unreachable over email *by construction*. Removing an unauthenticated brute-force target on a spoofable transport is the right posture, and it needs no new per-channel config. |
+| D8 | Email pairing is **operator-only, out of band**, enforced by an explicit guard | Removing an unauthenticated brute-force target on a spoofable transport is the right posture. **Corrected 2026-07-29 after review:** this was originally justified as unreachable "by construction" because an unpaired sender holds no token. That reasoning was WRONG. An unpaired sender resolves to `Ok(None)` → `AuthDecision::Rejected`, which still reaches the carve-out; presenting a live single-use pairing code would then mint a `token_sha256 = NULL` row, **permanently disabling DMARC+token for that address**. The carve-out is therefore skipped explicitly whenever `msg.evidence.is_some()` — evidence being `Some` is precisely the marker for "this transport cannot authenticate its own peers", so the rule is general rather than an email special case. Matrix passes `evidence: None` and keeps the carve-out unchanged. |
 
 ## 3. Non-goals
 
@@ -119,14 +119,31 @@ All additive or parity-preserving:
      `In-Reply-To`/`References` and thread.
    * `evidence` = `PeerEvidence { dmarc_pass, presented_token }`, from two pure
      fns in `gate.rs`:
-     * `trusted_dmarc_verdict(headers, authserv_id)` — considers **only the
-       topmost `Authentication-Results` header whose authserv-id equals the
-       configured value.** A sender can write arbitrary `Authentication-Results`
-       lines into the message they send; only the one our own MX prepended is
-       evidence. No matching header ⇒ **fail closed**.
-     * `extract_token(body)` → `(Option<token>, stripped_body)`. The token is
-       removed **before** the body becomes the instruction, so the shared secret
+     * `trusted_dmarc_pass(headers, authserv_id)` — considers **only the very
+       first `Authentication-Results` header in wire order**, and requires its
+       authserv-id to equal the configured value. A sender can write arbitrary
+       `Authentication-Results` lines into the message they send; our own MX
+       prepends its header on receipt, so the genuine verdict is always the
+       topmost one. **Corrected 2026-07-29 after review:** the original rule
+       was "topmost *matching* header", which let a typo'd configured
+       authserv-id skip the genuine header and hand the decision to a forged
+       one below it. Anything other than a match on the first header now
+       **fails closed**, so a misconfiguration is loud rather than silently
+       trusting a forgery. Parsing is quote- and comment-aware (`;` is legal
+       inside an RFC 5321 quoted local-part and inside comments), and the
+       first `dmarc=` segment wins — `dmarc=fail; dmarc=pass` is a fail.
+     * `extract_token(body)` → `(Option<token>, stripped_body)`. **Every**
+       case-insensitive occurrence of the token prefix, anywhere in the body,
+       is removed from the prefix through end-of-line (a leading BOM is
+       stripped first); the first occurrence supplies the presented token. The
+       secret is removed **before** the body becomes the instruction, so it
        never reaches a task payload, an LLM prompt, or a quoted reply.
+       **Corrected 2026-07-29 after review:** the original rule was
+       line-anchored and enumerated `>` as the quote marker, which leaked the
+       secret via `|`, `}`, `:`, an inline `you wrote: kastellan-token: …`, and
+       a UTF-8 BOM (U+FEFF is not `White_Space`, so `trim_start` misses it).
+       Matching anywhere subsumes every marker in one rule. Stated limitation:
+       a token split across lines by transport folding cannot be detected.
 3. `handle_inbound` authorizes with the evidence. On `RejectedUnauthentic` it
    audits `channel.rejected_unauthentic` (peer + reason code only — never the
    body, never the token) and **skips the pairing carve-out**, so a spoofed
