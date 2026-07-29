@@ -15,7 +15,9 @@ use std::time::Duration;
 /// suffix rather than the literal `t.*` names so the same fake serves both
 /// `TEST_SPEC` and the ack-specific specs below (`email.*`, `matrix.*`).
 /// While `down` is set every call fails (simulating the supervisor's respawn
-/// window, where `PersistentHandle::call` returns `Err`).
+/// window, where `PersistentHandle::call` returns `Err`); `fail_method`, if
+/// set, fails only that one exact method (used to exercise the ack-specific
+/// failure path without taking the whole worker down).
 struct FakeState {
     down: AtomicBool,
     polls: Mutex<VecDeque<Value>>,
@@ -25,6 +27,10 @@ struct FakeState {
     /// use this to assert an ack method was (or was not) invoked, and with
     /// which params.
     log: Mutex<Vec<(String, Value)>>,
+    /// When `Some(m)`, calls to method `m` return `Err` instead of the usual
+    /// canned response, independent of `down`. `None` means no per-method
+    /// failure is injected.
+    fail_method: Mutex<Option<String>>,
 }
 struct FakeCalls(Arc<FakeState>);
 impl WorkerCalls for FakeCalls {
@@ -33,6 +39,9 @@ impl WorkerCalls for FakeCalls {
             anyhow::bail!("persistent worker is restarting");
         }
         self.0.log.lock().unwrap().push((method.to_string(), params.clone()));
+        if self.0.fail_method.lock().unwrap().as_deref() == Some(method) {
+            anyhow::bail!("fake: forced failure for {method}");
+        }
         if method.ends_with(".init") {
             self.0.init_calls.fetch_add(1, Ordering::SeqCst);
             return Ok(json!({"user_id": "@fake:srv"}));
@@ -64,6 +73,7 @@ fn fake() -> (Arc<FakeState>, Box<dyn WorkerCalls>) {
         sends: Mutex::new(Vec::new()),
         init_calls: AtomicUsize::new(0),
         log: Mutex::new(Vec::new()),
+        fail_method: Mutex::new(None),
     });
     (st.clone(), Box::new(FakeCalls(st)))
 }
@@ -308,10 +318,14 @@ fn ack_is_called_after_the_event_reaches_the_bus() {
 
 #[test]
 fn no_ack_method_means_no_ack_call() {
-    // Matrix must be untouched: its spec has ack_method: None.
+    // Matrix must be untouched: its spec has ack_method: None. The event
+    // carries an ack_token on purpose — this isolates "ack_method: None
+    // gates the call" from "ack_token: None gates the call" (the latter has
+    // its own dedicated test below); without a token here, this test would
+    // pass even if the ack_method gate were broken.
     let (st, calls) = fake();
     st.polls.lock().unwrap().push_back(json!({"events": [
-        {"peer": "@me:srv", "conversation": "!r", "body": "hi"}
+        {"peer": "@me:srv", "conversation": "!r", "body": "hi", "ack_token": "99"}
     ]}));
     let (mut driver, _identity) = PolledWorkerDriver::spawn(
         spec_without_ack(),
@@ -353,4 +367,48 @@ fn an_event_without_an_ack_token_is_not_acked() {
     assert_eq!(msg.peer.0, "me@example.org");
     std::thread::sleep(Duration::from_millis(150));
     assert!(!st.log.lock().unwrap().iter().any(|(m, _)| m == "email.ack"));
+}
+
+#[test]
+fn ack_failure_is_non_fatal_and_the_driver_keeps_polling() {
+    // The whole reason the ack fires AFTER the bus hand-off is to guarantee
+    // redelivery when the ack itself fails. This test pins that: it forces
+    // `email.ack` to error while init/poll/send keep succeeding, and proves
+    // the driver thread survives — it must still be alive and polling well
+    // after the failed ack, not dead from an accidental early return.
+    let (st, calls) = fake();
+    st.polls.lock().unwrap().push_back(json!({"events": [
+        {"peer": "me@example.org", "conversation": "<a>", "body": "first", "ack_token": "1"}
+    ]}));
+    *st.fail_method.lock().unwrap() = Some("email.ack".to_string());
+    let (mut driver, _identity) = PolledWorkerDriver::spawn(
+        spec_with_ack(),
+        calls,
+        test_parse,
+        test_encode,
+        Some(encode_test_ack),
+        ChannelId("email".into()),
+    )
+    .unwrap();
+
+    let first = driver.inbound_rx.blocking_recv().expect("first inbound event");
+    assert_eq!(first.body, "first");
+
+    // Wait for the (failing) ack attempt itself, so we know the ack branch
+    // actually ran — not merely that it was skipped for some other reason.
+    wait_until(|| st.log.lock().unwrap().iter().any(|(m, _)| m == "email.ack"));
+
+    // Only now queue a second event: if the driver thread died in the
+    // ack-failure arm (e.g. a stray `return;`), inbound_rx would be closed
+    // and blocking_recv below would return None instead of the event —
+    // panicking with a clear message rather than hanging, since a dead
+    // driver drops its inbound_tx sender.
+    st.polls.lock().unwrap().push_back(json!({"events": [
+        {"peer": "me@example.org", "conversation": "<a>", "body": "second", "ack_token": "2"}
+    ]}));
+    let second = driver
+        .inbound_rx
+        .blocking_recv()
+        .expect("driver must keep polling after a failed ack, not die");
+    assert_eq!(second.body, "second");
 }
