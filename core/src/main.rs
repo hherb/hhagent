@@ -488,13 +488,18 @@ async fn main() -> Result<()> {
     let matrix_bus = matrix_boot::spawn_matrix_channel(&pool, &sandboxes, &force_routing).await;
 
     // ── Channel bus (Phase 2 slice #5 — email fallback). ──
-    // Gated on KASTELLAN_EMAIL_ENDPOINT (checked inside): unset ⇒ `Ok(None)`,
-    // and the daemon is byte-identical to an email-less build. Unlike Matrix,
-    // a set-but-partial config or a worker spawn failure ABORTS startup here
-    // (`?`) rather than logging and continuing — a half-configured email
-    // channel would reject every message closed and look like a delivery bug
-    // rather than the misconfiguration it is. See `main/email_boot.rs`.
-    let email_bus = email_boot::spawn_email_channel(&pool, &sandboxes, &force_routing).await?;
+    // Gated on KASTELLAN_EMAIL_ENDPOINT (checked inside): unset ⇒ `None` and
+    // the daemon is byte-identical to an email-less build. A set-but-partial
+    // config, a worker spawn failure, or a listener failure logs a loud
+    // `error!` naming what's wrong and yields `None` — the EMAIL CHANNEL does
+    // not start, the daemon does. Deliberately NOT an abort: this is the
+    // FALLBACK channel (it exists because Matrix has no homeserver failover),
+    // so a typo in its config must never take Matrix, the scheduler, and the
+    // graceful-shutdown path below down with it. Design §6 says the daemon
+    // refuses to start *the email channel*, not the daemon. The function
+    // returns `Option`, not `Result`, so no future `?` can reinstate the
+    // abort. See `main/email_boot.rs`.
+    let email_bus = email_boot::spawn_email_channel(&pool, &sandboxes, &force_routing).await;
 
     bootstrap::wait_for_shutdown().await?;
 

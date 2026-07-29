@@ -19,10 +19,60 @@ pub enum AuthDecision {
     /// Peer is paired but the transport-supplied evidence (DMARC and/or the
     /// per-pairing token) didn't check out. Distinct from [`Rejected`] because
     /// the bus must skip the pairing carve-out entirely for this outcome — see
-    /// `bus::handle_inbound`.
+    /// `bus::handle_inbound`. Carries a [`UnauthenticReason`] so the audit row
+    /// can say *which* check failed: without it, a wrong
+    /// `KASTELLAN_EMAIL_AUTHSERV_ID` (which rejects every single message —
+    /// TRAP 1 in `install::plan::render_email_help`) is byte-identical in
+    /// `audit_log` to a token typo, and the operator has nothing to diagnose
+    /// with. Design spec §4.3 + §6 both promise this reason code.
     ///
     /// [`Rejected`]: AuthDecision::Rejected
-    RejectedUnauthentic,
+    RejectedUnauthentic(UnauthenticReason),
+}
+
+/// Why an evidence-bearing message was refused. Every variant is a **non-secret
+/// classification label** — deliberately so, because [`Self::as_str`]'s output is
+/// written verbatim into a durable `audit_log` payload by
+/// `bus::handle_inbound`. A reason must therefore never be derived from, nor
+/// carry any fragment of, the message body, its headers, or the presented
+/// token. Adding a variant means adding another fixed label, never an
+/// interpolated value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnauthenticReason {
+    /// The pairing row carries **no** token, but the transport handed us
+    /// evidence — i.e. it is a transport that cannot vouch for its own sender.
+    /// Such a peer is admitted purely on the strength of the per-pairing
+    /// token, so a token-less row is *misconfigured* for it, not permissive.
+    /// See [`DbPeerAuthorizer::authorize`]'s `Ok(Some(None))` arm.
+    PairingHasNoToken,
+    /// The pairing requires a token but the transport supplied no evidence at
+    /// all (so neither a DMARC verdict nor a token could be checked).
+    NoEvidence,
+    /// The transport's DMARC verdict did not pass. This also covers the
+    /// **order-unknown** case: `email::wire::parse_email_poll_with` folds an
+    /// un-orderable `Authentication-Results` set into `dmarc_pass: false`
+    /// before the authorizer ever sees it, so the two are indistinguishable
+    /// here by construction (noted in the review's §5).
+    DmarcFail,
+    /// DMARC passed but the body presented no token at all.
+    NoToken,
+    /// A token was presented but did not match the pairing's stored hash.
+    TokenMismatch,
+}
+
+impl UnauthenticReason {
+    /// Stable audit label. These strings land in `audit_log` payloads that
+    /// operators query, so treat them as an interface: add new ones freely,
+    /// but do not rename an existing one.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PairingHasNoToken => "pairing_has_no_token",
+            Self::NoEvidence => "no_evidence",
+            Self::DmarcFail => "dmarc_fail",
+            Self::NoToken => "no_token",
+            Self::TokenMismatch => "token_mismatch",
+        }
+    }
 }
 
 /// The authorization seam. Async + `(channel, peer)`-scoped. Dyn-safe.
@@ -102,27 +152,55 @@ impl PeerAuthorizer for DbPeerAuthorizer {
         match kastellan_db::pairings::token_hash_for(&self.pool, &channel.0, &peer.0).await {
             // No active pairing.
             Ok(None) => AuthDecision::Rejected,
-            // Paired, no token required (Matrix) — evidence is not consulted.
-            Ok(Some(None)) => AuthDecision::Recognised,
+            // Paired, no token required — the Matrix shape, and valid ONLY for
+            // a transport that authenticates its own peers.
+            //
+            // `evidence.is_some()` is this branch's general marker for "this
+            // transport cannot vouch for its sender" — the SAME marker
+            // `bus::handle_inbound` uses to gate the pairing carve-out (spec
+            // D8). An evidence-bearing peer is admitted purely on the strength
+            // of its per-pairing token, so a row that carries none is
+            // MISCONFIGURED for that transport, not permissive: admitting here
+            // would collapse the entire email gate (no DMARC check, no token)
+            // for that address. Nothing creates such a row today — but nothing
+            // *prevents* one either (no DB CHECK; `insert_pairing`'s only
+            // caller is the now-guarded carve-out), so the guard is the thing
+            // that keeps it safe rather than an accident of call sites.
+            // Fail closed.
+            //
+            // Matrix always passes `evidence: None` (`matrix/wire.rs`), so this
+            // guard is Matrix-neutral by construction — pinned by
+            // `channel_bus_pg_e2e::db_peer_authorizer_covers_all_evidence_arms_…`.
+            Ok(Some(None)) => {
+                if evidence.is_some() {
+                    tracing::warn!(channel = %channel.0,
+                        "pairing carries no token but the transport supplied evidence; \
+                         refusing (pairing is misconfigured for this transport)");
+                    return AuthDecision::RejectedUnauthentic(
+                        UnauthenticReason::PairingHasNoToken,
+                    );
+                }
+                AuthDecision::Recognised
+            }
             // Paired WITH a token: the transport must supply evidence, DMARC
             // must pass, and the token must match.
             Ok(Some(Some(expected))) => {
                 let Some(ev) = evidence else {
                     tracing::warn!(channel = %channel.0,
                         "pairing requires a token but the transport supplied no evidence");
-                    return AuthDecision::RejectedUnauthentic;
+                    return AuthDecision::RejectedUnauthentic(UnauthenticReason::NoEvidence);
                 };
                 if !ev.dmarc_pass {
-                    return AuthDecision::RejectedUnauthentic;
+                    return AuthDecision::RejectedUnauthentic(UnauthenticReason::DmarcFail);
                 }
                 let presented = match ev.presented_token.as_deref() {
                     Some(t) => crate::channel::ingest::sha256_hex(t.as_bytes()),
-                    None => return AuthDecision::RejectedUnauthentic,
+                    None => return AuthDecision::RejectedUnauthentic(UnauthenticReason::NoToken),
                 };
                 if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
                     AuthDecision::Recognised
                 } else {
-                    AuthDecision::RejectedUnauthentic
+                    AuthDecision::RejectedUnauthentic(UnauthenticReason::TokenMismatch)
                 }
             }
             Err(e) => {
@@ -205,5 +283,39 @@ mod tests {
     #[test]
     fn constant_time_eq_false_for_different_lengths() {
         assert!(!constant_time_eq(b"short", b"a much longer string"));
+    }
+
+    // ---- UnauthenticReason: the audit labels are an operator-facing
+    // interface, so pin the exact strings AND the "no secret ever" property. ----
+
+    #[test]
+    fn unauthentic_reason_labels_are_stable() {
+        // Renaming any of these silently breaks operator audit_log queries.
+        assert_eq!(UnauthenticReason::PairingHasNoToken.as_str(), "pairing_has_no_token");
+        assert_eq!(UnauthenticReason::NoEvidence.as_str(), "no_evidence");
+        assert_eq!(UnauthenticReason::DmarcFail.as_str(), "dmarc_fail");
+        assert_eq!(UnauthenticReason::NoToken.as_str(), "no_token");
+        assert_eq!(UnauthenticReason::TokenMismatch.as_str(), "token_mismatch");
+    }
+
+    #[test]
+    fn unauthentic_reason_labels_are_fixed_lowercase_identifiers_not_interpolated() {
+        // A reason is written verbatim into a durable audit row, so it must be
+        // a fixed classification label — never anything that could have picked
+        // up a body fragment, a header, or a token.
+        for r in [
+            UnauthenticReason::PairingHasNoToken,
+            UnauthenticReason::NoEvidence,
+            UnauthenticReason::DmarcFail,
+            UnauthenticReason::NoToken,
+            UnauthenticReason::TokenMismatch,
+        ] {
+            let s = r.as_str();
+            assert!(!s.is_empty());
+            assert!(
+                s.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "reason label {s:?} must be a fixed [a-z_] identifier"
+            );
+        }
     }
 }

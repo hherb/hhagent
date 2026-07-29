@@ -117,8 +117,11 @@ impl CompletedTasks for PgCompletedTasks {
 /// Handle one inbound message. Order is security-load-bearing:
 ///   1. **authorize** (`(channel, peer, evidence)`), yielding three distinct
 ///      outcomes:
-///      - `RejectedUnauthentic` — the transport-supplied evidence didn't check
-///        out (bad DMARC / token). Dropped + audited immediately, BEFORE and
+///      - `RejectedUnauthentic(reason)` — the transport-supplied evidence
+///        didn't check out (bad DMARC / missing-or-wrong token / a pairing
+///        row with no token at all). Dropped + audited immediately, carrying
+///        `reason`'s stable label so the four denial arms are tellable apart
+///        in `audit_log`, and BEFORE and
 ///        WITHOUT the pairing carve-out: that carve-out compares unpaired
 ///        input against a live single-use code, and a transport that cannot
 ///        authenticate its sender must never get to attempt that;
@@ -145,16 +148,26 @@ pub async fn handle_inbound(
 ) -> Option<OutgoingMessage> {
     match authorizer.authorize(&msg.channel, &msg.peer, msg.evidence.as_ref()).await {
         AuthDecision::Recognised => {}
-        AuthDecision::RejectedUnauthentic => {
+        AuthDecision::RejectedUnauthentic(reason) => {
             // Deliberately BEFORE and WITHOUT the pairing carve-out: the carve-out
             // compares unpaired input against a live code, and a transport that
             // cannot authenticate its sender must not get to attempt that.
-            // Payload carries the channel + peer only — never the body, never
-            // the token.
+            // Payload carries the channel + peer + the reason CODE only — never
+            // the body, never the token, never a header. `reason` is one of a
+            // fixed set of `[a-z_]` labels (`UnauthenticReason::as_str`), which
+            // is what makes it safe to persist: without it every denial arm
+            // (DMARC fail, no token, wrong token, token-less pairing) writes a
+            // byte-identical row, and a wrong `KASTELLAN_EMAIL_AUTHSERV_ID` —
+            // the single most likely misconfiguration here, which rejects
+            // EVERY message — is indistinguishable from a token typo.
             events
                 .audit(
                     actions::REJECTED_UNAUTHENTIC,
-                    serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
+                    serde_json::json!({
+                        "channel": msg.channel.0,
+                        "peer": msg.peer.0,
+                        "reason": reason.as_str(),
+                    }),
                 )
                 .await;
             return None;

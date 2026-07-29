@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use kastellan_core::channel::auth::{AuthDecision, PeerAuthorizer};
+use kastellan_core::channel::auth::{AuthDecision, PeerAuthorizer, UnauthenticReason};
 use kastellan_core::channel::bus::{ChannelBus, ChannelEvents, CompletedTasks};
 use kastellan_core::channel::email::{wire, EmailChannel};
 use kastellan_core::channel::polled_driver::PolledWorkerDriver;
@@ -122,12 +122,16 @@ impl PeerAuthorizer for TokenAuthorizer {
         _p: &kastellan_core::channel::PeerId,
         evidence: Option<&PeerEvidence>,
     ) -> AuthDecision {
-        match evidence {
-            Some(e) if e.dmarc_pass && e.presented_token.as_deref() == Some("good-token") => {
-                AuthDecision::Recognised
-            }
-            Some(_) => AuthDecision::RejectedUnauthentic,
-            None => AuthDecision::Rejected,
+        let Some(e) = evidence else {
+            return AuthDecision::Rejected;
+        };
+        if !e.dmarc_pass {
+            return AuthDecision::RejectedUnauthentic(UnauthenticReason::DmarcFail);
+        }
+        match e.presented_token.as_deref() {
+            Some("good-token") => AuthDecision::Recognised,
+            Some(_) => AuthDecision::RejectedUnauthentic(UnauthenticReason::TokenMismatch),
+            None => AuthDecision::RejectedUnauthentic(UnauthenticReason::NoToken),
         }
     }
 }
@@ -434,11 +438,22 @@ async fn skipped_ids_are_acked_even_though_they_never_become_a_task() {
 
 // ── Task 10: daemon config gate ────────────────────────────────────────────
 //
-// The whole byte-identical-when-unset guarantee, plus the "partial config
-// aborts startup, never a silent skip" rule — see
+// The whole byte-identical-when-unset guarantee, plus the "partial config is
+// an error, never a silent skip" rule — see
 // `core/src/channel/email/config.rs`'s module docs for why a half-configured
 // channel is worse than no channel at all (a missing authserv-id would fail
 // every message closed, which looks exactly like a delivery bug).
+//
+// What that error DOES is scoped: `main::email_boot::spawn_email_channel`
+// turns it into a loud `error!` and returns `None`, so the EMAIL CHANNEL does
+// not start but the daemon does (design §6; final whole-branch review,
+// Important 5). It no longer aborts startup — the fallback channel must never
+// be able to take Matrix, the scheduler, or the graceful-shutdown path down
+// with it. `spawn_email_channel` itself needs the real daemon pool + sandbox
+// backends, so it is not directly unit-testable here; what IS pinned here is
+// the contract it consumes (`Ok(None)` vs `Err`), and `email_boot.rs`'s own
+// signature (`-> Option<ChannelBus>`, no `Result`) is what makes the abort
+// unreachable by construction.
 
 use kastellan_tests_common::env::{env_lock, EnvVarGuard};
 
@@ -464,5 +479,17 @@ fn partial_email_config_is_an_error_not_a_silent_skip() {
     let _i = EnvVarGuard::unset("KASTELLAN_EMAIL_AUTHSERV_ID");
     let _t = EnvVarGuard::unset("KASTELLAN_EMAIL_TOKEN_FILE");
     let _e = EnvVarGuard::set("KASTELLAN_EMAIL_ENDPOINT", "https://10.0.0.3:8443");
-    assert!(kastellan_core::channel::email::config::EmailConfig::from_env().is_err());
+    let err = kastellan_core::channel::email::config::EmailConfig::from_env()
+        .expect_err("a partial config must be an error, not a silent partial start")
+        .to_string();
+    // The daemon no longer aborts on this, so the message IS the remedy: it
+    // must name EVERY missing variable, or the operator restarts once per typo.
+    for key in [
+        "KASTELLAN_EMAIL_SUBSCRIPTION",
+        "KASTELLAN_EMAIL_ADDRESS",
+        "KASTELLAN_EMAIL_AUTHSERV_ID",
+        "KASTELLAN_EMAIL_TOKEN_FILE",
+    ] {
+        assert!(err.contains(key), "{key} must be named in the operator-facing error: {err}");
+    }
 }

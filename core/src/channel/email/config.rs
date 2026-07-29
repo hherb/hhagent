@@ -11,6 +11,16 @@
 //! message (an empty configured id never matches), which looks exactly like
 //! a delivery bug rather than the misconfiguration it actually is.
 //!
+//! **What that `Err` costs, and what it does not.** It refuses **the email
+//! channel**, not the daemon: `main::email_boot::spawn_email_channel` turns
+//! it into a loud `error!` and the daemon comes up with the email channel
+//! absent (design spec §6, and the final whole-branch review's Important 5).
+//! The fallback channel exists precisely because Matrix has no homeserver
+//! failover, so letting a typo in the fallback's config take the primary
+//! channel and the scheduler down with it inverts the whole point. The
+//! error therefore names **every** missing variable at once, not just the
+//! first — it is a message an operator reads and acts on, not an abort code.
+//!
 //! `EmailConfig::from_env` is a thin wrapper over the pure, injectable-getter
 //! [`parse_email_config`] (mirrors `matrix/config.rs`'s
 //! `parse_daemon_spawn_config` pattern) so the required/optional/blank
@@ -46,7 +56,8 @@ impl EmailConfig {
     /// Read config from the process environment. `Ok(None)` when
     /// `KASTELLAN_EMAIL_ENDPOINT` is unset or blank (channel absent). `Err`
     /// when it is set but any other required field is missing/blank, or the
-    /// worker binary cannot be resolved (see [`parse_email_config`]).
+    /// worker binary cannot be resolved (see [`parse_email_config`]). The
+    /// `Err` disables the CHANNEL, never the daemon — see the module docs.
     ///
     /// Env contract:
     /// - `KASTELLAN_EMAIL_ENDPOINT` (gate) — e.g. `https://127.0.0.1:8443`.
@@ -85,14 +96,32 @@ pub(crate) fn parse_email_config(
         return Ok(None);
     };
 
-    let require = |key: &str| -> anyhow::Result<String> {
-        non_blank(get(key))
-            .ok_or_else(|| anyhow::anyhow!("{key} is required once KASTELLAN_EMAIL_ENDPOINT is set"))
+    // Collect EVERY missing required var before failing, rather than `?`-ing
+    // out at the first one. The error is now an operator-facing log line
+    // rather than a startup abort (see `EmailConfig::from_env`'s docs), so
+    // naming all of them means one restart to fix a three-typo env file
+    // instead of three.
+    let mut missing: Vec<&'static str> = Vec::new();
+    let mut require = |key: &'static str| -> String {
+        match non_blank(get(key)) {
+            Some(v) => v,
+            None => {
+                missing.push(key);
+                String::new()
+            }
+        }
     };
-    let subscription = require("KASTELLAN_EMAIL_SUBSCRIPTION")?;
-    let address = require("KASTELLAN_EMAIL_ADDRESS")?;
-    let authserv_id = require("KASTELLAN_EMAIL_AUTHSERV_ID")?;
-    let token_file = require("KASTELLAN_EMAIL_TOKEN_FILE")?;
+    let subscription = require("KASTELLAN_EMAIL_SUBSCRIPTION");
+    let address = require("KASTELLAN_EMAIL_ADDRESS");
+    let authserv_id = require("KASTELLAN_EMAIL_AUTHSERV_ID");
+    let token_file = require("KASTELLAN_EMAIL_TOKEN_FILE");
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "missing or blank: {} ({} required once KASTELLAN_EMAIL_ENDPOINT is set)",
+            missing.join(", "),
+            if missing.len() == 1 { "is" } else { "are all" },
+        );
+    }
 
     let worker_bin = non_blank(get("KASTELLAN_EMAIL_WORKER_BIN"))
         .map(PathBuf::from)
@@ -203,6 +232,23 @@ mod tests {
         let g = env(&pairs);
         let err = parse_email_config(g, Some(Path::new("/exe"))).unwrap_err();
         assert!(err.to_string().contains("KASTELLAN_EMAIL_TOKEN_FILE"), "{err}");
+    }
+
+    /// The error is an operator-facing log line (the daemon no longer aborts
+    /// on it — see the module docs), so it must name EVERY missing variable,
+    /// not just whichever one happened to be checked first.
+    #[test]
+    fn every_missing_required_var_is_named_in_one_error() {
+        let g = env(&[("KASTELLAN_EMAIL_ENDPOINT", "https://127.0.0.1:8443")]);
+        let err = parse_email_config(g, Some(Path::new("/exe"))).unwrap_err().to_string();
+        for key in [
+            "KASTELLAN_EMAIL_SUBSCRIPTION",
+            "KASTELLAN_EMAIL_ADDRESS",
+            "KASTELLAN_EMAIL_AUTHSERV_ID",
+            "KASTELLAN_EMAIL_TOKEN_FILE",
+        ] {
+            assert!(err.contains(key), "{key} missing from the error: {err}");
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! a real cluster, plus the real `DbPeerAuthorizer`.
 
 use super::*;
-use crate::channel::auth::StaticPairings;
+use crate::channel::auth::{StaticPairings, UnauthenticReason};
 use crate::channel::{ChannelId, ConversationId, IncomingMessage, PeerEvidence, PeerId};
 use std::sync::Mutex;
 
@@ -163,7 +163,9 @@ async fn outbound_ignores_non_channel_completion() {
     assert!(ev.audited.lock().unwrap().is_empty()); // no reply audit for non-channel
 }
 
-/// Authorizer that mimics DbPeerAuthorizer's evidence rule without a DB.
+/// Authorizer that mimics DbPeerAuthorizer's evidence rule without a DB,
+/// including its per-arm [`UnauthenticReason`] classification, so the bus's
+/// audit payload can be asserted against the same reasons production emits.
 struct TokenAuthorizer {
     expected: &'static str,
 }
@@ -176,11 +178,16 @@ impl PeerAuthorizer for TokenAuthorizer {
         _p: &PeerId,
         evidence: Option<&PeerEvidence>,
     ) -> AuthDecision {
-        match evidence {
-            Some(e) if e.dmarc_pass
-                && e.presented_token.as_deref() == Some(self.expected) => AuthDecision::Recognised,
-            Some(_) => AuthDecision::RejectedUnauthentic,
-            None => AuthDecision::Rejected,
+        let Some(e) = evidence else {
+            return AuthDecision::Rejected;
+        };
+        if !e.dmarc_pass {
+            return AuthDecision::RejectedUnauthentic(UnauthenticReason::DmarcFail);
+        }
+        match e.presented_token.as_deref() {
+            Some(t) if t == self.expected => AuthDecision::Recognised,
+            Some(_) => AuthDecision::RejectedUnauthentic(UnauthenticReason::TokenMismatch),
+            None => AuthDecision::RejectedUnauthentic(UnauthenticReason::NoToken),
         }
     }
 }
@@ -237,6 +244,50 @@ async fn unauthentic_audit_payload_carries_no_body_and_no_token() {
     let rendered = payload.to_string();
     assert!(!rendered.contains(secret_body), "audit must never carry the body");
     assert!(!rendered.contains("good-token"), "audit must never carry the token");
+}
+
+/// The audit row must say WHICH check failed. Without this, a wrong
+/// `KASTELLAN_EMAIL_AUTHSERV_ID` (rejects every message — TRAP 1 in the
+/// operator env help) writes a row byte-identical to a token typo's.
+#[tokio::test]
+async fn unauthentic_audit_payload_carries_the_specific_reason_code() {
+    let auth = TokenAuthorizer { expected: "good-token" };
+
+    for (m, want) in [
+        // DMARC verdict failed (this also folds in order-unknown, which
+        // `email::wire` turns into `dmarc_pass: false` upstream).
+        (email_msg("hi", false, Some("good-token")), "dmarc_fail"),
+        // DMARC fine, but the body presented no token at all.
+        (email_msg("hi", true, None), "no_token"),
+        // DMARC fine, a token was presented, but it is the wrong one.
+        (email_msg("hi", true, Some("guessed")), "token_mismatch"),
+    ] {
+        let ev = FakeEvents::default();
+        handle_inbound(&auth, None, &ev, &m).await;
+        let audited = ev.audited.lock().unwrap().clone();
+        let (_, payload) =
+            audited.iter().find(|(a, _)| a == actions::REJECTED_UNAUTHENTIC).expect("audited");
+        assert_eq!(payload["reason"], want, "wrong reason code in {payload}");
+        assert_eq!(payload["channel"], "email");
+        assert_eq!(payload["peer"], "me@example.org");
+    }
+}
+
+/// The reason code must not become a new leak channel: it is a fixed label,
+/// so no body/token text may appear alongside it.
+#[tokio::test]
+async fn reason_code_does_not_leak_the_body_or_the_token() {
+    let auth = TokenAuthorizer { expected: "good-token" };
+    let ev = FakeEvents::default();
+    let secret_body = "my private question";
+    handle_inbound(&auth, None, &ev, &email_msg(secret_body, true, Some("guessed-token"))).await;
+    let audited = ev.audited.lock().unwrap().clone();
+    let (_, payload) =
+        audited.iter().find(|(a, _)| a == actions::REJECTED_UNAUTHENTIC).expect("audited");
+    assert_eq!(payload["reason"], "token_mismatch");
+    let rendered = payload.to_string();
+    assert!(!rendered.contains(secret_body), "audit must never carry the body");
+    assert!(!rendered.contains("guessed-token"), "audit must never carry the token");
 }
 
 #[tokio::test]

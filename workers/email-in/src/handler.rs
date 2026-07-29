@@ -8,10 +8,13 @@
 //!
 //! `email.poll`'s result carries two lists, never silently dropping a
 //! message: `events` (usable, handed to the bus) and `skipped`
-//! (`{"message_id", "reason"}` — unattributable or unfetchable, left for a
-//! later task to ack+audit; see the module docs on `build_event` and
-//! `poll` for the full reasoning, and `task-7-report.md`'s "Fix round 1"
-//! section for the review findings this addresses).
+//! (`{"message_id", "reason"}` — unattributable or **permanently**
+//! unfetchable, left for a later task to ack+audit; see the module docs on
+//! `build_event` and `poll` for the full reasoning, and `task-7-report.md`'s
+//! "Fix round 1" section for the review findings this addresses). A
+//! **transient** fetch failure appears in NEITHER list on purpose, so the
+//! server-side cursor cannot advance past a message the bus never saw — see
+//! `is_permanent`.
 
 use std::collections::HashSet;
 
@@ -67,13 +70,40 @@ impl EmailInHandler {
     /// reserved for when there is a real event to deliver; everything else
     /// waits out the full long-poll window like an ordinary empty poll would.
     ///
-    /// A message that can't become an event is never silently dropped: it is
-    /// recorded in the `skipped` list (`{"message_id", "reason"}`) and
-    /// logged to stderr, so core can later ack+audit it instead of the
-    /// subscription cursor wedging on it forever (it would otherwise never
-    /// advance, since nothing ever acks an id nobody ever saw). This worker
-    /// does not ack skipped ids itself — ack ownership stays in core (spec
-    /// D6): only the separate `email.ack` RPC ever calls `client.ack`.
+    /// A message that can't become an event is never silently dropped, but
+    /// what happens to it depends on **why** — see [`is_permanent`]:
+    ///
+    /// * A **permanent** failure (unattributable `From`, or a
+    ///   `message_detail` 4xx that will never succeed) is recorded in the
+    ///   `skipped` list (`{"message_id", "reason"}`) and logged, so core can
+    ///   ack+audit it instead of the subscription cursor wedging on it
+    ///   forever (it would otherwise never advance, since nothing ever acks
+    ///   an id nobody ever saw).
+    /// * A **transient** failure (`Transport(_)`, 5xx, 408, 429) is logged
+    ///   and omitted from BOTH lists, so nothing acks it, the cursor stays
+    ///   put, and localmail redelivers the message on the next poll. Acking
+    ///   it would move a MONOTONIC `GREATEST` cursor past a message the bus
+    ///   never saw — permanent, silent mail loss on nothing worse than a
+    ///   localmail restart.
+    ///
+    /// Either way the rest of the batch keeps being processed; one bad
+    /// message never aborts the others.
+    ///
+    /// **Known residual (batch ordering).** Core acks each event's own id, so
+    /// if a LATER message in the same batch succeeds while an earlier one
+    /// failed transiently, the later ack still drags the shared `GREATEST`
+    /// cursor past the earlier hole. This fix removes the common,
+    /// fully-avoidable loss (a blip fails the fetches it touches — typically
+    /// all of them, since the cause is the transport or localmail itself, in
+    /// which case there is no successful later event to ack) and cannot make
+    /// anything worse than the previous behaviour, which lost the message
+    /// unconditionally. Closing the residual completely needs a per-message
+    /// ack contract between the worker and localmail's cursor, not a
+    /// worker-side change.
+    ///
+    /// This worker does not ack skipped ids itself — ack ownership stays in
+    /// core (spec D6): only the separate `email.ack` RPC ever calls
+    /// `client.ack`.
     ///
     /// `seen` deduplicates within one `poll()` call: while the subscription
     /// cursor is unmoved, `changes` keeps returning the same stuck message on
@@ -113,7 +143,19 @@ impl EmailInHandler {
                         Some(event) => events.push(event),
                         None => record_skip(&mut skipped, message_id, "no usable From address"),
                     },
-                    Err(e) => record_skip(&mut skipped, message_id, &describe_email_error(&e)),
+                    // PERMANENT failure: this id will never fetch. Record it in
+                    // `skipped` so core acks it and the cursor moves past — one
+                    // poisoned message must not wedge the channel forever.
+                    Err(e) if is_permanent(&e) => {
+                        record_skip(&mut skipped, message_id, &describe_email_error(&e))
+                    }
+                    // TRANSIENT failure: deliberately in NEITHER list, so the
+                    // cursor does not advance and localmail redelivers it. See
+                    // `is_permanent`'s docs for why this distinction is a
+                    // data-loss fix, not a nicety. `seen` already holds the id,
+                    // so the retry slices below won't re-fetch it within this
+                    // same poll() call.
+                    Err(e) => record_transient(message_id, &describe_email_error(&e)),
                 }
             }
 
@@ -195,14 +237,82 @@ fn describe_email_error(e: &EmailError) -> String {
     }
 }
 
+/// Is this `message_detail` failure **permanent** — i.e. will retrying the
+/// exact same request never succeed?
+///
+/// This split is load-bearing for at-least-once delivery, and getting it
+/// wrong in either direction is a real bug (final whole-branch review,
+/// Important 2):
+///
+/// * **Permanent → `skipped`.** Core acks a skipped id
+///   (`polled_driver::run`'s ack-only loop), which advances localmail's
+///   subscription cursor past it. That is exactly what a 404 needs: without
+///   it the cursor can never move and ONE unfetchable message wedges the
+///   whole inbound channel forever.
+/// * **Transient → neither list.** Acking a transient failure would advance
+///   that same cursor — and it is a MONOTONIC `GREATEST` high-water mark, so
+///   the message can never be redelivered. A localmail restart or an egress
+///   blip in the window between `GET /v1/changes` and
+///   `GET /v1/messages/{id}` would then destroy the user's email silently.
+///   Leaving it unresolved keeps the cursor put and localmail redelivers it
+///   on the next poll — the "no loss" the design spec §6 promises for a
+///   localmail outage.
+///
+/// Classification, deliberately conservative (anything not provably permanent
+/// is treated as transient, because the transient branch's failure mode is
+/// redelivery and the permanent branch's is destruction):
+///
+/// * `Upstream { 400..=499 }` — permanent (404 gone, 403 not-permitted, …),
+///   **except** `408 Request Timeout` and `429 Too Many Requests`, which are
+///   explicitly retryable in HTTP semantics.
+/// * `Upstream { 5xx }` — transient. A server error is by definition the
+///   server's temporary problem.
+/// * `Transport(_)` — transient: connection reset, TLS failure, no route.
+/// * `BadParams(_)` — permanent: the worker built the request itself from the
+///   message id, so an identical retry yields an identical failure.
+///
+/// **Known residual, accepted:** `Transport(_)` also covers a JSON decode
+/// failure and a response exceeding `JSON_MAX_BYTES`, which are in practice
+/// permanent for that message and will therefore be retried forever, holding
+/// the cursor. That is the *safe* direction (nothing is lost, the operator
+/// sees the same transient log line every poll) and the alternative —
+/// classifying decode failures as permanent — would ack away a message merely
+/// because localmail hiccuped mid-body. A cap/decode-specific error variant
+/// is the clean fix and belongs with the body-size cap already filed for a
+/// later slice.
+fn is_permanent(e: &EmailError) -> bool {
+    match e {
+        EmailError::BadParams(_) => true,
+        EmailError::Upstream { status, .. } => {
+            (400..500).contains(status) && *status != 408 && *status != 429
+        }
+        EmailError::Transport(_) => false,
+    }
+}
+
 /// Record one message as unable to become an event — logged to stderr AND
 /// appended to `skipped`, never silently dropped (review finding C2b: a
 /// dropped-with-no-trace message meant the subscription cursor could never
 /// advance past it, since nothing ever acks an id nobody ever saw). This
 /// worker never acks a skipped id itself; that stays a core decision.
+///
+/// **Only ever call this for a PERMANENT failure** — see [`is_permanent`]:
+/// core acks every id in `skipped`, which moves the cursor past it for good.
 fn record_skip(skipped: &mut Vec<serde_json::Value>, message_id: &str, reason: &str) {
     eprintln!("kastellan-worker-email-in: skipping message {message_id}: {reason}");
     skipped.push(serde_json::json!({ "message_id": message_id, "reason": reason }));
+}
+
+/// Log a TRANSIENT `message_detail` failure. Deliberately does **not** touch
+/// `skipped` — see [`is_permanent`]. Worded distinctly from
+/// [`record_skip`]'s "skipping" line (which means "gone for good") so an
+/// operator grepping stderr can tell "this will come back" from "this was
+/// dropped", which is the whole point of the distinction.
+fn record_transient(message_id: &str, reason: &str) {
+    eprintln!(
+        "kastellan-worker-email-in: transient failure on message {message_id} \
+         (NOT acked, will be redelivered): {reason}"
+    );
 }
 
 /// Build one event from a localmail message detail

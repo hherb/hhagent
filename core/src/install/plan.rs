@@ -206,8 +206,13 @@ pub fn render_email_help() -> String {
 # Inbound only in this slice: the agent can receive and act on email, but
 # replies still go out over Matrix until slice 2 ships the SMTP worker.
 #
-# All five are required together once you set the first one — a partial
-# config aborts daemon startup rather than silently skipping the channel.
+# All five are required together once you set the first one. A partial config
+# does NOT silently skip the channel and does NOT take the daemon down: the
+# daemon logs a loud "EMAIL CHANNEL DISABLED" error naming every missing
+# variable, then comes up with Matrix and the scheduler running and the email
+# channel OFF. Grep the startup log for that line before assuming the channel
+# is live. (This is the fallback channel; a typo in it must never remove the
+# primary one.)
 #KASTELLAN_EMAIL_ENDPOINT=https://10.0.0.3:8443
 #KASTELLAN_EMAIL_SUBSCRIPTION=kastellan
 #KASTELLAN_EMAIL_ADDRESS=kastellan@example.org
@@ -764,6 +769,17 @@ mod tests {
         assert!(
             help.contains("kastellan-worker-mail"),
             "must name which worker #492's rule actually governs: {help}"
+        );
+        // Partial-config behaviour: the CHANNEL is disabled, the DAEMON is not.
+        // The operator's only signal is a startup log line, so the help must
+        // name it verbatim and must NOT still claim the daemon aborts.
+        assert!(
+            help.contains("EMAIL CHANNEL DISABLED"),
+            "must name the exact startup log line to grep for: {help}"
+        );
+        assert!(
+            !help.contains("aborts daemon startup"),
+            "stale claim: a partial config no longer aborts the daemon: {help}"
         );
     }
 

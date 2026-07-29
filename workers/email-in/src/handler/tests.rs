@@ -127,6 +127,90 @@ fn failed_message_detail_for_one_message_does_not_abort_the_batch() {
     assert_eq!(skipped[0]["message_id"], "8");
 }
 
+// ---- PERMANENT vs TRANSIENT `message_detail` failures (final whole-branch
+// review, Important 2). A skipped id is ACKED by core, which advances
+// localmail's monotonic `GREATEST` cursor past it FOREVER — so only a failure
+// that can never succeed may be skipped. Anything retryable must be omitted
+// from both lists so the message is redelivered. ----
+
+#[test]
+fn is_permanent_classifies_each_failure_class() {
+    // 4xx: permanently unfetchable (the id is gone / not permitted).
+    assert!(is_permanent(&EmailError::Upstream { status: 404, body: "gone".into() }));
+    assert!(is_permanent(&EmailError::Upstream { status: 403, body: "nope".into() }));
+    assert!(is_permanent(&EmailError::Upstream { status: 400, body: "bad".into() }));
+    // …except the two retryable 4xx statuses.
+    assert!(!is_permanent(&EmailError::Upstream { status: 408, body: "timeout".into() }));
+    assert!(!is_permanent(&EmailError::Upstream { status: 429, body: "slow down".into() }));
+    // 5xx: the server's temporary problem.
+    assert!(!is_permanent(&EmailError::Upstream { status: 500, body: "boom".into() }));
+    assert!(!is_permanent(&EmailError::Upstream { status: 503, body: "restarting".into() }));
+    // Transport: reset / TLS / no route — retryable.
+    assert!(!is_permanent(&EmailError::Transport("connection reset".into())));
+    // Worker-built request: an identical retry fails identically.
+    assert!(is_permanent(&EmailError::BadParams("not a base url".into())));
+}
+
+#[test]
+fn a_permanent_404_lands_in_skipped_so_the_cursor_can_move_past_it() {
+    // One poisoned message must not wedge the channel forever: core acks
+    // skipped ids, which is exactly what a 404 needs.
+    let mut h = handler_with_detail_status("8", 404);
+    let out = h.call("email.poll", serde_json::json!({"timeout_ms": 10})).unwrap();
+    let events = out["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "the good message still becomes an event");
+    assert_eq!(events[0]["ack_token"], "7");
+    let skipped = out["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "a permanent failure is recorded for ack");
+    assert_eq!(skipped[0]["message_id"], "8");
+    assert!(skipped[0]["reason"].as_str().unwrap().contains("404"));
+}
+
+#[test]
+fn a_transient_5xx_is_not_skipped_so_the_message_is_redelivered() {
+    // Acking this would advance localmail's GREATEST cursor past a message
+    // the bus never saw — the user's email would be gone for good.
+    let mut h = handler_with_detail_status("8", 503);
+    let out = h.call("email.poll", serde_json::json!({"timeout_ms": 10})).unwrap();
+    let events = out["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "the batch still continues with the other messages");
+    assert_eq!(events[0]["ack_token"], "7");
+    assert!(
+        out["skipped"].as_array().unwrap().is_empty(),
+        "a 5xx must NOT be acked away: {:?}",
+        out["skipped"]
+    );
+}
+
+#[test]
+fn a_transient_transport_error_is_not_skipped_so_the_message_is_redelivered() {
+    // The localmail-restart / egress-blip case the review named explicitly.
+    let mut h = handler_with_transport_failure_on("8");
+    let out = h.call("email.poll", serde_json::json!({"timeout_ms": 10})).unwrap();
+    let events = out["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "the batch still continues with the other messages");
+    assert_eq!(events[0]["ack_token"], "7");
+    assert!(
+        out["skipped"].as_array().unwrap().is_empty(),
+        "a transport failure must NOT be acked away: {:?}",
+        out["skipped"]
+    );
+}
+
+#[test]
+fn a_whole_batch_failing_transiently_acks_nothing_at_all() {
+    // localmail down between `changes` and `messages/{id}`: nothing may be
+    // acked, so every message comes back on the next poll.
+    let mut h = handler_with_all_details_failing_transiently();
+    let out = h.call("email.poll", serde_json::json!({"timeout_ms": 10})).unwrap();
+    assert!(out["events"].as_array().unwrap().is_empty());
+    assert!(
+        out["skipped"].as_array().unwrap().is_empty(),
+        "nothing may be acked when the whole batch failed transiently: {:?}",
+        out["skipped"]
+    );
+}
+
 #[test]
 fn ack_posts_the_cursor_upstream() {
     let (mut h, recorder) = handler_recording_requests();
@@ -371,14 +455,26 @@ fn handler_with_unattributable_message() -> crate::handler::EmailInHandler {
     )
 }
 
-/// Fake transport: `/v1/changes` returns two new message ids ("7", "8");
-/// `/v1/messages/7` succeeds, `/v1/messages/8` fails (404) — proves one
-/// message's `message_detail` failure does not abort the rest of the batch.
-struct PartialFailureFake {
+/// How a `/v1/messages/{id}` fetch fails in [`DetailOutcomeFake`].
+enum DetailOutcome {
+    /// A non-2xx HTTP status → `EmailError::Upstream { status, .. }`.
+    Status(u16),
+    /// A transport-level failure (reset / TLS / no route) →
+    /// `EmailError::Transport(_)`.
+    TransportError,
+}
+
+/// Fake transport: `/v1/changes` returns two new message ids ("7", "8") and
+/// every `/v1/messages/{id}` succeeds EXCEPT the ids in `failing`, which
+/// produce `outcome`. One fake covering every `message_detail` failure class,
+/// so the permanent-vs-transient split is exercised over identical fixtures.
+struct DetailOutcomeFake {
     changes: RawResponse,
     good_detail: RawResponse,
+    failing: Vec<String>,
+    outcome: DetailOutcome,
 }
-impl HttpGet for PartialFailureFake {
+impl HttpGet for DetailOutcomeFake {
     fn get(&self, _u: &Url) -> Result<RawResponse, String> {
         unreachable!("client uses get_authed")
     }
@@ -387,30 +483,57 @@ impl HttpGet for PartialFailureFake {
     }
     fn get_authed(&self, url: &Url, _bearer: &str, _max: usize) -> Result<RawResponse, String> {
         if url.path().starts_with("/v1/changes") {
-            Ok(self.changes.clone())
-        } else if url.path() == "/v1/messages/8" {
-            Ok(RawResponse {
-                status: 404,
-                location: None,
-                content_type: "text/plain".into(),
-                body: b"not found".to_vec(),
-            })
-        } else {
-            Ok(self.good_detail.clone())
+            return Ok(self.changes.clone());
         }
+        let id = url.path().rsplit('/').next().unwrap_or_default();
+        if self.failing.iter().any(|f| f == id) {
+            return match self.outcome {
+                DetailOutcome::Status(status) => Ok(RawResponse {
+                    status,
+                    location: None,
+                    content_type: "text/plain".into(),
+                    body: format!("upstream said {status}").into_bytes(),
+                }),
+                DetailOutcome::TransportError => Err("connection reset by peer".to_string()),
+            };
+        }
+        Ok(self.good_detail.clone())
     }
 }
 
-fn handler_with_one_good_one_failing_detail() -> crate::handler::EmailInHandler {
-    let transport: Box<dyn HttpGet> = Box::new(PartialFailureFake {
+fn handler_with_detail_outcome(
+    failing: &[&str],
+    outcome: DetailOutcome,
+) -> crate::handler::EmailInHandler {
+    let transport: Box<dyn HttpGet> = Box::new(DetailOutcomeFake {
         changes: changes_resp(&["7", "8"]),
         good_detail: detail_resp("me@example.org", Some("<mid-1@example.org>"), None, &[]),
+        failing: failing.iter().map(|s| (*s).to_string()).collect(),
+        outcome,
     });
     crate::handler::EmailInHandler::with_client(
         client_with(transport),
         "sub".to_string(),
         "agent@example.org".to_string(),
     )
+}
+
+fn handler_with_detail_status(id: &str, status: u16) -> crate::handler::EmailInHandler {
+    handler_with_detail_outcome(&[id], DetailOutcome::Status(status))
+}
+
+fn handler_with_transport_failure_on(id: &str) -> crate::handler::EmailInHandler {
+    handler_with_detail_outcome(&[id], DetailOutcome::TransportError)
+}
+
+fn handler_with_all_details_failing_transiently() -> crate::handler::EmailInHandler {
+    handler_with_detail_outcome(&["7", "8"], DetailOutcome::TransportError)
+}
+
+/// `/v1/messages/7` succeeds, `/v1/messages/8` 404s — proves one message's
+/// PERMANENT `message_detail` failure does not abort the rest of the batch.
+fn handler_with_one_good_one_failing_detail() -> crate::handler::EmailInHandler {
+    handler_with_detail_status("8", 404)
 }
 
 /// Fake transport recording every request's method + path+query, so the

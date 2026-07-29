@@ -5,30 +5,52 @@
 //! differences forced by the email channel's own design
 //! (`docs/superpowers/specs/2026-07-28-email-fallback-channel-design.md`):
 //!
-//! 1. **Fail-closed on misconfiguration or spawn failure, not fail-soft.**
+//! 1. **The email CHANNEL refuses to start; the DAEMON does not.**
 //!    [`kastellan_core::channel::email::config::EmailConfig::from_env`]
-//!    already refuses a PARTIAL config (`Err`, not `Ok(None)`) precisely so
-//!    a missing `KASTELLAN_EMAIL_AUTHSERV_ID` etc. aborts startup instead of
-//!    quietly rejecting every message and looking like a delivery bug — see
-//!    that function's module docs. This function preserves that posture end
-//!    to end: both a config `Err` and a `spawn_email_worker` `Err` propagate
-//!    out through `?` and abort daemon bring-up, unlike Matrix's
-//!    unreachable-homeserver case (logs and returns `None`). `email.init`
-//!    does no network I/O at all (see `workers/email-in/src/handler.rs`), so
-//!    unlike Matrix's login there is no "the remote service happens to be
-//!    down right now" case to fail-soft over — a spawn failure here means a
+//!    refuses a PARTIAL config (`Err`, not `Ok(None)`) precisely so a missing
+//!    `KASTELLAN_EMAIL_AUTHSERV_ID` etc. is loud instead of quietly
+//!    rejecting every message and looking like a delivery bug — see that
+//!    function's module docs. This function turns that `Err`, and a
+//!    `spawn_email_worker` `Err`, into a **prominent `error!` plus `None`**:
+//!    the email channel does not come up, everything else does.
+//!
+//!    That is a deliberate correction (final whole-branch review, Important
+//!    5). An earlier version propagated both through `?`, aborting daemon
+//!    startup. Three reasons that was wrong: (a) **availability inversion** —
+//!    this channel exists *because* Matrix has no homeserver failover, so a
+//!    typo in the fallback's config must not take the primary channel and the
+//!    scheduler down with it; (b) **spec deviation** — design §6 says the
+//!    daemon refuses to start *the email channel*, not the daemon; (c) the
+//!    fail-closed argument did not actually apply — a half-configured channel
+//!    already fails **closed** (a blank authserv-id makes
+//!    `gate::trusted_dmarc_pass` reject every message), so there was no
+//!    fail-open case the abort protected against. What the abort really
+//!    bought was *loudness*, which an `error!` delivers without the
+//!    collateral — and it additionally removed the last startup path that
+//!    skipped `main.rs`'s graceful shutdown sequence (bus shutdowns →
+//!    scheduler → audit mirror → `pool.close()`).
+//!
+//!    The posture DIFFERENCE from Matrix is real and kept: Matrix fails soft
+//!    over an unreachable homeserver because that is a transient outage,
+//!    whereas `email.init` does no network I/O at all (see
+//!    `workers/email-in/src/handler.rs`), so any failure here is a
 //!    deployment/config problem (bad worker_bin, sandbox refusal, egress
-//!    misconfig), not a transient outage.
+//!    misconfig) and is logged at `error!` accordingly, naming every missing
+//!    variable so one restart is enough to fix it.
 //! 2. **No microVM branch.** [`kastellan_core::channel::email::config::EmailConfig`]
 //!    has no `use_microvm` field in this slice — the worker always runs on
 //!    the host jail backend (bwrap on Linux, Seatbelt on macOS), which is
 //!    also the sidecar backend (the same 5c invariant Matrix documents: the
 //!    egress proxy needs a real network route; a VM sidecar would have none).
 //!
-//! The final `PgCompletedTasks::connect` step stays fail-soft (`Ok(None)`,
-//! matching Matrix exactly) — a LISTEN/NOTIFY bring-up hiccup on an
-//! already-open pool is a generic DB-listener concern, not an
-//! email-channel-specific misconfiguration.
+//! The final `PgCompletedTasks::connect` step behaves the same way (matching
+//! Matrix exactly) — a LISTEN/NOTIFY bring-up hiccup on an already-open pool
+//! is a generic DB-listener concern, not an email-channel-specific
+//! misconfiguration — so every arm of this module now converges on one
+//! outcome: `None` plus a loud, unmistakable `error!` (see
+//! `log_channel_disabled`). The single exception is an **unset**
+//! `KASTELLAN_EMAIL_ENDPOINT`, which is silent by design: the channel is
+//! simply not configured, which is the default and not a problem to report.
 
 use std::sync::Arc;
 
@@ -101,20 +123,43 @@ fn email_skipped_audit_sink(pool: PgPool, handle: tokio::runtime::Handle) -> Ack
 }
 
 
+/// Loud, unmistakable log line for every "the email channel is NOT running"
+/// outcome. Kept in one place so no failure arm can accidentally word it in a
+/// way an operator could read as "the channel came up".
+///
+/// Deliberately shouty and explicit about the two facts that matter: the
+/// channel is **off**, and the daemon is **fine**. `cause` carries the
+/// underlying error, which for a config problem names every missing variable
+/// (`email::config::parse_email_config`).
+fn log_channel_disabled(cause: &anyhow::Error) {
+    error!(
+        error = %format!("{cause:#}"),
+        "EMAIL CHANNEL DISABLED — it did NOT start and NO email will be received. \
+         The rest of the daemon (Matrix, scheduler, tools) is running normally. \
+         Fix what `error` names, then restart the daemon to enable the channel."
+    );
+}
+
 /// Spawn the email channel bus if `KASTELLAN_EMAIL_ENDPOINT` is set.
 ///
 /// Gated on [`kastellan_core::channel::email::config::EmailConfig::from_env`]:
-/// unset ⇒ `Ok(None)` and the daemon is byte-identical to an email-less
-/// build. Set-but-partial ⇒ `Err`, which the caller should propagate to abort
-/// startup (see the module docs above for why). Fully configured ⇒ the
-/// sandboxed worker is spawned (force-routed through a real 1:1
+/// unset ⇒ `None` with **no log noise at all** (the channel is simply absent
+/// and the daemon is byte-identical to an email-less build). Fully configured
+/// ⇒ the sandboxed worker is spawned (force-routed through a real 1:1
 /// transparent-tunnel sidecar whenever `force_routing` is `Some`, exactly
 /// mirroring `matrix_boot::spawn_matrix_channel`'s `MatrixEgress` wiring —
 /// passing `None` here would silently degrade the worker onto the HOST
 /// network namespace, see [`kastellan_core::channel::email::EmailEgress`]'s
 /// docs) and a real audit closure is wired so every skipped id lands in
-/// `audit_log`. A worker spawn failure also aborts startup (`Err`) — see the
-/// module docs' point 1.
+/// `audit_log`.
+///
+/// **Every failure arm returns `None` after a loud
+/// [`log_channel_disabled`]** — a set-but-partial config, a worker spawn
+/// failure, and a `PgCompletedTasks::connect` failure alike. None of them
+/// aborts the daemon; see the module docs' point 1 for why that is the
+/// correct posture for a *fallback* channel. There is no `Err` variant to
+/// return, which is what makes it impossible for a future caller to
+/// re-introduce the abort with a stray `?`.
 ///
 /// * `pool` — daemon-scoped runtime pool (cloned into the authorizer, pairing
 ///   service, events, completion seams, and the skipped-id audit sink).
@@ -127,11 +172,16 @@ pub(crate) async fn spawn_email_channel(
     pool: &PgPool,
     sandboxes: &SandboxBackends,
     force_routing: &Option<Arc<ForceRoutingConfig>>,
-) -> anyhow::Result<Option<ChannelBus>> {
-    let Some(cfg) = kastellan_core::channel::email::config::EmailConfig::from_env()
-        .map_err(|e| anyhow::anyhow!("email channel misconfigured: {e}"))?
-    else {
-        return Ok(None);
+) -> Option<ChannelBus> {
+    let cfg = match kastellan_core::channel::email::config::EmailConfig::from_env() {
+        // Unset ⇒ channel absent. Silent on purpose: this is the default for
+        // every deployment that doesn't use the email fallback.
+        Ok(None) => return None,
+        Ok(Some(cfg)) => cfg,
+        Err(e) => {
+            log_channel_disabled(&e.context("email channel configuration is incomplete or invalid"));
+            return None;
+        }
     };
 
     // Worker backend: always the host jail — no microVM option for this
@@ -155,14 +205,19 @@ pub(crate) async fn spawn_email_channel(
     let audit_ack_only =
         Some(email_skipped_audit_sink(pool.clone(), tokio::runtime::Handle::current()));
 
-    let spawned = kastellan_core::channel::email::spawn_email_worker(
+    let spawned = match kastellan_core::channel::email::spawn_email_worker(
         backend,
         ChannelId("email".to_string()),
         &cfg,
         egress,
         audit_ack_only,
-    )
-    .map_err(|e| anyhow::anyhow!("email worker failed to start: {e:#}"))?;
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log_channel_disabled(&e.context("the email worker failed to start"));
+            return None;
+        }
+    };
 
     info!(identity = %spawned.identity, "email worker started; starting channel bus");
     let authorizer =
@@ -180,11 +235,11 @@ pub(crate) async fn spawn_email_channel(
                 Box::new(completed),
             );
             info!("email channel bus running");
-            Ok(Some(bus))
+            Some(bus)
         }
         Err(e) => {
-            error!(error = %e, "email: PgCompletedTasks::connect failed; channel not started");
-            Ok(None)
+            log_channel_disabled(&e.context("PgCompletedTasks::connect (LISTEN/NOTIFY) failed"));
+            None
         }
     }
 }

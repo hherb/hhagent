@@ -807,6 +807,21 @@ deliberately weakened implementation."
 
 ---
 
+> ⚠️ **The code in this task was amended in-branch by review; the shipped code
+> is the authority.** Three changes it does not show: (1) the pairing carve-out
+> in `bus::handle_inbound` is gated on `msg.evidence.is_none()` — this task's
+> `// ... existing carve-out + REJECTED_UNPAIRED block, unchanged ...` is
+> **wrong**, because an unpaired email sender resolves to `Rejected` and *does*
+> reach the carve-out, where `try_pair` would mint a NULL-token row and disable
+> DMARC+token for that address for good (spec D8, corrected); (2)
+> `DbPeerAuthorizer`'s `Ok(Some(None))` arm refuses an evidence-bearing
+> transport instead of admitting it — a token-less pairing row is misconfigured
+> for such a transport, not permissive; (3) `AuthDecision::RejectedUnauthentic`
+> carries an `UnauthenticReason`, which the bus writes into the audit payload as
+> a stable label, because otherwise every denial arm produces a byte-identical
+> `audit_log` row and a wrong `KASTELLAN_EMAIL_AUTHSERV_ID` is
+> indistinguishable from a token typo. Read the code, not this task.
+
 ### Task 5: evidence plumbing — types, authorizer, bus
 
 **Files:**
@@ -1923,6 +1938,21 @@ to the real API."
 ```
 
 ---
+
+> ⚠️ **The code and prose in this task were amended in-branch by review; the
+> shipped code is the authority.** Three corrections: (1) `spawn_email_channel`
+> returns `Option<ChannelBus>`, **not** `anyhow::Result<Option<...>>`, and
+> `main.rs` does **not** `?` it — a partial config or spawn failure logs a loud
+> `error!` and leaves the daemon running, because a *fallback* channel must not
+> be able to take Matrix, the scheduler, and the graceful-shutdown path down
+> with it (design §6: the daemon refuses to start *the email channel*, not the
+> daemon); (2) the env-help draft here repeats the refuted D8 claim that "the
+> token lives on the pairing row, so an unpaired sender can never present a
+> valid one" — the **shipped** `render_email_help` correctly drops it, and
+> operator-only pairing is enforced by explicit guards instead; (3) the TRAP 3
+> draft still assumes the extra-CA path applies to this channel — it does not
+> (the channel sidecar is a transparent tunnel with no MITM leg), and the
+> shipped TRAP 3 says so. Read the code, not this task.
 
 ### Task 10: daemon wiring, operator docs, roadmap
 

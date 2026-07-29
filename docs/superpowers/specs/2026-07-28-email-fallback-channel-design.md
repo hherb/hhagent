@@ -93,13 +93,26 @@ All additive or parity-preserving:
   `None` means "the transport authenticates its own peers" (Matrix: E2E +
   homeserver auth) and the bus applies no extra check.
 * `PeerAuthorizer::authorize` gains the evidence parameter.
-* `AuthDecision` gains `RejectedUnauthentic`, distinct from `Rejected`.
+* `AuthDecision` gains `RejectedUnauthentic(UnauthenticReason)`, distinct from
+  `Rejected`. The payload is a fixed, non-secret classification label
+  (`dmarc_fail` / `no_evidence` / `no_token` / `token_mismatch` /
+  `pairing_has_no_token`) so §4.3's promised reason code actually reaches
+  `audit_log` instead of being discarded at the authorizer.
 * `channel::actions` gains `REJECTED_UNAUTHENTIC = "channel.rejected_unauthentic"`.
 * `PolledWorkerSpec` gains `ack_method: Option<&'static str>` plus an
   `EncodeAck` fn, symmetric with the existing init/poll/send fields.
 
-`DbPeerAuthorizer` fetches the active pairing row; if `token_sha256` is
-**NULL** the evidence is ignored entirely, so **Matrix is byte-identical**.
+`DbPeerAuthorizer` fetches the active pairing row. If `token_sha256` is
+**NULL** *and* the transport supplied no evidence (`evidence == None`), the
+peer is `Recognised` — that is exactly the Matrix shape, so **Matrix is
+byte-identical**. **Corrected 2026-07-29 after review:** a NULL token with
+evidence **present** is now `RejectedUnauthentic(PairingHasNoToken)`, not
+`Recognised`. `evidence.is_some()` is the same "this transport cannot vouch
+for its sender" marker D8 uses, and such a peer is admitted purely on the
+strength of its per-pairing token — so a row without one is *misconfigured*
+for that transport, not permissive. Admitting would have collapsed the entire
+email gate (no DMARC check, no token) for that address; nothing creates such a
+row today, but no DB `CHECK` or code guard prevented one either.
 
 ### 4.3 Inbound data flow, one message
 
@@ -145,13 +158,14 @@ All additive or parity-preserving:
        Matching anywhere subsumes every marker in one rule. Stated limitation:
        a token split across lines by transport folding cannot be detected.
 3. `handle_inbound` authorizes with the evidence. On `RejectedUnauthentic` it
-   audits `channel.rejected_unauthentic` (peer + reason code only — never the
-   body, never the token) and **skips the pairing carve-out**, so a spoofed
-   email cannot even attempt a code claim. This is belt-and-braces with D8, not
-   a second mechanism: D8 makes the carve-out unreachable over email because an
-   unpaired sender has no token, and this makes the skip explicit at the one
-   place unpaired input is touched, so the property survives a future change to
-   how tokens are provisioned.
+   audits `channel.rejected_unauthentic` (peer + the `UnauthenticReason` label
+   only — never the body, never the token) and **skips the pairing carve-out**,
+   so a spoofed email cannot even attempt a code claim. **Corrected 2026-07-29
+   after review:** this is *not* belt-and-braces — it is the mechanism. The
+   original text said D8 already made the carve-out unreachable over email
+   because an unpaired sender has no token; that reasoning was refuted (see
+   D8). The carve-out is reachable, and the `msg.evidence.is_none()` gate here
+   is what closes it.
 4. Passing messages continue down the existing path unchanged: Strict injection
    screen → `tasks` payload → agent → `route::reply_body` → `Channel::send`.
 
@@ -205,20 +219,26 @@ channel.
 |---|---|
 | Worker dies | `PersistentWorker` respawns with backoff; **nothing lost** — the unacked cursor is localmail's |
 | localmail down | Poll errors; driver logs the down/up transition once and retries; no loss |
+| One message's `message_detail` fails **transiently** (5xx, 408, 429, transport) | Omitted from **both** `events` and `skipped`, so nothing acks it and localmail's monotonic cursor stays put — redelivered next poll. The rest of the batch still processes (`workers/email-in`'s `is_permanent`) |
+| One message's `message_detail` fails **permanently** (4xx other than 408/429) | Recorded in `skipped`, acked + audited `channel.skipped_ack_only`, so one poisoned message cannot wedge the channel forever |
 | Malformed poll result | Batch skipped + logged (existing driver behaviour) and left *unacked*, so it retries |
-| Gate fails | Dropped, audited `channel.rejected_unauthentic`, reason code only |
+| Gate fails | Dropped, audited `channel.rejected_unauthentic` with the `UnauthenticReason` label (`dmarc_fail` / `no_evidence` / `no_token` / `token_mismatch` / `pairing_has_no_token`) — reason code only, never the body, never the token |
 | SMTP send fails (slice 2) | The driver's existing `pending` retention holds the reply across a respawn |
-| Config incomplete | The daemon refuses to start the email channel. Unset config ⇒ channel absent ⇒ byte-identical to today |
+| Config incomplete | The daemon refuses to start **the email channel** — a loud `error!` naming every missing variable, then the daemon comes up **without** it. Deliberately *not* an abort: this is the fallback channel (it exists because Matrix has no homeserver failover), so its misconfiguration must not remove the primary one, and a half-configured channel already fails closed anyway (a blank authserv-id rejects every message). Unset config ⇒ channel absent ⇒ byte-identical to today |
 
 ## 7. Testing
 
 * **`gate.rs` units** — forged extra `Authentication-Results` headers,
   authserv-id mismatch, no matching header, multiple headers; token
   absent/duplicated/trailing; body verifiably stripped of the secret.
-* **`DbPeerAuthorizer` (PG)** — NULL `token_sha256` ⇒ evidence ignored, pinning
-  **Matrix parity**; non-NULL ⇒ DMARC *and* token both required; wrong token
-  rejected.
-* **Bus** — `RejectedUnauthentic` audits the new action **and never reaches the
+* **`DbPeerAuthorizer` (PG)** — NULL `token_sha256` **with no evidence** ⇒
+  `Recognised`, pinning **Matrix parity**; NULL `token_sha256` **with**
+  evidence ⇒ `RejectedUnauthentic(PairingHasNoToken)`, asserted for both a
+  hostile and a good-looking evidence value so the guard cannot be weakened to
+  "bad evidence only"; non-NULL ⇒ DMARC *and* token both required; wrong token,
+  missing token, and missing evidence each rejected with their own reason.
+* **Bus** — `RejectedUnauthentic` audits the new action **with the right reason
+  code for each arm**, never carries the body or token, **and never reaches the
   pairing carve-out**.
 * **Worker units** over the `web-common` fake-HTTP seam, as `mail` does.
 * **Hermetic e2e** `core/tests/email_channel_e2e.rs` — fake worker process +

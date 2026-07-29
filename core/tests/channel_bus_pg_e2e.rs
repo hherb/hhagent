@@ -9,7 +9,9 @@ use std::collections::HashMap;
 
 use tokio::sync::mpsc;
 
-use kastellan_core::channel::auth::{AuthDecision, DbPeerAuthorizer, PeerAuthorizer, StaticPairings};
+use kastellan_core::channel::auth::{
+    AuthDecision, DbPeerAuthorizer, PeerAuthorizer, StaticPairings, UnauthenticReason,
+};
 use kastellan_core::channel::bus::{
     handle_completed, handle_inbound, CompletedTasks, PgChannelEvents, PgCompletedTasks,
 };
@@ -137,9 +139,10 @@ async fn channel_inbound_enqueues_and_completion_routes_a_reply() {
 
 /// Exercises `DbPeerAuthorizer::authorize` — the REAL production authorizer,
 /// not the `TokenAuthorizer` fake in `bus.rs`'s unit tests — against a live
-/// `pairings` table, covering all five decision arms
-/// (`token_hash_for`'s `Ok(None)` / `Ok(Some(None))` / `Ok(Some(Some(_)))`
-/// split three ways).
+/// `pairings` table, covering every decision arm of `token_hash_for`'s
+/// `Ok(None)` / `Ok(Some(None))` / `Ok(Some(Some(_)))` split, INCLUDING each
+/// arm's specific `UnauthenticReason` (the audit label an operator diagnoses
+/// with) and the `Ok(Some(None))` + evidence guard added by the final review.
 ///
 /// Seeding uses the ADMIN pool (`connect_admin_pool`), same rationale as
 /// `db/tests/pairings_e2e.rs`'s token round-trip test: not because
@@ -192,9 +195,11 @@ async fn db_peer_authorizer_covers_all_evidence_arms_against_a_real_pairing_tabl
         "an address with no pairings row at all must be Rejected"
     );
 
-    // ---- 2. Paired, token_sha256 IS NULL (the Matrix shape) → Recognised,
-    //         with evidence genuinely IGNORED (not just absent). This is the
-    //         Matrix-parity pin, on the REAL authorizer. ----
+    // ---- 2. Paired, token_sha256 IS NULL (the Matrix shape) + NO evidence
+    //         → Recognised. THIS assertion is the Matrix-parity pin: Matrix
+    //         hard-codes `evidence: None` (`matrix/wire.rs`) and its pairing
+    //         rows carry a NULL token, so this is the exact production shape.
+    //         It must stay green for Matrix to be byte-identical. ----
     let matrix_ch = ChannelId("matrix".into());
     let matrix_peer = PeerId("matrix-shape@example.org".into());
     kastellan_db::pairings::insert_pairing_with_token(
@@ -211,13 +216,41 @@ async fn db_peer_authorizer_covers_all_evidence_arms_against_a_real_pairing_tabl
         AuthDecision::Recognised,
         "a NULL token_sha256 row must admit with no evidence at all (Matrix)"
     );
+
+    // ---- 2b. Same NULL-token row, but the transport DID supply evidence →
+    //          RejectedUnauthentic(PairingHasNoToken).
+    //
+    //          This assertion was INVERTED by the final whole-branch review
+    //          (Important 1). It previously pinned `Recognised` — i.e. it
+    //          pinned as *correct* the behaviour that a `channel='email'`
+    //          pairing row with a NULL `token_sha256` would admit a sender
+    //          whose DMARC FAILED and whose token was wrong, collapsing the
+    //          entire email gate for that address. Nothing creates such a row
+    //          today, but no DB CHECK, code guard, or test prevented one.
+    //
+    //          `evidence.is_some()` is the branch's general "this transport
+    //          cannot vouch for its sender" marker (it already gates the
+    //          pairing carve-out in `bus::handle_inbound`); `auth.rs` now
+    //          applies the same marker here. Matrix is unaffected because it
+    //          never produces evidence — which is exactly what assertion 2
+    //          above pins. ----
     let hostile_evidence =
         PeerEvidence { dmarc_pass: false, presented_token: Some("wrong".into()) };
     assert_eq!(
         authorizer.authorize(&matrix_ch, &matrix_peer, Some(&hostile_evidence)).await,
-        AuthDecision::Recognised,
-        "a NULL token_sha256 row must admit even when evidence is present and BAD — \
-         proving evidence is ignored, not coincidentally satisfied"
+        AuthDecision::RejectedUnauthentic(UnauthenticReason::PairingHasNoToken),
+        "a token-less pairing row must REFUSE an evidence-bearing transport: such a \
+         peer is admitted only on the strength of its token, so a row without one is \
+         misconfigured for it, not permissive"
+    );
+    // Not just the hostile shape: even evidence that looks perfect must be
+    // refused, so the guard cannot be weakened to "bad evidence only".
+    let good_looking_evidence =
+        PeerEvidence { dmarc_pass: true, presented_token: Some("anything".into()) };
+    assert_eq!(
+        authorizer.authorize(&matrix_ch, &matrix_peer, Some(&good_looking_evidence)).await,
+        AuthDecision::RejectedUnauthentic(UnauthenticReason::PairingHasNoToken),
+        "the refusal is about the MISSING pairing token, not about the evidence quality"
     );
 
     // ---- 3-6. Paired WITH a token (the email shape): four evidence arms. ----
@@ -243,27 +276,37 @@ async fn db_peer_authorizer_covers_all_evidence_arms_against_a_real_pairing_tabl
         "correct token + DMARC pass must admit"
     );
 
-    // 4. Correct token but dmarc_pass == false → RejectedUnauthentic.
+    // 4. Correct token but dmarc_pass == false → RejectedUnauthentic(DmarcFail).
     let bad_dmarc = PeerEvidence { dmarc_pass: false, presented_token: Some(good_token.into()) };
     assert_eq!(
         authorizer.authorize(&email_ch, &email_peer, Some(&bad_dmarc)).await,
-        AuthDecision::RejectedUnauthentic,
+        AuthDecision::RejectedUnauthentic(UnauthenticReason::DmarcFail),
         "a correct token with a failed DMARC verdict must not admit"
     );
 
-    // 5. Wrong token (DMARC otherwise fine) → RejectedUnauthentic.
+    // 5. Wrong token (DMARC otherwise fine) → RejectedUnauthentic(TokenMismatch).
     let wrong_token =
         PeerEvidence { dmarc_pass: true, presented_token: Some("not-the-token".into()) };
     assert_eq!(
         authorizer.authorize(&email_ch, &email_peer, Some(&wrong_token)).await,
-        AuthDecision::RejectedUnauthentic,
+        AuthDecision::RejectedUnauthentic(UnauthenticReason::TokenMismatch),
         "a wrong token must not admit even with a good DMARC verdict"
     );
 
-    // 6. Token required but the transport supplied no evidence → RejectedUnauthentic.
+    // 5b. DMARC fine but NO token presented at all → RejectedUnauthentic(NoToken).
+    //     Distinct from 5: an HTML-only mail (no `body_text`) lands here, and
+    //     the operator needs to tell it apart from a wrong token.
+    let no_token = PeerEvidence { dmarc_pass: true, presented_token: None };
+    assert_eq!(
+        authorizer.authorize(&email_ch, &email_peer, Some(&no_token)).await,
+        AuthDecision::RejectedUnauthentic(UnauthenticReason::NoToken),
+        "DMARC pass with no token presented must not admit"
+    );
+
+    // 6. Token required but the transport supplied no evidence → RejectedUnauthentic(NoEvidence).
     assert_eq!(
         authorizer.authorize(&email_ch, &email_peer, None).await,
-        AuthDecision::RejectedUnauthentic,
+        AuthDecision::RejectedUnauthentic(UnauthenticReason::NoEvidence),
         "a token-required pairing with no evidence at all must not admit"
     );
 
