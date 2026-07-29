@@ -25,7 +25,7 @@
 //! shape: parse defensively, never trust a byte offset to line up with a
 //! char boundary, never assume ASCII.
 
-use super::authres_parse::{authserv_id_of, method_result_of, top_level_segments};
+use super::authres_parse::{authserv_id_of, dmarc_verdict, top_level_segments};
 
 /// Line prefix carrying the per-pairing token, e.g.
 /// `kastellan-token: 9f2a…`. Matched case-insensitively.
@@ -61,8 +61,19 @@ const AUTH_RESULTS: &str = "authentication-results";
 ///
 /// Also fails closed: no `Authentication-Results` header at all, an
 /// empty/unconfigured `authserv_id`, a malformed header value (unterminated
-/// quoted-string or unbalanced comment — see [`top_level_segments`]), or no
-/// `dmarc=` verdict anywhere in the header.
+/// quoted-string or unbalanced comment — see [`top_level_segments`]), no
+/// `dmarc=` verdict anywhere in the header, or MORE THAN ONE `dmarc=`
+/// verdict in the header (see [`dmarc_verdict`] — never legitimate, always
+/// refused rather than guessed at, regardless of which one looks real).
+///
+/// **Operational note for callers:** `headers` must be supplied in wire
+/// order, topmost first — this function has no other way to know which
+/// header the receiving MX actually wrote. A multi-milter MX can legitimately
+/// emit two `Authentication-Results` headers with the same authserv-id; if
+/// the topmost one lacks a `dmarc=` result, every message fails closed under
+/// this rule (a deployment/ordering problem, not one this function can
+/// safely route around) — see `task-4-report.md` for the full operational
+/// note.
 pub fn trusted_dmarc_pass(headers: &[(String, String)], authserv_id: &str) -> bool {
     let want = authserv_id.trim().to_ascii_lowercase();
     if want.is_empty() {
@@ -84,20 +95,7 @@ pub fn trusted_dmarc_pass(headers: &[(String, String)], authserv_id: &str) -> bo
     if authserv_id_of(segments[0]) != want {
         return false;
     }
-    // The FIRST segment whose method is "dmarc" decides. Do NOT use `.any()`
-    // over all segments: "dmarc=fail; dmarc=pass" in the same header must
-    // read as fail — that IS the real verdict our own MX computed; a second,
-    // later "dmarc=pass" in the same header is not something a compliant MX
-    // would ever emit, and trusting it is exactly the forgery this exists
-    // to prevent.
-    for segment in &segments[1..] {
-        if let Some((method, result)) = method_result_of(segment) {
-            if method == "dmarc" {
-                return result == "pass";
-            }
-        }
-    }
-    false
+    dmarc_verdict(&segments[1..]).unwrap_or(false)
 }
 
 /// Split a body into `(presented_token, body_with_every_occurrence_removed)`.
@@ -280,8 +278,35 @@ mod tests {
     }
 
     #[test]
-    fn first_dmarc_segment_wins_not_any_matching_segment() {
+    fn a_second_dmarc_segment_fails_closed_even_though_the_first_says_fail() {
+        // Fails closed via dmarc_verdict's "> 1 methodspec" rule, not literal
+        // first-match-wins — see the test below for the case (first = pass)
+        // where only that rule, not luck, saves it.
         let headers = vec![h("Authentication-Results", "mx.example.net; dmarc=fail; dmarc=pass")];
+        assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    // --- hardening round 3: two more bypass strings the reviewer found ---
+
+    #[test]
+    fn dmarc_pass_is_not_smuggled_via_a_well_formed_second_dmarc_segment() {
+        // No malformed quoting needed: an MX echoing an unescaped '"' back
+        // into a property value can leave TWO well-formed top-level dmarc
+        // segments — forged "pass" first, real "fail" second. Only the
+        // more-than-one-dmarc-methodspec rule saves this.
+        let headers = vec![h(
+            "Authentication-Results",
+            "mx.example.net; spf=pass smtp.mailfrom=\"a\"; dmarc=pass; x=\"b\"@evil.com; dmarc=fail",
+        )];
+        assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    #[test]
+    fn dmarc_pass_is_not_smuggled_when_the_real_verdict_has_space_before_equals() {
+        // RFC 8601 permits CFWS around '='; "dmarc =fail" is legal. Before
+        // whitespace-tolerant parsing this segment was invisible to the
+        // dmarc lookup entirely, so the forged "dmarc=pass" below decided.
+        let headers = vec![h("Authentication-Results", "mx.example.net; dmarc =fail; dmarc=pass")];
         assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
     }
 

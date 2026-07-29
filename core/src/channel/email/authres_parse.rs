@@ -133,21 +133,77 @@ pub(super) fn authserv_id_of(id_segment: &str) -> String {
 /// Extracts `(method, result)` from a resinfo segment, lower-cased, or
 /// `None` if it doesn't contain one.
 ///
-/// Per RFC 8601 §2.2 a resinfo segment is `method=result` FIRST, optionally
-/// followed by whitespace-separated `ptype.property=value` pairs or a
-/// trailing comment — e.g. `dmarc=pass header.from=example.com`. Comments
-/// and quoted-strings are stripped BEFORE tokenizing (so a directly-attached
-/// comment like `pass(policy)` still reads as `pass`, the same as a spaced
-/// one), and only the FIRST whitespace-delimited token of what remains is
-/// ever treated as a method=result pair: anything after it is a property
-/// spec and must never be mistaken for one — this is what stops an attacker
-/// from smuggling `dmarc=pass` into a property VALUE (e.g. a quoted
-/// `smtp.mailfrom` local-part) and having it read back as a real verdict.
+/// Per RFC 8601 §2.2 a resinfo segment is `method [CFWS] "=" [CFWS] result`
+/// FIRST, optionally followed by whitespace-separated `ptype.property=value`
+/// pairs or a trailing comment — e.g. `dmarc=pass header.from=example.com`.
+/// Comments and quoted-strings are stripped BEFORE tokenizing (so a
+/// directly-attached comment like `pass(policy)` still reads as `pass`, the
+/// same as a spaced one).
+///
+/// CFWS is legal around the `=`, so `dmarc =fail`, `dmarc= fail`, and
+/// `dmarc = fail` are all legal input a compliant MX may emit and must all
+/// read as `("dmarc", "fail")`, not silently fail to parse (a segment this
+/// function fails to recognise is invisible to [`dmarc_verdict`]'s dmarc
+/// count, which is exactly how a legally-spaced real verdict could once be
+/// skipped in favour of a forged, unspaced one below it). To support that
+/// without reopening the property-value-smuggling hole this guards against,
+/// method and result are read positionally — method is the run of
+/// non-whitespace, non-`=` characters at the very START of what remains
+/// after stripping, i.e. still the FIRST token position, never found by
+/// scanning further into the segment — rather than by taking a single
+/// whitespace-delimited token and requiring the `=` to be inside it.
 pub(super) fn method_result_of(segment: &str) -> Option<(String, String)> {
     let stripped = strip_quotes_and_comments(segment);
-    let token = stripped.split_whitespace().next()?;
-    let (method, result) = token.split_once('=')?;
-    Some((method.trim().to_ascii_lowercase(), result.trim().to_ascii_lowercase()))
+    let rest = stripped.trim_start();
+    let method_end = rest.find(|c: char| c.is_whitespace() || c == '=')?;
+    let method = &rest[..method_end];
+    if method.is_empty() {
+        return None;
+    }
+    let rest = rest[method_end..].trim_start().strip_prefix('=')?.trim_start();
+    let result_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let result = &rest[..result_end];
+    if result.is_empty() {
+        return None;
+    }
+    Some((method.to_ascii_lowercase(), result.to_ascii_lowercase()))
+}
+
+/// Scans resinfo segments (i.e. `segments[1..]` of a [`top_level_segments`]
+/// result) for `dmarc=` verdicts.
+///
+/// * `Some(true)` — exactly one `dmarc` methodspec is present and its result
+///   is `pass`.
+/// * `Some(false)` — exactly one `dmarc` methodspec is present and its
+///   result is anything else.
+/// * `None` — zero `dmarc` methodspecs are present, OR more than one is.
+///
+/// More than one `dmarc` methodspec in a single header is never legitimate:
+/// a compliant MX computes and emits a DMARC verdict exactly once. A second
+/// one is either a forgery attempt or a parse ambiguity, and in both cases
+/// refusing (treating it the same as "no verdict found") is the safe
+/// choice — this is what stops a forged `dmarc=pass` segment that is
+/// syntactically well-formed on its own (e.g. because an upstream MX echoed
+/// an unescaped `"` back into a property value, self-closing a quote early
+/// and making the forged segment parse cleanly) from ever being chosen over
+/// the real verdict, regardless of which of the two comes first.
+pub(super) fn dmarc_verdict(segments: &[&str]) -> Option<bool> {
+    let mut verdict: Option<bool> = None;
+    let mut count = 0usize;
+    for segment in segments {
+        if let Some((method, result)) = method_result_of(segment) {
+            if method == "dmarc" {
+                count += 1;
+                if verdict.is_none() {
+                    verdict = Some(result == "pass");
+                }
+            }
+        }
+    }
+    if count > 1 {
+        return None; // Ambiguous: refuse rather than guess which one is real.
+    }
+    verdict
 }
 
 #[cfg(test)]
@@ -206,5 +262,45 @@ mod tests {
     #[test]
     fn method_result_of_none_for_a_segment_with_no_equals_sign() {
         assert_eq!(method_result_of(" not-a-pair"), None);
+    }
+
+    #[test]
+    fn method_result_of_tolerates_space_before_equals() {
+        assert_eq!(
+            method_result_of(" dmarc =fail"),
+            Some(("dmarc".to_string(), "fail".to_string()))
+        );
+    }
+
+    #[test]
+    fn method_result_of_tolerates_space_after_equals() {
+        assert_eq!(
+            method_result_of(" dmarc= fail"),
+            Some(("dmarc".to_string(), "fail".to_string()))
+        );
+    }
+
+    #[test]
+    fn method_result_of_tolerates_space_around_equals() {
+        assert_eq!(
+            method_result_of(" dmarc = fail"),
+            Some(("dmarc".to_string(), "fail".to_string()))
+        );
+    }
+
+    #[test]
+    fn dmarc_verdict_is_none_when_more_than_one_dmarc_methodspec_is_present() {
+        assert_eq!(dmarc_verdict(&[" dmarc=fail", " dmarc=pass"]), None);
+    }
+
+    #[test]
+    fn dmarc_verdict_is_none_when_no_dmarc_methodspec_is_present() {
+        assert_eq!(dmarc_verdict(&[" spf=pass"]), None);
+    }
+
+    #[test]
+    fn dmarc_verdict_is_some_for_exactly_one_dmarc_methodspec() {
+        assert_eq!(dmarc_verdict(&[" spf=pass", " dmarc=pass"]), Some(true));
+        assert_eq!(dmarc_verdict(&[" dmarc=fail"]), Some(false));
     }
 }
