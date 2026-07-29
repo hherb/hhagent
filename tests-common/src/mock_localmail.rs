@@ -4,6 +4,13 @@
 //! {"text": …}`). Response SHAPES are pinned against real localmail by the
 //! Mac-only contract test in `core/tests/mail_daemon_e2e.rs`.
 //!
+//! Also serves the two endpoints `workers/email-in` (the email fallback
+//! channel's worker) hits — `GET /v1/changes?subscription=<name>` and
+//! `POST /v1/changes/ack` — so this mock stays a faithful stand-in for
+//! worker-level email-in tests too (added alongside the task-9 hermetic
+//! channel e2e, which itself does not use this mock — that test's fake
+//! worker speaks JSON-RPC directly, with no localmail HTTP involved at all).
+//!
 //! Two spawn flavours, same request routing/response bodies, different
 //! transport:
 //! * [`spawn_mock_localmail`] — plain HTTP. Deliberate: it sidesteps the
@@ -206,8 +213,17 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
         path == m || path.starts_with(&format!("{m}?"))
     };
 
-    // Order matters: the more specific attachment paths before /v1/messages.
-    if path.starts_with("/v1/search") {
+    // Order matters: the more specific /v1/changes/ack must be checked before
+    // the more general /v1/changes prefix (an ack path also starts with it),
+    // and both before the attachment/message paths below.
+    if path.starts_with("/v1/changes/ack") {
+        ("204 No Content", "text/plain", Vec::new())
+    } else if path.starts_with("/v1/changes") {
+        json(serde_json::json!({
+            "new_messages": [{"message_id": CANNED_MESSAGE_ID}],
+            "next_cursor": "7"
+        }).to_string())
+    } else if path.starts_with("/v1/search") {
         json(serde_json::json!({
             "results": [{"message_id": CANNED_MESSAGE_ID, "subject": "invoice", "snippet": "…"}],
             "next_cursor": serde_json::Value::Null
