@@ -9,6 +9,33 @@
 //! workers (Phase 2) instantiate the same driver with their own
 //! [`PolledWorkerSpec`] + parse/encode fns. Design + trade-offs:
 //! `docs/superpowers/specs/2026-07-02-firecracker-microvm-slice5b4-matrix-in-vm-design.md`.
+//!
+//! ## Optional ack support
+//!
+//! Some polled transports (the email fallback channel) keep their polling
+//! cursor server-side: the mail service only stops re-sending a message once
+//! the worker explicitly acks it. Matrix has no such cursor, so ack support is
+//! *optional* — a [`PolledWorkerSpec`] with `ack_method: None` (Matrix's spec)
+//! makes the driver skip the ack step entirely, with no extra RPC and no
+//! change to control flow versus before this existed.
+//!
+//! Why the ack fires *after* the event is handed to the bus, not before: if
+//! the worker died between receiving the poll result and the driver forwarding
+//! it, an ack sent first would advance the cursor for a message the bus never
+//! got — a silent drop. Acking after `inbound_tx.blocking_send` returns `Ok`
+//! means the worst case on a crash is redelivery (the message is re-sent next
+//! poll because the cursor didn't move), never loss. That is an intentional
+//! at-least-once contract, not an oversight — do not "fix" it into
+//! exactly-once without a receipt protocol on the bus side too.
+//!
+//! A failed ack call is itself non-fatal: it's logged and the loop continues,
+//! leaving the cursor unadvanced (same redelivery outcome as a crash). The one
+//! residual gap is structural and shared with Matrix's existing behaviour: if
+//! the bus *accepts* the send but a downstream consumer later fails to fully
+//! process it, the message is still acked (Matrix already drops in the
+//! equivalent case, logging "channel enqueue failed; message dropped") — this
+//! driver does not invent a receipt protocol to close that gap for one
+//! channel.
 
 use std::collections::VecDeque;
 use std::sync::mpsc as std_mpsc;
@@ -43,6 +70,12 @@ pub struct PolledWorkerSpec {
     pub poll_method: &'static str,
     /// Outbound-delivery method; params come from the `EncodeSend` fn.
     pub send_method: &'static str,
+    /// Optional cursor-advance method, called once per inbound event right
+    /// after the driver hands that event to the bus (see `run`, step 3).
+    /// `None` for a worker with no server-side polling cursor to advance —
+    /// Matrix sets this to `None`, so it never gets the extra RPC and its
+    /// control flow is byte-identical to before this field existed.
+    pub ack_method: Option<&'static str>,
     /// Worker-side long-poll wait. Outbound latency is bounded by this (the
     /// single JSON-RPC pipe serializes poll and send).
     pub poll_timeout_ms: u64,
@@ -71,6 +104,11 @@ pub type ParsePoll = fn(serde_json::Value) -> anyhow::Result<Vec<PolledEvent>>;
 
 /// Encode one outbound message into the send method's params.
 pub type EncodeSend = fn(&OutgoingMessage) -> serde_json::Value;
+
+/// Encode one event's [`PolledEvent::ack_token`] into the ack method's params
+/// (e.g. `{"cursor": tok}`). Only called when both `PolledWorkerSpec::ack_method`
+/// and the event's own `ack_token` are present — see `run`.
+pub type EncodeAck = fn(&str) -> serde_json::Value;
 
 /// Seam over "something that can call the worker" so the driver is unit-tested
 /// without a supervisor or a process. Production is [`PersistentHandle`].
@@ -107,6 +145,7 @@ impl PolledWorkerDriver {
         calls: Box<dyn WorkerCalls>,
         parse_poll: ParsePoll,
         encode_send: EncodeSend,
+        encode_ack: Option<EncodeAck>,
         cid: ChannelId,
     ) -> anyhow::Result<(Self, serde_json::Value)> {
         let identity = calls
@@ -114,8 +153,9 @@ impl PolledWorkerDriver {
             .map_err(|e| anyhow::anyhow!("{}: {e}", spec.init_method))?;
         let (inbound_tx, inbound_rx) = tok_mpsc::channel::<IncomingMessage>(INBOUND_BUFFER);
         let (outbound_tx, outbound_rx) = std_mpsc::channel::<OutgoingMessage>();
-        let join =
-            thread::spawn(move || run(calls, spec, parse_poll, encode_send, inbound_tx, outbound_rx, cid));
+        let join = thread::spawn(move || {
+            run(calls, spec, parse_poll, encode_send, encode_ack, inbound_tx, outbound_rx, cid)
+        });
         Ok((Self { inbound_rx, outbound_tx, join }, identity))
     }
 }
@@ -125,14 +165,17 @@ impl PolledWorkerDriver {
 /// 1. drain queued outbound messages into `pending` (non-blocking);
 /// 2. flush `pending` front-first, stopping at the first error — unacked
 ///    messages STAY in `pending`, so a death mid-send loses nothing;
-/// 3. long-poll for inbound events and forward them to the bus;
+/// 3. long-poll for inbound events, forward them to the bus, then — for a
+///    spec with `ack_method` set — ack the ones that carried an `ack_token`;
 /// 4. on any call error, sleep one short slice (shutdown-responsive) and
 ///    retry — the supervisor is respawning the worker underneath.
+#[allow(clippy::too_many_arguments)] // mirrors spawn's own descriptor args + the two channel endpoints
 fn run(
     calls: Box<dyn WorkerCalls>,
     spec: PolledWorkerSpec,
     parse_poll: ParsePoll,
     encode_send: EncodeSend,
+    encode_ack: Option<EncodeAck>,
     inbound_tx: tok_mpsc::Sender<IncomingMessage>,
     outbound_rx: std_mpsc::Receiver<OutgoingMessage>,
     cid: ChannelId,
@@ -186,6 +229,9 @@ fn run(
                     match parse_poll(v) {
                         Ok(events) => {
                             for ev in events {
+                                // Captured before `ev`'s other fields move into
+                                // `msg` below — a partial move, not a clone.
+                                let ack_token = ev.ack_token;
                                 let msg = IncomingMessage {
                                     channel: cid.clone(),
                                     peer: PeerId(ev.peer),
@@ -196,6 +242,29 @@ fn run(
                                 if inbound_tx.blocking_send(msg).is_err() {
                                     tracing::info!(label = spec.label, "inbound receiver closed; polled driver exiting");
                                     return;
+                                }
+
+                                // Ack only after the bus has accepted the event
+                                // (the blocking_send above returned Ok), so a
+                                // worker death between poll and hand-off
+                                // redelivers the message on the next poll
+                                // rather than silently dropping it.
+                                //
+                                // Known residual (matches Matrix's existing
+                                // "channel enqueue failed; message dropped"
+                                // semantics rather than inventing a receipt
+                                // protocol): if the bus later fails downstream
+                                // of this accept, the message is acked but
+                                // lost. A failed ack call itself is also
+                                // non-fatal — it just leaves the worker's
+                                // cursor unadvanced, so the message is
+                                // redelivered. At-least-once, by design.
+                                if let (Some(method), Some(enc), Some(tok)) =
+                                    (spec.ack_method, encode_ack, ack_token.as_deref())
+                                {
+                                    if let Err(e) = calls.call(method, enc(tok)) {
+                                        tracing::warn!(label = spec.label, error = %e, "ack failed; event will be redelivered");
+                                    }
                                 }
                             }
                         }

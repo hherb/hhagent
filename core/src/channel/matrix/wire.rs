@@ -26,6 +26,8 @@ pub const MATRIX_POLLED_SPEC: PolledWorkerSpec = PolledWorkerSpec {
     init_method: "matrix.init",
     poll_method: "matrix.poll",
     send_method: "matrix.send",
+    // Matrix has no server-side polling cursor to advance — no ack RPC.
+    ack_method: None,
     poll_timeout_ms: POLL_MS,
 };
 

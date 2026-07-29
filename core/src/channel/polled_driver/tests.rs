@@ -8,15 +8,23 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Scripted fake worker: `t.init` returns a fixed identity, `t.poll` pops the
-/// next canned poll RESULT (empty batch when none queued), `t.send` records its
-/// params. While `down` is set every call fails (simulating the supervisor's
-/// respawn window, where `PersistentHandle::call` returns `Err`).
+/// Scripted fake worker: a `*.init` method returns a fixed identity, `*.poll`
+/// pops the next canned poll RESULT (empty batch when none queued), `*.send`
+/// records its params, `*.ack` is accepted (recorded in `log` only — no
+/// dedicated field, since only the ack tests care about it). Matched by
+/// suffix rather than the literal `t.*` names so the same fake serves both
+/// `TEST_SPEC` and the ack-specific specs below (`email.*`, `matrix.*`).
+/// While `down` is set every call fails (simulating the supervisor's respawn
+/// window, where `PersistentHandle::call` returns `Err`).
 struct FakeState {
     down: AtomicBool,
     polls: Mutex<VecDeque<Value>>,
     sends: Mutex<Vec<Value>>,
     init_calls: AtomicUsize,
+    /// Every accepted call, in order, as `(method, params)` — the ack tests
+    /// use this to assert an ack method was (or was not) invoked, and with
+    /// which params.
+    log: Mutex<Vec<(String, Value)>>,
 }
 struct FakeCalls(Arc<FakeState>);
 impl WorkerCalls for FakeCalls {
@@ -24,24 +32,28 @@ impl WorkerCalls for FakeCalls {
         if self.0.down.load(Ordering::SeqCst) {
             anyhow::bail!("persistent worker is restarting");
         }
-        match method {
-            "t.init" => {
-                self.0.init_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(json!({"user_id": "@fake:srv"}))
-            }
-            "t.poll" => Ok(self
+        self.0.log.lock().unwrap().push((method.to_string(), params.clone()));
+        if method.ends_with(".init") {
+            self.0.init_calls.fetch_add(1, Ordering::SeqCst);
+            return Ok(json!({"user_id": "@fake:srv"}));
+        }
+        if method.ends_with(".poll") {
+            return Ok(self
                 .0
                 .polls
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| json!({"events": []}))),
-            "t.send" => {
-                self.0.sends.lock().unwrap().push(params);
-                Ok(json!({}))
-            }
-            m => anyhow::bail!("unknown method {m}"),
+                .unwrap_or_else(|| json!({"events": []})));
         }
+        if method.ends_with(".send") {
+            self.0.sends.lock().unwrap().push(params);
+            return Ok(json!({}));
+        }
+        if method.ends_with(".ack") {
+            return Ok(json!({}));
+        }
+        anyhow::bail!("unknown method {method}")
     }
 }
 
@@ -51,6 +63,7 @@ fn fake() -> (Arc<FakeState>, Box<dyn WorkerCalls>) {
         polls: Mutex::new(VecDeque::new()),
         sends: Mutex::new(Vec::new()),
         init_calls: AtomicUsize::new(0),
+        log: Mutex::new(Vec::new()),
     });
     (st.clone(), Box::new(FakeCalls(st)))
 }
@@ -67,7 +80,7 @@ fn test_parse(v: Value) -> anyhow::Result<Vec<PolledEvent>> {
                     .into(),
                 body: e["body"].as_str().ok_or_else(|| anyhow::anyhow!("bad event"))?.into(),
                 evidence: None,
-                ack_token: None,
+                ack_token: e["ack_token"].as_str().map(String::from),
             })
         })
         .collect()
@@ -80,14 +93,46 @@ const TEST_SPEC: PolledWorkerSpec = PolledWorkerSpec {
     init_method: "t.init",
     poll_method: "t.poll",
     send_method: "t.send",
+    ack_method: None,
     poll_timeout_ms: 5,
 };
 
 fn spawn_test_driver(
     calls: Box<dyn WorkerCalls>,
 ) -> (PolledWorkerDriver, Value) {
-    PolledWorkerDriver::spawn(TEST_SPEC, calls, test_parse, test_encode, ChannelId("t".into()))
+    PolledWorkerDriver::spawn(TEST_SPEC, calls, test_parse, test_encode, None, ChannelId("t".into()))
         .expect("driver spawn")
+}
+
+/// Spec for the ack-bearing tests below: an email-fallback-shaped channel
+/// whose worker keeps a server-side polling cursor that must be advanced.
+fn spec_with_ack() -> PolledWorkerSpec {
+    PolledWorkerSpec {
+        label: "email",
+        init_method: "email.init",
+        poll_method: "email.poll",
+        send_method: "email.send",
+        ack_method: Some("email.ack"),
+        poll_timeout_ms: 50,
+    }
+}
+
+/// Spec shaped like Matrix's real [`crate::channel::matrix::wire::MATRIX_POLLED_SPEC`]:
+/// `ack_method: None`. Used to pin that a spec without an ack method never
+/// triggers an ack call, regardless of what the events carry.
+fn spec_without_ack() -> PolledWorkerSpec {
+    PolledWorkerSpec {
+        label: "matrix",
+        init_method: "matrix.init",
+        poll_method: "matrix.poll",
+        send_method: "matrix.send",
+        ack_method: None,
+        poll_timeout_ms: 50,
+    }
+}
+
+fn encode_test_ack(cursor: &str) -> Value {
+    json!({ "cursor": cursor })
 }
 
 #[test]
@@ -131,8 +176,14 @@ fn malformed_poll_result_is_skipped_not_fatal() {
 fn init_failure_fails_spawn() {
     let (st, calls) = fake();
     st.down.store(true, Ordering::SeqCst);
-    let res =
-        PolledWorkerDriver::spawn(TEST_SPEC, calls, test_parse, test_encode, ChannelId("t".into()));
+    let res = PolledWorkerDriver::spawn(
+        TEST_SPEC,
+        calls,
+        test_parse,
+        test_encode,
+        None,
+        ChannelId("t".into()),
+    );
     assert!(res.is_err(), "init error must fail the spawn (login proof)");
 }
 
@@ -228,4 +279,78 @@ fn dropping_endpoints_during_a_down_window_stops_the_driver_thread() {
     done_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("driver must exit from the retry loop when endpoints drop");
+}
+
+#[test]
+fn ack_is_called_after_the_event_reaches_the_bus() {
+    let (st, calls) = fake();
+    st.polls.lock().unwrap().push_back(json!({"events": [
+        {"peer": "me@example.org", "conversation": "<a>", "body": "hi", "ack_token": "42"}
+    ]}));
+    let (mut driver, _identity) = PolledWorkerDriver::spawn(
+        spec_with_ack(),
+        calls,
+        test_parse,
+        test_encode,
+        Some(encode_test_ack),
+        ChannelId("email".into()),
+    )
+    .unwrap();
+
+    let msg = driver.inbound_rx.blocking_recv().expect("one inbound event");
+    assert_eq!(msg.peer.0, "me@example.org");
+
+    wait_until(|| st.log.lock().unwrap().iter().any(|(m, _)| m == "email.ack"));
+    let log = st.log.lock().unwrap();
+    let entry = log.iter().find(|(m, _)| m == "email.ack").cloned().unwrap();
+    assert_eq!(entry.1["cursor"], "42", "ack must carry the event's own cursor");
+}
+
+#[test]
+fn no_ack_method_means_no_ack_call() {
+    // Matrix must be untouched: its spec has ack_method: None.
+    let (st, calls) = fake();
+    st.polls.lock().unwrap().push_back(json!({"events": [
+        {"peer": "@me:srv", "conversation": "!r", "body": "hi"}
+    ]}));
+    let (mut driver, _identity) = PolledWorkerDriver::spawn(
+        spec_without_ack(),
+        calls,
+        test_parse,
+        test_encode,
+        None,
+        ChannelId("matrix".into()),
+    )
+    .unwrap();
+    let msg = driver.inbound_rx.blocking_recv().expect("one inbound event");
+    assert_eq!(msg.peer.0, "@me:srv");
+    // No ack ever fires here, so there is no bus-side signal to wait on;
+    // give the (busy-spinning) driver a few loop iterations before asserting
+    // absence, same pattern as the retention test above.
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !st.log.lock().unwrap().iter().any(|(m, _)| m.ends_with(".ack")),
+        "a spec without ack_method must never call ack"
+    );
+}
+
+#[test]
+fn an_event_without_an_ack_token_is_not_acked() {
+    let (st, calls) = fake();
+    st.polls.lock().unwrap().push_back(json!({"events": [
+        {"peer": "me@example.org", "conversation": "<a>", "body": "hi"}
+    ]}));
+    let (mut driver, _identity) = PolledWorkerDriver::spawn(
+        spec_with_ack(),
+        calls,
+        test_parse,
+        test_encode,
+        Some(encode_test_ack),
+        ChannelId("email".into()),
+    )
+    .unwrap();
+    let msg = driver.inbound_rx.blocking_recv().expect("one inbound event");
+    assert_eq!(msg.peer.0, "me@example.org");
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!st.log.lock().unwrap().iter().any(|(m, _)| m == "email.ack"));
 }
