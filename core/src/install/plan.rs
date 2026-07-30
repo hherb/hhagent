@@ -167,6 +167,88 @@ pub fn render_upstream_ca_help() -> String {
     .to_string()
 }
 
+/// Render the commented email-fallback-channel help block (Phase 2 slice #5).
+///
+/// Purely informational — none of the five `KASTELLAN_EMAIL_*` vars is set by
+/// this slice's install flow (no `--email-*` flags), so unlike the Matrix
+/// block below this one is unconditional and entirely commented out, same
+/// posture as [`render_upstream_ca_help`]. Split out as its own pure function
+/// for the identical reason: the three operator traps below are
+/// unit-tested wording, not free-floating prose that can silently drift from
+/// what `channel::email::gate` and `channel::email::config` actually enforce.
+///
+/// The three traps are the whole reason this is more than one line:
+///
+/// 1. **authserv-id must match exactly.** `gate::trusted_dmarc_pass` only
+///    trusts the TOPMOST `Authentication-Results` header, and only when it
+///    names this exact id — anyone can forge their own such header in a
+///    message they send, so a wrong id here fails every message closed.
+/// 2. **Pairing is operator-only.** There is no in-channel pairing over
+///    email by design (`kastellan-cli pair issue-token`) — see
+///    `docs/superpowers/specs/2026-07-28-email-fallback-channel-design.md`'s
+///    D8: an unpaired sender's `Rejected` outcome deliberately skips the
+///    carve-out for any transport that supplies evidence.
+/// 3. **This channel's force-routed sidecar cannot reach a self-signed
+///    localmail today.** `channel::email::spawn_email_worker`'s force-routed
+///    path (`egress::persistent_net::spawn_net_transport`) is a
+///    TRANSPARENT TUNNEL — it hardcodes `disable_mitm: true` and
+///    `upstream_extra_ca: None` — so `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` has
+///    no effect on it; there is no MITM re-origination leg for it to widen
+///    trust on. A self-signed origin is refused by the worker's own
+///    webpki-only TLS client, force-routed or not. That env var DOES apply
+///    to the separate `kastellan-worker-mail` TOOL, whose force-routed
+///    sidecar does MITM (`egress::net_worker::spawn_net_worker`) — and per
+///    #492 ITS allowlist must then resolve to a single private origin. The
+///    two must not be conflated even though they may point at the same
+///    localmail address.
+pub fn render_email_help() -> String {
+    r#"# --- Email fallback channel (Phase 2 slice #5) -------------------------------
+# Inbound only in this slice: the agent can receive and act on email, but
+# replies still go out over Matrix until slice 2 ships the SMTP worker.
+#
+# All five are required together once you set the first one. A partial config
+# does NOT silently skip the channel and does NOT take the daemon down: the
+# daemon logs a loud "EMAIL CHANNEL DISABLED" error naming every missing
+# variable, then comes up with Matrix and the scheduler running and the email
+# channel OFF. Grep the startup log for that line before assuming the channel
+# is live. (This is the fallback channel; a typo in it must never remove the
+# primary one.)
+#KASTELLAN_EMAIL_ENDPOINT=https://10.0.0.3:8443
+#KASTELLAN_EMAIL_SUBSCRIPTION=kastellan
+#KASTELLAN_EMAIL_ADDRESS=kastellan@example.org
+#KASTELLAN_EMAIL_TOKEN_FILE=/home/hherb/.config/kastellan/localmail-channel.token
+#
+# TRAP 1: KASTELLAN_EMAIL_AUTHSERV_ID must be your own MX's identifier
+# EXACTLY as it appears in the Authentication-Results headers it writes.
+# Only the TOPMOST such header is consulted — anyone can write their own
+# Authentication-Results lines into a message they send. Get this wrong and
+# every message fails closed (silently rejected, never delivered).
+#KASTELLAN_EMAIL_AUTHSERV_ID=mx.example.net
+#
+# TRAP 2: pairing is operator-only, never in-channel:
+#   kastellan-cli pair issue-token --channel email --peer you@example.org
+# The printed token must appear in the BODY of every message from that peer.
+# There is no in-channel pairing over email by design.
+# Send PLAIN TEXT (or multipart/alternative including a text part): the token is
+# only ever read from the message's text body, so an HTML-only message has no
+# token to find and is rejected with reason `no_token` in audit_log. Check there
+# first if a correctly-paired address is being turned away.
+#
+# TRAP 3: a self-signed localmail is NOT reachable by this channel today,
+# even force-routed. Its force-routed sidecar is a plain transparent tunnel (no
+# MITM leg), so KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA above has NO EFFECT on it
+# — there is nothing for it to widen trust on. A self-signed origin is
+# refused by the worker's own webpki-only TLS client, force-routed or not;
+# localmail must present a PUBLICLY-TRUSTED certificate for this channel to
+# reach it until a later slice extends the tunnel with MITM + extra-CA
+# support. KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA DOES apply to the SEPARATE
+# kastellan-worker-mail tool, whose force-routed sidecar does MITM — and per
+# issue #492 ITS egress allowlist must then resolve to a SINGLE private
+# origin. Don't conflate the two, even when they point at the same address.
+"#
+    .to_string()
+}
+
 /// Render the `kastellan.env` EnvironmentFile contents.
 pub fn render_env_file(args: &InstallArgs, layout: &Layout) -> String {
     let mut s = String::new();
@@ -212,6 +294,11 @@ pub fn render_env_file(args: &InstallArgs, layout: &Layout) -> String {
         s.push_str(&format!("KASTELLAN_MATRIX_USER={user}\n"));
         s.push_str("KASTELLAN_MATRIX_ENFORCE_SANDBOX=1\n");
     }
+    // Email fallback channel (Phase 2 slice #5) — commented informational
+    // block only; unlike Matrix above, this slice has no `--email-*` install
+    // flags, so the five KASTELLAN_EMAIL_* vars are never set here. See
+    // render_email_help for the three operator traps.
+    s.push_str(&render_email_help());
     s
 }
 
@@ -637,5 +724,80 @@ mod tests {
         let args = test_args("m", "http://h:1", None);
         let layout = layout();
         assert!(render_env_file(&args, &layout).contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"));
+    }
+
+    /// Same guard as `help_block_is_entirely_commented_out`, for the email
+    /// block: a stray uncommented example line would silently start the email
+    /// channel against a placeholder endpoint on the operator's next daemon
+    /// restart, polling a config nobody configured.
+    #[test]
+    fn email_help_block_is_entirely_commented_out() {
+        for line in render_email_help().lines() {
+            assert!(
+                line.starts_with('#'),
+                "help block must stay inert; this line would be read as config: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn email_help_block_names_the_env_var_and_traps() {
+        let help = render_email_help();
+        assert!(help.contains("KASTELLAN_EMAIL_ENDPOINT"), "{help}");
+        assert!(help.contains("KASTELLAN_EMAIL_AUTHSERV_ID"), "{help}");
+        // Trap 1: the authserv-id must match the MX's own header value exactly,
+        // and only the topmost Authentication-Results header is trusted.
+        assert!(help.contains("EXACTLY"), "must state the exact-match rule: {help}");
+        assert!(help.contains("TOPMOST"), "must state only the topmost header is trusted: {help}");
+        // Trap 2: pairing is operator-only, never in-channel.
+        assert!(help.contains("pair issue-token"), "must name the pairing command: {help}");
+        assert!(help.contains("in-channel pairing"), "must state there is no in-channel pairing: {help}");
+        // The token is read only from the text body, so an HTML-only sender is
+        // rejected `no_token` however correctly they are paired — an operator
+        // cannot diagnose that without being told where to look.
+        assert!(help.contains("PLAIN TEXT"), "must tell the operator to send plain text: {help}");
+        assert!(help.contains("no_token"), "must name the audit reason to grep for: {help}");
+        // Trap 3: the force-routed sidecar for THIS channel is a transparent
+        // tunnel with no MITM leg, so KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA has
+        // no effect on it and a self-signed localmail is not reachable by it
+        // today — must say so plainly, not imply the var fixes it.
+        assert!(help.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"), "{help}");
+        assert!(help.contains("NO EFFECT"), "must state the var does nothing on this path: {help}");
+        assert!(
+            help.contains("not reachable") || help.contains("NOT reachable"),
+            "must state a self-signed localmail is unreachable by this channel today: {help}"
+        );
+        assert!(
+            help.contains("transparent tunnel"),
+            "must name why: the force-routed sidecar has no MITM leg: {help}"
+        );
+        // The #492 single-origin rule is real, but it governs the SEPARATE
+        // kastellan-worker-mail tool (which does MITM), not this channel —
+        // must say so to avoid conflating the two.
+        assert!(help.contains("#492"), "must reference the constraining issue: {help}");
+        assert!(
+            help.contains("kastellan-worker-mail"),
+            "must name which worker #492's rule actually governs: {help}"
+        );
+        // Partial-config behaviour: the CHANNEL is disabled, the DAEMON is not.
+        // The operator's only signal is a startup log line, so the help must
+        // name it verbatim and must NOT still claim the daemon aborts.
+        assert!(
+            help.contains("EMAIL CHANNEL DISABLED"),
+            "must name the exact startup log line to grep for: {help}"
+        );
+        assert!(
+            !help.contains("aborts daemon startup"),
+            "stale claim: a partial config no longer aborts the daemon: {help}"
+        );
+    }
+
+    #[test]
+    fn env_file_includes_the_email_help_block() {
+        let args = test_args("m", "http://h:1", None);
+        let layout = layout();
+        let s = render_env_file(&args, &layout);
+        assert!(s.contains("KASTELLAN_EMAIL_ENDPOINT"), "{s}");
+        assert!(s.contains("KASTELLAN_EMAIL_AUTHSERV_ID"), "{s}");
     }
 }

@@ -42,6 +42,12 @@ pub(crate) const EGRESS_SCRATCH_DIR_PREFIX: &str = "egress-";
 /// `"{MATRIX_SCRATCH_DIR_PREFIX}{pid}-{seq}"` under the same `scratch_root`.
 pub(crate) const MATRIX_SCRATCH_DIR_PREFIX: &str = "matrix-";
 
+/// Name prefix of the email channel worker's per-spawn scratch dir. Same
+/// shape and same crash-leak class as `MATRIX_SCRATCH_DIR_PREFIX` — kept in
+/// sync with the producer in `crate::channel::email`, which formats
+/// `"{EMAIL_SCRATCH_DIR_PREFIX}{pid}-{seq}"` under the same `scratch_root`.
+pub(crate) const EMAIL_SCRATCH_DIR_PREFIX: &str = "email-";
+
 /// Name prefix of the per-worker embed-broker sidecar scratch dir (Slice B).
 /// Kept in sync with `BrokerKind::Embed.scratch_prefix()` (the producer in
 /// `crate::broker::spawn`), which formats `"{EMBED_SCRATCH_DIR_PREFIX}{pid}-{seq}"`
@@ -59,6 +65,7 @@ pub(crate) const SEARCH_SCRATCH_DIR_PREFIX: &str = "search-";
 pub(crate) const SCRATCH_DIR_PREFIXES: &[&str] = &[
     EGRESS_SCRATCH_DIR_PREFIX,
     MATRIX_SCRATCH_DIR_PREFIX,
+    EMAIL_SCRATCH_DIR_PREFIX,
     EMBED_SCRATCH_DIR_PREFIX,
     SEARCH_SCRATCH_DIR_PREFIX,
 ];
@@ -163,6 +170,7 @@ mod tests {
         assert_eq!(parse_daemon_pid("egress-12345-0"), Some(12345));
         assert_eq!(parse_daemon_pid("egress-1-9999"), Some(1));
         assert_eq!(parse_daemon_pid("matrix-12345-0"), Some(12345));
+        assert_eq!(parse_daemon_pid("email-12345-0"), Some(12345));
     }
 
     /// Both broker kinds' scratch dirs are swept — an `embed-<pid>-<seq>` and a

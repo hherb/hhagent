@@ -113,6 +113,58 @@ where
         .collect()
 }
 
+/// Insert a pairing directly (operator action — no in-channel handshake), with
+/// an optional long-lived token hash. `token_sha256` is `None` for transports
+/// that authenticate their own peers (Matrix); `Some(hash)` for email, where
+/// the sender must present the plaintext in every message.
+pub async fn insert_pairing_with_token<'e, E>(
+    executor: E,
+    channel: &str,
+    peer: &str,
+    method: &str,
+    token_sha256: Option<&str>,
+) -> Result<i64, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO pairings (channel, peer, method, token_sha256)
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(channel)
+    .bind(peer)
+    .bind(method)
+    .bind(token_sha256)
+    .fetch_one(executor)
+    .await?;
+    Ok(id)
+}
+
+/// Token requirement for an ACTIVE pairing.
+///
+/// Three-state on purpose, and the caller must not collapse it:
+/// * `None` — no active pairing (revoked rows included). Not authorized.
+/// * `Some(None)` — paired, no token required (Matrix).
+/// * `Some(Some(hash))` — paired, and the sender must present this token.
+pub async fn token_hash_for<'e, E>(
+    executor: E,
+    channel: &str,
+    peer: &str,
+) -> Result<Option<Option<String>>, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT token_sha256 FROM pairings
+          WHERE channel = $1 AND peer = $2 AND revoked_at IS NULL",
+    )
+    .bind(channel)
+    .bind(peer)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(|(h,)| h))
+}
+
 fn dec(col: &'static str) -> impl Fn(sqlx::Error) -> DbError {
     move |e| DbError::Query(format!("decode pairings.{col}: {e}"))
 }

@@ -4,6 +4,13 @@
 //! {"text": …}`). Response SHAPES are pinned against real localmail by the
 //! Mac-only contract test in `core/tests/mail_daemon_e2e.rs`.
 //!
+//! Also serves the two endpoints `workers/email-in` (the email fallback
+//! channel's worker) hits — `GET /v1/changes?subscription=<name>` and
+//! `POST /v1/changes/ack` — so this mock stays a faithful stand-in for
+//! worker-level email-in tests too (added alongside the task-9 hermetic
+//! channel e2e, which itself does not use this mock — that test's fake
+//! worker speaks JSON-RPC directly, with no localmail HTTP involved at all).
+//!
 //! Two spawn flavours, same request routing/response bodies, different
 //! transport:
 //! * [`spawn_mock_localmail`] — plain HTTP. Deliberate: it sidesteps the
@@ -206,8 +213,29 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
         path == m || path.starts_with(&format!("{m}?"))
     };
 
-    // Order matters: the more specific attachment paths before /v1/messages.
-    if path.starts_with("/v1/search") {
+    // Order matters: the more specific /v1/changes/ack must be checked before
+    // the more general /v1/changes prefix (an ack path also starts with it),
+    // and both before the attachment/message paths below.
+    if path.starts_with("/v1/changes/ack") {
+        ("204 No Content", "text/plain", Vec::new())
+    } else if path.starts_with("/v1/changes") {
+        // Shape confirmed against the real localmail route (task-1-report.md's
+        // "Final response shapes" — `message_id`, `next_cursor`, and the
+        // embedded `account.id` are all STRINGS on the wire, unlike
+        // `/v1/accounts`' own numeric `id` below; `email-in`'s handler reads
+        // `message_id` via `.as_str()` and silently skips anything else, so a
+        // number here would swallow every message with no error at all.
+        json(serde_json::json!({
+            "new_messages": [{
+                "message_id": CANNED_MESSAGE_ID.to_string(),
+                "subject": "invoice",
+                "from": {"address": "billing@example.test", "name": "Billing"},
+                "date": "2026-07-28T00:00:00+00:00",
+                "account": {"id": "1", "name": "horst-gmail"}
+            }],
+            "next_cursor": CANNED_MESSAGE_ID.to_string()
+        }).to_string())
+    } else if path.starts_with("/v1/search") {
         json(serde_json::json!({
             "results": [{"message_id": CANNED_MESSAGE_ID, "subject": "invoice", "snippet": "…"}],
             "next_cursor": serde_json::Value::Null
@@ -287,6 +315,78 @@ mod tests {
         let body = resp.split("\r\n\r\n").nth(1).unwrap();
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(v["text"], CANNED_ATTACHMENT_TEXT);
+    }
+
+    /// `GET /v1/changes` must return `message_id` (and `next_cursor`) as JSON
+    /// STRINGS, matching the real localmail contract confirmed in
+    /// `task-1-report.md`'s "Final response shapes" — `workers/email-in`'s
+    /// handler reads `message_id` via `serde_json::Value::as_str`, which
+    /// returns `None` for a JSON number and silently SKIPS the message
+    /// (`handler.rs::poll`'s `let Some(message_id) = … else { continue }`),
+    /// never erroring loudly. `is_string` is the assertion that actually
+    /// catches that regression — a looser "the field is present" check would
+    /// not have. Chosen over a full `workers/email-in`-driven e2e (this
+    /// crate's own test module, not a new integration test elsewhere) because
+    /// `kastellan-worker-email-in` currently has zero dev-dependencies
+    /// (neither `tokio` nor `kastellan-tests-common`), and pulling both in
+    /// just to exercise one mock route is disproportionate to the fix; this
+    /// still fails loudly on exactly the bug that shipped.
+    #[test]
+    fn changes_returns_message_id_and_next_cursor_as_strings() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mock = rt.block_on(spawn_mock_localmail());
+        let addr = mock.base_url.strip_prefix("http://").unwrap().to_string();
+        let mut s = TcpStream::connect(&addr).unwrap();
+        write!(
+            s,
+            "GET /v1/changes?subscription=test HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer t\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        let messages = v["new_messages"].as_array().expect("new_messages must be an array");
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]["message_id"].is_string(),
+            "message_id must be a JSON string, not a number, or email-in's handler silently \
+             drops every message via .as_str() == None; got {}",
+            messages[0]["message_id"]
+        );
+        assert_eq!(messages[0]["message_id"], CANNED_MESSAGE_ID.to_string());
+        assert!(
+            v["next_cursor"].is_string(),
+            "next_cursor must be a JSON string; got {}",
+            v["next_cursor"]
+        );
+    }
+
+    /// `POST /v1/changes/ack` must answer `204 No Content` with an empty
+    /// body — the real contract confirmed in `task-1-report.md`;
+    /// `EmailClient::ack` never parses the body, only checks the status.
+    #[test]
+    fn changes_ack_is_204_with_empty_body() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mock = rt.block_on(spawn_mock_localmail());
+        let addr = mock.base_url.strip_prefix("http://").unwrap().to_string();
+        let mut s = TcpStream::connect(&addr).unwrap();
+        let payload = br#"{"subscription":"test","cursor":"7"}"#;
+        write!(
+            s,
+            "POST /v1/changes/ack HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer t\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        )
+        .unwrap();
+        s.write_all(payload).unwrap();
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp).unwrap();
+        let resp = String::from_utf8_lossy(&resp);
+        assert!(resp.starts_with("HTTP/1.1 204"), "resp: {resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(body.is_empty(), "204 must have an empty body, got: {body:?}");
     }
 
     /// A request with no bearer is refused (auth wiring is exercised).

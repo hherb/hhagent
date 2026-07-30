@@ -90,6 +90,7 @@ async fn inbound_message_round_trips_to_a_reply() {
             peer: PeerId("@me:srv".into()),
             conversation: ConversationId("!room:srv".into()),
             body: "what's on my calendar?".into(),
+            evidence: None,
         }]),
         outbox: outbox.clone(),
     };

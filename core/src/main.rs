@@ -8,6 +8,8 @@ use tracing::info;
 // bare `mod bootstrap;` would resolve to `src/bootstrap.rs`, not `src/main/`.
 #[path = "main/bootstrap.rs"]
 mod bootstrap;
+#[path = "main/email_boot.rs"]
+mod email_boot;
 #[path = "main/matrix_boot.rs"]
 mod matrix_boot;
 
@@ -485,11 +487,28 @@ async fn main() -> Result<()> {
     // `main/matrix_boot.rs`.
     let matrix_bus = matrix_boot::spawn_matrix_channel(&pool, &sandboxes, &force_routing).await;
 
+    // ── Channel bus (Phase 2 slice #5 — email fallback). ──
+    // Gated on KASTELLAN_EMAIL_ENDPOINT (checked inside): unset ⇒ `None` and
+    // the daemon is byte-identical to an email-less build. A set-but-partial
+    // config, a worker spawn failure, or a listener failure logs a loud
+    // `error!` naming what's wrong and yields `None` — the EMAIL CHANNEL does
+    // not start, the daemon does. Deliberately NOT an abort: this is the
+    // FALLBACK channel (it exists because Matrix has no homeserver failover),
+    // so a typo in its config must never take Matrix, the scheduler, and the
+    // graceful-shutdown path below down with it. Design §6 says the daemon
+    // refuses to start *the email channel*, not the daemon. The function
+    // returns `Option`, not `Result`, so no future `?` can reinstate the
+    // abort. See `main/email_boot.rs`.
+    let email_bus = email_boot::spawn_email_channel(&pool, &sandboxes, &force_routing).await;
+
     bootstrap::wait_for_shutdown().await?;
 
-    // Stop the channel bus first so no further inbound messages are enqueued and
-    // the worker's stdin closes (clean worker exit).
+    // Stop the channel buses first so no further inbound messages are enqueued
+    // and each worker's stdin closes (clean worker exit).
     if let Some(bus) = matrix_bus {
+        bus.shutdown().await;
+    }
+    if let Some(bus) = email_bus {
         bus.shutdown().await;
     }
 
