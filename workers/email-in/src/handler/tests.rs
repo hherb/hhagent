@@ -104,6 +104,40 @@ fn poll_honours_timeout_when_batch_yields_no_events() {
     assert_eq!(out["events"].as_array().unwrap().len(), 0);
 }
 
+/// The idle cost of the channel is `timeout_ms / POLL_INTERVAL` upstream
+/// requests per window, NOT one — localmail's `/v1/changes` answers
+/// immediately, so `poll` re-asks to emulate a long poll. At the original
+/// 250ms interval a 15s window issued 60 requests (~4/s forever, and — once
+/// force-routed — 60 fresh TLS handshakes and 60 `egress.allowed` audit rows,
+/// since `proxy_connect` pools nothing). Pinned here so raising the window, or
+/// dropping the interval back, can't quietly restore that.
+#[test]
+fn poll_issues_one_changes_request_per_interval_not_one_per_250ms() {
+    let (mut h, log) = handler_recording_requests();
+    // A 1.5s window: with a seconds-scale interval that is one call at t=0 and
+    // one at the deadline. At the original 250ms it was ~7 — so `<= 3` fails
+    // loudly on a regression while keeping this test's own wall clock at 1.5s
+    // (the sleep is `POLL_INTERVAL.min(deadline - now)`, so a longer interval
+    // never makes the test slower than the window it asks for).
+    h.call("email.poll", serde_json::json!({"timeout_ms": 1_500})).unwrap();
+    let calls = log.lock().unwrap();
+    let changes = calls.iter().filter(|c| c.contains("/v1/changes")).count();
+    assert!(
+        (1..=3).contains(&changes),
+        "a 1.5s window must issue ~2 changes calls, not one per 250ms; got {changes}: {calls:?}"
+    );
+}
+
+#[test]
+fn poll_interval_is_seconds_not_milliseconds() {
+    // A guard on the constant itself, so the reasoning in its doc comment
+    // can't be undone by a one-token edit without a test failing.
+    assert!(
+        POLL_INTERVAL >= std::time::Duration::from_secs(1),
+        "a sub-second interval makes an idle channel hammer localmail: {POLL_INTERVAL:?}"
+    );
+}
+
 #[test]
 fn unattributable_message_lands_in_skipped_not_vanishing() {
     let mut h = handler_with_unattributable_message();
@@ -135,13 +169,18 @@ fn failed_message_detail_for_one_message_does_not_abort_the_batch() {
 
 #[test]
 fn is_permanent_classifies_each_failure_class() {
-    // 4xx: permanently unfetchable (the id is gone / not permitted).
+    // 4xx: permanently unfetchable (the id is gone / the request is malformed).
     assert!(is_permanent(&EmailError::Upstream { status: 404, body: "gone".into() }));
-    assert!(is_permanent(&EmailError::Upstream { status: 403, body: "nope".into() }));
     assert!(is_permanent(&EmailError::Upstream { status: 400, body: "bad".into() }));
-    // …except the two retryable 4xx statuses.
+    assert!(is_permanent(&EmailError::Upstream { status: 410, body: "gone".into() }));
+    // …except the four retryable 4xx statuses. 408/429 are retryable by HTTP
+    // semantics; 401/403 are retryable after an OPERATOR action (a rotated
+    // localmail token, a re-granted api-user), so acking them away would
+    // destroy mail over a recoverable credential problem — see `is_permanent`.
     assert!(!is_permanent(&EmailError::Upstream { status: 408, body: "timeout".into() }));
     assert!(!is_permanent(&EmailError::Upstream { status: 429, body: "slow down".into() }));
+    assert!(!is_permanent(&EmailError::Upstream { status: 401, body: "unauthorized".into() }));
+    assert!(!is_permanent(&EmailError::Upstream { status: 403, body: "nope".into() }));
     // 5xx: the server's temporary problem.
     assert!(!is_permanent(&EmailError::Upstream { status: 500, body: "boom".into() }));
     assert!(!is_permanent(&EmailError::Upstream { status: 503, body: "restarting".into() }));
@@ -180,6 +219,25 @@ fn a_transient_5xx_is_not_skipped_so_the_message_is_redelivered() {
         "a 5xx must NOT be acked away: {:?}",
         out["skipped"]
     );
+}
+
+#[test]
+fn an_auth_denied_detail_is_not_acked_away_so_a_token_rotation_can_recover_it() {
+    // 401/403 mean "fix the localmail credential", not "this message is gone".
+    // Acking either would advance the monotonic cursor past mail the operator
+    // could otherwise have recovered by re-granting the api-user (review).
+    for status in [401u16, 403] {
+        let mut h = handler_with_detail_status("8", status);
+        let out = h.call("email.poll", serde_json::json!({"timeout_ms": 10})).unwrap();
+        let events = out["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "the good message still becomes an event ({status})");
+        assert_eq!(events[0]["ack_token"], "7");
+        assert!(
+            out["skipped"].as_array().unwrap().is_empty(),
+            "a {status} must NOT be acked away: {:?}",
+            out["skipped"]
+        );
+    }
 }
 
 #[test]

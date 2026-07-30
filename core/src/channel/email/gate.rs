@@ -310,6 +310,85 @@ mod tests {
         assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
     }
 
+    // --- hardening round 4: the RFC 8601 method-version bypass (review) ---
+
+    #[test]
+    fn dmarc_pass_is_not_smuggled_when_the_real_verdict_carries_a_method_version() {
+        // RFC 8601 §2.2 permits `method = Keyword [ [CFWS] "/" [CFWS]
+        // method-version ]`, so `dmarc/1=fail` is a legal real verdict. Before
+        // the parser consumed that suffix the segment was invisible to the
+        // dmarc count, the more-than-one-dmarc rule never fired, and the
+        // forged `dmarc=pass` below became the only verdict found — a live
+        // gate bypass.
+        let headers = vec![h("Authentication-Results", "mx.example.net; dmarc/1=fail; dmarc=pass")];
+        assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    #[test]
+    fn dmarc_pass_is_not_smuggled_when_the_real_versioned_verdict_has_cfws_around_the_slash() {
+        let headers =
+            vec![h("Authentication-Results", "mx.example.net; dmarc / 1 = fail; dmarc=pass")];
+        assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    #[test]
+    fn an_honest_versioned_dmarc_pass_is_still_admitted() {
+        // The companion false-negative: a compliant MX emitting the versioned
+        // form must not have every message rejected (which would present as a
+        // delivery bug, not a misconfiguration).
+        let headers = vec![h("Authentication-Results", "mx.example.net; dmarc/1=pass")];
+        assert!(trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    #[test]
+    fn an_honest_versioned_dmarc_fail_is_still_rejected() {
+        let headers = vec![h("Authentication-Results", "mx.example.net; dmarc/1=fail")];
+        assert!(!trusted_dmarc_pass(&headers, "mx.example.net"));
+    }
+
+    /// DOCUMENTED RESIDUAL, deliberately asserted as-is: a non-compliant MX
+    /// that echoes attacker text into its own header value **unescaped** can be
+    /// made to swallow its own verdict.
+    ///
+    /// The attacker controls text either side of the verdict the MX writes
+    /// (`smtp.mailfrom=` before, `header.from=` after). Opening a quote in the
+    /// first and closing it in the second puts the genuine `dmarc=fail` inside a
+    /// stripped quoted-string, so the forged `dmarc=pass` after the closing
+    /// quote is the ONLY methodspec left — count 1, verdict pass. The
+    /// more-than-one-dmarc rule cannot see this, and no change to this parser
+    /// can: from here, swallowed text is indistinguishable from an MX that never
+    /// ran DMARC (see `authres_parse::dmarc_verdict`'s residual note).
+    ///
+    /// This asserts `true` on purpose. It is NOT an endorsement — it pins the
+    /// exact boundary of what a DMARC pass proves, so that (a) nobody reads the
+    /// suite as showing the header check is sufficient on its own, and (b) if a
+    /// future change does close it, this test fails and gets to be rewritten as
+    /// a win. RFC 8601 §2.2 requires escaping an embedded `"`, so a compliant MX
+    /// never offers the primitive; the reason a compromised one is survivable is
+    /// the SECOND factor — the per-pairing token, which no header manipulation
+    /// can produce (`DbPeerAuthorizer::authorize` requires both).
+    #[test]
+    fn residual_a_non_escaping_mx_can_be_made_to_swallow_its_own_verdict() {
+        let headers = vec![h(
+            "Authentication-Results",
+            // The two `"` are the attacker's, in fields the MX echoed verbatim.
+            "mx.example.net; spf=pass smtp.mailfrom=a\"@evil.com; dmarc=fail header.from=b\"; dmarc=pass",
+        )];
+        assert!(
+            trusted_dmarc_pass(&headers, "mx.example.net"),
+            "if this now fails the residual has been closed — rewrite this test as a positive"
+        );
+    }
+
+    #[test]
+    fn a_comment_cannot_weld_a_forged_authserv_id_into_the_configured_one() {
+        // Comments are CFWS, so removing one must SEPARATE its neighbours. When
+        // it deleted them instead, `mx(x)example.net` collapsed to
+        // `mxexample.net` and matched that configured id exactly.
+        let headers = vec![h("Authentication-Results", "mx(x)example.net; dmarc=pass")];
+        assert!(!trusted_dmarc_pass(&headers, "mxexample.net"));
+    }
+
     #[test]
     fn dmarc_fail_is_not_smuggled_via_a_semicolon_inside_the_authserv_id_comment() {
         // The regression the F2 comment-stripping fix introduced: the

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use kastellan_db::tasks::{self, Lane};
 
@@ -258,7 +258,17 @@ pub async fn handle_completed(
     };
     let out = reply_for_completed_task(&payload, result.as_ref())?;
     let Some(tx) = senders.get(&out.channel) else {
-        warn!(channel = %out.channel.0, "no channel registered for reply; dropping");
+        // NOT a warning: the daemon runs one `ChannelBus` per channel family
+        // (`main.rs` spawns a Matrix bus and an email bus), and every bus's
+        // completed-task pump sees EVERY completed channel task via
+        // LISTEN/NOTIFY. So "this reply isn't for a channel I serve" is the
+        // normal case on each reply — the other bus is handling it — and
+        // logging it at `warn` fired a misleading "dropping" line for every
+        // successfully delivered reply, which is exactly how an operator learns
+        // to ignore warnings (review finding). Unifying the buses would remove
+        // the ambiguity outright and let this go back to being a real `warn!`
+        // (it would then mean "nothing serves this channel at all") — #497.
+        debug!(channel = %out.channel.0, "reply is for a channel this bus does not serve; ignoring");
         return None;
     };
     if let Err(e) = tx.send(out.clone()).await {
@@ -318,8 +328,28 @@ impl ChannelBus {
                             None => { info!(channel = %id.0, "inbound closed"); break; }
                         },
                         Some(out) = rx.recv() => {
+                            // `handle_completed` already wrote `channel.replied`
+                            // when it queued this — that row means "routed",
+                            // not "delivered" (see `actions::REPLIED`). The
+                            // actual transport attempt is HERE, so a failure
+                            // must leave its own durable trace, or the audit
+                            // trail asserts a delivery that never happened. In
+                            // slice 1 `EmailChannel::send` always fails, so
+                            // without this pair every email answer looked
+                            // delivered. Payload is channel + peer only: the
+                            // error is transport text, not a fixed label, and
+                            // the body must never be persisted.
+                            let peer = out.peer.clone();
                             if let Err(e) = ch.send(out).await {
                                 warn!(channel = %id.0, error = %e, "channel send failed");
+                                events
+                                    .audit(
+                                        actions::REPLY_UNDELIVERED,
+                                        serde_json::json!({
+                                            "channel": id.0, "peer": peer.0,
+                                        }),
+                                    )
+                                    .await;
                             }
                         }
                     }

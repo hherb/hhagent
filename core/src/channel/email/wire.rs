@@ -55,9 +55,18 @@ use crate::channel::email::gate::{extract_token, trusted_dmarc_pass};
 use crate::channel::polled_driver::{PolledEvent, PolledWorkerSpec};
 use crate::channel::PeerEvidence;
 
-/// Long-poll wait inside one `email.poll`. Longer than Matrix's 2s: email is
-/// an async fallback, not an interactive chat, and each poll is an HTTP round
-/// trip to localmail.
+/// Long-poll window for one `email.poll` call. Longer than Matrix's 2s: email
+/// is an async fallback, not an interactive chat.
+///
+/// This bounds the WINDOW, not the request count. localmail's `/v1/changes`
+/// answers immediately, so the worker emulates a long poll by re-asking every
+/// `handler::POLL_INTERVAL` — a 15s window is `15_000 / POLL_INTERVAL`
+/// upstream requests, not one. (An earlier version of this comment claimed
+/// "each poll is an HTTP round trip to localmail", which was true of the
+/// window and false of its interior; the interval was 250ms, so an idle
+/// channel issued ~4 requests/s forever. See `handler::POLL_INTERVAL` for the
+/// full cost breakdown.) Raising this value is cheap; lowering the interval is
+/// not.
 pub const POLL_MS: u64 = 15_000;
 
 /// The email instantiation of the channel-generic polled driver.
@@ -79,8 +88,27 @@ static AUTHSERV_ID: OnceLock<String> = OnceLock::new();
 /// `spawn_email_worker` before `PolledWorkerDriver::spawn`. Idempotent; a
 /// second call with a different value is ignored, which is correct for a
 /// single-daemon process and avoids a mid-flight trust change.
+///
+/// A *conflicting* second call is ignored **loudly**. This value is the gate's
+/// entire trust root: if some later caller (a second channel instance, a
+/// diagnostic subcommand) tried to install a different one, the effect would
+/// be that every message is judged against the FIRST id — fail-closed, but
+/// completely invisible, presenting as "email silently stopped working" (review
+/// finding). Repeating the SAME value stays silent, which is what the e2e
+/// suite does on every test.
 pub fn set_authserv_id(id: &str) {
-    let _ = AUTHSERV_ID.set(id.to_string());
+    if let Err(rejected) = AUTHSERV_ID.set(id.to_string()) {
+        let in_force = AUTHSERV_ID.get().map(String::as_str).unwrap_or("");
+        if in_force != rejected {
+            tracing::warn!(
+                in_force,
+                rejected,
+                "email authserv-id is already set to a DIFFERENT value; keeping the first. \
+                 Every inbound message is judged against `in_force`, so if `rejected` is the \
+                 correct one for this deployment the gate will reject everything."
+            );
+        }
+    }
 }
 
 /// `ParsePoll` entry point (the fn-pointer shape `PolledWorkerDriver` needs).

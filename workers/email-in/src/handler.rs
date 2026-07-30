@@ -22,6 +22,29 @@ use kastellan_protocol::{codes, server::Handler, RpcError};
 
 use crate::client::{EmailClient, EmailError};
 
+/// Gap between successive `GET /v1/changes` calls inside ONE `email.poll`
+/// window.
+///
+/// This — not `email.poll`'s `timeout_ms` — is what sets the channel's idle
+/// cost, because localmail's `/v1/changes` returns immediately rather than
+/// holding the request open: `poll` emulates a long poll by re-asking, so one
+/// 15s window issues `15_000 / POLL_INTERVAL` upstream requests, forever, even
+/// on a completely empty inbox.
+///
+/// At the original 250ms that was 60 requests per window ≈ 4/s ≈ 345k/day,
+/// which the design never intended (`wire::POLL_MS`'s own comment reasons about
+/// "each poll is an HTTP round trip to localmail" — true of the window, false
+/// of the interior) and which is far from free once the channel is
+/// force-routed: `web_common::proxy_connect` pools nothing, so EVERY request is
+/// a fresh UDS connect + proxy `CONNECT` + full TLS handshake, and every
+/// CONNECT decision becomes an `egress.allowed` `audit_log` row via
+/// `egress::net_worker::pg_decision_sink`. 5s cuts all three by 20× (≈17k
+/// requests/day) at a worst-case cost of 5s of extra inbound latency — nothing
+/// at all for an asynchronous fallback channel whose own transport is measured
+/// in seconds-to-minutes. `poll_issues_one_changes_request_per_interval` pins
+/// the ratio so the regression cannot come back silently.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub struct EmailInHandler {
     client: EmailClient,
     /// Named localmail subscription this worker polls/acks — kastellan holds
@@ -57,8 +80,15 @@ impl EmailInHandler {
 
     /// `email.poll {timeout_ms}` — long-polls: call `changes`, and if it
     /// comes back empty (or every message in it turns out unattributable /
-    /// unfetchable), sleep in short slices (capped at 250ms, and further
-    /// capped at whatever remains of the budget) until `timeout_ms` elapses.
+    /// unfetchable), sleep in slices ([`POLL_INTERVAL`], further capped at
+    /// whatever remains of the budget) until `timeout_ms` elapses.
+    ///
+    /// **`timeout_ms` bounds the window, [`POLL_INTERVAL`] sets the cost.**
+    /// localmail's `/v1/changes` answers immediately — it is not itself a
+    /// long-poll endpoint — so this loop *emulates* one, and the number of
+    /// upstream requests per window is `timeout_ms / POLL_INTERVAL`, not one.
+    /// See [`POLL_INTERVAL`] for why that ratio is deliberately small; the
+    /// worst-case added inbound latency is one `POLL_INTERVAL`.
     ///
     /// **Must honour `timeout_ms` in every case, not just when `changes`
     /// itself is empty.** An earlier version returned the instant a batch's
@@ -117,7 +147,6 @@ impl EmailInHandler {
         }
         let p: P = parse_params(params)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(p.timeout_ms);
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
         let mut events = Vec::new();
         let mut skipped = Vec::new();
@@ -262,9 +291,24 @@ fn describe_email_error(e: &EmailError) -> String {
 /// is treated as transient, because the transient branch's failure mode is
 /// redelivery and the permanent branch's is destruction):
 ///
-/// * `Upstream { 400..=499 }` — permanent (404 gone, 403 not-permitted, …),
-///   **except** `408 Request Timeout` and `429 Too Many Requests`, which are
-///   explicitly retryable in HTTP semantics.
+/// * `Upstream { 400..=499 }` — permanent (404 gone, 400 malformed, …),
+///   **except** four statuses:
+///   * `408 Request Timeout` and `429 Too Many Requests` — explicitly
+///     retryable in HTTP semantics.
+///   * `401 Unauthorized` and `403 Forbidden` — retryable after an **operator
+///     action**, and therefore NOT permanent by this function's own test
+///     ("will retrying the exact same request never succeed?"). An expired or
+///     rotated localmail bearer token, or a withdrawn `api-user` grant, makes
+///     the identical request succeed again the moment the operator fixes it;
+///     acking the message away first would destroy mail over a recoverable
+///     credential problem, and destruction is the one direction this
+///     classification must never guess wrong in. Note `email_err_to_rpc`
+///     already treats these two as their own class ("check token / api-user
+///     grant") — i.e. as configuration, not as a fact about the message —
+///     so calling them permanent here was internally inconsistent too
+///     (review finding). A wholly-revoked token normally fails the earlier
+///     `changes` call and never reaches this branch; this covers the narrower
+///     per-message/per-mailbox denial that does.
 /// * `Upstream { 5xx }` — transient. A server error is by definition the
 ///   server's temporary problem.
 /// * `Transport(_)` — transient: connection reset, TLS failure, no route.
@@ -291,7 +335,7 @@ fn is_permanent(e: &EmailError) -> bool {
     match e {
         EmailError::BadParams(_) => true,
         EmailError::Upstream { status, .. } => {
-            (400..500).contains(status) && *status != 408 && *status != 429
+            (400..500).contains(status) && !matches!(*status, 401 | 403 | 408 | 429)
         }
         EmailError::Transport(_) => false,
     }
@@ -346,6 +390,14 @@ fn record_transient(message_id: &str, reason: &str) {
 /// `Reply-To` is deliberately never consulted for the peer: honouring it
 /// would let a sender who passes the gate redirect the agent's reply to a
 /// third party by simply setting a Reply-To header.
+///
+/// `body` is localmail's `body_text` and nothing else — no HTML part is read or
+/// converted. Since the per-pairing token is only ever found in this field
+/// (`gate::extract_token`), an HTML-only message carries no discoverable token
+/// and is refused `no_token` no matter how correctly its sender is paired. That
+/// is the safe direction (a body we cannot parse must not be trusted to contain
+/// the secret), and it is called out for operators in
+/// `install::plan::render_email_help`'s TRAP 2.
 ///
 /// `auth_results` is every `Authentication-Results` header value, in the
 /// best order this worker can establish — this worker never inspects their

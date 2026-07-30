@@ -229,6 +229,10 @@ pub fn render_email_help() -> String {
 #   kastellan-cli pair issue-token --channel email --peer you@example.org
 # The printed token must appear in the BODY of every message from that peer.
 # There is no in-channel pairing over email by design.
+# Send PLAIN TEXT (or multipart/alternative including a text part): the token is
+# only ever read from the message's text body, so an HTML-only message has no
+# token to find and is rejected with reason `no_token` in audit_log. Check there
+# first if a correctly-paired address is being turned away.
 #
 # TRAP 3: a self-signed localmail is NOT reachable by this channel today,
 # even force-routed. Its force-routed sidecar is a plain transparent tunnel (no
@@ -748,6 +752,11 @@ mod tests {
         // Trap 2: pairing is operator-only, never in-channel.
         assert!(help.contains("pair issue-token"), "must name the pairing command: {help}");
         assert!(help.contains("in-channel pairing"), "must state there is no in-channel pairing: {help}");
+        // The token is read only from the text body, so an HTML-only sender is
+        // rejected `no_token` however correctly they are paired — an operator
+        // cannot diagnose that without being told where to look.
+        assert!(help.contains("PLAIN TEXT"), "must tell the operator to send plain text: {help}");
+        assert!(help.contains("no_token"), "must name the audit reason to grep for: {help}");
         // Trap 3: the force-routed sidecar for THIS channel is a transparent
         // tunnel with no MITM leg, so KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA has
         // no effect on it and a self-signed localmail is not reachable by it

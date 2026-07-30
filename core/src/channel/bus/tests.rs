@@ -149,6 +149,83 @@ async fn outbound_routes_completed_channel_task_to_its_channel() {
     assert_eq!(ev.audited.lock().unwrap()[0].0, actions::REPLIED);
 }
 
+/// A channel whose `send` always fails — the exact shape `EmailChannel` has in
+/// slice 1, which has no outbound worker yet. `recv` parks on a channel the test
+/// keeps the sender for, so the bus's per-channel pump stays alive and reaches
+/// its outbound arm (returning `None` would break the pump loop instead).
+struct RefusingChannel {
+    id: ChannelId,
+    inbound_rx: mpsc::Receiver<IncomingMessage>,
+}
+
+#[async_trait::async_trait]
+impl Channel for RefusingChannel {
+    fn id(&self) -> ChannelId {
+        self.id.clone()
+    }
+    async fn recv(&mut self) -> Option<IncomingMessage> {
+        self.inbound_rx.recv().await
+    }
+    async fn send(&self, _msg: OutgoingMessage) -> anyhow::Result<()> {
+        anyhow::bail!("test transport refuses (mirrors slice-1 EmailChannel::send)")
+    }
+}
+
+/// `channel.replied` means "routed to the channel", not "delivered" — the
+/// transport attempt happens afterwards, in the per-channel pump. A refusing
+/// transport must therefore leave its own durable row, or the audit trail
+/// asserts a delivery that never happened. This is not hypothetical: in slice 1
+/// EVERY email reply takes this path, so without the compensating row every
+/// email answer looked delivered in `audit_log` (review finding).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_reply_audits_reply_undelivered_alongside_replied() {
+    let ev = Arc::new(FakeEvents::default());
+    let mut rows = HashMap::new();
+    rows.insert(
+        7i64,
+        (
+            serde_json::json!({"kind":"channel","channel":"email","peer":"me@example.org","conversation":"<m1@x>"}),
+            Some(serde_json::json!({"kind":"completed","message":"42 * 17 = 714"})),
+        ),
+    );
+    let completed = FakeCompleted { ids: Mutex::new(vec![7]), rows };
+
+    // Sender kept alive for the whole test so `recv` stays pending.
+    let (_inbound_tx, inbound_rx) = mpsc::channel::<IncomingMessage>(1);
+    let channel = RefusingChannel { id: ChannelId("email".into()), inbound_rx };
+
+    let bus = ChannelBus::spawn(
+        vec![Box::new(channel)],
+        Arc::new(StaticPairings::new()),
+        None,
+        ev.clone(),
+        Box::new(completed),
+    );
+
+    // Poll until both rows land (the two pumps are separate tasks).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let seen = ev.audited.lock().unwrap().clone();
+        let replied = seen.iter().any(|(a, _)| a == actions::REPLIED);
+        let undelivered = seen.iter().find(|(a, _)| a == actions::REPLY_UNDELIVERED);
+        if let (true, Some((_, payload))) = (replied, undelivered) {
+            assert_eq!(payload["channel"], "email");
+            assert_eq!(payload["peer"], "me@example.org");
+            let rendered = payload.to_string();
+            assert!(!rendered.contains("714"), "must never persist the reply body: {rendered}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a refused reply must audit {} as well as {}; saw {seen:?}",
+            actions::REPLY_UNDELIVERED,
+            actions::REPLIED,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    bus.shutdown().await;
+}
+
 #[tokio::test]
 async fn outbound_ignores_non_channel_completion() {
     let ev = FakeEvents::default();
