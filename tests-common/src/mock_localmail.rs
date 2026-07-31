@@ -4,12 +4,16 @@
 //! {"text": …}`). Response SHAPES are pinned against real localmail by the
 //! Mac-only contract test in `core/tests/mail_daemon_e2e.rs`.
 //!
-//! Also serves the two endpoints `workers/email-in` (the email fallback
-//! channel's worker) hits — `GET /v1/changes?subscription=<name>` and
-//! `POST /v1/changes/ack` — so this mock stays a faithful stand-in for
-//! worker-level email-in tests too (added alongside the task-9 hermetic
-//! channel e2e, which itself does not use this mock — that test's fake
-//! worker speaks JSON-RPC directly, with no localmail HTTP involved at all).
+//! Also serves the **three** endpoints `workers/email-in` (the email fallback
+//! channel's worker) hits — `GET /v1/changes?subscription=<name>`,
+//! `GET /v1/messages/{id}?headers=full`, and `POST /v1/changes/ack` — so this
+//! mock stays a faithful stand-in for worker-level email-in tests too (added
+//! alongside the task-9 hermetic channel e2e, which itself does not use this
+//! mock — that test's fake worker speaks JSON-RPC directly, with no localmail
+//! HTTP involved at all). The message-detail route is shared with the mail
+//! tool, which reads only `attachments`; `email-in` additionally reads
+//! `from.address`, `body_text` and (only under `?headers=full`) `headers` —
+//! see [`route`] for the source-confirmed shapes.
 //!
 //! Two spawn flavours, same request routing/response bodies, different
 //! transport:
@@ -35,6 +39,22 @@ pub const CANNED_ATTACHMENT_TEXT: &str = "NORTH COAST AREA HEALTH SERVICE invoic
 pub const CANNED_ATTACHMENT_BYTES: &[u8] = b"%PDF-1.4 canned attachment bytes";
 /// The message id the canned search/list hits reference.
 pub const CANNED_MESSAGE_ID: i64 = 7;
+/// The canned message's From address. On the wire localmail wraps it in an
+/// address OBJECT (`{"address", "name"}`), never a bare string — see [`route`].
+/// Already lowercase, matching the peer `email-in` derives from it.
+pub const CANNED_FROM_ADDRESS: &str = "billing@example.test";
+/// The canned message's plain-text body. localmail names this field
+/// `body_text` (not `body`); it is what becomes an inbound event's body.
+pub const CANNED_BODY_TEXT: &str = "please find the invoice attached";
+/// The canned message's RFC 5322 `Message-ID` header value, which `email-in`
+/// turns into the inbound event's conversation id.
+pub const CANNED_MESSAGE_ID_HEADER: &str = "<mid-7@example.test>";
+/// authserv-id of the "our own MX" half of [`CANNED_AUTH_RESULTS`]. A consumer
+/// that configures this as its trusted authserv-id gets `dmarc_pass: true`.
+pub const CANNED_AUTHSERV_ID: &str = "mx.example.net";
+/// The canned `Authentication-Results` header value: a genuine `dmarc=pass`
+/// stamped by [`CANNED_AUTHSERV_ID`]. Only ever served under `?headers=full`.
+pub const CANNED_AUTH_RESULTS: &str = "mx.example.net; dmarc=pass";
 
 /// A live plain-HTTP localmail mock. Aborts its listener task on drop.
 pub struct MockLocalmail {
@@ -184,6 +204,15 @@ fn content_length(head: &str) -> usize {
     0
 }
 
+/// Does this request-target's query string carry the exact pair `headers=full`?
+/// Matches localmail's own test (`full_headers=(headers == "full")`) rather
+/// than a loose substring check, so a client sending some *other* spelling gets
+/// the same header-less 200 a real localmail would give it.
+fn wants_full_headers(path: &str) -> bool {
+    path.split_once('?')
+        .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "headers=full"))
+}
+
 /// Pure request-line/headers → (status, content-type, body). Asserts a
 /// non-empty bearer so the auth wiring is exercised, then routes by path.
 fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
@@ -247,18 +276,44 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
     } else if path.starts_with("/v1/attachments/") {
         ("200 OK", "application/pdf", CANNED_ATTACHMENT_BYTES.to_vec())
     } else if is_message_by_id {
-        json(serde_json::json!({
+        // Shape confirmed against localmail's own source
+        // (`localmail/src/localmail/api/messages.py::get_message`), because
+        // `email-in`'s `build_event` reads three fields the earlier
+        // mail-tool-only shape got wrong or omitted:
+        //   * `from` is an address OBJECT (`_address()` → `{"address","name"}`),
+        //     NOT a bare string. `build_event` reads `from.address`, so a bare
+        //     string yields `None` — the message becomes a `skipped` entry and
+        //     never an inbound event, silently.
+        //   * the plain-text body is `body_text`, not `body`.
+        //   * `headers` exists ONLY when the request carried `?headers=full`
+        //     (`serve/routes/messages.py::detail` maps that query pair to
+        //     `full_headers=(headers == "full")`), and every value is an ARRAY
+        //     of that exact-cased header's occurrences in wire order. Gating it
+        //     here keeps the mock honest about a real trap: a client that asks
+        //     with the wrong query spelling gets a 200 with no headers at all,
+        //     hence no `Authentication-Results`, hence a fail-closed DMARC
+        //     verdict for every message — which looks like a delivery bug.
+        // The mail tool reads only `attachments`, which is unchanged.
+        let mut msg = serde_json::json!({
             "id": CANNED_MESSAGE_ID,
             "subject": "invoice",
-            "from": "billing@example.test",
-            "body": "please find the invoice attached",
+            "from": {"address": CANNED_FROM_ADDRESS, "name": "Billing"},
+            "date": "2026-07-28T00:00:00+00:00",
+            "body_text": CANNED_BODY_TEXT,
             "attachments": [{
                 "filename": "invoice.pdf",
                 "sha256": CANNED_SHA256,
                 "content_type": "application/pdf",
                 "size": CANNED_ATTACHMENT_BYTES.len()
             }]
-        }).to_string())
+        });
+        if wants_full_headers(path) {
+            msg["headers"] = serde_json::json!({
+                "Message-ID": [CANNED_MESSAGE_ID_HEADER],
+                "Authentication-Results": [CANNED_AUTH_RESULTS],
+            });
+        }
+        json(msg.to_string())
     } else if path.starts_with("/v1/messages") {
         json(serde_json::json!({
             "results": [{"message_id": CANNED_MESSAGE_ID, "subject": "invoice"}],
@@ -387,6 +442,72 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 204"), "resp: {resp}");
         let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
         assert!(body.is_empty(), "204 must have an empty body, got: {body:?}");
+    }
+
+    /// One raw `GET /v1/messages/{id}` against the mock, with and without
+    /// `?headers=full`; returns the parsed body.
+    fn message_detail(query: &str) -> serde_json::Value {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mock = rt.block_on(spawn_mock_localmail());
+        let addr = mock.base_url.strip_prefix("http://").unwrap().to_string();
+        let mut s = TcpStream::connect(&addr).unwrap();
+        write!(
+            s,
+            "GET /v1/messages/{CANNED_MESSAGE_ID}{query} HTTP/1.1\r\nHost: x\r\n\
+             Authorization: Bearer t\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+        serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    /// `GET /v1/messages/{id}` must serve `from` as an address OBJECT and the
+    /// plain-text body as `body_text` — the real localmail contract
+    /// (`api/messages.py::get_message`). `email-in`'s `build_event` reads
+    /// `from.address`; against a bare `"from": "a@b"` string it returns `None`
+    /// and the message becomes a `skipped` entry instead of an inbound event,
+    /// with no error anywhere. `is_string()` on the nested address is the
+    /// assertion that catches that regression — "the field is present" would not.
+    #[test]
+    fn message_detail_serves_from_as_an_address_object_and_body_text() {
+        let v = message_detail("");
+        assert!(
+            v["from"]["address"].is_string(),
+            "from must be an address object, not a bare string, or email-in's build_event \
+             silently skips every message; got from = {}",
+            v["from"]
+        );
+        assert_eq!(v["from"]["address"], CANNED_FROM_ADDRESS);
+        assert_eq!(v["body_text"], CANNED_BODY_TEXT);
+    }
+
+    /// `headers` is served only under `?headers=full`, exactly as localmail
+    /// gates it (`full_headers=(headers == "full")`), and each value is an
+    /// ARRAY of that header's wire occurrences. Both halves matter: without the
+    /// gate the mock would hide the "wrong query spelling ⇒ no
+    /// Authentication-Results ⇒ every message fails DMARC closed" trap, and
+    /// without the array shape `email-in`'s `header_values` would fall through
+    /// to its defensive string arm rather than the real path.
+    #[test]
+    fn message_detail_gates_headers_on_the_full_query_pair() {
+        let compact = message_detail("");
+        assert!(
+            compact.get("headers").is_none(),
+            "a compact request must get NO headers key; got {}",
+            compact
+        );
+
+        let full = message_detail("?headers=full");
+        let auth = full["headers"]["Authentication-Results"]
+            .as_array()
+            .expect("Authentication-Results must be an ARRAY of wire occurrences");
+        assert_eq!(auth, &vec![serde_json::json!(CANNED_AUTH_RESULTS)]);
+        assert_eq!(
+            full["headers"]["Message-ID"],
+            serde_json::json!([CANNED_MESSAGE_ID_HEADER])
+        );
     }
 
     /// A request with no bearer is refused (auth wiring is exercised).

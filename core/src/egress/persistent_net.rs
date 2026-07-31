@@ -76,10 +76,16 @@ pub struct NetTransportSpawn<'a> {
     pub worker_name: &'a str,
     /// This transport's sidecar TLS posture — see [`super::spawn::Mitm`].
     /// Channel callers choose: the email channel intercepts (so the operator's
-    /// upstream anchor reaches a self-signed private origin, and the leg is
-    /// visible to the leak scanner); Matrix tunnels transparently, because
+    /// upstream anchor reaches a self-signed private origin, and the plaintext
+    /// leg becomes MITM-**visible**); Matrix tunnels transparently, because
     /// matrix-sdk terminates its own TLS through `ProxyBridge` and cannot be
     /// made to trust a per-instance CA.
+    ///
+    /// Visible is the precondition for the #3b credential-leak scanner, NOT
+    /// coverage by it: this transport provisions no `secret_fingerprints` (only
+    /// `super::net_worker`'s per-tool-call path does), so no `secret_hashes.json`
+    /// ever lands in the sidecar's scratch and the proxy's `load_patterns` fails
+    /// OPEN — nothing on this path is scanned today.
     pub mitm: Mitm<'a>,
     /// A **worker-side** origin cert, appended to `fs_read` so a VM RO-share
     /// carries it in-guest. Test-only today; `None` in production. Meaningful
