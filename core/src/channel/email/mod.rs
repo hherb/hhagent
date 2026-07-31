@@ -23,6 +23,7 @@
 //!
 //! [`SandboxPolicy`]: kastellan_sandbox::SandboxPolicy
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
@@ -148,14 +149,19 @@ fn email_backoff() -> RestartBackoff {
 ///
 /// `egress` mirrors `matrix::spawn_matrix_worker`'s parameter of the same
 /// name exactly (see [`EmailEgress`]'s docs for why `None` is unsafe in
-/// production): `Some` brings up a fresh per-worker transparent-tunnel
-/// sidecar alongside the worker on every (re)spawn and routes the worker
-/// through it (private netns); `None` spawns the worker directly on
-/// `Net::Allowlist` (the legacy path, e.g. a future `kastellan-cli email
-/// probe` diagnostic). Note this sidecar is a TRANSPARENT tunnel, same as
-/// Matrix's — it does not by itself solve TLS to a self-signed localmail
-/// origin (that needs the MITM + upstream-extra-CA seam, #492, which is not
-/// wired into this path); it closes the containment gap, not the TLS one.
+/// production): `Some` brings up a fresh per-worker sidecar alongside the
+/// worker on every (re)spawn and routes the worker through it (private
+/// netns); `None` spawns the worker directly on `Net::Allowlist` (the legacy
+/// path, e.g. a future `kastellan-cli email probe` diagnostic). Unlike
+/// Matrix's sidecar, this one ALWAYS INTERCEPTS (`Mitm::Intercept`): it
+/// terminates the worker's TLS and re-originates upstream, so an operator
+/// anchor — selected once here via [`ForceRoutingConfig::upstream_ca_for`],
+/// before the respawn factory is built — reaches a self-signed localmail when
+/// one is configured for this worker's origin, and the leg is visible to the
+/// egress boundary's credential-leak scanner. With no anchor configured the
+/// upstream leg is plain webpki, the same posture every other force-routed
+/// tool worker already has; the posture itself is never conditional on the
+/// anchor being present.
 ///
 /// Records `cfg.authserv_id` via [`wire::set_authserv_id`] *before* starting
 /// the driver, so the very first `email.poll` result is parsed against the
@@ -203,6 +209,26 @@ pub fn spawn_email_worker(
     // `matrix::spawn_matrix_worker`'s branching exactly (minus the VM /
     // password-bootstrap concerns, which do not apply to this worker).
     let allowlist = vec![format!("{host}:{port}")];
+
+    // #492's selector, reused verbatim so the channel inherits the
+    // single-private-origin rule: exactly one configured origin, and it must be
+    // the only host this worker can dial. Selected HERE rather than inside the
+    // factory so a configuration disagreement disables the email channel once,
+    // loudly, at startup — instead of failing forever inside the supervisor's
+    // respawn backoff. Owned so the closure holds no borrow into the Arc.
+    let upstream_extra_ca: Option<PathBuf> = match &egress {
+        Some(eg) => eg
+            .routing
+            .upstream_ca_for(&allowlist)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "email channel: refusing to start — KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA: {e}"
+                )
+            })?
+            .map(|p| p.to_path_buf()),
+        None => None,
+    };
+
     let spawn_seq = AtomicU64::new(0);
     let factory: PersistentFactory = Box::new(move || match &egress {
         Some(eg) => {
@@ -230,7 +256,15 @@ pub fn spawn_email_worker(
                 base_policy: policy.clone(),
                 allowlist: &allowlist,
                 worker_name: "email",
-                mitm: Mitm::Transparent,
+                // The email channel ALWAYS intercepts: the sidecar terminates
+                // the worker's TLS and re-originates upstream, so an operator
+                // anchor (when configured) reaches a self-signed localmail and
+                // the leg is visible to the #3b leak scanner. With no anchor the
+                // upstream leg is plain webpki — the same posture every
+                // force-routed tool worker has.
+                mitm: Mitm::Intercept {
+                    upstream_extra_ca: upstream_extra_ca.as_deref(),
+                },
                 worker_extra_ca: None,
             };
             let sink = (eg.routing.make_sink)();
@@ -340,5 +374,31 @@ mod tests {
             p.proxy_uds.is_none(),
             "the direct (egress: None) path must never force-route through a proxy UDS"
         );
+    }
+
+    #[test]
+    fn email_transport_intercepts_and_carries_the_selected_anchor() {
+        // A config naming this channel's own origin yields an intercepting posture
+        // holding that anchor — the whole point of the slice.
+        let map = crate::egress::upstream_ca::parse_upstream_cas(
+            r#"{"10.0.0.3":"/etc/kastellan/localmail.pem"}"#,
+        )
+        .expect("valid config");
+        let allowlist = vec!["10.0.0.3:8443".to_string()];
+        let selected = crate::egress::upstream_ca::select_ca_for_allowlist(&map, &allowlist)
+            .expect("single private origin selects cleanly");
+        assert_eq!(selected, Some(std::path::Path::new("/etc/kastellan/localmail.pem")));
+    }
+
+    #[test]
+    fn email_anchor_selection_refuses_a_mixed_allowlist() {
+        // The channel must fail its own bring-up rather than widen trust to a second
+        // host, and it must do so at boot, not inside the respawn loop.
+        let map = crate::egress::upstream_ca::parse_upstream_cas(
+            r#"{"10.0.0.3":"/etc/kastellan/localmail.pem"}"#,
+        )
+        .expect("valid config");
+        let allowlist = vec!["10.0.0.3:8443".to_string(), "smtp.example.com:587".to_string()];
+        assert!(crate::egress::upstream_ca::select_ca_for_allowlist(&map, &allowlist).is_err());
     }
 }
