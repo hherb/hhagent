@@ -49,7 +49,14 @@ const STDERR_SETTLE: Duration = Duration::from_millis(250);
 /// long-lived channel sidecar (matrix) gets `0` instead — see [`proxy_policy`].
 const SHORT_LIVED_SIDECAR_CPU_MS: u64 = 10_000;
 
-/// A running sidecar. Drop or `shutdown()` kills it.
+/// A running sidecar. Call [`shutdown`](SidecarHandle::shutdown) or
+/// [`terminate`](SidecarHandle::terminate) to kill it — this type has **no**
+/// `Drop` impl, so simply letting it go out of scope leaks the child process
+/// (`std::process::Child`'s own drop does not kill it). The `Drop`-bearing
+/// wrapper that ties teardown to scope is `egress::net_worker::EgressSidecar`,
+/// which holds one of these and calls `terminate()` from its own `Drop`; a
+/// bare `SidecarHandle` dropped before it is wrapped (or without ever being
+/// wrapped) leaks — tracked as issue #502.
 #[derive(Debug)]
 pub struct SidecarHandle {
     child: Child,

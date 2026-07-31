@@ -513,5 +513,23 @@ mod tests {
             "a CA keyed to a host this worker never dials must not be handed to its sidecar: {:?}",
             sidecar_policy.env
         );
+        // Load-bearing design decision, pinned by mutation: this channel
+        // intercepts UNCONDITIONALLY, not "when an anchor happens to be
+        // configured". This call resolves to NO anchor for this worker (the
+        // map has only an unrelated host), so if `spawn_email_worker` ever
+        // switched to picking the posture from `upstream_extra_ca.is_some()`
+        // (i.e. `Mitm::Transparent` when anchorless), this is exactly the
+        // case that would flip — and `KASTELLAN_EGRESS_PROXY_DISABLE_MITM` is
+        // pushed only for the transparent posture (see `proxy_policy`), so
+        // its absence here is the proof the sidecar still intercepts.
+        assert!(
+            !sidecar_policy
+                .env
+                .iter()
+                .any(|(k, _)| k == "KASTELLAN_EGRESS_PROXY_DISABLE_MITM"),
+            "an anchorless email channel spawn must still intercept, never fall back to \
+             transparent: {:?}",
+            sidecar_policy.env
+        );
     }
 }

@@ -419,6 +419,21 @@ fn mock_localmail_shapes_match_real_localmail() {
             }
         }
     }
+    // This gate exists specifically to catch the shared `mock_localmail` test
+    // double drifting from the real service's field shape (see the comment
+    // above `detail_shape_checked`'s first use) — that drift already happened
+    // once and was fixed on this branch. `detail_shape_checked` is set inside
+    // the loop above but was never asserted afterwards: if `/v1/messages`
+    // returned zero rows, or every per-id `GET` above failed (`msg` is
+    // `None`), the loop runs to completion having exercised nothing and the
+    // test would still report success — exactly the silent pass this gate is
+    // meant to prevent. Fail loudly instead.
+    assert!(
+        detail_shape_checked,
+        "the message-detail shape check never ran (zero rows from /v1/messages, or every \
+         per-id GET to /v1/messages/{{id}} failed) — this anti-drift gate checked nothing; \
+         see the mock_localmail drift this test exists to catch"
+    );
     let Some(sha) = sha else {
         eprintln!("[NOTE] no attachment in the archive; skipping the attachment-text shape check");
         return;

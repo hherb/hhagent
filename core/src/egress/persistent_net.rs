@@ -174,7 +174,11 @@ pub fn spawn_net_transport(
 
     // 3. Spawn the worker + connect the Client (ClientTransport applies the same
     //    lockdown-env derivation every spawn path uses). Fail-closed: if this
-    //    errors, `sidecar` drops here and its Drop kills the proxy.
+    //    errors, `sidecar` (still a bare `SidecarHandle`, not yet wrapped by
+    //    `EgressSidecar`) is dropped here by `?` — but `SidecarHandle` has no
+    //    `Drop` impl, so this LEAKS the sidecar process rather than killing
+    //    it (issue #502, pre-existing on the Matrix call site too; this
+    //    caller adds a second respawn-backoff loop over the same leak).
     let inner = ClientTransport::spawn(params.backend, &forced, params.program, params.args)?;
 
     // 4. Drain the sidecar's decision stdout into the caller's sink (draining

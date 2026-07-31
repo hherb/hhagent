@@ -201,6 +201,17 @@ pub fn render_upstream_ca_help() -> String {
 ///    worker's allowlist must resolve to that single private origin. Verify a
 ///    cert's shape with:
 ///    `openssl x509 -in <cert.pem> -noout -text | grep -A1 'Basic Constraints'`
+///    **Also:** `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` is ONE global map, keyed
+///    by host only (not host:port — see [`render_upstream_ca_help`]'s
+///    CAVEAT). An entry configured for this channel's origin is handed to
+///    EVERY worker whose allowlist resolves to that same address, including
+///    the separate `kastellan-worker-mail` TOOL if it points at the same
+///    host. Two services sharing an address (e.g. localmail on `:8443` and a
+///    search service on `:8888`, both `10.0.0.3`) cannot be distinguished by
+///    this map: there is no log, no error, just a silently widened upstream
+///    trust for whichever other worker resolves there. Don't conflate this
+///    channel with the `kastellan-worker-mail` tool when reasoning about who
+///    an anchor reaches.
 pub fn render_email_help() -> String {
     r#"# --- Email fallback channel (Phase 2 slice #5) -------------------------------
 # Inbound only in this slice: the agent can receive and act on email, but
@@ -247,6 +258,16 @@ pub fn render_email_help() -> String {
 # allowlist must resolve to that single private origin. Verify a cert's shape
 # with:
 #   openssl x509 -in <cert.pem> -noout -text | grep -A1 'Basic Constraints'
+#
+# NOTE: KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA is ONE GLOBAL map, keyed by HOST
+# only (not host:port — see the CAVEAT in the upstream-CA help block above).
+# An entry added for THIS channel's origin is handed to EVERY worker whose
+# allowlist resolves to that same address — including the SEPARATE
+# kastellan-worker-mail TOOL, if it points at the same host. Two services
+# sharing an address (e.g. localmail on :8443 and a search service on :8888,
+# both 10.0.0.3) cannot be distinguished by this map: nothing logs or errors
+# when a second worker's sidecar silently inherits the first's anchor. Don't
+# conflate this channel with the kastellan-worker-mail tool.
 "#
     .to_string()
 }
@@ -777,6 +798,23 @@ mod tests {
         assert!(
             !help.contains("NO EFFECT"),
             "stale claim: the var now has an effect on this channel's path: {help}"
+        );
+        // The map is global and host-keyed (not per-service): an anchor added
+        // for this channel's origin silently reaches every other worker whose
+        // allowlist resolves to the same address, including the separate
+        // kastellan-worker-mail tool — this must be spelled out so an operator
+        // doesn't conflate the two when reasoning about who an anchor reaches.
+        assert!(
+            help.contains("kastellan-worker-mail"),
+            "must name the tool that can silently inherit this channel's anchor: {help}"
+        );
+        assert!(
+            help.contains("GLOBAL") || help.contains("global"),
+            "must state the map is global across workers, not scoped to this channel: {help}"
+        );
+        assert!(
+            help.contains("cannot be distinguished"),
+            "must state two services sharing an address are indistinguishable to the map: {help}"
         );
         // Partial-config behaviour: the CHANNEL is disabled, the DAEMON is not.
         // The operator's only signal is a startup log line, so the help must

@@ -544,6 +544,11 @@ Rename the field and add the posture:
     /// visible to the leak scanner); Matrix tunnels transparently, because
     /// matrix-sdk terminates its own TLS through `ProxyBridge` and cannot be
     /// made to trust a per-instance CA.
+    /// **[Corrected 2026-08-01: "visible to the leak scanner" is false —
+    /// interception is the precondition for scanning, not coverage; this
+    /// path provisions no `secret_fingerprints`, so the proxy's
+    /// `load_patterns` fails open and nothing here is scanned. See issue
+    /// #501.]**
     pub mitm: Mitm<'a>,
     /// A **worker-side** origin cert, appended to `fs_read` so a VM RO-share
     /// carries it in-guest. Test-only today; `None` in production. Meaningful
@@ -714,6 +719,9 @@ In the factory's `NetTransportSpawn` literal:
                 // the leg is visible to the #3b leak scanner. With no anchor the
                 // upstream leg is plain webpki — the same posture every
                 // force-routed tool worker has.
+                // [Corrected 2026-08-01: "visible to the #3b leak scanner" is
+                // false — interception is the precondition for scanning, not
+                // coverage; nothing on this path is scanned. See issue #501.]
                 mitm: Mitm::Intercept {
                     upstream_extra_ca: upstream_extra_ca.as_deref(),
                 },

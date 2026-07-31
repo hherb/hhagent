@@ -167,7 +167,11 @@ is built by `web-common::http::make_get`, which already prefers
 anchor is configured". With no anchor the sidecar is webpki-only, which is the
 same posture every force-routed tool worker has; with one it reaches the
 self-signed origin. One shape to reason about, and the leak scanner covers the
-leg either way.
+leg either way. **[Corrected 2026-08-01: this is false — interception is the
+precondition for scanning, not coverage; `spawn_net_transport` provisions no
+`secret_fingerprints`, so no `secret_hashes.json` reaches this leg's sidecar
+scratch and the proxy's `load_patterns` fails open — nothing on this path is
+scanned. See issue #501.]**
 
 The anchor is selected **once, before the factory closure is built** (and only
 when force-routing is on, i.e. the channel's `egress` is `Some`), from the config
@@ -292,7 +296,10 @@ new `cfg`-gated code, which lowers but does not eliminate the risk.
 - **Intercept only when an anchor is configured.** Preserves today's bytes when
   unconfigured, at the cost of the channel's posture becoming a function of
   config — two shapes to test and reason about, and leak scanning that covers the
-  leg only sometimes.
+  leg only sometimes. **[Corrected 2026-08-01: "leak scanning that covers the
+  leg" is false either way — interception is the precondition for scanning,
+  not coverage; nothing on this path is scanned regardless of posture. See
+  issue #501.]**
 - **A dedicated operator env switch for the posture.** A third configuration
   surface for one decision, and a wrong setting fails late and opaquely as a
   `mitm_failed` egress decision rather than at startup.
