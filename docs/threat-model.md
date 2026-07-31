@@ -1,6 +1,7 @@
 # kastellan — Threat Model
 
-> **Status: skeleton.** Updated as backends and workers come online.
+> **Status: maintained.** Current as of 2026-07 (the v0.2.0 era); kept in step
+> with the shipped backends and workers.
 
 ## Invariant
 
@@ -18,7 +19,8 @@ Nothing else.
 1. **Prompt injection** drives malicious tool calls (the LLM is *not* trusted).
 2. **A tool worker is fully compromised** — RCE inside the sandbox.
 3. **A Python dependency contains a supply-chain backdoor**.
-4. **The agent autonomously authors malicious Python** and runs it (Phase 4 capability).
+4. **The agent autonomously authors malicious Python** and runs it — live today
+   via `python-exec` and the L3 python-skill lifecycle, so in scope now.
 5. **A messaging-channel peer impersonates the user**.
 6. **Memory-write injection** — a process (or compromised worker) with `INSERT`
    on `memories` plants attacker-controlled text. The recall lane
@@ -43,16 +45,25 @@ The daemon locates plain compiled workers as **siblings of its own binary**
 [`core::worker_manifest::discover_binary`](../core/src/worker_manifest.rs)), so a
 flat install resolves with no env vars. This introduces one trust assumption
 worth stating explicitly: **the install directory containing `kastellan` and its
-worker binaries must not be writable by the agent's own OS user.** The invariant
-above grants a worst-case compromise the agent's own user account — so if
-`<exe_dir>` were user-writable, a compromised process could drop a malicious
-`kastellan-worker-<name>` next to the daemon and have it registered as a tool on
-the next start. Production deployment therefore installs the daemon + workers
-into a root-owned bindir (the systemd/launchd unit's install path); the
-user-writable cargo `target/debug` tree is a dev convenience, not a production
-trust boundary. The `KASTELLAN_*_BIN` override is authoritative and **fails
-closed** (a set-but-invalid override is rejected, never silently substituted by
-the sibling), so it cannot be used to widen discovery beyond the operator's
+worker binaries must not be writable by any principal other than root or the
+daemon's own euid.** The per-user install that `kastellan-cli install` produces
+(`~/.local/lib/kastellan`, owned by the daemon user, no root required) *is* the
+trusted shape — writability by the daemon's own user is already inside the
+threat-model boundary, because a compromise that can write there already runs
+as the daemon. What the invariant excludes is any *lesser* principal: a
+world-writable or group-writable dir, or one owned by a foreign uid, would let
+that principal drop a malicious `kastellan-worker-<name>` next to the daemon
+and have it registered as a tool on the next start. The daemon probes this at
+startup ([`assess_install_dir` /
+`InstallDirTrust`](../core/src/worker_manifest.rs): Untrusted iff
+world-writable, group-writable, or owned by a uid that is neither 0 nor the
+daemon's euid) — a warn-only advisory unless
+`KASTELLAN_REQUIRE_TRUSTED_INSTALL_DIR=1` makes it enforcing. **Known
+residual:** the probe inspects the leaf dir only, so a safe leaf under a
+group/world-writable *parent* is still substitutable wholesale via `rename(2)`.
+The `KASTELLAN_*_BIN` override is authoritative and **fails closed** (a
+set-but-invalid override is rejected, never silently substituted by the
+sibling), so it cannot be used to widen discovery beyond the operator's
 explicit intent.
 
 ## Asymmetric platform note
@@ -76,9 +87,9 @@ the best containment available without entitlements.
 | Policy gate (core) | Static allow/deny per `(tool, args, data class)` before any tool spawn |
 | Parent-side sandbox (bwrap / Seatbelt) | Namespace isolation, FS bind-mount, network unshare. Applied by `core::tool_host`. |
 | Worker-side sandbox (Landlock + seccomp-bpf) | Second, finer kernel filter installed by the worker on itself via [`kastellan-worker-prelude`](../workers/prelude/). One-way: cannot be relaxed once `restrict_self`/`apply_filter` returns. |
-| **Optional separate-kernel micro-VM** (opt-in, Linux: Firecracker `FirecrackerVm`; macOS: Apple `container`) | A throwaway **guest kernel** under KVM. **What it replaces vs. what it keeps (slice 1):** the micro-VM is a worker's *parent-side* sandbox backend — it is selected *instead of* the bwrap/Seatbelt row for that one worker (a worker carries exactly one backend), so for a VM-mode worker bwrap is **not** also applied. It does **not** replace the *worker-side* row: the unchanged worker still installs its own Landlock + seccomp-bpf on itself inside the guest. Net effect is strictly stronger than bwrap: VM-grade isolation **+** the worker self-filter, with `mem_mb` enforced by the hypervisor (closing the macOS-Seatbelt memory gap and adding a blast wall on Linux). A kernel-level escape in the worker-side seccomp/Landlock layer still has to cross the guest-kernel/VM boundary. (Stacking the VM *on top of* host bwrap — VM-in-bwrap — is a later slice; today it is VM-instead-of-bwrap.) **Opt-in per worker, not the default** — today `python-exec` via `KASTELLAN_PYTHON_EXEC_USE_MICROVM=1` (Linux, `Net::Deny`). Applied by [`sandbox::linux_firecracker`](../sandbox/src/linux_firecracker.rs) / `sandbox::macos_container`. Scope is unchanged for non-opted workers (still bwrap/Seatbelt). |
+| **Optional separate-kernel micro-VM** (opt-in, Linux: Firecracker `FirecrackerVm`; macOS: Apple `container`) | A throwaway **guest kernel** under KVM. **What it replaces vs. what it keeps (slice 1):** the micro-VM is a worker's *parent-side* sandbox backend — it is selected *instead of* the bwrap/Seatbelt row for that one worker (a worker carries exactly one backend), so for a VM-mode worker bwrap is **not** also applied. It does **not** replace the *worker-side* row: the unchanged worker still installs its own Landlock + seccomp-bpf on itself inside the guest. Net effect is strictly stronger than bwrap: VM-grade isolation **+** the worker self-filter, with `mem_mb` enforced by the hypervisor (closing the macOS-Seatbelt memory gap and adding a blast wall on Linux). A kernel-level escape in the worker-side seccomp/Landlock layer still has to cross the guest-kernel/VM boundary. (Stacking the VM *on top of* host bwrap — VM-in-bwrap — is a later slice; today it is VM-instead-of-bwrap.) **Opt-in per worker, not the default** — `python-exec`, `web-fetch`, `web-search`, `web-research` and `browser-driver` each opt in via `KASTELLAN_{PYTHON_EXEC,WEB_FETCH,WEB_SEARCH,WEB_RESEARCH,BROWSER_DRIVER}_USE_MICROVM=1` (Linux). Net egress works inside the VM: a networked VM worker reaches its force-routed egress sidecar over a vsock transport, so VM mode is no longer `Net::Deny`-only. The guest kernel is sha256-pinned and re-verified at **every VM boot** ([`sandbox::guest_kernel_pin`](../sandbox/src/guest_kernel_pin.rs), fail-closed). Applied by [`sandbox::linux_firecracker`](../sandbox/src/linux_firecracker.rs) / `sandbox::macos_container`. Scope is unchanged for non-opted workers (still bwrap/Seatbelt). |
 | Resource caps (Linux: cgroup v2 via `systemd-run --user --scope`) | Hard `MemoryMax` + `MemorySwapMax=0` from `policy.mem_mb`; defense-in-depth `CPUQuota=200%` and `TasksMax=64` defaults. Wraps `bwrap` so the cgroup is in place before the worker namespace is created. Applied by [`sandbox::linux_cgroup`](../sandbox/src/linux_cgroup.rs). |
-| Egress proxy       | Per-worker host:port allowlist, SSRF/IP-pinning, TLS pinning, audit-log every request. **Slices #1+#2 built** (boundary allowlist + SSRF/IP defense + unbypassable OS force-routing + CONNECT-over-UDS transport + port-scoping #241, `workers/egress-proxy`); the scheduler auto-flip that makes force-routing the default live path is the remaining wire-up — see "Network egress" below. TLS-intercept leak-scanner + TLS-pinning are slices #3–4. |
+| Egress proxy       | Per-worker host:port allowlist, SSRF/IP-pinning, TLS-intercept leak scan, SPKI pinning, audit-log every request. **All four slices built** (`workers/egress-proxy`) and **force-routed by default** in the supervised deployment (`KASTELLAN_EGRESS_FORCE_ROUTING=1`) — see "Network egress" below. |
 | Postgres role isolation | Workers cannot reach Postgres at all; only the core has the DB connection |
 | Append-only audit log   | Every tool call, LLM call, channel message, memory write |
 
@@ -111,53 +122,62 @@ the actual containment boundary, with injection screening as defense-in-depth
 that lowers attempt volume rather than a guarantee. Cross-slice stateful
 screening is a possible future hardening.
 
-### Network egress: interim containment and the SSRF/DNS caveat
+### Network egress: the force-routed proxy boundary (and its residual risks)
 
-The `web-fetch` worker is the first network-egress tool, but the **egress proxy
-(the row above) is not yet built**. Until it lands, containment for `web-fetch`
-is the worker's *self-enforced* host allowlist: it requires `https`, matches the
-request host (and every redirect hop) against the admin-controlled allowlist
-sourced from `tool_allowlists`, and refuses anything off-list with
-`POLICY_DENIED`. This is real (a compromised LLM cannot widen the list — it is
-injected by the host-side manifest, not from `step.parameters`) but
-**worker-trust-dependent**: it holds only as long as the worker binary itself is
-not compromised. It becomes defense-in-depth layer 2 once the egress proxy
-enforces the same allowlist at the boundary.
+Every networked worker egresses through a sandboxed per-worker CONNECT proxy
+([`workers/egress-proxy`](../workers/egress-proxy/)). All four slices are
+built, and force-routing is **on by default** in the supervised deployment:
 
-Crucially, the worker's self-enforced allowlist matches **host *names*, not
-resolved IPs.** DNS resolution happens inside the jail, so an allowlisted name
-that resolves to a private/internal address — or an attacker performing DNS
-rebinding on a record they control — would still be connected to.
-**Host-allowlist ≠ IP-level containment.**
+- **Slice #1 — boundary allowlist + SSRF/DNS defence.** The proxy matches every
+  request against the admin-controlled allowlist at the `host:port` *endpoint*
+  level (#241; a bare-host, port-unconstrained grant is flagged distinctly in
+  `audit_log`), resolves DNS *itself*, rejects
+  private/loopback/link-local/ULA/CGNAT/multicast resolved IPs (with a
+  literal-IP carve-out for an operator-allowlisted address such as a local
+  SearxNG `127.0.0.1`), **pins** the surviving IP, dials it, and audits every
+  decision. The SSRF predicate is `kastellan-net-classify::is_denied_range`,
+  shared by every consumer so the definitions cannot drift.
+- **Slice #2 — unbypassable force-routing, the default live path.** Under
+  `KASTELLAN_EGRESS_FORCE_ROUTING=1` (the supervised deployment's default) the
+  kernel does the enforcing, not the worker: a `Net::Allowlist` worker is
+  placed in a **private network namespace** on Linux (`bwrap`: `--unshare-all`
+  minus `--share-net`, the proxy UDS bind-mounted in — AF_UNIX is
+  mount-ns-scoped, not net-ns) or behind a **deny-all-outbound-except-the-UDS**
+  Seatbelt filter on macOS (gated by the on-host `seatbelt_uds_probe.rs`; a
+  host that can't prove AF_INET is denied falls back to the `MacosContainer`
+  VM-netns backend). The worker has *no direct route*; its only egress is
+  `CONNECT host:port` to the proxy over the UDS (`web-common::ProxyConnectGet`).
+  Host-side wiring is
+  [`core/src/worker_lifecycle/force_route.rs`](../core/src/worker_lifecycle/force_route.rs)
+  + [`core/src/egress/spawn.rs`](../core/src/egress/spawn.rs) — sidecar-first,
+  **fail-closed** (no proxy ⇒ no worker), 1:1 teardown, decision-ingest →
+  `audit_log`.
+- **Slice #3 — TLS intercept + credential-leak scan.** The proxy MITMs the
+  worker's TLS with a per-spawn CA the worker trusts, scans the cleartext for
+  credential leaks, and re-originates TLS upstream itself.
+- **Slice #4 — SPKI cert pinning.** `KASTELLAN_EGRESS_PROXY_PINS` pins upstream
+  origins by SPKI hash (`PinningVerifier`, on the re-origination leg). No pins
+  are provisioned by default; unset means standard webpki validation.
 
-**Egress-proxy slice #1 (2026-06-10) builds the mechanism that closes this gap**
-([`workers/egress-proxy`](../workers/egress-proxy/)): a sandboxed per-worker
-CONNECT proxy that resolves DNS *itself*, rejects
-private/loopback/link-local/ULA/CGNAT/multicast resolved IPs (with a literal-IP
-carve-out for an operator-allowlisted address such as a local SearxNG
-`127.0.0.1`), **pins** the surviving IP, dials it, and audits every decision.
+The `web-fetch` worker's *self-enforced* host allowlist (require `https`, match
+the request host and every redirect hop against the admin-controlled list from
+`tool_allowlists`, refuse off-list with `POLICY_DENIED`) is retained as
+**defence-in-depth layer 2** behind the proxy. It matches host *names*, not
+resolved IPs — IP-level containment (SSRF, DNS rebinding) is the proxy's job:
+self-resolved DNS + `is_denied_range` + IP pinning at the boundary.
 
-**Egress-proxy slice #2 (2026-06-11) builds the unbypassable force-routing**
-([`feat/egress-proxy-slice2-impl`](../workers/egress-proxy/)). Three layers now
-make a *compromised* worker unable to bypass the proxy:
-- **OS-level barrier (the kernel does the enforcing, not the worker).** A
-  `Net::Allowlist` worker with `proxy_uds` set is placed in a **private network
-  namespace** on Linux (`bwrap`: `--unshare-all` minus `--share-net`, the proxy
-  UDS bind-mounted in — AF_UNIX is mount-ns-scoped, not net-ns) and a
-  **deny-all-outbound-except-the-UDS** Seatbelt filter on macOS. The worker has
-  *no route off the allowlist*; its only egress is the proxy UDS. The macOS
-  filter is gated by a real on-host probe (`seatbelt_uds_probe.rs`, AF_INET
-  denied / UDS allowed — **confirmed** on the dev Mac); if a host can't prove
-  AF_INET is denied, net workers fall back to the `MacosContainer` (real VM
-  netns) backend. The Linux kernel barrier is proven by `linux_force_routing.rs`
-  (run on the DGX).
-- **Worker transport.** The worker reaches origins only by speaking
-  `CONNECT host:port` to the proxy over the UDS (`web-common::ProxyConnectGet`,
-  selected by `make_get` when `KASTELLAN_EGRESS_PROXY_UDS` is set). TLS stays
-  end-to-end worker↔origin.
-- **Port-scoped boundary (#241).** The proxy's allowlist now matches the
-  `host:port` *endpoint*, not just the host; a bare-host (port-unconstrained)
-  grant is flagged distinctly in `audit_log`.
+**Upstream extra-CA (operator config, single private origin).** A private
+origin serving a self-signed / private-CA cert is unreachable through the
+proxy's webpki-only upstream leg until the operator sets
+`KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA={"<private-ip-literal>":"/abs/ca.pem"}`
+([`core/src/egress/upstream_ca.rs`](../core/src/egress/upstream_ca.rs)). The
+trust-scope rule is **enforced, not documented**: an anchor is handed to a
+sidecar only when that worker's allowlist resolves to a **single private
+origin written as an IP literal** (privateness decided by the same
+`is_denied_range`), and a refusal **fails the spawn**; PEMs are read at daemon
+startup, fail-closed. Known limitation: keying is per-**host**, not
+per-`host:port`, so two private services sharing one address share an anchor —
+give co-located private services distinct addresses.
 
 **`browser-driver` exception — loopback shim, and a macOS-only caveat (#286).**
 A headless Chromium cannot speak `CONNECT`-over-UDS, so the browser reaches its
@@ -174,17 +194,17 @@ by the pre-existing #284) but is a real Linux/macOS guarantee divergence —
 tracked in **#286** (scope the rule to the shim's bound port, use a UDS-only
 transport, or route the browser through the `MacosContainer` VM-netns backend).
 
-The coupled host-side spawn (`core::egress::spawn_net_worker`: sidecar-first +
-**fail-closed** — no proxy ⇒ no worker — policy rewrite, 1:1 teardown,
-decision-ingest → `audit_log`) is **built and unit-tested**. The remaining step
-to make this the *default live path* is wiring `spawn_net_worker` into the
-scheduler's worker-lifecycle spawn site (a shared-trait change, landing with the
-DGX force-routing acceptance run). Until that flip ships and the operator enables
-it, the live containment for `web-fetch`/`web-search` remains the worker's
-self-enforced allowlist — so do not yet treat the proxy as protection against
-egress to internal IP ranges from a compromised worker in the running daemon,
-even though the mechanism that provides it is now complete and tested.
-`Net::ProxyEgress` is the policy variant the proxy itself runs under.
+**Residual risks, stated honestly.** The credential-leak scan sees only
+cleartext crossing the proxy and matches **verbatim contiguous bytes** — an
+encoded, split, or worker-side-encrypted secret evades it. TLS intercept
+applies only where the worker trusts the proxy CA: the browser-driver's
+Chromium and the `email-in` channel worker ride their sidecars as
+**transparent tunnels** (no MITM) — still force-routed and
+allowlist/SSRF-enforced, but their TLS payload is not inspected, and
+`KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` has no effect on the email channel's
+tunnel (a known slice-3 gap; the `mail` *tool* worker's MITM'd sidecar is
+covered). `Net::ProxyEgress` is the policy variant the proxy itself runs
+under.
 
 ## Communication channel (adversary #5)
 
@@ -212,9 +232,11 @@ separable layers, because transport security and peer identity are distinct prob
    `cassandra::injection_guard` exactly like worker output — a channel peer is no more trusted
    than a fetched web page — and every inbound/outbound message lands in `audit_log`.
 
-**Channel-worker network containment:** the Matrix/IMAP/SMTP client runs under `Net::Allowlist`
-scoped to only its configured server endpoint(s), force-routed through the per-worker egress
-proxy, so a compromised channel worker reaches its one server and nothing else.
+**Channel-worker network containment:** each channel client — the sandboxed Matrix worker and
+the `email-in` poller (which speaks to a localmail `/v1` endpoint; no IMAP client and no mail
+credentials inside a kastellan jail) — runs under `Net::Allowlist` scoped to only its configured
+server endpoint(s), force-routed through the per-worker egress proxy, so a compromised channel
+worker reaches its one server and nothing else.
 
 **Homeserver hosting blast radius (Tiers B/C).** Co-hosting conduwuit on the WireGuard/ingress
 VPS (Tier B) or on the kastellan host (Tier C, "poor man's") places the larger public-facing
@@ -225,14 +247,20 @@ hardening (dedicated unprivileged user, `NoNewPrivileges`/`ProtectSystem=strict`
 `SystemCallFilter`, loopback-bound behind a TLS reverse proxy, no federation port) as the
 minimum bar — defense-in-depth that reduces but does not eliminate shared-host blast radius.
 **Email is the fallback because Matrix has no single-user homeserver failover** — redundancy is
-cross-transport, not a second homeserver. Email is treated as **low-trust** (spoofable):
-notifications only, never commands, surfaced only after SPF/DKIM/DMARC pass + a per-pairing
-in-body token.
+cross-transport, not a second homeserver. Email is treated as **low-trust** (spoofable), so its
+inbound path (slice 1, shipped) is gated twice before a message can become a task: the DMARC gate
+(an `Authentication-Results` header written by the operator's own MX, authserv-id exact-match)
+plus the per-pairing in-body token, with `DbPeerAuthorizer` enforcing that evidence at the
+ChannelBus authorization chokepoint — the same path Matrix tasks take. The channel is config-gated
+off by default (`KASTELLAN_EMAIL_*` unset ⇒ channel absent; a misconfiguration disables it loudly
+while the daemon keeps running). **Outbound email does not exist yet** (slice 2, SMTP):
+`EmailChannel::send` refuses unconditionally and the refusal is audited as
+`channel.reply_undelivered` — today email can carry (heavily gated) commands but cannot yet
+deliver notifications or replies.
 
-## Negative tests (CI-enforced as backends land)
+## Negative tests (CI-enforced)
 
 - `python-exec` attempts `socket.connect` → blocked.
-- `web-fetch` attempts a non-allowlisted host → blocked at egress proxy.
 - `shell-exec` attempts a non-allowlisted argv → rejected before spawn.
 - `browser-driver` attempts to read `~/.ssh/` → blocked by sandbox.
 - Adversarial web page in agent context tries to exfiltrate via `web-fetch` → request blocked, audit log shows attempt.
@@ -241,7 +269,7 @@ in-body token.
 - `channel` (Matrix): an inbound message from a peer **not** in `KASTELLAN_MATRIX_PEERS` → dropped, no task enqueued, no reply sent. (Shipped: `core/tests/matrix_channel_e2e.rs::unpaired_inbound_is_dropped_no_reply` — a real worker process driven through `MatrixChannel` + the bus, hermetic; the live sandboxed matrix-rust-sdk client + egress routing is slice #2 Phase D.)
 - `channel` pairing (slice #3): with **no active code**, an unpaired peer's message is dropped (`channel.rejected_unpaired`), the carve-out inert. With an active code, a **wrong** body is dropped (`channel.rejected_unpaired`) and **never enqueued/echoed** (compare-only). A **correct** code binds the peer (`pairings` row + `channel.paired`), consumes the code single-use (`claim_code` atomic UPDATE), and returns only a fixed ack — the code body itself never reaches the agent. (Shipped: `bus::handle_inbound` carve-out tests + `db::pairings` PG e2e single-use claim.)
 
-Already shipped (Phase 0 + Phase 0 hardening stage 1):
+Already shipped:
 
 - `sandbox/tests/linux_smoke.rs` — bwrap denies `/etc/passwd`, `/home`, network under `Net::Deny`.
 - `core/tests/shell_exec_e2e.rs` — non-allowlisted argv rejected by worker policy with `POLICY_DENIED`; full round-trip through bwrap + Landlock + seccomp.
@@ -249,10 +277,9 @@ Already shipped (Phase 0 + Phase 0 hardening stage 1):
 - `workers/prelude/tests/seccomp_smoke.rs` — `unshare(CLONE_NEWUSER)` and `mount(...)` are killed with `SIGSYS`; `getpid()` survives.
 - `sandbox/tests/macos_smoke.rs` — Seatbelt denies `/etc/master.passwd`, `/Users/...`, raw `/dev/disk0`, and network under `Net::Deny`. Also: a worker calling `bootstrap_look_up("com.apple.coreservices.appleevents")` is denied (`worker_cannot_look_up_arbitrary_mach_services`, issue #1) — closes the largest pre-existing asymmetry vs the threat-model invariant; and the worker process is the leader of a fresh session, so any future attempt to open `/dev/tty` fails with ENXIO regardless of profile broadening (`worker_runs_in_its_own_session`, issue #2).
 - `sandbox/tests/linux_smoke.rs::worker_with_low_mem_max_is_oom_killed` — a worker that allocates 256 MiB under `MemoryMax=32M` is OOM-killed by the kernel. Closes the cgroup-resource layer.
+- `web-fetch` attempts a non-allowlisted host → blocked at the egress proxy boundary (`workers/egress-proxy` `decide_blocks_off_allowlist` / `handle_conn_reports_block_for_off_allowlist`), with the worker's own layer-2 refusal pinned by `core/tests/web_fetch_e2e.rs::host_outside_allowlist_is_denied`.
 
 ## Open items
 
-- Choice of egress-proxy TLS-pinning approach (cert pinning vs CA pinning vs SPKI pinning).
-- Egress proxy must close the `web-fetch` SSRF/DNS-rebinding gap: reject private/link-local/loopback resolved IPs and pin the resolved address across the connection (see "Network egress" above). The host-name allowlist alone does not contain egress to internal IP ranges. **Slice #1 implements this logic** (`workers/egress-proxy`), but it is not yet enforcing on live workers — slice #2's force-routing wires it in.
 - Whether `python-exec` should default to micro-VM rather than seccomp/Seatbelt-only.
 - Concrete `setrlimit` budgets per worker class.

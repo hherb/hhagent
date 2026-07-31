@@ -64,7 +64,9 @@ tunnel or (C) the agent. The hardened unit contains an RCE to the `matrix` user 
 its store — defense-in-depth that **reduces but does not eliminate** shared-host
 blast radius. Tier A avoids it entirely. **Redundancy is cross-transport (the
 email fallback), not a second homeserver** — Matrix has no single-user homeserver
-failover.
+failover. Note that the email channel's slice 1 is **inbound-only** today —
+outbound notification failover arrives with SMTP slice 2 — so do not yet expect
+email to deliver notifications when Matrix is down.
 
 ## Production install (Tiers B/C — run as root)
 

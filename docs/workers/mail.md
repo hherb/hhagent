@@ -76,6 +76,31 @@ retention/cleanup of delivered files is an operator concern.
    under force-routing; a remote endpoint is a normal allowlisted host (use HTTPS
    off-loopback).
 
+5. **Self-signed / private-CA localmail over HTTPS.** Under force-routing the
+   proxy re-originates upstream TLS with webpki trust only, so a localmail
+   serving a self-signed or private-CA cert on a **private IP literal** also
+   needs the operator anchor on the daemon:
+
+   ```sh
+   KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA='{"<private-ip>":"/abs/path/to/cert.pem"}'
+   ```
+
+   Trust-scope is enforced and fail-closed: the anchor is handed out only when
+   the worker's allowlist resolves to a **single private origin** (enforced at
+   parse/spawn; a refusal fails the spawn), and the PEM is read at daemon
+   startup. The cert itself must be a **non-CA leaf** (`CA:FALSE`) — a `CA:TRUE`
+   self-signed leaf, the common `openssl req -x509` shape, is rejected by the
+   proxy's rustls at handshake (`CaUsedAsEndEntity`) even though `openssl
+   verify` accepts it. Verify the shape with:
+
+   ```sh
+   openssl x509 -in <cert.pem> -noout -text | grep -A1 'Basic Constraints'
+   ```
+
+   This covers the mail **tool**'s MITM'd egress sidecar only; the email
+   *channel*'s (`email-in`) force-routed sidecar is a transparent tunnel, which
+   `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` does not affect.
+
 ## Behaviour notes
 
 - **Read-only.** Only GET endpoints plus `POST /v1/search` (a POST solely to
