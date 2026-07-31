@@ -11,7 +11,7 @@ use kastellan_sandbox::{SandboxBackend, SandboxPolicy};
 
 use super::audit::EgressAuditRow;
 use super::net_worker::{rewrite_worker_policy, spawn_ingest_thread, EgressSidecar};
-use super::spawn::spawn_sidecar;
+use super::spawn::{spawn_sidecar, Mitm, SidecarSpawn};
 use crate::worker_lifecycle::persistent::{ClientTransport, PersistentTransport};
 
 /// Rewrite `base` for transparent-tunnel force-routing onto `uds`: proxy_uds set,
@@ -84,15 +84,15 @@ pub fn spawn_net_transport(
     // 1. Sidecar first (transparent tunnel), fail-closed.
     let mut sidecar = spawn_sidecar(
         params.sidecar_backend,
-        params.proxy_bin,
-        params.allowlist,
-        scratch,
-        params.worker_name,
-        None, // no cert pins
-        true, // disable_mitm — transparent tunnel
-        true, // long-lived: a channel sidecar outlives many dispatches (issue #395)
-        None, // upstream_extra_ca: N/A — disable_mitm above means there is no
-              // re-origination leg to widen trust on, now or after #492.
+        &SidecarSpawn {
+            binary: params.proxy_bin,
+            allowlist: params.allowlist,
+            scratch,
+            worker: params.worker_name,
+            cert_pins_json: None,
+            mitm: Mitm::Transparent,
+            long_lived: true, // a channel sidecar outlives many dispatches (#395)
+        },
     )?;
     let stdout = sidecar.stdout();
     let uds = sidecar.uds_path.clone();

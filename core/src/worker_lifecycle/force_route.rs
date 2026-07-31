@@ -23,6 +23,7 @@ use kastellan_sandbox::{Net, SandboxBackend, SandboxPolicy};
 
 use crate::egress::audit::EgressAuditRow;
 use crate::egress::cert_pins::{parse_cert_pins, select_pins_for_allowlist, CertPinError, CertPinMap};
+use crate::egress::spawn::Mitm;
 use crate::egress::upstream_ca::{
     check_ca_pem_contents, parse_upstream_cas, select_ca_for_allowlist, UpstreamCaError,
     UpstreamCaFileError, UpstreamCaMap, UpstreamCaSelectError,
@@ -297,6 +298,32 @@ pub(crate) fn disable_mitm_for(worker_name: &str) -> bool {
     matches!(worker_name, BROWSER_DRIVER_TOOL | MATRIX_TOOL)
 }
 
+/// Pure: this worker's sidecar posture, given the anchor #492's selector picked
+/// for its allowlist.
+///
+/// Refuses — rather than silently dropping the anchor — when the operator
+/// configured one for a worker whose sidecar transparently tunnels. `Mitm`
+/// makes that pair unrepresentable *downstream*, but the operator still needs
+/// to be told their config line does nothing, and told it in terms of the env
+/// var and the worker name rather than an internal field.
+pub(crate) fn mitm_for<'a>(
+    worker_name: &str,
+    upstream_extra_ca: Option<&'a Path>,
+) -> Result<Mitm<'a>, String> {
+    if disable_mitm_for(worker_name) {
+        if upstream_extra_ca.is_some() {
+            return Err(format!(
+                "worker {worker_name:?}: refusing to spawn — {ENV_UPSTREAM_EXTRA_CA} names an \
+                 extra trust anchor for this worker's origin, but this worker's sidecar runs in \
+                 transparent-tunnel (no-MITM) mode and never re-originates TLS, so the anchor \
+                 would be silently inert. Remove that entry."
+            ));
+        }
+        return Ok(Mitm::Transparent);
+    }
+    Ok(Mitm::Intercept { upstream_extra_ca })
+}
+
 /// How a single worker spawn should be routed, given the force-routing posture.
 /// This is the **single source of truth** for the routing decision;
 /// [`spawn_worker_maybe_forced`] is a thin actor over it. Keeping it a pure enum
@@ -385,22 +412,14 @@ pub(crate) fn spawn_worker_maybe_forced(
                 )))
             })?;
             // Workers that do their own end-to-end TLS + can't trust our CA
-            // (browser, matrix) → their sidecar transparently tunnels.
-            let disable_mitm = disable_mitm_for(worker_name);
-            // A tunnel never re-originates TLS, so an anchor there is inert.
-            // `spawn::check_upstream_extra_ca` is the backstop that enforces
-            // this, but its message names only the path and `disable_mitm` —
-            // reading like an internal wiring bug. Catch it here, where the env
-            // var and the worker name are both in scope, so the operator is
-            // pointed at the config line they actually have to change.
-            if disable_mitm && upstream_extra_ca.is_some() {
-                return Err(ToolHostError::Io(std::io::Error::other(format!(
-                    "worker {worker_name:?}: refusing to spawn — {ENV_UPSTREAM_EXTRA_CA} names an \
-                     extra trust anchor for this worker's origin, but this worker's sidecar runs \
-                     in transparent-tunnel (no-MITM) mode and never re-originates TLS, so the \
-                     anchor would be silently inert. Remove that entry."
-                ))));
-            }
+            // (browser, matrix) → their sidecar transparently tunnels; a tunnel
+            // never re-originates TLS, so an anchor there is inert. `mitm_for`
+            // refuses that pair here, where the env var and the worker name are
+            // both in scope, so the operator is pointed at the config line they
+            // actually have to change (`spawn::check_upstream_extra_ca` remains
+            // the downstream backstop, but its message names only the path).
+            let mitm = mitm_for(worker_name, upstream_extra_ca)
+                .map_err(|msg| ToolHostError::Io(std::io::Error::other(msg)))?;
             let params = crate::egress::net_worker::NetWorkerSpawn {
                 backend,
                 // The egress-proxy sidecar is the real-network egress boundary,
@@ -414,9 +433,7 @@ pub(crate) fn spawn_worker_maybe_forced(
                 worker_name,
                 secret_fingerprints: &[],
                 cert_pins_json: pins_json.as_deref(),
-                disable_mitm,
-                // #492 — always `None` when `disable_mitm`, rejected above.
-                upstream_extra_ca,
+                mitm,
             };
             spawn_forced_net_worker(&params, &cfg.scratch_root, (cfg.make_sink)())
         }

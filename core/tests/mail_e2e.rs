@@ -215,6 +215,7 @@ fn mail_policy_force_routes_and_enforces_its_endpoint_allowlist() {
     use std::time::{Duration, Instant};
 
     use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
+    use kastellan_core::egress::spawn::Mitm;
     use kastellan_sandbox::Net;
     use kastellan_tests_common::egress_forcing::{
         assert_connect_established, minted_uds, short_scratch_root,
@@ -278,8 +279,7 @@ fn mail_policy_force_routes_and_enforces_its_endpoint_allowlist() {
             worker_name: "mail",
             secret_fingerprints: &[],
             cert_pins_json: None,
-            disable_mitm: false,
-            upstream_extra_ca: None,
+            mitm: Mitm::Intercept { upstream_extra_ca: None },
         };
         let mut worker = spawn_forced_net_worker(&params, &scratch_root, sink)
             .expect("force-routed mail worker + sidecar spawn");
@@ -367,6 +367,7 @@ async fn run_forced_mail_search_over_tls(
     use std::sync::{Arc, Mutex};
 
     use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
+    use kastellan_core::egress::spawn::Mitm;
     use kastellan_sandbox::Net;
     use kastellan_tests_common::egress_forcing::short_scratch_root;
     use kastellan_tests_common::mock_localmail::spawn_mock_localmail_tls;
@@ -414,8 +415,8 @@ async fn run_forced_mail_search_over_tls(
         worker_name: "mail",
         secret_fingerprints: &[],
         cert_pins_json: None,
-        disable_mitm: false, // MITM ON — mail's real posture
-        upstream_extra_ca: with_extra_ca.then_some(ca_path.as_path()),
+        // MITM ON — mail's real posture.
+        mitm: Mitm::Intercept { upstream_extra_ca: with_extra_ca.then_some(ca_path.as_path()) },
     };
     let mut worker = spawn_forced_net_worker(&params, &scratch_root, sink)
         .expect("force-routed mail worker + sidecar spawn");
@@ -573,6 +574,7 @@ fn force_routed_search_against_real_localmail() {
     use std::sync::{Arc, Mutex};
 
     use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
+    use kastellan_core::egress::spawn::Mitm;
     use kastellan_sandbox::Net;
     use kastellan_tests_common::egress_forcing::short_scratch_root;
     use kastellan_tests_common::egress_proxy_bin_or_skip;
@@ -645,8 +647,7 @@ fn force_routed_search_against_real_localmail() {
             worker_name: "mail",
             secret_fingerprints: &[],
             cert_pins_json: None,
-            disable_mitm: false,
-            upstream_extra_ca: Some(ca_path.as_path()),
+            mitm: Mitm::Intercept { upstream_extra_ca: Some(ca_path.as_path()) },
         };
         let mut worker = spawn_forced_net_worker(&params, &scratch_root, sink)
             .expect("force-routed mail worker + sidecar spawn");

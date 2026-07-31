@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
+use kastellan_core::egress::spawn::Mitm;
 use kastellan_core::tool_host::WorkerSpec;
 
 use kastellan_sandbox::{Net, SandboxPolicy};
@@ -123,8 +124,7 @@ fn forced_coupling_enforces_allowlist_and_ingests_decisions() {
         worker_name: "web-fetch",
         secret_fingerprints: &[],
         cert_pins_json: None,
-        disable_mitm: false,
-        upstream_extra_ca: None,
+        mitm: Mitm::Intercept { upstream_extra_ca: None },
     };
     let mut worker = spawn_forced_net_worker(&params, &scratch_root, sink)
         .expect("force-routed worker + sidecar spawn (fail-closed if the proxy is missing)");
@@ -235,8 +235,7 @@ fn forced_coupling_worker_has_no_direct_route() {
         worker_name: "web-fetch",
         secret_fingerprints: &[],
         cert_pins_json: None,
-        disable_mitm: false,
-        upstream_extra_ca: None,
+        mitm: Mitm::Intercept { upstream_extra_ca: None },
     };
     let worker = spawn_forced_net_worker(&params, &scratch_root, |_row| {})
         .expect("force-routed getent worker + sidecar spawn");
@@ -361,8 +360,7 @@ fn real_mitm_fetch_through_sidecar() {
         worker_name: "web-fetch",
         secret_fingerprints: &[],
         cert_pins_json: None,
-        disable_mitm: false,
-        upstream_extra_ca: None,
+        mitm: Mitm::Intercept { upstream_extra_ca: None },
     };
     let worker = spawn_forced_net_worker(&params, &scratch_root, |_row| {})
         .expect("force-routed worker + sidecar");

@@ -20,7 +20,7 @@ use kastellan_sandbox::{SandboxBackend, SandboxPolicy};
 
 use super::audit::{ingest_decisions_into, EgressAuditRow};
 use super::leak_provision::write_secret_hashes;
-use super::spawn::{spawn_sidecar, SidecarHandle, UDS_FILE_NAME};
+use super::spawn::{spawn_sidecar, Mitm, SidecarHandle, SidecarSpawn, UDS_FILE_NAME};
 use crate::tool_host::{spawn_worker, SupervisedWorker, ToolHostError, WorkerSpec};
 
 /// Everything needed to spawn a net worker + its egress sidecar, except *where*
@@ -45,23 +45,13 @@ pub struct NetWorkerSpawn<'a> {
     /// SPKI pin JSON for the #4 cert pinner (`None` today). Passed opaque to the
     /// sidecar env; the proxy parses + enforces.
     pub cert_pins_json: Option<&'a str>,
-    /// Put this worker's sidecar into no-MITM (transparent-tunnel) mode. Set for
-    /// the browser, which does end-to-end TLS and can't trust our CA (slice #2).
-    pub disable_mitm: bool,
-    /// Operator-provided extra CA to trust on the sidecar's re-origination
-    /// (upstream) leg, for a self-signed private origin (localmail, #491).
-    /// `None` ⇒ webpki-only (the production default — no prod wiring yet).
-    ///
-    /// Must be an **absolute** path (it is bound into the proxy jail via
-    /// `SandboxPolicy.fs_read`) and must not be paired with `disable_mitm` (a
-    /// transparent tunnel has no re-origination leg to widen trust on, so an
-    /// anchor there would be silently inert). Both are rejected up front by
-    /// `spawn::check_upstream_extra_ca`, before anything is spawned.
-    ///
-    /// The anchor is trusted for every host THIS sidecar may reach, so it suits a
-    /// single-origin worker; see `egress-proxy::pins::build_upstream_client_config`
+    /// This worker's sidecar TLS posture. `Mitm::Transparent` for a worker that
+    /// does its own end-to-end TLS and cannot trust our CA (the browser);
+    /// `Mitm::Intercept { upstream_extra_ca }` otherwise, where the optional
+    /// anchor is trusted for every host THIS sidecar may reach — so it suits a
+    /// single-origin worker. See `egress-proxy::pins::build_upstream_client_config`
     /// for the trust-scope and `CA:FALSE` constraints.
-    pub upstream_extra_ca: Option<&'a Path>,
+    pub mitm: Mitm<'a>,
 }
 
 /// Maximum byte length of a Unix-domain-socket path. `sockaddr_un.sun_path` is
@@ -216,14 +206,15 @@ where
     //    `backend`, which may be a VM.
     let mut sidecar = spawn_sidecar(
         params.sidecar_backend,
-        params.proxy_bin,
-        params.allowlist,
-        scratch,
-        params.worker_name,
-        params.cert_pins_json,
-        params.disable_mitm,
-        false, // short-lived: 1:1 with a single tool-call dispatch (issue #395)
-        params.upstream_extra_ca,
+        &SidecarSpawn {
+            binary: params.proxy_bin,
+            allowlist: params.allowlist,
+            scratch,
+            worker: params.worker_name,
+            cert_pins_json: params.cert_pins_json,
+            mitm: params.mitm,
+            long_lived: false, // 1:1 with a single tool-call dispatch (issue #395)
+        },
     )
     .map_err(|e| ToolHostError::Io(std::io::Error::other(format!("egress sidecar: {e}"))))?;
     // Capture the proxy stdout for the ingest thread before the handle moves.
@@ -248,13 +239,13 @@ where
     }
     // 2. Rewrite the worker policy onto the sidecar UDS.
     let uds = sidecar.uds_path.clone();
-    // The sidecar exports its CA next to the UDS (same scratch dir). MITM workers
-    // trust it; a transparent-tunnel worker (`disable_mitm`) gets `None`.
+    // The sidecar exports its CA next to the UDS (same scratch dir). An
+    // intercepting worker trusts it; a transparent-tunnel worker gets `None`.
     let ca = uds
         .parent()
         .map(|d| d.join(super::spawn::CA_FILE_NAME))
         .unwrap_or_else(|| PathBuf::from(super::spawn::CA_FILE_NAME));
-    let ca = (!params.disable_mitm).then_some(ca.as_path());
+    let ca = (!params.mitm.is_transparent()).then_some(ca.as_path());
     let forced = rewrite_worker_policy(params.spec.policy.clone(), &uds, ca);
     let forced_spec = WorkerSpec {
         policy: &forced,

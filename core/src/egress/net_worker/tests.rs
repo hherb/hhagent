@@ -124,8 +124,7 @@ fn spawn_net_worker_fails_closed_when_sidecar_unavailable() {
         worker_name: "web-fetch",
         secret_fingerprints: &[], // none for this fail-closed test
         cert_pins_json: None,
-        disable_mitm: false,
-        upstream_extra_ca: None,
+        mitm: Mitm::Intercept { upstream_extra_ca: None },
     };
     let res = spawn_net_worker(&params, Path::new("/tmp/kastellan-net-worker-test"), |_row| {});
     assert!(res.is_err(), "no proxy => no net worker (fail-closed)");
@@ -159,8 +158,7 @@ fn spawn_forced_net_worker_fails_closed_when_sidecar_unavailable() {
         worker_name: "web-fetch",
         secret_fingerprints: &[], // none for this fail-closed test
         cert_pins_json: None,
-        disable_mitm: false,
-        upstream_extra_ca: None,
+        mitm: Mitm::Intercept { upstream_extra_ca: None },
     };
     let res = spawn_forced_net_worker(&params, scratch_root.path(), |_row| {});
     assert!(res.is_err(), "no proxy => no net worker (fail-closed)");
@@ -202,8 +200,7 @@ fn spawn_forced_net_worker_cleans_scratch_on_failure() {
         worker_name: "web-fetch",
         secret_fingerprints: &[],
         cert_pins_json: None,
-        disable_mitm: false,
-        upstream_extra_ca: None,
+        mitm: Mitm::Intercept { upstream_extra_ca: None },
     };
     let _ = spawn_forced_net_worker(&params, scratch_root.path(), |_row| {});
     let leftovers: Vec<_> = std::fs::read_dir(scratch_root.path())
@@ -234,8 +231,7 @@ fn net_worker_spawn_struct_carries_pins_field() {
         worker_name: "web-fetch",
         secret_fingerprints: &[],
         cert_pins_json: Some(r#"{"api.anthropic.com":["sha256/AAAA"]}"#),
-        disable_mitm: false,
-        upstream_extra_ca: None,
+        mitm: Mitm::Intercept { upstream_extra_ca: None },
     };
     let scratch = tempfile::tempdir().unwrap();
     let res = spawn_net_worker(&params, scratch.path(), |_row| {});
@@ -312,8 +308,7 @@ fn spawn_net_worker_spawns_sidecar_under_sidecar_backend() {
         worker_name: "web-research",
         secret_fingerprints: &[],
         cert_pins_json: None,
-        disable_mitm: false,
-        upstream_extra_ca: None,
+        mitm: Mitm::Intercept { upstream_extra_ca: None },
     };
     let scratch = tempfile::tempdir().unwrap();
     let res = spawn_net_worker(&params, scratch.path(), |_row| {});

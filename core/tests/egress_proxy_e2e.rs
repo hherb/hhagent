@@ -13,7 +13,7 @@ use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 
 use kastellan_core::egress::audit::decision_to_audit;
-use kastellan_core::egress::spawn::spawn_sidecar;
+use kastellan_core::egress::spawn::{spawn_sidecar, Mitm, SidecarSpawn};
 use kastellan_tests_common::egress_forcing::short_scratch_root;
 use kastellan_tests_common::{
     backend, bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_sandbox_unavailable, unique_suffix,
@@ -58,8 +58,16 @@ fn allowed_literal_origin_round_trips_and_blocks_off_allowlist() {
     // Allowlist: the literal loopback origin (the local-SearxNG carve-out shape).
     let allowlist = vec!["127.0.0.1".to_string()];
     let backend = backend();
-    let mut handle = spawn_sidecar(backend.as_ref(), &binary, &allowlist, &scratch, "web-fetch", None, false, false, None)
-        .expect("sidecar spawns and binds UDS");
+    let spec = SidecarSpawn {
+        binary: &binary,
+        allowlist: &allowlist,
+        scratch: &scratch,
+        worker: "web-fetch",
+        cert_pins_json: None,
+        mitm: Mitm::Intercept { upstream_extra_ca: None },
+        long_lived: false,
+    };
+    let mut handle = spawn_sidecar(backend.as_ref(), &spec).expect("sidecar spawns and binds UDS");
     let stdout = handle.stdout().expect("child stdout piped");
 
     // Allowed round-trip via CONNECT to the literal-allowlisted origin.
@@ -117,8 +125,16 @@ fn real_host_round_trips_through_sidecar() {
     std::fs::create_dir_all(&scratch).unwrap();
     let allowlist = vec!["example.com".to_string()];
     let backend = backend();
-    let handle = spawn_sidecar(backend.as_ref(), &binary, &allowlist, &scratch, "web-fetch", None, false, false, None)
-        .expect("sidecar spawns");
+    let spec = SidecarSpawn {
+        binary: &binary,
+        allowlist: &allowlist,
+        scratch: &scratch,
+        worker: "web-fetch",
+        cert_pins_json: None,
+        mitm: Mitm::Intercept { upstream_extra_ca: None },
+        long_lived: false,
+    };
+    let handle = spawn_sidecar(backend.as_ref(), &spec).expect("sidecar spawns");
 
     let mut client = UnixStream::connect(&handle.uds_path).unwrap();
     write!(client, "CONNECT example.com:443 HTTP/1.1\r\n\r\n").unwrap();
@@ -172,18 +188,17 @@ fn sidecar_with_unreadable_extra_ca_fails_fast_with_reason() {
     let allowlist = vec!["127.0.0.1".to_string()];
     let backend = backend();
     let started = std::time::Instant::now();
-    let err = spawn_sidecar(
-        backend.as_ref(),
-        &binary,
-        &allowlist,
-        &scratch,
-        "mail",
-        None,
-        false,
-        false,
-        Some(&missing_ca),
-    )
-    .expect_err("an unreadable upstream extra CA must fail the bring-up closed");
+    let spec = SidecarSpawn {
+        binary: &binary,
+        allowlist: &allowlist,
+        scratch: &scratch,
+        worker: "mail",
+        cert_pins_json: None,
+        mitm: Mitm::Intercept { upstream_extra_ca: Some(&missing_ca) },
+        long_lived: false,
+    };
+    let err = spawn_sidecar(backend.as_ref(), &spec)
+        .expect_err("an unreadable upstream extra CA must fail the bring-up closed");
     let elapsed = started.elapsed();
 
     let msg = format!("{err:#}");
