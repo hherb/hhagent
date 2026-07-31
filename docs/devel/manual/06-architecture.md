@@ -12,7 +12,7 @@ find the right place to make a change.
  Your message
       │
       ▼
- Channel adapter (Matrix E2E · email failover)
+ Channel adapter (Matrix E2E · email failover — inbound-only today)
       │  JSON-RPC over Unix socket
       ▼
  AGENT CORE  ───── Postgres (memory, tasks, audit, secrets)
@@ -176,7 +176,7 @@ pipeline.
 
 | Type of feature | Where to start |
 |-----------------|---------------|
-| New tool worker (Rust) | New crate under `workers/`; add to `[workspace.members]`; spawn from `core/src/tool_host.rs` |
+| New tool worker (Rust) | New crate under `workers/`; add to `[workspace.members]`; implement `WorkerManifest` in `core/src/workers/<name>.rs`; add one line to `WORKER_MANIFESTS` in `core/src/registry_build.rs` — no `tool_host.rs` edit |
 | New CLI subcommand | New file under `core/src/bin/kastellan-cli/`; register in `main.rs` |
 | New DB table | New migration in `db/migrations/`; new helpers in `db/src/` |
 | New CASSANDRA pre-spawn rule | Extend `core/src/cassandra/constitutional.rs` or `deterministic.rs` |

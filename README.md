@@ -157,19 +157,24 @@ expected to refuse PRs that violate them.
 
 ## Status
 
-**Past scaffold. Phase 1 (Memory & Loop) is complete; the Phase 3 egress
-boundary is substantially built; and Phase 2 channels and Phase 4 python-exec
-are both in progress.** The project is a Rust workspace of 17 crates with a
-working agent loop, real cross-platform sandboxing, persistent memory, net-egress
-workers behind a hardened egress proxy, and an inbound Matrix channel.
+**Past scaffold. Phases 0–1 (sandboxed core, memory & loop) are complete; the
+egress boundary is fully built and force-routed by default; the Matrix channel
+is live end-to-end; the email failover's gated inbound half has shipped; and
+python-exec is live with operator-approved agent-authored Python skills.** The
+project is a Rust workspace of 27 crates (v0.2.0 on crates.io) with a working
+agent loop, real cross-platform sandboxing — including opt-in micro-VM backends
+on both OSes — persistent memory, net-egress workers behind a hardened egress
+proxy, and live Matrix + gated email-inbound channels.
 
 What works today:
 
 - **Sandboxing — double-contained, cross-platform.** `bubblewrap` + Landlock +
   seccomp-bpf on Linux (wrapped in a `systemd-run --scope` cgroup for CPU/memory
-  caps); `sandbox-exec` (Seatbelt) plus an opt-in Apple `container` micro-VM
-  backend on macOS. One OS process and one kernel sandbox per worker, all driven
-  from a single `SandboxPolicy`, with negative tests asserting that denials deny.
+  caps), plus an opt-in Firecracker micro-VM backend (sha256-pinned guest
+  kernel, verified at every VM boot); `sandbox-exec` (Seatbelt) plus an opt-in
+  Apple `container` micro-VM backend on macOS. One OS process and one kernel
+  sandbox per worker, all driven from a single `SandboxPolicy`, with negative
+  tests asserting that denials deny.
 - **Agent loop + scheduler.** A Postgres-backed task queue (`LISTEN/NOTIFY`,
   leased claims) running the LLM plan → **CASSANDRA** review → dispatcher
   chokepoint → sandboxed-step loop, with append-only audit rows at every
@@ -184,31 +189,47 @@ What works today:
 - **L3 skill arc.** Crystallise a successful trajectory → operator approve/pin →
   recall-surface → re-invoke, with trust tiers and live re-validation at dispatch.
 - **Workers.** `shell-exec` (argv-allowlisted execve), `web-fetch` (HTTPS-only,
-  host-allowlisted, redirect/size-capped readable-text extraction — the first
-  `Net::Allowlist` consumer), `web-search` (SearxNG-backed query worker),
-  `gliner-relex` (Python entity/relation extraction under the sandbox),
-  `browser-driver` (Playwright read-only render scaffold), and `python-exec`
-  (the strictest jail of any worker — `Net::Deny`, ephemeral scratch only,
-  curated stdlib; shipped and acceptance-green on both Linux and macOS).
+  host-allowlisted, redirect/size-capped readable-text extraction), `web-search`
+  (SearxNG-backed query worker), `web-research` (composite search → fetch →
+  ranked-passages research in one call), `mail` (six read-only tools over a
+  local mail archive — search, read, attachments delivered to a durable
+  per-task folder; live-verified against a 37k-message archive), `gliner-relex`
+  (Python entity/relation extraction under the sandbox), `browser-driver`
+  (Playwright read-only render worker, opt-in), `python-exec` (the strictest
+  jail of any worker — `Net::Deny`, ephemeral scratch only, curated stdlib;
+  acceptance-green on both Linux and macOS), plus trusted `embed-broker` /
+  `search-broker` sidecars that bridge jailed workers to embedding and search
+  backends without widening their egress.
 - **Egress boundary.** A per-worker egress proxy that every networked worker is
   **force-routed through by default** (private network namespace, no direct
   route): host-allowlist + DNS-resolves-itself + SSRF rejection of
   private/loopback/link-local IPs, TLS interception that scans the cleartext for
   the worker's own secrets (credential-leak scanner), and server-certificate
-  pinning — every allow and block decision audited.
-- **Channels.** An inbound Matrix path (self-hosted, single-user, federation off,
-  E2E): the decision/message bus, operator-issued single-use peer pairing
-  (fail-closed), and inbound prompt-injection screening, with email reserved as a
-  low-trust failover. Every inbound and outbound message is audited.
+  pinning — every allow and block decision audited. An operator-configured
+  extra CA (`KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA`) lets the inspection leg reach
+  a single private, self-signed origin (e.g. a local mail archive) — enforced
+  to exactly one private origin, fail-closed.
+- **Channels.** A live Matrix channel (self-hosted, single-user, federation off,
+  E2E — `matrix-rust-sdk` inside a sandboxed worker): the decision/message bus,
+  operator-issued single-use peer pairing (fail-closed), and inbound
+  prompt-injection screening. The email failover's gated inbound half is live
+  too (config-gated, off by default): a sandboxed `email-in` worker polls a
+  local mail archive, and a message is enqueued only after a DMARC verdict
+  stamped by the operator's own MX **plus** a per-pairing in-body token;
+  outbound email replies arrive with the next slice. Every inbound and outbound
+  message is audited.
 - **Supporting infrastructure.** OS-native supervisor units (`systemd --user` /
   launchd) including an `kastellan.target`; AES-256-GCM secrets at rest with opaque
   `secret://` references; an OpenAI-compatible, local-first LLM router; a
   `kastellan-cli audit tail` viewer.
 
-Not built yet (see the roadmap): the live sandboxed Matrix client and the email
-failover transport, the real browser render path (only the scaffold exists), the
-agent-authored skill catalog on top of `python-exec`, the frontier-egress worker
-that the certificate-pinning path is waiting on, and the Phase-5
+Not built yet (see the roadmap): outbound email delivery (SMTP — replies to
+email are currently routed but not delivered, and audited as such), MITM
+inspection of browser and email-channel traffic (both ride the proxy as opaque
+tunnels today), the CASSANDRA LLM review stages (the constitutional and
+data-classification stages are deterministic rules today), the tiered
+delegation policy for agent-authored skills, the frontier-egress worker that
+the certificate-pinning path is waiting on, and the Phase-5
 frontier-escalation policy gate.
 
 Day-to-day state — what's green and the next task — lives in
@@ -219,42 +240,55 @@ sequenced build plan is [`docs/devel/ROADMAP.md`](docs/devel/ROADMAP.md). See al
 
 ## Layout
 
-Rust workspace, 17 crates:
+Rust workspace, 27 crates (plus two Python workers outside Cargo):
 
 ```
 core/                  kastellan-core: agent loop, scheduler, memory, CASSANDRA, audit,
-                       tool-host chokepoint, channel bus, egress integration, handoff cache;
-                       `kastellan` daemon + `kastellan-cli`
+                       tool-host chokepoint, channel bus (Matrix + email), egress
+                       integration, handoff cache, installer; `kastellan` daemon +
+                       `kastellan-cli`
 db/                    kastellan-db: Postgres helpers + embedded migrations (pgvector +
                        tsvector/GIN + relational graph), secrets-at-rest, pairings, audit writer
-leak-scan/             kastellan-leak-scan: shared credential-leak scanner (egress proxy)
-llm-router/            kastellan-llm-router: sole egress for LLM calls (OpenAI-compatible HTTP)
+leak-scan/             kastellan-leak-scan: shared credential-leak scanner (egress proxy + core)
+llm-router/            kastellan-llm-router: sole core-side egress for LLM calls
+                       (OpenAI-compatible HTTP)
+net-classify/          kastellan-net-classify: pure SSRF / denied-IP-range predicate
 sandbox/               kastellan-sandbox: SandboxPolicy + per-OS backends
-                       (bwrap / Seatbelt / Apple container)
+                       (bwrap / Seatbelt / Apple container / Firecracker micro-VM)
 supervisor/            kastellan-supervisor: systemd --user / launchd unit generation + drivers
 protocol/              kastellan-protocol: JSON-RPC 2.0 over stdio (MCP-stdio compatible)
 tests-common/          kastellan-tests-common: shared dev-dep test harness (Pg cluster, fixtures)
 workers/prelude/       Landlock + seccomp lock-down prelude (worker-side `serve_stdio`)
-workers/web-common/    shared HTTP/allowlist/proxy-connect lib for net-egress workers
+workers/web-common/    shared HTTP/allowlist/proxy-connect/search/fetch/extract lib
+                       for net-egress workers
 workers/shell-exec/    argv-allowlisted execve worker
 workers/web-fetch/     HTTPS-only, host-allowlisted fetch + readable-text extraction
 workers/web-search/    SearxNG-backed web.search worker
+workers/web-research/  composite research worker: search → fetch → chunk → rank passages
+workers/mail/          read-only local-mail-archive tools (search/read/attachments)
+workers/email-in/      inbound-email poller for the gated email fallback channel
 workers/egress-proxy/  per-worker egress boundary (allowlist + SSRF + TLS intercept +
-                       credential-leak scan + cert pinning)
+                       credential-leak scan + cert pinning + operator extra-CA)
 workers/python-exec/   strict no-network Python executor (Net::Deny, ephemeral scratch)
+workers/embed-broker/  trusted sidecar bridging jailed workers to the embedding backend
+workers/search-broker/ trusted sidecar bridging jailed workers to SearxNG
 workers/matrix/        Matrix channel client (matrix-rust-sdk)
 workers/matrix-wire/   shared Matrix wire types
-workers/gliner-relex/  Python entity/relation extraction worker (sandboxed; non-Rust)
-workers/browser-driver/ Playwright read-only render worker (scaffold; non-Rust)
+workers/microvm-run/   Firecracker micro-VM launcher (internal, unpublished)
+workers/microvm-init/  micro-VM guest PID-1 vsock↔stdio adapter (internal, unpublished)
+workers/kv-demo/       demo long-lived Net::Deny KV worker (test/reference, unpublished)
+workers/net-demo/      demo long-lived Net::Allowlist worker (test/reference, unpublished)
+workers/gliner-relex/  Python entity/relation extraction worker (sandboxed; non-Cargo)
+workers/browser-driver/ Playwright read-only render worker (opt-in; non-Cargo)
 
 config/                example runtime policy + per-worker sandbox profiles
 seeds/                 L0 memory meta-rule seed data
-scripts/               host setup (AppArmor profile, Postgres install, SearxNG, Matrix)
+scripts/               host setup (AppArmor profile, Postgres install, SearxNG, Matrix,
+                       Firecracker/rootfs builds)
+site/                  kastellan.dev website source (Cloudflare Pages, no build step)
 docs/                  architecture, threat-model, CASSANDRA design, roadmap, handovers,
                        user manual (docs/user/manual), developer manual (docs/devel/manual)
 ```
-
-(`workers/mail` is a placeholder for the email failover transport.)
 
 ## Setup
 

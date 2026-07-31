@@ -36,8 +36,11 @@ for token in '#4f46e5' '#fafbfd' '#0f172a'; do
 done
 
 # 4. No raw .md link targets leaked, and every local href/src resolves.
+# (Absolute URLs contain ':' — e.g. the GitHub blob links the converter
+# rewrites out-of-manual .md targets to — and are legitimate; only a
+# relative/local .md target means the converter missed a link.)
 for p in "$OUT"/*.html; do
-  if grep -qE '(href|src)="[^"]+\.md(#[^"]*)?"' "$p"; then
+  if grep -qE '(href|src)="[^":]+\.md(#[^"]*)?"' "$p"; then
     echo "FAIL: $(basename "$p") contains an unrewritten .md link"; fail=1
   fi
   for ref in $(grep -oE '(href|src)="[^"]+"' "$p" | sed -E 's/^(href|src)="//; s/"$//' \

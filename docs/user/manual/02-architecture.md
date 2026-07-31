@@ -48,7 +48,8 @@ valuable, it is never the thing exposed to danger.
 
 A **worker** is a small, separate program that does exactly one
 outside-world job. There is a worker for fetching web pages, one for web
-search, one for running Python, one for driving a browser, and so on.
+search, one for deeper web research, one for reading your mail archive,
+one for running Python, one for driving a browser, and so on.
 
 Three rules govern every worker, with no exceptions:
 
@@ -212,10 +213,21 @@ back, at any time, exactly what the agent did and why.
 You talk to Kastellan over **Matrix**: a self-hosted, single-user,
 end-to-end-encrypted chat that only you and the agent share, with
 federation (talking to other Matrix servers) turned off so the surface is
-as small as possible. Email can serve as a *low-trust* backup — for
-notifications only, never for commands, because email is too easily
-spoofed. The program that connects to Matrix is itself a sandboxed worker,
-confined to talking to your one chat server and nothing else.
+as small as possible. The program that connects to Matrix is itself a
+sandboxed worker, confined to talking to your one chat server and nothing
+else.
+
+Email can serve as a *lower-trust* backup route in. Because email is so
+easily spoofed, an emailed instruction is accepted only through a strict
+gate: your **own mail server** must have stamped the message as genuinely
+coming from your address (an anti-spoofing verdict called DMARC), the
+message body must contain a **secret token** you were given when you
+paired that address, and a final **database check** confirms both pieces
+of evidence before anything is queued. The whole channel stays off until
+you configure it, and it is one-way for now: Kastellan can *receive*
+email, but sending replies by email is the next piece to be built. The
+part that listens for email is, of course, a sandboxed worker like all
+the rest.
 
 ---
 

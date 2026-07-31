@@ -12,8 +12,9 @@ acting, and never trusts its own LLM output.
 
 When running, kastellan:
 
-- listens on Matrix (self-hosted, single-user, federation off, E2E), with email
-  (IMAP/SMTP) as a low-trust failover
+- listens on Matrix (self-hosted, single-user, federation off, E2E), with a
+  low-trust email failover (inbound-only today: a sandboxed worker polls a
+  localmail server's `/v1` API — the core never speaks raw IMAP/SMTP)
 - receives a task from you (e.g. "research this topic and draft a summary")
 - formulates a multi-step plan using a locally-running or frontier LLM
 - runs each plan step through **CASSANDRA**, a semantic review pipeline that
@@ -48,7 +49,7 @@ record to the wrong person". CASSANDRA reviews each *plan*, not each syscall.
 
 ## Current status
 
-The project is in active development. As of mid-2026:
+The project is in active development. As of late July 2026 (v0.2.0):
 
 - The full parent-side sandbox stack works on both Linux (bwrap +
   cgroup v2) and macOS (Seatbelt). Both platforms also have an **opt-in
@@ -75,12 +76,18 @@ The project is in active development. As of mid-2026:
   pinning are all implemented behind it).
 - **Workers in the workspace today (Rust):** `prelude` (shared init +
   lockdown shim), `shell-exec`, `web-common` (shared net-egress helpers),
-  `web-fetch`, `web-search`, `python-exec` (curated-stdlib executor for
-  agent-authored Python), `egress-proxy`, `matrix` / `matrix-wire`
-  (the Matrix channel worker), and the Firecracker micro-VM support
+  `web-fetch`, `web-search`, `web-research` (composite search → fetch →
+  chunk → BM25-rank passages), `python-exec` (curated-stdlib executor for
+  agent-authored Python), `egress-proxy`, `embed-broker` / `search-broker`
+  (trusted sidecars bridging a jailed worker's UDS to the operator's
+  embedding backend / a SearxNG backend), `mail` (six read-only `mail.*`
+  tools against a localmail archive), `email-in` (inbound poller for the
+  email failover channel), `matrix` / `matrix-wire`
+  (the Matrix channel worker), the Firecracker micro-VM support
   crates `microvm-run` (the launcher) / `microvm-init` (the guest PID 1
-  vsock-stdio adapter) / `kv-demo` (a long-lived persistent-store demo
-  worker + integration fixture).
+  vsock-stdio adapter), and the demo workers `kv-demo` (a long-lived
+  persistent-store demo + integration fixture) / `net-demo` (network
+  egress inside a persistent VM).
 - **Python workers (built with `uv`, outside the Cargo workspace, driven
   from core over JSON-RPC):** `gliner-relex` (entity/relation extraction)
   and `browser-driver` (headless Chromium render). Each has a Rust-side
@@ -89,8 +96,12 @@ The project is in active development. As of mid-2026:
   the primary channel. The inbound worker is live: a `LiveSdk` backed by
   `matrix-rust-sdk` (feature-gated behind `live-matrix`) does the real
   restore-or-login, sync, poll, and send, routed through the worker's own
-  egress sidecar. Email failover and the `workers/mail` worker are not yet
-  built (`workers/mail` is an empty scaffold).
+  egress sidecar. The email failover channel shipped inbound-only
+  (slice 1): the sandboxed `email-in` worker polls a localmail `/v1`
+  endpoint behind a core-side DMARC + pairing-token gate; outbound
+  replies (SMTP) land with slice 2. The `workers/mail` worker is shipped
+  too — six read-only `mail.*` tools, live-verified against a
+  37k-message archive.
 
 See `docs/devel/ROADMAP.md` for the phased feature list and the latest
 `docs/devel/handovers/HANDOVER.md` for what shipped most recently.

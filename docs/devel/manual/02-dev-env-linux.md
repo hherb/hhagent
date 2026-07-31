@@ -126,6 +126,12 @@ for the micro-VM stays on bwrap. `/dev/kvm` is usually already accessible; pass
 `--kvm` if not. The full walkthrough is in the
 [Linux micro-VM setup runbook](../runbooks/2026-06-26-linux-microvm-setup.md).
 
+The installer is also a **hard prerequisite for every rootfs build**
+(`scripts/workers/microvm/build-*-rootfs.sh`): builds only *verify* the pinned
+guest kernel (`require_guest_kernel`) and never create one, so run the
+installer before your first build. Re-run it after a pinned-kernel bump — it
+is idempotent and repairs older installs.
+
 ---
 
 ## Troubleshooting

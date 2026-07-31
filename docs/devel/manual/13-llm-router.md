@@ -1,12 +1,16 @@
 # 13 — LLM router
 
-The `llm-router` crate is the **only** place in the workspace that opens
-an outbound HTTP connection to a model backend. Every model call the
-agent core makes — scheduler reasoning, recall embeddings, the future
-auto-reply drafter — goes through `Router::send` (or
-`Router::embed`). That makes it the obvious mounting point for the future
-egress proxy, for the policy gate that decides local vs. frontier, and
-for the audit-row payload format.
+The `llm-router` crate is the **only** core-side egress to a model
+backend. Every model call the agent core makes — scheduler reasoning,
+recall embeddings, the future auto-reply drafter — goes through
+`Router::send` (or `Router::embed`). (One other crate in the workspace
+deliberately speaks to a model backend: the trusted `embed-broker`
+sidecar, which bridges a jailed worker's Unix socket to the operator's
+OpenAI-compatible embedding endpoint so in-VM workers can embed without
+egress; `search-broker` is the analogous sidecar for search.) The router
+remains the obvious mounting point for the future egress proxy, for the
+policy gate that decides local vs. frontier, and for the audit-row
+payload format.
 
 > This chapter documents the developer-facing surface. The crate-level
 > doc comment in `llm-router/src/lib.rs` is the live source of truth.
@@ -93,17 +97,24 @@ caller changes.
 
 ## What the chokepoint guarantees today
 
-1. **Single egress URL.** No worker, tool, or library elsewhere in the
-   workspace opens an outbound HTTP connection to a model backend. (The
-   per-worker egress proxy that already guards *tool* egress is separate;
-   the router is the core's own single LLM-egress seam, and is where a
-   Phase-5 LLM-egress policy would mount.)
+1. **Single core-side egress URL.** Nothing else in the agent core opens
+   an outbound HTTP connection to a model backend. (The per-worker
+   egress proxy that already guards *tool* egress is separate, and the
+   trusted `embed-broker` sidecar is the one other deliberate
+   model-backend client in the workspace — it serves jailed workers over
+   a Unix socket so they can embed without egress. The router is the
+   core's own single LLM-egress seam, and is where a Phase-5 LLM-egress
+   policy would mount.)
 2. **Stable typed surface.** Callers see `ChatRequest` / `ChatResponse`,
    not raw JSON.
 3. **Audit-log friendly.** `Backend::as_tag` and the serde shapes are
    sized to fit the 4 KiB-capped `audit_log.payload` envelope
    (`db::audit::truncate_payload` will SHA-256-fingerprint the rare
-   oversized payload on the dispatcher side).
+   oversized payload on the dispatcher side). `actor = "llm:router"`
+   audit rows are written today: Phase 1 memory recall shipped, and
+   `memory::embed_query` routes every recall embedding through the
+   router and audits the call — see
+   [chapter 12](./12-memory-and-recall.md).
 
 ---
 
@@ -116,10 +127,6 @@ caller changes.
   scheduler will negotiate that in Phase 1.
 - **Frontier dispatch.** `PolicyGate` is the seam; the call path is
   unwired by design until Phase 5.
-- **Direct integration with `tool_host::dispatch`.** Phase 0 ships the
-  typed surface; the dispatcher will start routing
-  `actor = "llm:router"` audit rows once the first concrete consumer
-  (Phase 1 memory recall) is fully wired.
 
 ---
 

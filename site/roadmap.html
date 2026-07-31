@@ -35,7 +35,7 @@
     <!-- 1. Page head -->
     <div class="page-head wrap">
       <h1>Where Kastellan stands</h1>
-      <p class="subtitle">Curated by hand, updated as milestones ship. Last updated: <time datetime="2026-06">June 2026</time>.</p>
+      <p class="subtitle">Curated by hand, updated as milestones ship. Last updated: <time datetime="2026-07">July 2026</time>.</p>
     </div>
 
     <!-- 2. Stat cards -->
@@ -43,20 +43,20 @@
       <div class="grid-3">
         <div class="card">
           <div class="stat">
-            <span>v0.1.0</span>
+            <span>v0.2.0</span>
             <span>published on crates.io</span>
           </div>
         </div>
         <div class="card">
           <div class="stat">
-            <span>~1,500</span>
+            <span>~2,900</span>
             <span>tests green on Linux + macOS</span>
           </div>
         </div>
         <div class="card">
           <div class="stat">
-            <span>Phases 2–4</span>
-            <span>channels · egress · python-exec, in progress</span>
+            <span>Phase 2</span>
+            <span>channels — Matrix live; email replies next</span>
           </div>
         </div>
       </div>
@@ -80,21 +80,21 @@
         </li>
 
         <li class="timeline-item">
-          <span class="dot-wip"></span>
-          <h3 class="timeline-title">Phase 3 — Web egress <span class="badge-wip">IN PROGRESS</span></h3>
-          <p class="timeline-text">Web search and web fetch shipped behind host allowlists. The egress proxy — the single chokepoint all worker traffic is forced through — now <strong>force-routes every networked worker by default</strong> (private netns, no direct route), terminates and inspects worker TLS, scans the cleartext for the worker&#8217;s own secrets, and pins server certificates. Remaining: wiring it to the first frontier-egress worker. <span aria-hidden="true">←</span> currently being built</p>
+          <span class="dot-done"></span>
+          <h3 class="timeline-title">Phase 3 — Web egress <span class="badge-done">SHIPPED</span></h3>
+          <p class="timeline-text">Web search, web fetch, one-call web research, and a read-only mail-archive tool shipped behind host allowlists. The egress proxy — the single chokepoint all worker traffic is forced through — <strong>force-routes every networked worker by default</strong> (private netns, no direct route), terminates and inspects worker TLS, scans the cleartext for the worker&#8217;s own secrets, and pins server certificates; an operator-configured extra CA can admit exactly one private TLS origin. Optional micro-VM isolation (Firecracker on Linux, Apple <code>container</code> on macOS) wraps networked workers end to end. Remaining: wiring the proxy to the first frontier-egress worker.</p>
         </li>
 
         <li class="timeline-item">
           <span class="dot-wip"></span>
           <h3 class="timeline-title">Phase 2 — Channels <span class="badge-wip">IN PROGRESS</span></h3>
-          <p class="timeline-text">Matrix — self-hosted, single-user, federation off, end-to-end encrypted — is how you&#8217;ll actually talk to it, with email as a cross-transport, low-trust failover (notifications only, never commands). The inbound path, peer pairing, and the message bus have shipped; the live sandboxed Matrix client is landing.</p>
+          <p class="timeline-text">Matrix — self-hosted, single-user, federation off, end-to-end encrypted — is <strong>live end to end</strong>: the sandboxed Matrix client, peer pairing, and the message bus have all shipped. The email failover&#8217;s inbound half shipped too, off by default and gated hard (a DMARC verdict from your own mail server <em>plus</em> a per-pairing token in the body). Remaining: outbound email replies (SMTP) — until then email is receive-only. <span aria-hidden="true">←</span> currently being built</p>
         </li>
 
         <li class="timeline-item">
           <span class="dot-wip"></span>
           <h3 class="timeline-title">Phase 4 — python-exec &amp; agent-authored skills <span class="badge-wip">IN PROGRESS</span></h3>
-          <p class="timeline-text">Python in the strictest jail of any worker — no network, ephemeral scratch only, curated stdlib. The first slice has shipped and passed acceptance on both Linux and macOS; a catalog of named skills with trust tiers and human approval gates follows.</p>
+          <p class="timeline-text">Python in the strictest jail of any worker — no network, ephemeral scratch only, curated stdlib — shipped and acceptance-green on both Linux and macOS, with an optional Firecracker micro-VM boundary on Linux. Agent-authored Python skills already run through an operator-approval lifecycle (crystallise → approve → pin → invoke); the tiered delegation policy follows.</p>
         </li>
 
         <li class="timeline-item">

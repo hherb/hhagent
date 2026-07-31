@@ -111,6 +111,13 @@ The CLI for interacting with a running daemon:
 | `KASTELLAN_SHELL_ALLOWLIST` | `[]` | JSON array of allowed argv patterns (read by the shell-exec worker) |
 | `KASTELLAN_EGRESS_FORCE_ROUTING` | `1` (on) | Route `Net::Allowlist` workers through their per-worker egress proxy. Fail-closed. |
 | `KASTELLAN_WEB_SEARCH_ENDPOINT` | (unset) | SearxNG `/search` endpoint for the web-search worker |
+| `KASTELLAN_{WEB_FETCH,WEB_SEARCH,WEB_RESEARCH,BROWSER_DRIVER}_ALLOWLIST` | (per worker) | Per-worker `host:port` egress allowlist for the net workers |
+| `KASTELLAN_MAIL_ENDPOINT` | (unset) | localmail `/v1` base URL for the read-only mail worker |
+| `KASTELLAN_MAIL_TOKEN_FILE` | (unset) | File holding the mail worker's localmail bearer token |
+| `KASTELLAN_MAIL_ATTACHMENT_MAX_BYTES` | 25 MiB | Size cap for `mail.get_attachment` downloads |
+| `KASTELLAN_EMAIL_ENDPOINT` | (unset) | Enables the inbound email channel (localmail `/v1`); unset ⇒ channel absent |
+| `KASTELLAN_EMAIL_{SUBSCRIPTION,ADDRESS,AUTHSERV_ID,TOKEN_FILE}` | — | Required once the email channel is enabled (`KASTELLAN_EMAIL_WORKER_BIN` is optional) |
+| `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` | (unset) | Extra CA anchor for the egress proxy's upstream leg, keyed by a single private-IP origin |
 | `KASTELLAN_STATE_DIR` | `~/.local/state/kastellan` | Audit JSONL output directory |
 
 ### Opt-in worker enable flags
@@ -128,6 +135,10 @@ Some workers are gated behind an explicit enable flag (off by default):
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `KASTELLAN_PYTHON_EXEC_USE_MICROVM=1` | off | Run `python-exec` inside a Firecracker micro-VM instead of bwrap |
+| `KASTELLAN_WEB_FETCH_USE_MICROVM=1` | off | Same, for `web-fetch` |
+| `KASTELLAN_WEB_SEARCH_USE_MICROVM=1` | off | Same, for `web-search` |
+| `KASTELLAN_WEB_RESEARCH_USE_MICROVM=1` | off | Same, for `web-research` |
+| `KASTELLAN_BROWSER_DRIVER_USE_MICROVM=1` | off | Same, for `browser-driver` |
 | `KASTELLAN_MICROVM_CONFINE_VMM=0` | on | Opt **out** of wrapping the `firecracker` VMM process in its own bwrap+cgroup jail (confinement is on by default, fail-closed) |
 
 ---

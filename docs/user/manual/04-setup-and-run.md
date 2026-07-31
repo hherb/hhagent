@@ -300,6 +300,16 @@ KASTELLAN_PYTHON_EXEC_ENABLE=1        # allow the agent to run Python
 KASTELLAN_BROWSER_DRIVER_ENABLE=1     # allow headless browsing
 ```
 
+Two newer capabilities are gated by *configuration* rather than a single
+switch — each stays off until you give it the settings it needs. The
+**mail tool** (searching and reading your own local mail archive) comes
+on when you set `KASTELLAN_MAIL_ENDPOINT` (plus
+`KASTELLAN_MAIL_TOKEN_FILE`); the walkthrough is in `docs/workers/mail.md`.
+The **inbound email channel** (receiving gated instructions by email)
+comes on when you set the `KASTELLAN_EMAIL_*` group of settings; the
+installer writes a commented-out guide to those into `kastellan.env`.
+Leave them unset and both features simply stay off.
+
 Network-using tools are confined to an **allowlist** of sites you control —
 for instance, the web-fetch worker will only ever connect to the hosts you
 list:
