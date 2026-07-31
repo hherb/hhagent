@@ -146,12 +146,15 @@ fn log_channel_disabled(cause: &anyhow::Error) {
 /// unset ⇒ `None` with **no log noise at all** (the channel is simply absent
 /// and the daemon is byte-identical to an email-less build). Fully configured
 /// ⇒ the sandboxed worker is spawned (force-routed through a real 1:1
-/// transparent-tunnel sidecar whenever `force_routing` is `Some`, exactly
-/// mirroring `matrix_boot::spawn_matrix_channel`'s `MatrixEgress` wiring —
-/// passing `None` here would silently degrade the worker onto the HOST
-/// network namespace, see [`kastellan_core::channel::email::EmailEgress`]'s
-/// docs) and a real audit closure is wired so every skipped id lands in
-/// `audit_log`.
+/// intercepting sidecar whenever `force_routing` is `Some` — the `Some`/`None`
+/// branching mirrors `matrix_boot::spawn_matrix_channel`'s `MatrixEgress`
+/// wiring exactly, but the TLS posture does NOT: Matrix's sidecar stays a
+/// transparent tunnel (matrix-sdk terminates its own TLS end-to-end), while
+/// this one always intercepts (`Mitm::Intercept`) so an operator's
+/// upstream-extra-CA anchor can reach a self-signed localmail — passing
+/// `None` here would silently degrade the worker onto the HOST network
+/// namespace, see [`kastellan_core::channel::email::EmailEgress`]'s docs) and
+/// a real audit closure is wired so every skipped id lands in `audit_log`.
 ///
 /// **Every failure arm returns `None` after a loud
 /// [`log_channel_disabled`]** — a set-but-partial config, a worker spawn
@@ -167,7 +170,8 @@ fn log_channel_disabled(cause: &anyhow::Error) {
 ///   the host jail (bwrap/Seatbelt) — there is no microVM option in this
 ///   slice.
 /// * `force_routing` — the resolved egress force-routing config; `Some` ⇒
-///   each (re)spawn gets a 1:1 transparent-tunnel sidecar via `EmailEgress`.
+///   each (re)spawn gets a 1:1 intercepting sidecar via `EmailEgress` (see
+///   that type's docs for why its TLS posture differs from Matrix's).
 pub(crate) async fn spawn_email_channel(
     pool: &PgPool,
     sandboxes: &SandboxBackends,

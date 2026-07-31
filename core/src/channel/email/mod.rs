@@ -116,7 +116,9 @@ pub struct SpawnedEmailWorker {
 /// type (channels stay decoupled; see `matrix::MatrixEgress`'s own docs for
 /// why each field is what it is). `None` ⇒ the legacy direct `Net::Allowlist`
 /// path (dev / no operator opt-in). `Some` ⇒ every (re)spawn goes through a
-/// 1:1 transparent-tunnel sidecar, audited through the daemon's sink, AND —
+/// 1:1 intercepting sidecar (`Mitm::Intercept` — see [`spawn_email_worker`]'s
+/// docs for why, unlike Matrix's, this one always intercepts), audited
+/// through the daemon's sink, AND —
 /// this is the part that is not cosmetic — the worker runs in a PRIVATE netns
 /// with no route out except the sidecar's UDS. A `Net::Allowlist` policy with
 /// `proxy_uds: None` takes the legacy `--share-net` path instead (see
@@ -157,8 +159,13 @@ fn email_backoff() -> RestartBackoff {
 /// terminates the worker's TLS and re-originates upstream, so an operator
 /// anchor — selected once here via [`ForceRoutingConfig::upstream_ca_for`],
 /// before the respawn factory is built — reaches a self-signed localmail when
-/// one is configured for this worker's origin, and the leg is visible to the
-/// egress boundary's credential-leak scanner. With no anchor configured the
+/// one is configured for this worker's origin, and the plaintext leg becomes
+/// MITM-visible. Interception is the *precondition* for the egress boundary's
+/// credential-leak scanner, not coverage by it: this persistent-transport
+/// path (unlike `egress::net_worker`'s per-tool-call one) provisions no
+/// `secret_fingerprints`, so no `secret_hashes.json` ever lands in this
+/// sidecar's scratch dir and the proxy's `load_patterns` finds none — it
+/// fails OPEN (scans nothing), not closed. With no anchor configured the
 /// upstream leg is plain webpki, the same posture every other force-routed
 /// tool worker already has; the posture itself is never conditional on the
 /// anchor being present.
@@ -202,7 +209,7 @@ pub fn spawn_email_worker(
         .to_string();
 
     // PersistentFactory: each call brings up a fresh worker — force-routed
-    // through a 1:1 transparent-tunnel sidecar when `egress` is Some (the
+    // through a 1:1 intercepting sidecar when `egress` is Some (the
     // sidecar + worker respawn together; decisions flow to the audit sink),
     // else a plain direct-allowlist spawn (dev / probe). The factory runs on
     // the SUPERVISOR's persistent thread (PDEATHSIG-safe, #348). Follows
@@ -259,9 +266,14 @@ pub fn spawn_email_worker(
                 // The email channel ALWAYS intercepts: the sidecar terminates
                 // the worker's TLS and re-originates upstream, so an operator
                 // anchor (when configured) reaches a self-signed localmail and
-                // the leg is visible to the #3b leak scanner. With no anchor the
-                // upstream leg is plain webpki — the same posture every
-                // force-routed tool worker has.
+                // the plaintext leg becomes MITM-visible. That is the
+                // precondition for the #3b credential-leak scanner, not
+                // coverage by it — this persistent-transport path provisions
+                // no secret_fingerprints (only net_worker.rs's per-tool-call
+                // path does), so the proxy finds no secret_hashes.json here
+                // and load_patterns fails OPEN (scans nothing). With no
+                // anchor the upstream leg is plain webpki — the same posture
+                // every force-routed tool worker has.
                 mitm: Mitm::Intercept {
                     upstream_extra_ca: upstream_extra_ca.as_deref(),
                 },
@@ -376,29 +388,130 @@ mod tests {
         );
     }
 
-    #[test]
-    fn email_transport_intercepts_and_carries_the_selected_anchor() {
-        // A config naming this channel's own origin yields an intercepting posture
-        // holding that anchor — the whole point of the slice.
-        let map = crate::egress::upstream_ca::parse_upstream_cas(
-            r#"{"10.0.0.3":"/etc/kastellan/localmail.pem"}"#,
-        )
-        .expect("valid config");
-        let allowlist = vec!["10.0.0.3:8443".to_string()];
-        let selected = crate::egress::upstream_ca::select_ca_for_allowlist(&map, &allowlist)
-            .expect("single private origin selects cleanly");
-        assert_eq!(selected, Some(std::path::Path::new("/etc/kastellan/localmail.pem")));
+    /// A no-op [`crate::worker_lifecycle::force_route::DecisionSinkFactory`] —
+    /// proves the wiring without a live audit sink, same convention as
+    /// `force_route::tests::noop_sink_factory`.
+    fn noop_sink() -> crate::worker_lifecycle::force_route::DecisionSinkFactory {
+        Box::new(|| Box::new(|_row: crate::egress::audit::EgressAuditRow| {}))
     }
 
+    /// The positive half of Task 3's wiring, exercised end to end through the
+    /// public entry point (not just `upstream_ca::select_ca_for_allowlist` in
+    /// isolation, which only proves the first link in the chain and is already
+    /// covered by `egress::upstream_ca`'s own unit tests): a configured anchor
+    /// for this worker's own endpoint must reach the intercepting SIDECAR's
+    /// actual `SandboxPolicy` env, built by `proxy_policy` several calls deep
+    /// (`spawn_email_worker` → factory → `spawn_net_transport` →
+    /// `spawn_sidecar` → `proxy_policy`). Both backends refuse to spawn
+    /// (hermetic, no real process), but the sidecar backend still captures the
+    /// policy it was handed before refusing — same technique as
+    /// `force_route::tests::a_selected_extra_ca_reaches_the_sidecar_policy_env_and_fs_read`.
     #[test]
-    fn email_anchor_selection_refuses_a_mixed_allowlist() {
-        // The channel must fail its own bring-up rather than widen trust to a second
-        // host, and it must do so at boot, not inside the respawn loop.
-        let map = crate::egress::upstream_ca::parse_upstream_cas(
-            r#"{"10.0.0.3":"/etc/kastellan/localmail.pem"}"#,
+    fn egress_some_intercepts_and_the_selected_anchor_reaches_the_sidecar_policy() {
+        let worker_backend = Arc::new(PolicyCapturingBackend { policies: Mutex::new(Vec::new()) });
+        let sidecar_backend = Arc::new(PolicyCapturingBackend { policies: Mutex::new(Vec::new()) });
+        let cfg = test_cfg(); // endpoint https://127.0.0.1:8443 — host is 127.0.0.1
+        let ca_map = crate::egress::upstream_ca::parse_upstream_cas(
+            r#"{"127.0.0.1":"/etc/kastellan/localmail.pem"}"#,
         )
         .expect("valid config");
-        let allowlist = vec!["10.0.0.3:8443".to_string(), "smtp.example.com:587".to_string()];
-        assert!(crate::egress::upstream_ca::select_ca_for_allowlist(&map, &allowlist).is_err());
+        let scratch_root = tempfile::tempdir().expect("scratch root");
+        let routing = ForceRoutingConfig::new(
+            PathBuf::from("/bin/kastellan-worker-egress-proxy"),
+            scratch_root.path().to_path_buf(),
+            noop_sink(),
+            None,
+        )
+        .with_upstream_cas(Some(ca_map));
+        let egress = EmailEgress {
+            sidecar_backend: sidecar_backend.clone() as Arc<dyn SandboxBackend>,
+            routing: Arc::new(routing),
+        };
+
+        // The sidecar backend always refuses, so this always errors — the
+        // point is what got CAPTURED before the refusal, not the outcome.
+        let _ = spawn_email_worker(
+            worker_backend.clone() as Arc<dyn SandboxBackend>,
+            ChannelId("email".into()),
+            &cfg,
+            Some(egress),
+            None,
+        );
+
+        let sidecar_policies = sidecar_backend.policies.lock().expect("capture mutex poisoned");
+        let sidecar_policy =
+            sidecar_policies.first().expect("the sidecar spawn must have been attempted");
+        assert!(
+            sidecar_policy.env.iter().any(|(k, v)| k
+                == "KASTELLAN_EGRESS_PROXY_UPSTREAM_EXTRA_CA"
+                && v == "/etc/kastellan/localmail.pem"),
+            "the selected anchor must reach the sidecar's env: {:?}",
+            sidecar_policy.env
+        );
+        assert!(
+            !sidecar_policy.env.iter().any(|(k, _)| k == "KASTELLAN_EGRESS_PROXY_DISABLE_MITM"),
+            "an intercepting sidecar must NOT carry the disable-MITM key: {:?}",
+            sidecar_policy.env
+        );
+    }
+
+    /// `upstream_ca::select_ca_for_allowlist`'s two `Err` arms
+    /// (`MixedAllowlist`, `MultipleKeyedHosts`) both require the worker's OWN
+    /// allowlist to name at least two distinct hosts: `matched` is bounded by
+    /// the size of that host set, and once it has exactly one member `others`
+    /// is always empty (see that function's three-way match on `matched.as_slice()`).
+    /// `spawn_email_worker` always builds a single-entry allowlist
+    /// (`vec![format!("{host}:{port}")]`, derived once from `cfg.endpoint`), so
+    /// for THIS call site `upstream_ca_for` can only ever return `Ok(None)` or
+    /// `Ok(Some(_))` — never `Err` — no matter what else is in the operator's
+    /// CA map. This is not a gap: the refusal arms ARE reachable and tested
+    /// where a worker's allowlist genuinely has more than one host
+    /// (`egress::upstream_ca`'s own unit tests select the map in isolation;
+    /// `force_route::tests` exercises the full multi-host spawn path for the
+    /// general-purpose net-worker case). This test pins the email-specific
+    /// half of that invariant: a CA entry for a host this worker never dials
+    /// is simply irrelevant to it, never a refusal.
+    #[test]
+    fn an_unrelated_configured_origin_does_not_reach_or_block_the_sidecar() {
+        let worker_backend = Arc::new(PolicyCapturingBackend { policies: Mutex::new(Vec::new()) });
+        let sidecar_backend = Arc::new(PolicyCapturingBackend { policies: Mutex::new(Vec::new()) });
+        let cfg = test_cfg(); // endpoint host is 127.0.0.1
+        let ca_map = crate::egress::upstream_ca::parse_upstream_cas(
+            r#"{"10.0.0.3":"/etc/kastellan/unrelated.pem"}"#, // a different host
+        )
+        .expect("valid config");
+        let scratch_root = tempfile::tempdir().expect("scratch root");
+        let routing = ForceRoutingConfig::new(
+            PathBuf::from("/bin/kastellan-worker-egress-proxy"),
+            scratch_root.path().to_path_buf(),
+            noop_sink(),
+            None,
+        )
+        .with_upstream_cas(Some(ca_map));
+        let egress = EmailEgress {
+            sidecar_backend: sidecar_backend.clone() as Arc<dyn SandboxBackend>,
+            routing: Arc::new(routing),
+        };
+
+        let _ = spawn_email_worker(
+            worker_backend.clone() as Arc<dyn SandboxBackend>,
+            ChannelId("email".into()),
+            &cfg,
+            Some(egress),
+            None,
+        );
+
+        let sidecar_policies = sidecar_backend.policies.lock().expect("capture mutex poisoned");
+        let sidecar_policy = sidecar_policies.first().expect(
+            "an unrelated CA entry must not block the spawn from reaching the sidecar attempt",
+        );
+        assert!(
+            !sidecar_policy
+                .env
+                .iter()
+                .any(|(k, _)| k == "KASTELLAN_EGRESS_PROXY_UPSTREAM_EXTRA_CA"),
+            "a CA keyed to a host this worker never dials must not be handed to its sidecar: {:?}",
+            sidecar_policy.env
+        );
     }
 }
