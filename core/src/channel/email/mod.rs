@@ -35,6 +35,7 @@ use kastellan_sandbox::SandboxBackend;
 
 use crate::channel::polled_driver::{AckOnlyAudit, PolledWorkerDriver};
 use crate::egress::persistent_net::{spawn_net_transport, NetTransportSpawn};
+use crate::egress::spawn::Mitm;
 use crate::worker_lifecycle::force_route::ForceRoutingConfig;
 use crate::worker_lifecycle::persistent::{
     ClientTransport, PersistentFactory, PersistentTransport, PersistentWorker,
@@ -229,7 +230,8 @@ pub fn spawn_email_worker(
                 base_policy: policy.clone(),
                 allowlist: &allowlist,
                 worker_name: "email",
-                extra_ca: None,
+                mitm: Mitm::Transparent,
+                worker_extra_ca: None,
             };
             let sink = (eg.routing.make_sink)();
             // On the fail-closed path the sidecar's Drop removes only the UDS,

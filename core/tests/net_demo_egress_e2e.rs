@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kastellan_core::egress::persistent_net::{spawn_net_transport, NetTransportSpawn};
+use kastellan_core::egress::spawn::Mitm;
 use kastellan_core::worker_lifecycle::{PersistentFactory, PersistentTransport, PersistentWorker};
 use kastellan_sandbox::{Net, Profile, SandboxBackends, SandboxPolicy};
 
@@ -155,7 +156,8 @@ fn net_demo_tls_probe_survives_respawn_under_default_backend() {
                 base_policy: base,
                 allowlist: &allow,
                 worker_name: "net-demo",
-                extra_ca: Some(&ca_path),
+                mitm: Mitm::Transparent,
+                worker_extra_ca: Some(&ca_path),
             };
             let t = spawn_net_transport(&params, &scratch, |_row| {})?;
             Ok(Box::new(t) as Box<dyn PersistentTransport>)
