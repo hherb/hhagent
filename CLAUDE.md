@@ -16,18 +16,20 @@ ROADMAP.md) and commit them — see the checklist at the bottom of HANDOVER.md.
 ## Project shape
 
 A personal agentic system, security-first, vendor-neutral, AGPL-licensed.
-Rust workspace with 5 crates today:
+Rust workspace with 27 crates (full tree in the root `README.md` Layout
+section). The load-bearing ones:
 
-- `core` (`kastellan-core`): bin + lib. Owns the agent loop, memory, policy, LLM router, audit log, IPC. Currently has `tool_host`; everything else is stubbed.
-- `sandbox` (`kastellan-sandbox`): cross-platform sandbox abstraction. `SandboxPolicy` + `SandboxBackend` trait. **Linux backend done** (`linux_bwrap.rs`); macOS Seatbelt backend is the next major work item.
-- `supervisor` (`kastellan-supervisor`): systemd / launchd abstraction. Stub.
+- `core` (`kastellan-core`): bin + lib. Agent loop + scheduler, three-lane memory, CASSANDRA oversight, audit log, the `tool_host` dispatcher chokepoint, channel bus (Matrix + gated email inbound), egress integration, secrets vault, installer; ships the `kastellan` daemon + `kastellan-cli`.
+- `sandbox` (`kastellan-sandbox`): cross-platform sandbox abstraction. `SandboxPolicy` + `SandboxBackend` trait. Backends: Linux bwrap (+`systemd-run --scope` cgroup), macOS Seatbelt, opt-in Apple `container` micro-VM (macOS), opt-in Firecracker micro-VM (Linux; sha256-pinned guest kernel verified at every VM boot).
+- `supervisor` (`kastellan-supervisor`): systemd --user / launchd unit generation + drivers; brings up the real `kastellan.target`.
 - `protocol` (`kastellan-protocol`): JSON-RPC 2.0 server/client over stdio (MCP-stdio compatible). Sole IPC mechanism between core and workers.
-- `workers/shell-exec` (`kastellan-worker-shell-exec`): first jailed worker. Argv allowlist via `KASTELLAN_SHELL_ALLOWLIST` env, no shell interpretation.
+- `db`, `llm-router`, `leak-scan`, `net-classify`, `tests-common`: Postgres layer + embedded migrations, the sole core-side LLM egress, the shared credential-leak scanner, the pure SSRF/denied-range predicate, and the shared dev-dep test harness.
+- `workers/*`: 18 Rust workers/sidecars (prelude, shell-exec, web-common, web-fetch, web-search, web-research, mail, email-in, python-exec, egress-proxy, embed-broker, search-broker, matrix, matrix-wire, microvm-run, microvm-init, kv-demo, net-demo) plus two Python workers outside Cargo (gliner-relex, browser-driver).
 
 ## Hard constraints (do not violate)
 
 - **AGPL-3.0 project; AGPL-compatible dependencies only.** Apache-2.0 / MIT / BSD / MPL / LGPL / (A)GPL all fine. Block any CDDL, BUSL, SSPL, Elastic License, or "source-available" dep — these are not compatible.
-- **Cross-platform: Linux + macOS first-class.** No Linux-only or macOS-only code without a counterpart of equivalent guarantee. The sandbox layer is the canonical example: `linux_bwrap.rs` and (future) `macos_seatbelt.rs` both implement `SandboxBackend` from the same `SandboxPolicy` struct.
+- **Cross-platform: Linux + macOS first-class.** No Linux-only or macOS-only code without a counterpart of equivalent guarantee. The sandbox layer is the canonical example: `linux_bwrap.rs` and `macos_seatbelt/` both implement `SandboxBackend` from the same `SandboxPolicy` struct.
 - **No NVIDIA / DGX hard dependency.** Primary host is a DGX Spark, but the system must run on any Linux box and macOS.
 - **Rust core, Python only inside sandboxed workers.** Don't introduce PyO3/in-process Python. Workers communicate over stdio JSON-RPC; the core never executes untrusted code in-process.
 - **Every worker is sandboxed before it runs.** There is no "spawn unsandboxed" escape hatch in `tool_host`. Don't add one.
@@ -40,16 +42,16 @@ Cargo isn't on the default `PATH` for non-interactive shells; source the env fir
 source "$HOME/.cargo/env"
 
 cargo build --workspace                                    # builds core + workers
-cargo test --workspace                                     # all tests, currently 18 green
+cargo test --workspace                                     # all tests (authoritative counts live in HANDOVER.md)
 cargo test -p kastellan-sandbox                              # one crate
 cargo test -p kastellan-sandbox --test linux_smoke           # one integration-test file
 cargo test -p kastellan-sandbox argv_starts_with_bwrap       # one test by name substring
 cargo test --workspace -- --nocapture                      # show stderr (useful when sandbox tests skip)
 
-./target/debug/kastellan                                     # run the (skeleton) core daemon
+./target/debug/kastellan                                     # run the core daemon
 ```
 
-There's no `cargo fmt` or `clippy` config yet; before adding either, decide on style. Until then, keep formatting consistent with what's already in the tree.
+There's no `rustfmt` config yet; keep formatting consistent with what's already in the tree. Clippy IS enforced: CI runs `cargo clippy --workspace --all-targets -- -D warnings` and the tree is warning-clean — keep it that way.
 
 ## Linux host setup (Ubuntu 24.04+)
 
@@ -62,7 +64,8 @@ Fix: `sudo scripts/linux/install-bwrap-apparmor-profile.sh` once. Same pattern F
 
 Other Linux distros without AppArmor user-ns restrictions don't need this script.
 
-For the optional Firecracker micro-VM backend (`KASTELLAN_PYTHON_EXEC_USE_MICROVM=1`),
+For the optional Firecracker micro-VM backend (`KASTELLAN_<WORKER>_USE_MICROVM=1`,
+e.g. `KASTELLAN_PYTHON_EXEC_USE_MICROVM=1`),
 run the one-time privileged setup: `sudo scripts/linux/install-firecracker-vsock.sh`.
 It does three things — grants the worker user the vsock device, provisions
 `/var/lib/kastellan/microvm` as `root:<worker-group>` mode `1775`, and installs the
@@ -86,8 +89,8 @@ deliberately with `scripts/workers/microvm/fetch-guest-kernel.sh <dir>`.
 - **bwrap argv builder pattern.** `linux_bwrap::build_argv()` is a pure function that takes `SandboxPolicy` → `Vec<String>`; it's separately testable from the spawn. Always include `--unshare-all`, `--die-with-parent`, `--new-session`, `--as-pid-1`, `--clearenv`. Env vars come *only* from `policy.env` via `--setenv`. Network depends on `Net` + `proxy_uds`: **force-routed** `Net::Allowlist` **with** `proxy_uds` set (the default in the supervised deployment — `KASTELLAN_EGRESS_FORCE_ROUTING=1`, egress slice #2) → **private netns** (NO `--share-net`) + `--bind` the proxy UDS into the jail; the worker has no direct route and reaches the allowlist only via the egress proxy (which enforces host:port + SSRF). **Legacy** `Net::Allowlist` **without** `proxy_uds` → `--share-net` (host netns). `Net::ProxyEgress` (the proxy's own policy) keeps `--share-net`.
 - **`SandboxPolicy.fs_read` paths must be absolute.** `LinuxBwrap::spawn_under_policy` rejects relative paths up front.
 - **`SandboxBackend` is `dyn`-safe.** Don't add generic methods to it; add new strategies as new types implementing the trait.
-- **Worker binaries find themselves at runtime via `CARGO_MANIFEST_DIR` + workspace `target/debug/`** (see `core/tests/shell_exec_e2e.rs::worker_binary`). Production deployment will need a stable install location convention — flagged in HANDOVER.md "Open questions".
-- **The agent core never speaks to Postgres or the LLM directly from a worker.** Memory access is core-only; LLM calls go through (the future) `llm_router`.
+- **Worker binaries are discovered `current_exe()`-relative** (`core::worker_manifest::discover_binary`): in the dev tree that resolves to workspace `target/debug/`, and `kastellan-cli install` copies all binaries into `~/.local/lib/kastellan/` so the same discovery works in a real deployment (no env override needed).
+- **The agent core never speaks to Postgres or the LLM directly from a worker.** Memory access is core-only; LLM calls go through `llm-router` (the sole core-side model egress; the trusted `embed-broker`/`search-broker` sidecars are the deliberate worker-side exceptions).
 
 ## When tests "pass" but feel suspicious
 

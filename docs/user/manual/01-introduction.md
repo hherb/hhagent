@@ -39,12 +39,18 @@ When fully set up, Kastellan can:
 
 - **Talk to you over secure chat.** Day-to-day you message it over
   [Matrix](https://matrix.org) — a self-hosted, end-to-end-encrypted chat
-  system that only you and the agent share. Email can act as a low-trust
-  backup channel for notifications.
+  system that only you and the agent share. Email can act as a lower-trust
+  backup way to *reach* it: instructions you send by email are accepted
+  only through a strict authenticity gate, and the channel stays off until
+  you switch it on. (Replies back out by email aren't built yet.)
 - **Search and read the web.** It can run web searches and fetch and read
   pages, extracting the readable text for you.
 - **Drive a web browser.** For pages that only work with a real browser,
   it can render them headlessly and read the result.
+- **Search and read your own email archive.** If you keep a local archive
+  of your mail, Kastellan can search it, read messages, and save copies of
+  attachments into a task's own folder — strictly read-only: it cannot
+  alter, send, or delete anything in the archive.
 - **Run Python.** It can write and execute small Python programs to compute
   or transform things — inside the strictest cell of all.
 - **Remember.** It keeps a long-term memory in a local database — facts,
@@ -130,7 +136,8 @@ will happen and is built to contain it.
 
 ## Current status (honest snapshot)
 
-Kastellan is under active development. As of mid-2026:
+Kastellan is under active development. As of late July 2026 (current
+release: **v0.2.0**):
 
 - The full sandboxing stack works on **both Linux and macOS**. On Linux there
   is now also an optional, stronger **micro-VM** cell (a lightweight virtual
@@ -141,12 +148,20 @@ Kastellan is under active development. As of mid-2026:
 - Several real tools work end to end: running allow-listed commands,
   fetching and reading web pages, web search, running Python, and headless
   browsing.
+- Two newer tools joined them: the **mail tool**, which searches and reads
+  your own local mail archive (read-only), and a **web-research** tool
+  that does a whole research pass in one call — search, fetch the most
+  promising pages, and pull out the most relevant passages.
 - The **egress proxy** — the guarded internet doorway — is built through
   all its stages (allowlist, forced routing, secret-leak scanning, and
   certificate pinning) and is on by default in the supervised deployment.
 - The **Matrix chat channel** now works end to end: you can message the agent
   over encrypted, self-hosted chat and get a reply, with a running deployment
   driven by the system service supervisor.
+- Email can now reach the agent as a strictly **gated backup channel**: an
+  emailed instruction is accepted only when your own mail server's
+  anti-spoofing verdict and a secret pairing token both check out. It is
+  off by default, and replies by email are not built yet.
 - A **one-command install** (`kastellan-cli install`) takes a freshly-built
   copy to a running, supervised agent — database and daemon included — without
   needing root.

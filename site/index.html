@@ -46,7 +46,7 @@
           <a class="btn-ghost" href="https://github.com/hherb/kastellan/blob/main/docs/user/manual/index.md">Read the manual →</a>
         </div>
         <pre class="chip" role="region" tabindex="0" aria-label="Install command: cargo install kastellan-core">$ cargo install kastellan-core
-<span class="chip-comment"># v0.1.0 on crates.io</span></pre>
+<span class="chip-comment"># v0.2.0 on crates.io</span></pre>
       </div>
       <div>
         <img src="assets/logo.png" alt="The Kastellan robot mascot holding mail, calendar, chat, and code icons" width="280" height="280" fetchpriority="high" decoding="async">
@@ -88,16 +88,16 @@
       <h2>What it does <span style="font-size: 0.55em; font-weight: 400; letter-spacing: 0; color: var(--muted);">— each capability inside its own walls</span></h2>
       <div class="grid-3">
         <article class="card">
-          <h3 class="card-title"><span aria-hidden="true">💬</span> Talks to you <span class="badge-wip">in progress</span></h3>
-          <p class="card-text">Matrix — self-hosted, single-user, end-to-end encrypted — with email as a low-trust failover.</p>
+          <h3 class="card-title"><span aria-hidden="true">💬</span> Talks to you <span class="badge-done">today</span></h3>
+          <p class="card-text">Matrix — self-hosted, single-user, end-to-end encrypted — live today. Inbound email works behind a strict authentication gate; email replies land next.</p>
         </article>
         <article class="card">
           <h3 class="card-title"><span aria-hidden="true">🌐</span> Works the web <span class="badge-done">today</span></h3>
-          <p class="card-text">Web search and page fetch, host-allowlisted; a sandboxed browser is next.</p>
+          <p class="card-text">Web search, page fetch, and one-call research — host-allowlisted; read-only sandboxed browser rendering is opt-in.</p>
         </article>
         <article class="card">
-          <h3 class="card-title"><span aria-hidden="true">🐍</span> Runs code <span class="badge-wip">in progress</span></h3>
-          <p class="card-text">Python in the strictest jail of any worker — no network, ephemeral scratch only.</p>
+          <h3 class="card-title"><span aria-hidden="true">🐍</span> Runs code <span class="badge-done">today</span></h3>
+          <p class="card-text">Python in the strictest jail of any worker — no network, ephemeral scratch only; optionally inside a micro-VM.</p>
         </article>
         <article class="card">
           <h3 class="card-title"><span aria-hidden="true">🧠</span> Remembers <span class="badge-done">today</span></h3>
@@ -122,15 +122,15 @@
       </div>
       <div class="stats">
         <div class="stat">
-          <span>v0.1.0</span>
+          <span>v0.2.0</span>
           <span>on crates.io</span>
         </div>
         <div class="stat">
-          <span>~1,500</span>
+          <span>~2,900</span>
           <span>tests green</span>
         </div>
         <div class="stat">
-          <span>13</span>
+          <span>27</span>
           <span>workspace crates</span>
         </div>
         <div class="stat">
@@ -141,8 +141,9 @@
       <p>
         <span class="dot-done"></span> Phase 0 — Sandboxed core (done) &nbsp;·&nbsp;
         <span class="dot-done"></span> Phase 1 — Memory &amp; agent loop (done) &nbsp;·&nbsp;
-        <span class="dot-wip"></span> Phase 3 — Egress proxy (force-routed by default) &nbsp;·&nbsp;
-        <span class="dot-wip"></span> Channels (Matrix) · python-exec (landing) &nbsp;·&nbsp;
+        <span class="dot-done"></span> Egress proxy (force-routed by default) &nbsp;·&nbsp;
+        <span class="dot-done"></span> python-exec &amp; approved skills &nbsp;·&nbsp;
+        <span class="dot-wip"></span> Channels — Matrix live · email inbound gated, replies next &nbsp;·&nbsp;
         <span class="dot-plan"></span> Frontier gate (planned)
       </p>
     </section>

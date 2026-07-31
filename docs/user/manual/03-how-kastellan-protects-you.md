@@ -108,9 +108,15 @@ pretending to be you.
 - **Screening.** Even a paired peer's messages are screened for injection,
   because *any* input is treated as potentially hostile.
 
-Email, being easily spoofed, is held to a far lower trust level: it can
-carry *notifications* only, never commands, and only after standard
-anti-spoofing checks pass.
+Email, being easily spoofed, is held to a far lower trust level. It can
+carry instructions to the agent, but only through a strict gate: your own
+mail server must have stamped the message as genuinely from your address
+(the DMARC anti-spoofing verdict), the message body must carry a secret
+token issued when you paired that address, and a database-backed check
+confirms that evidence before anything is queued. The whole channel is
+off by default. And it is one-way today: Kastellan cannot yet send
+replies or notifications *out* by email — that part is not built until
+the next stage of work.
 
 ### Threat 6 — A secret leaks into the logs or out to the internet
 

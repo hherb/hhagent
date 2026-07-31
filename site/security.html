@@ -62,7 +62,7 @@
       <h2>Defence in depth</h2>
       <ol class="defence">
         <li>
-          <p><strong>One process, one sandbox per tool.</strong> Every tool invocation gets its own OS process inside its own kernel jail — bubblewrap on Linux, Seatbelt on macOS, optionally an Apple container micro-VM. Workers never share a sandbox with each other or with the core.</p>
+          <p><strong>One process, one sandbox per tool.</strong> Every tool invocation gets its own OS process inside its own kernel jail — bubblewrap on Linux, Seatbelt on macOS, optionally a micro-VM (Firecracker on Linux with a hash-pinned guest kernel, Apple container on macOS). Workers never share a sandbox with each other or with the core.</p>
         </li>
         <li>
           <p><strong>Double containment.</strong> The parent installs the OS sandbox at spawn; the worker then locks itself down again with Landlock and seccomp before serving a single request. A kernel bug in either layer alone does not breach the worker.</p>
@@ -97,7 +97,7 @@
     <section class="wrap" aria-label="Limitations and honesty">
       <div class="note">
         <h2>What we don&#8217;t claim</h2>
-        <p>macOS Seatbelt is weaker than the Linux stack — a documented asymmetry, not a footnote. The credential-leak scan catches only verbatim, contiguous secret bytes — encoding or splitting evades it; it is defence-in-depth, not the containment boundary. No frontier-egress worker is wired up yet, so certificate pinning ships ready but provisioned with no pins by default. CASSANDRA&#8217;s LLM review stages are still deterministic stubs. The full, current threat model lives in the repo: <a href="https://github.com/hherb/kastellan/blob/main/docs/threat-model.md">docs/threat-model.md</a></p>
+        <p>macOS Seatbelt is weaker than the Linux stack — a documented asymmetry, not a footnote. The credential-leak scan catches only verbatim, contiguous secret bytes — encoding or splitting evades it; it is defence-in-depth, not the containment boundary. No frontier-egress worker is wired up yet, so certificate pinning ships ready but provisioned with no pins by default. Browser and email-channel traffic ride the egress proxy as opaque tunnels — allowlisted and SSRF-checked, but not TLS-inspected. CASSANDRA&#8217;s constitutional and data-classification stages are deterministic rules today; its LLM review stages are not built yet. The full, current threat model lives in the repo: <a href="https://github.com/hherb/kastellan/blob/main/docs/threat-model.md">docs/threat-model.md</a></p>
       </div>
     </section>
 
