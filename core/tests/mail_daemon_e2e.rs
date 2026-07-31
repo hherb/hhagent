@@ -368,6 +368,8 @@ fn mock_localmail_shapes_match_real_localmail() {
         "real localmail /v1/messages must key rows under `results`: {list:?}"
     );
     let mut sha: Option<String> = None;
+    // Checked once, on the first detail actually fetched (see below).
+    let mut detail_shape_checked = false;
     if let Some(rows) = list.as_ref().and_then(|v| v.get("results")).and_then(|r| r.as_array()) {
         for row in rows {
             let Some(id) = row.get("message_id").or_else(|| row.get("id")).and_then(|v| v.as_i64())
@@ -375,6 +377,37 @@ fn mock_localmail_shapes_match_real_localmail() {
                 continue;
             };
             let (_h, msg) = curl("GET", &format!("/v1/messages/{id}"), None);
+
+            // 3a. get_message's own field shape. Previously this loop used the
+            // detail response only to discover an attachment sha, so the
+            // message-detail fields were the ONE surface this anti-drift gate
+            // did not pin — which is exactly how `mock_localmail` was able to
+            // drift into a mail-tool-only shape (`"from"` as a bare string,
+            // `"body"` instead of `"body_text"`) that `workers/email-in`
+            // cannot parse at all. That drift is silent by construction:
+            // `build_event` reads `from.address`, gets `None`, and records the
+            // message as `skipped` rather than erroring. Both asserts below
+            // fail loudly on exactly that shape — indexing a JSON string with
+            // `["address"]` yields `Null`, so `is_string()` is `false`.
+            if let Some(msg) = msg.as_ref() {
+                if !detail_shape_checked {
+                    detail_shape_checked = true;
+                    assert!(
+                        msg["from"]["address"].is_string(),
+                        "real localmail /v1/messages/{{id}} must serve `from` as an ADDRESS \
+                         OBJECT (`_address()` → {{address, name}}), not a bare string — \
+                         email-in reads `from.address`; got from = {}",
+                        msg["from"]
+                    );
+                    assert!(
+                        msg.get("body_text").is_some(),
+                        "real localmail /v1/messages/{{id}} must name the plain-text body \
+                         `body_text` (not `body`); got keys {:?}",
+                        msg.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                    );
+                }
+            }
+
             if let Some(s) = msg
                 .as_ref()
                 .and_then(|m| m.get("attachments"))

@@ -285,6 +285,13 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
         //     string yields `None` — the message becomes a `skipped` entry and
         //     never an inbound event, silently.
         //   * the plain-text body is `body_text`, not `body`.
+        //   * `id` is a STRING (`"id": str(mid)`), not a number — the same
+        //     numeric-vs-string trap `changes_returns_message_id_and_next_cursor_as_strings`
+        //     already guards on the `/v1/changes` route, and the shape
+        //     `email-in`'s own fixture uses (`handler/tests.rs`: `"id": "42"`).
+        //     Nothing in the tree reads this field today (verified by grep — the
+        //     only mail-adjacent `id` reads are other fixtures and the real
+        //     localmail LIST route), so this is fidelity, not a behaviour fix.
         //   * `headers` exists ONLY when the request carried `?headers=full`
         //     (`serve/routes/messages.py::detail` maps that query pair to
         //     `full_headers=(headers == "full")`), and every value is an ARRAY
@@ -295,7 +302,7 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
         //     verdict for every message — which looks like a delivery bug.
         // The mail tool reads only `attachments`, which is unchanged.
         let mut msg = serde_json::json!({
-            "id": CANNED_MESSAGE_ID,
+            "id": CANNED_MESSAGE_ID.to_string(),
             "subject": "invoice",
             "from": {"address": CANNED_FROM_ADDRESS, "name": "Billing"},
             "date": "2026-07-28T00:00:00+00:00",
@@ -481,6 +488,9 @@ mod tests {
         );
         assert_eq!(v["from"]["address"], CANNED_FROM_ADDRESS);
         assert_eq!(v["body_text"], CANNED_BODY_TEXT);
+        // Same numeric-vs-string trap `changes_returns_message_id_and_next_cursor_as_strings`
+        // guards one route over: localmail serves `"id": str(mid)`.
+        assert!(v["id"].is_string(), "id must be a JSON string; got {}", v["id"]);
     }
 
     /// `headers` is served only under `?headers=full`, exactly as localmail

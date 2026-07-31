@@ -508,9 +508,14 @@ fn force_routed_search_round_trips_through_mitm_sidecar() {
 /// `is_err()` alone would be satisfied by ANY failure (worker crash, PG hiccup,
 /// dispatch timeout), so the control would silently stop being a control the day
 /// something upstream of TLS broke. So we also pin the failure to the
-/// re-origination leg: on an upstream handshake failure the proxy emits an
-/// allowed-but-failed decision whose reason is `mitm_failed: …`
-/// (`classify_mitm_error`), which the host maps into the audit row's payload.
+/// re-origination leg, and pin it *precisely*: the assertion matches
+/// `mitm_failed: origin TLS handshake` rather than the bare `mitm_failed:`
+/// prefix. `classify_mitm_error` (`workers/egress-proxy/src/proxy.rs`) stamps
+/// that prefix onto every non-pin intercept failure, and `mitm.rs` reaches it
+/// from five sites — including `worker TLS handshake: …`, which fires BEFORE the
+/// origin is dialled, and `dial origin …: connection refused`. Matching the bare
+/// prefix would therefore also accept broken per-instance CA provisioning or an
+/// origin that never bound, neither of which is what this control tests.
 #[test]
 fn force_routed_search_fails_without_upstream_extra_ca() {
     use kastellan_tests_common::egress_proxy_bin_or_skip;
@@ -540,10 +545,11 @@ fn force_routed_search_fails_without_upstream_extra_ca() {
         assert!(
             rows.iter().any(|r| r.payload["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.starts_with("mitm_failed:"))),
-            "the failure must be the proxy's upstream handshake rejecting the \
-             self-signed origin (a `mitm_failed: …` decision), not an incidental \
-             error; got {:?}",
+                .is_some_and(|reason| reason.starts_with("mitm_failed: origin TLS handshake"))),
+            "the failure must be the proxy's UPSTREAM handshake rejecting the \
+             self-signed origin (a `mitm_failed: origin TLS handshake: …` decision) — \
+             a bare `mitm_failed:` would also match a worker-side handshake or a \
+             refused dial, which this control is not about; got {:?}",
             rows.iter().map(|r| (r.action.clone(), r.payload.clone())).collect::<Vec<_>>()
         );
     });

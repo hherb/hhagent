@@ -268,9 +268,20 @@ fn force_routed_email_poll_round_trips_through_mitm_sidecar() {
 /// "No event arrived" alone would be satisfied by ANY failure (worker crash, a
 /// mock that never bound, a jail refusal), so the control would silently stop
 /// being a control the day something upstream of TLS broke. The decision
-/// assertion pins it to the re-origination leg: on an upstream handshake failure
-/// the proxy emits a decision whose reason is `mitm_failed: …`
-/// (`classify_mitm_error`), which the host maps into the audit row's payload.
+/// assertion is what pins it to the re-origination leg.
+///
+/// That assertion matches `mitm_failed: origin TLS handshake` and **not** the
+/// bare `mitm_failed:` prefix, which would be far too broad to mean what this
+/// test claims. `classify_mitm_error`
+/// (`workers/egress-proxy/src/proxy.rs`) stamps that prefix onto *every*
+/// non-pin intercept failure, and `mitm.rs` reaches it from five sites —
+/// including `worker TLS handshake: …`, which fires BEFORE the origin is ever
+/// dialled, and `dial origin …: connection refused`. So a bare-prefix match
+/// would be satisfied by broken per-instance CA provisioning or by an origin
+/// that never bound, neither of which has anything to do with the missing
+/// operator anchor. Only `origin TLS handshake: …` is the re-origination leg
+/// this test exists to exercise (observed in full:
+/// `mitm_failed: origin TLS handshake: invalid peer certificate: UnknownIssuer`).
 #[test]
 fn without_the_operator_anchor_the_mitm_leg_fails_closed() {
     let Some(proxy) = proxy_or_skip() else {
@@ -289,9 +300,11 @@ fn without_the_operator_anchor_the_mitm_leg_fails_closed() {
         assert!(
             rows.iter().any(|r| r.payload["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.starts_with("mitm_failed:"))),
-            "the failure must be the proxy's upstream handshake rejecting the self-signed origin \
-             (a `mitm_failed: …` decision), not an incidental error; got {:?}",
+                .is_some_and(|reason| reason.starts_with("mitm_failed: origin TLS handshake"))),
+            "the failure must be the proxy's UPSTREAM handshake rejecting the self-signed origin \
+             (a `mitm_failed: origin TLS handshake: …` decision) — a bare `mitm_failed:` would \
+             also match a worker-side handshake or a refused dial, which this test is not about; \
+             got {:?}",
             decision_summary(&rows)
         );
     });
