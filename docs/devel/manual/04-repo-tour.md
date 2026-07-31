@@ -12,7 +12,9 @@ core/           The agent brain: scheduler, memory, CASSANDRA, audit, IPC,
                 channel bus, egress integration, secret vault, handoff cache
 db/             Database crate: migrations, Postgres helpers, secrets
 leak-scan/      Pure credential-leak scanner shared by core + egress-proxy
-llm-router/     Sole egress for LLM calls (local + frontier, OpenAI shape)
+llm-router/     Sole core-side LLM egress (local + frontier, OpenAI shape)
+net-classify/   Pure IP-range classifier: the SSRF / DNS-rebinding deny
+                predicate the egress proxy enforces at connect time
 sandbox/        Cross-platform sandbox abstraction (bwrap / Seatbelt / container)
 supervisor/     Service supervisor abstraction (systemd --user / launchd)
 protocol/       JSON-RPC 2.0 over stdio — the IPC wire format
@@ -29,16 +31,18 @@ seeds/          Seed data (memory L0 meta-rules, entity/relation kinds)
 site/           Public website (kastellan.dev) sources
 ```
 
-The **workspace members** declared in the top-level `Cargo.toml` are:
-`core`, `db`, `leak-scan`, `llm-router`, `sandbox`, `supervisor`,
-`protocol`, `tests-common`, and the Rust workers `workers/prelude`,
+The **workspace members** declared in the top-level `Cargo.toml` are 27
+crates: `core`, `db`, `leak-scan`, `llm-router`, `net-classify`,
+`sandbox`, `supervisor`, `protocol`, `tests-common`, and the Rust workers
+`workers/prelude`, `workers/mail`, `workers/email-in`,
 `workers/shell-exec`, `workers/web-common`, `workers/web-fetch`,
-`workers/web-search`, `workers/python-exec`, `workers/egress-proxy`,
+`workers/web-research`, `workers/web-search`, `workers/python-exec`,
+`workers/egress-proxy`, `workers/embed-broker`, `workers/search-broker`,
 `workers/matrix-wire`, `workers/matrix`, plus the Firecracker micro-VM
-support crates `workers/microvm-run`, `workers/microvm-init`, and
-`workers/kv-demo`. The Python workers (`workers/gliner-relex`,
-`workers/browser-driver`) live outside the Rust workspace and are built
-with `uv`; `workers/mail` is an empty scaffold. See
+support crates `workers/microvm-run`, `workers/microvm-init`, and the
+demo workers `workers/kv-demo`, `workers/net-demo`. The Python workers
+(`workers/gliner-relex`, `workers/browser-driver`) live outside the Rust
+workspace and are built with `uv`. See
 [The `workers/` directory](#the-workers-directory) below.
 
 ---
@@ -51,6 +55,8 @@ This is the largest crate and the one most contributors will touch.
 core/src/
   main.rs                Daemon entry point (probe → connect pool → spawn
                          mirror → block on SIGTERM/SIGINT)
+  main/                  Daemon bootstrap split: bootstrap.rs plus the
+                         config-gated email_boot.rs / matrix_boot.rs
   lib.rs                 Public crate API
   tool_host.rs           THE dispatcher chokepoint — every worker call goes here
   tool_host/             Chokepoint submodules: secret_scrub (python-exec
@@ -87,13 +93,21 @@ core/src/
   secrets/               Vault (TTL'd in-memory store) + SecretRef opaque
                          newtype + secret:// substitution + value_fingerprint
   channel/               Channel bus: Channel trait, auth/pairing,
-                         injection screen, route, Matrix adapter
+                         injection screen, route, Matrix adapter,
+                         polled_driver.rs (generic long-poll driver for
+                         PersistentWorker-supervised channel workers), and
+                         email/ (the inbound email channel: config, gate
+                         [DMARC + token], policy, wire, authres_parse)
   egress/                Host side of the egress proxy: sidecar spawn,
                          force-routed net workers, decision audit, leak
                          provisioning
+  broker/                Trusted broker sidecars (embed / search): spawn +
+                         discovery of the UDS bridge to an operator backend
   handoff.rs             In-memory content-addressed large-result cache
   registry_build.rs      Static WORKER_MANIFESTS + build_tool_registry
   worker_manifest.rs     WorkerManifest trait + binary discovery
+  worker_stderr.rs       Detached-thread drain of a worker's piped stderr
+                         (prevents pipe-full deadlock; chunks at debug)
 
   entity_extraction/     Entity extraction pipeline (calls gliner-relex worker)
   observation/           Observation phase: turn channel events into L0 rows
@@ -108,14 +122,19 @@ core/src/
   workers/               Host-side manifests + clients for each worker
     shell_exec.rs        ShellExecManifest + entry
     web_fetch.rs / web_search.rs
+    web_research.rs      Composite research-worker manifest
+    mail.rs              Read-only localmail mail.* worker manifest
     python_exec.rs       Net::Deny + WorkerStrict executor manifest
     browser_driver.rs / browser_driver/   Playwright render worker manifest
     gliner_relex.rs / gliner_relex/        torch entity-extraction manifest
     interpreter_deps.rs  Out-of-prefix interpreter-lib auto-bind helper
+    endpoint_guard.rs    Resolve-time endpoint guard for force-routed workers
 
   audit_mirror.rs        Background JSONL mirror of audit_log rows
   audit_tail.rs          CLI audit log viewer helpers
   cli_audit.rs           Audit write helpers used by CLI subcommands
+  install/               kastellan-cli install planner: layout/spec planning
+                         (plan.rs) + IO orchestration (run.rs)
   bin/kastellan-cli/       All CLI subcommands (ask, audit, tasks, entities,
                          relations, memory l1/l3, secrets, pair, …)
 ```
@@ -144,12 +163,20 @@ sandbox/src/
                       probe, images (mkfs.ext4 RO/RW + persistent), mounts
                       (kastellan.mounts share manifest), confine (unprivileged
                       VMM confinement), cleanup (orphan run-dir sweep)
+  guest_kernel_pin.rs sha256-pin verification of the micro-VM guest kernel,
+                      run fail-closed at every VM boot
+  pid.rs              Cross-platform pid-liveness check shared by the
+                      orphan-reclaim sweeps
   macos_seatbelt/     macOS backend (sandbox-exec / Seatbelt) — shipped
   macos_container/    macOS micro-VM backend (Apple `container` CLI, opt-in
                       per-worker, Tahoe+) — wired into SandboxBackendKind
 sandbox/tests/
   linux_smoke.rs            Negative tests: file denials, net denial, OOM kill
+  linux_force_routing.rs    Force-routed worker has no direct route: private
+                            netns whose only egress is the bound proxy UDS
   macos_smoke.rs            Same tests for macOS
+  seatbelt_uds_probe.rs     macOS twin: Seatbelt denies AF_INET, permits the
+                            proxy UDS
   macos_container_smoke.rs  Real Apple `container` tests (opt-in)
 ```
 
@@ -188,10 +215,24 @@ workers/
                     HttpGet transport, CONNECT-over-UDS proxy connector.
   web-fetch/        [RUST] HTTPS-only web.fetch (HTML readability / PDF / text).
   web-search/       [RUST] web.search against a SearxNG JSON endpoint.
+  web-research/     [RUST] Composite web.research: search → fetch top-N
+                    allowlisted pages → chunk → BM25-rank passages, one call.
   python-exec/      [RUST] Executes agent-authored Python under the strictest
                     policy (Net::Deny, curated stdlib, no site-packages).
   egress-proxy/     [RUST] Per-worker sandboxed CONNECT proxy: allowlist + SSRF
                     + TLS-intercept MITM + leak scanner + SPKI pinning.
+  embed-broker/     [RUST] Trusted embedding-broker sidecar: bridges a jailed
+                    worker's UDS to the operator's embedding backend, so the
+                    worker needs no embed egress.
+  search-broker/    [RUST] Trusted search-broker sidecar: the same bridge
+                    shape, UDS → SearxNG.
+  mail/             [RUST] Six read-only mail.* tools against localmail's /v1
+                    (search, get_message, list_messages, list_accounts,
+                    get_attachment_text, get_attachment → a durable per-task
+                    out dir). Live-verified against a 37k-message archive.
+  email-in/         [RUST] Sandboxed inbound-email poller (email.init / poll /
+                    ack) for the email failover channel; the DMARC+token gate
+                    stays core-side.
   matrix-wire/      [RUST] Shared serde wire types for the Matrix worker.
   matrix/           [RUST] Matrix channel worker (matrix-rust-sdk behind a seam;
                     hermetic parts compile by default, the live LiveSdk is
@@ -203,12 +244,14 @@ workers/
   kv-demo/          [RUST] Long-lived Net::Deny key-value worker with a
                     persistent store — the 5b demo + micro-VM integration
                     fixture.
+  net-demo/         [RUST] Long-lived Net::Allowlist demo worker: end-to-end
+                    TLS through a transparent-tunnel egress sidecar (network
+                    egress inside a persistent VM).
 
   gliner-relex/     [PYTHON] Named-entity + relation extraction via GLiNER +
                     ReLeX. Built with uv. Host manifest in core/src/workers.
   browser-driver/   [PYTHON] Playwright headless-Chromium read-only render.
                     Built with uv. Host manifest in core/src/workers.
-  mail/             [empty scaffold] IMAP/SMTP failover — not yet built.
 ```
 
 Workers communicate with the core exclusively over stdin/stdout using
@@ -245,7 +288,7 @@ db/src/
                       providers [OS keyring], async DB I/O)
   tests.rs            Cross-module DB integration tests
   bin/                kastellan-db-init and other admin binaries
-db/migrations/        Embedded *.sql migrations (0001..0019) via sqlx::migrate!
+db/migrations/        Embedded *.sql migrations (0001..0022) via sqlx::migrate!
 ```
 
 Migrations live under `db/migrations/` and are embedded into the binary at

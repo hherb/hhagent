@@ -109,7 +109,10 @@ a micro-VM respawn sets it to a `PersistentStore { host_backing, guest_mount,
 size_mib }` — see the micro-VM section below.
 
 **Important:** `fs_read` paths must be absolute. Relative paths are rejected
-at `spawn_under_policy` time with a clear error.
+at `spawn_under_policy` time with a clear error. Symlinked host-side
+*sources* are canonicalized before binding — bwrap and the Firecracker
+backend bind the canonical source at the original destination. This applies
+to host paths only; guest-side paths stay lexical.
 
 ---
 
@@ -124,7 +127,9 @@ at `spawn_under_policy` time with a clear error.
   netns with **no direct route**; `proxy_uds` is set at spawn to its own
   egress-proxy sidecar's Unix socket, and the proxy enforces the allowlist +
   an SSRF guard. The worker literally cannot reach anything the proxy didn't
-  approve.
+  approve. (Under the Firecracker backend the worker reaches its egress
+  sidecar over vsock rather than a bind-mounted Unix socket — same proxy,
+  different transport.)
 - `Net::ProxyEgress` — the egress proxy's *own* policy: it keeps the host
   netns because it is the thing doing real DNS + outbound connections, and it
   is self-enforcing.
@@ -162,14 +167,20 @@ exploit in the worker does not reach the host kernel:
   the host. It supports host-directory sharing, a warm/idle reuse lifecycle, a
   vsock egress transport (network in a VM), unprivileged-VMM confinement (the
   `firecracker` process is itself wrapped in a bwrap+cgroup jail, on by default),
-  and long-lived persistent-VM workers.
+  and long-lived persistent-VM workers. The guest kernel is sha256-pinned and
+  verified at every VM boot (`sandbox/src/guest_kernel_pin.rs`, fail-closed,
+  no override).
 - **macOS — Apple `container`.** An opt-in per-worker micro-VM using Apple's
   `container` CLI (macOS Tahoe+), the parity backend that gives macOS real
   memory enforcement.
 
 Both are **opt-in per worker** — the default path stays bwrap (Linux) /
-Seatbelt (macOS). The Firecracker backend is gated behind
-`KASTELLAN_PYTHON_EXEC_USE_MICROVM=1` for python-exec; VMM confinement is on by
+Seatbelt (macOS). The Firecracker backend is gated behind a per-worker flag:
+`KASTELLAN_PYTHON_EXEC_USE_MICROVM=1`, `KASTELLAN_WEB_FETCH_USE_MICROVM=1`,
+`KASTELLAN_WEB_SEARCH_USE_MICROVM=1`, `KASTELLAN_WEB_RESEARCH_USE_MICROVM=1`,
+or `KASTELLAN_BROWSER_DRIVER_USE_MICROVM=1`; the Matrix channel worker has a
+persistent-VM path of its own. The VM-entry arc is complete — a real page has
+been rendered in-VM through a real egress sidecar. VMM confinement is on by
 default and opts out with `KASTELLAN_MICROVM_CONFINE_VMM=0`. See the
 [Linux micro-VM setup runbook](../runbooks/2026-06-26-linux-microvm-setup.md)
 for the one-time host setup (`scripts/linux/install-firecracker-vsock.sh`).
