@@ -288,7 +288,9 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
         //   * `id` is a STRING (`"id": str(mid)`), not a number — the same
         //     numeric-vs-string trap `changes_returns_message_id_and_next_cursor_as_strings`
         //     already guards on the `/v1/changes` route, and the shape
-        //     `email-in`'s own fixture uses (`handler/tests.rs`: `"id": "42"`).
+        //     `email-in`'s own message-detail fixtures use (`handler/tests.rs`:
+        //     `"id": "7"`; `client.rs`'s `message_detail_requests_full_headers`:
+        //     `"id":"42"`).
         //     Nothing in the tree reads this field today (verified by grep — the
         //     only mail-adjacent `id` reads are other fixtures and the real
         //     localmail LIST route), so this is fidelity, not a behaviour fix.

@@ -47,6 +47,10 @@ use kastellan_tests_common::{
 /// The email worker binary this file drives.
 const EMAIL_WORKER: &str = "kastellan-worker-email-in";
 
+/// Loopback literal the mock always binds, the `upstream_cas` key below, and the
+/// `host` every decision about this origin carries.
+const ORIGIN_HOST: &str = "127.0.0.1";
+
 /// How long the positive case waits for the first inbound event. Generous: it
 /// covers sidecar bring-up (up to a 5s readiness budget), the jailed worker
 /// spawn, `email.init`, and one `GET /v1/changes` + `GET /v1/messages/{id}`
@@ -91,14 +95,22 @@ fn proxy_or_skip() -> Option<std::path::PathBuf> {
 /// force-routing coupling, the mock — is identical between the two callers, so a
 /// difference in outcome can only be attributed to the anchor.
 ///
-/// Returns the first inbound message (if any arrived within `wait`) and every
-/// egress decision the sidecar emitted.
+/// Returns the first inbound message (if any arrived within `wait`), every
+/// egress decision the sidecar emitted, and the mock's ephemeral port — the
+/// callers need that last one to scope their decision assertions to this origin
+/// rather than to any decision that happens to carry the right flag.
 async fn run_forced_email_poll_over_tls(
     proxy: &Path,
     with_extra_ca: bool,
     wait: Duration,
-) -> (Option<IncomingMessage>, Vec<EgressAuditRow>) {
+) -> (Option<IncomingMessage>, Vec<EgressAuditRow>, u16) {
     let (mock, cert_pem) = spawn_mock_localmail_tls().await;
+    let origin_port = mock
+        .base_url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("mock base_url should end in :<port>; got {}", mock.base_url));
 
     // The anchor and the bearer token both need absolute paths readable from
     // inside their respective jails (`proxy_policy` fs_reads the CA;
@@ -127,7 +139,7 @@ async fn run_forced_email_poll_over_tls(
     // The mock binds loopback, so the endpoint host is the IP literal `127.0.0.1`
     // — which is also the key `upstream_ca`'s single-private-origin rule expects.
     let upstream_cas = with_extra_ca.then(|| {
-        parse_upstream_cas(&format!(r#"{{"127.0.0.1": "{}"}}"#, ca_path.display()))
+        parse_upstream_cas(&format!(r#"{{"{ORIGIN_HOST}": "{}"}}"#, ca_path.display()))
             .expect("valid upstream extra-CA config")
     });
 
@@ -187,7 +199,31 @@ async fn run_forced_email_poll_over_tls(
 
     let _ = std::fs::remove_dir_all(&scratch_root);
     let captured = std::mem::take(&mut *rows.lock().expect("rows mutex"));
-    (received, captured)
+    (received, captured, origin_port)
+}
+
+/// Does this decision concern the mock origin **specifically** — matching `host`
+/// *and* `port`, never just one?
+///
+/// Both halves are load-bearing, and the host half is the weaker one here: the
+/// mock binds the bare loopback literal, the least discriminating host string in
+/// the suite. On a real box `127.0.0.1` is also SearxNG, the embed broker and
+/// localmail proper, and #448 already cost a round-trip to a bare-host egress
+/// assertion that false-positived on a co-resident service. Matching the port too
+/// is the convention `is_allowed_row_for` in
+/// `web_fetch_firecracker_egress_e2e.rs` set after #469: "a bare-host check would
+/// pass on any decision mentioning the host" — that all-port-grant lesson applies
+/// to assertions, not only to allowlists.
+///
+/// The sidecar's allowlist here happens to hold exactly one `host:port`, so today
+/// this filter cannot reject a row the unscoped check would have accepted — it is
+/// a no-op. That is precisely why it is worth pinning while it is free: it keeps
+/// the assertion honest the day the allowlist grows a second entry, a retry lands
+/// a decision for another origin, or this file is copied as the template for the
+/// next channel's MITM e2e.
+fn is_for_origin(r: &EgressAuditRow, port: u16) -> bool {
+    r.payload["host"].as_str() == Some(ORIGIN_HOST)
+        && r.payload["port"].as_u64() == Some(u64::from(port))
 }
 
 /// Hermetic full round-trip: the REAL email-in worker, force-routed in MITM
@@ -217,6 +253,8 @@ async fn run_forced_email_poll_over_tls(
 /// BEFORE `run_mitm` performs the upstream handshake, so on its own it proves
 /// only "not transparently tunnelled", never "re-origination succeeded". A test
 /// that asserted only this would pass with re-origination completely broken.
+/// It is scoped to a decision for the mock origin's own `host:port` (see
+/// `is_for_origin`) rather than to any row carrying the flag.
 #[test]
 fn force_routed_email_poll_round_trips_through_mitm_sidecar() {
     let Some(proxy) = proxy_or_skip() else {
@@ -224,7 +262,7 @@ fn force_routed_email_poll_round_trips_through_mitm_sidecar() {
     };
 
     driver_runtime().block_on(async {
-        let (received, rows) =
+        let (received, rows, origin_port) =
             run_forced_email_poll_over_tls(&proxy, true, POSITIVE_WAIT).await;
 
         let msg = received.unwrap_or_else(|| {
@@ -249,9 +287,11 @@ fn force_routed_email_poll_round_trips_through_mitm_sidecar() {
         );
 
         assert!(
-            rows.iter().any(|r| r.action == "egress.allowed"
+            rows.iter().any(|r| is_for_origin(r, origin_port)
+                && r.action == "egress.allowed"
                 && r.payload["tls_intercepted"] == serde_json::Value::Bool(true)),
-            "expected an MITM-intercepted allow decision (tls_intercepted: true); got {:?}",
+            "expected an MITM-intercepted allow decision (tls_intercepted: true) for the mock \
+             origin {ORIGIN_HOST}:{origin_port}; got {:?}",
             decision_summary(&rows)
         );
     });
@@ -282,6 +322,8 @@ fn force_routed_email_poll_round_trips_through_mitm_sidecar() {
 /// operator anchor. Only `origin TLS handshake: …` is the re-origination leg
 /// this test exists to exercise (observed in full:
 /// `mitm_failed: origin TLS handshake: invalid peer certificate: UnknownIssuer`).
+/// It is `host:port`-scoped for the same reason the positive assertion is (see
+/// `is_for_origin`): the reason string alone would not say *which* origin failed.
 #[test]
 fn without_the_operator_anchor_the_mitm_leg_fails_closed() {
     let Some(proxy) = proxy_or_skip() else {
@@ -289,7 +331,7 @@ fn without_the_operator_anchor_the_mitm_leg_fails_closed() {
     };
 
     driver_runtime().block_on(async {
-        let (received, rows) =
+        let (received, rows, origin_port) =
             run_forced_email_poll_over_tls(&proxy, false, NEGATIVE_WAIT).await;
 
         assert!(
@@ -298,34 +340,44 @@ fn without_the_operator_anchor_the_mitm_leg_fails_closed() {
              origin, so no event can round-trip; got {received:?}"
         );
         assert!(
-            rows.iter().any(|r| r.payload["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.starts_with("mitm_failed: origin TLS handshake"))),
+            rows.iter().any(|r| is_for_origin(r, origin_port)
+                && r.payload["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with("mitm_failed: origin TLS handshake"))),
             "the failure must be the proxy's UPSTREAM handshake rejecting the self-signed origin \
-             (a `mitm_failed: origin TLS handshake: …` decision) — a bare `mitm_failed:` would \
-             also match a worker-side handshake or a refused dial, which this test is not about; \
-             got {:?}",
+             at {ORIGIN_HOST}:{origin_port} (a `mitm_failed: origin TLS handshake: …` decision) — \
+             a bare `mitm_failed:` would also match a worker-side handshake or a refused dial, \
+             which this test is not about; got {:?}",
             decision_summary(&rows)
         );
     });
 }
 
-/// Deduplicated `action / reason / tls_intercepted × count` view of the captured
-/// decisions, for assertion failure messages.
+/// Deduplicated `host:port / action / reason / tls_intercepted × count` view of
+/// the captured decisions, for assertion failure messages.
 ///
 /// Deliberately not a raw `{:?}` over the rows: the driver retries a failing
 /// poll every 200ms, so a failure prints ~40 near-identical multi-field JSON
 /// objects and the one line that explains it (`mitm_failed: …`) is invisible in
-/// the noise. Collapsing to the three fields that discriminate keeps the
-/// message diagnostic. `tls_intercepted` is kept because it is exactly the
-/// field a reader will want to check against the weaker-signal caveat above —
-/// it is `true` on the failing rows too.
+/// the noise. Collapsing to the fields that discriminate keeps the message
+/// diagnostic. `tls_intercepted` is kept because it is exactly the field a
+/// reader will want to check against the weaker-signal caveat above — it is
+/// `true` on the failing rows too.
+///
+/// `host:port` is kept because both assertions are scoped by it (`is_for_origin`).
+/// Without it here, the one failure mode the scoping introduces — decisions
+/// arrived, but for some other origin — would print a summary that looks like it
+/// should have matched, and the reader would have no way to see why it did not.
 fn decision_summary(rows: &[EgressAuditRow]) -> Vec<String> {
     let mut seen: Vec<(String, usize)> = Vec::new();
     for r in rows {
         let key = format!(
-            "{} reason={:?} tls_intercepted={}",
-            r.action, r.payload["reason"], r.payload["tls_intercepted"]
+            "{}:{} {} reason={:?} tls_intercepted={}",
+            r.payload["host"].as_str().unwrap_or("<no host>"),
+            r.payload["port"],
+            r.action,
+            r.payload["reason"],
+            r.payload["tls_intercepted"]
         );
         match seen.iter_mut().find(|(k, _)| *k == key) {
             Some((_, n)) => *n += 1,
