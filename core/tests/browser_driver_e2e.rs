@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
+use kastellan_core::egress::spawn::Mitm;
 use kastellan_core::secrets::Vault;
 use kastellan_core::tool_host::{build_program_and_args, dispatch, spawn_worker, WorkerSpec};
 use kastellan_core::workers::browser_driver::{browser_driver_entry, BrowserDriverEnv};
@@ -226,8 +227,8 @@ fn short_scratch_root(tag: &str) -> PathBuf {
 
 /// Render `url` through the real jail **force-routed** through an egress-proxy
 /// sidecar (the production posture). Mirrors `render_in_jail` but spawns via
-/// `spawn_forced_net_worker` with `disable_mitm: true` (the browser tunnels TLS
-/// end-to-end; the sidecar transparently tunnels).
+/// `spawn_forced_net_worker` with `mitm: Mitm::Transparent` (the browser tunnels
+/// TLS end-to-end; the sidecar transparently tunnels).
 /// One sidecar decision, flattened to the fields the acceptance asserts on:
 /// `(action, host, port)` — e.g. `("egress.allowed", "127.0.0.1", 40787)`.
 /// We capture tuples rather than `EgressAuditRow` (which isn't `Clone`) so the
@@ -236,7 +237,7 @@ type CapturedDecision = (String, String, u64);
 
 /// Render `url` through the real jail **force-routed** through an egress-proxy
 /// sidecar (the production posture). Mirrors `render_in_jail` but spawns via
-/// `spawn_forced_net_worker` with `disable_mitm: true` (the browser does
+/// `spawn_forced_net_worker` with `mitm: Mitm::Transparent` (the browser does
 /// end-to-end TLS; the sidecar transparently tunnels — no MITM).
 ///
 /// Returns `(render_result, decisions)`. The **decisions** are the acceptance
@@ -271,9 +272,9 @@ async fn render_in_jail_forced(
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     // Per-spawn writable scratch (#283), prepared on a private policy copy before
     // force-routing rewrites it (the rewrite only sets proxy_uds — the browser is a
-    // transparent-tunnel worker, `disable_mitm=true` ⇒ `mitm=false`, so no CA is
-    // injected — the scratch grant/env survive). No-op on Linux. The RAII guard is
-    // bound to the worker via `with_scratch` below.
+    // transparent-tunnel worker, `mitm: Mitm::Transparent`, so no CA is injected —
+    // the scratch grant/env survive). No-op on Linux. The RAII guard is bound to
+    // the worker via `with_scratch` below.
     let mut policy = entry.policy.clone();
     let scratch =
         kastellan_core::tool_host::prepare_ephemeral_scratch(&mut policy, entry.ephemeral_scratch)
@@ -294,8 +295,7 @@ async fn render_in_jail_forced(
         worker_name: "browser-driver",
         secret_fingerprints: &[],
         cert_pins_json: None,
-        disable_mitm: true,
-        upstream_extra_ca: None,
+        mitm: Mitm::Transparent,
     };
     let decisions: std::sync::Arc<std::sync::Mutex<Vec<CapturedDecision>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

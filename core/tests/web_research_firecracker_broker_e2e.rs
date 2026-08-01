@@ -48,6 +48,7 @@ use std::sync::Arc;
 
 use kastellan_core::broker::{spawn_broker, BrokerConfig, BrokerKind};
 use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
+use kastellan_core::egress::spawn::Mitm;
 use kastellan_core::secrets::Vault;
 use kastellan_core::tool_host::{dispatch, WorkerSpec};
 use kastellan_core::worker_lifecycle::force_route::rewrite_policy_for_broker;
@@ -361,7 +362,7 @@ async fn brokered_vm_worker_ranks_hybrid_over_vsock_with_zero_embed_egress() {
 
     // Force-route the VM worker onto a HOST MITM egress sidecar. broker_uds
     // survives the force-route clone, so both vsock channels (1025 egress, 1026
-    // broker) are live. disable_mitm: false → the sidecar delivers its
+    // broker) are live. `Mitm::Intercept` → the sidecar delivers its
     // per-instance CA in-guest (the web-research rootfs ships no system CA).
     let spec = WorkerSpec {
         policy: &policy,
@@ -381,8 +382,8 @@ async fn brokered_vm_worker_ranks_hybrid_over_vsock_with_zero_embed_egress() {
         worker_name: "web-research",
         secret_fingerprints: &[],
         cert_pins_json: None,
-        disable_mitm: false, // MITM: deliver the per-instance CA into the VM
-        upstream_extra_ca: None,
+        // MITM: deliver the per-instance CA into the VM.
+        mitm: Mitm::Intercept { upstream_extra_ca: None },
     };
     // Print each egress decision (allow/deny + host) so a live-tier failure is
     // diagnosable — which CONNECTs the proxy saw and whether any were blocked.

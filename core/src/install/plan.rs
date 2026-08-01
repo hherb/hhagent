@@ -188,19 +188,30 @@ pub fn render_upstream_ca_help() -> String {
 ///    `docs/superpowers/specs/2026-07-28-email-fallback-channel-design.md`'s
 ///    D8: an unpaired sender's `Rejected` outcome deliberately skips the
 ///    carve-out for any transport that supplies evidence.
-/// 3. **This channel's force-routed sidecar cannot reach a self-signed
-///    localmail today.** `channel::email::spawn_email_worker`'s force-routed
-///    path (`egress::persistent_net::spawn_net_transport`) is a
-///    TRANSPARENT TUNNEL — it hardcodes `disable_mitm: true` and
-///    `upstream_extra_ca: None` — so `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` has
-///    no effect on it; there is no MITM re-origination leg for it to widen
-///    trust on. A self-signed origin is refused by the worker's own
-///    webpki-only TLS client, force-routed or not. That env var DOES apply
-///    to the separate `kastellan-worker-mail` TOOL, whose force-routed
-///    sidecar does MITM (`egress::net_worker::spawn_net_worker`) — and per
-///    #492 ITS allowlist must then resolve to a single private origin. The
-///    two must not be conflated even though they may point at the same
-///    localmail address.
+/// 3. **A self-signed localmail needs `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA`.**
+///    This channel's force-routed sidecar terminates the worker's TLS and
+///    re-originates upstream, so the operator anchor named for this origin is
+///    what lets it validate a self-signed cert. Two constraints come with it,
+///    both inherited from #492: the cert must be a real CA that signed the
+///    origin leaf **or** a self-signed leaf with `basicConstraints CA:FALSE`
+///    (a `CA:TRUE` self-signed leaf is rejected at handshake time by rustls as
+///    `CaUsedAsEndEntity`, even though `openssl verify` accepts it — and
+///    `openssl req -x509` commonly produces exactly that shape); and the
+///    anchor is trusted for every host that sidecar can reach, so this
+///    worker's allowlist must resolve to that single private origin. Verify a
+///    cert's shape with:
+///    `openssl x509 -in <cert.pem> -noout -text | grep -A1 'Basic Constraints'`
+///    **Also:** `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` is ONE global map, keyed
+///    by host only (not host:port — see [`render_upstream_ca_help`]'s
+///    CAVEAT). An entry configured for this channel's origin is handed to
+///    EVERY worker whose allowlist resolves to that same address, including
+///    the separate `kastellan-worker-mail` TOOL if it points at the same
+///    host. Two services sharing an address (e.g. localmail on `:8443` and a
+///    search service on `:8888`, both `10.0.0.3`) cannot be distinguished by
+///    this map: there is no log, no error, just a silently widened upstream
+///    trust for whichever other worker resolves there. Don't conflate this
+///    channel with the `kastellan-worker-mail` tool when reasoning about who
+///    an anchor reaches.
 pub fn render_email_help() -> String {
     r#"# --- Email fallback channel (Phase 2 slice #5) -------------------------------
 # Inbound only in this slice: the agent can receive and act on email, but
@@ -234,17 +245,29 @@ pub fn render_email_help() -> String {
 # token to find and is rejected with reason `no_token` in audit_log. Check there
 # first if a correctly-paired address is being turned away.
 #
-# TRAP 3: a self-signed localmail is NOT reachable by this channel today,
-# even force-routed. Its force-routed sidecar is a plain transparent tunnel (no
-# MITM leg), so KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA above has NO EFFECT on it
-# — there is nothing for it to widen trust on. A self-signed origin is
-# refused by the worker's own webpki-only TLS client, force-routed or not;
-# localmail must present a PUBLICLY-TRUSTED certificate for this channel to
-# reach it until a later slice extends the tunnel with MITM + extra-CA
-# support. KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA DOES apply to the SEPARATE
-# kastellan-worker-mail tool, whose force-routed sidecar does MITM — and per
-# issue #492 ITS egress allowlist must then resolve to a SINGLE private
-# origin. Don't conflate the two, even when they point at the same address.
+# TRAP 3: a self-signed localmail needs KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA
+# above. This channel's force-routed sidecar terminates the worker's TLS and
+# re-originates upstream, so the operator anchor named for this origin is
+# what lets it validate a self-signed cert. Two constraints come with it,
+# both inherited from #492: the cert must be a real CA that signed the origin
+# leaf, or a self-signed leaf marked basicConstraints CA:FALSE (a CA:TRUE
+# self-signed leaf is REJECTED at handshake time by rustls as
+# CaUsedAsEndEntity, even though `openssl verify` accepts it — and
+# `openssl req -x509` commonly produces exactly that shape); and the anchor is
+# trusted for every host that sidecar can reach, so this worker's egress
+# allowlist must resolve to that single private origin. Verify a cert's shape
+# with:
+#   openssl x509 -in <cert.pem> -noout -text | grep -A1 'Basic Constraints'
+#
+# NOTE: KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA is ONE GLOBAL map, keyed by HOST
+# only (not host:port — see the CAVEAT in the upstream-CA help block above).
+# An entry added for THIS channel's origin is handed to EVERY worker whose
+# allowlist resolves to that same address — including the SEPARATE
+# kastellan-worker-mail TOOL, if it points at the same host. Two services
+# sharing an address (e.g. localmail on :8443 and a search service on :8888,
+# both 10.0.0.3) cannot be distinguished by this map: nothing logs or errors
+# when a second worker's sidecar silently inherits the first's anchor. Don't
+# conflate this channel with the kastellan-worker-mail tool.
 "#
     .to_string()
 }
@@ -757,27 +780,41 @@ mod tests {
         // cannot diagnose that without being told where to look.
         assert!(help.contains("PLAIN TEXT"), "must tell the operator to send plain text: {help}");
         assert!(help.contains("no_token"), "must name the audit reason to grep for: {help}");
-        // Trap 3: the force-routed sidecar for THIS channel is a transparent
-        // tunnel with no MITM leg, so KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA has
-        // no effect on it and a self-signed localmail is not reachable by it
-        // today — must say so plainly, not imply the var fixes it.
+        // Trap 3: the force-routed sidecar for THIS channel intercepts (it
+        // terminates the worker's TLS and re-originates upstream), so
+        // KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA is what lets it validate a
+        // self-signed localmail — must say so plainly, not the old (now
+        // false) claim that the var has no effect here.
         assert!(help.contains("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA"), "{help}");
-        assert!(help.contains("NO EFFECT"), "must state the var does nothing on this path: {help}");
+        assert!(help.contains("CA:FALSE"), "must state the working cert shape: {help}");
+        assert!(help.contains("CaUsedAsEndEntity"), "must name the rustls error: {help}");
         assert!(
-            help.contains("not reachable") || help.contains("NOT reachable"),
-            "must state a self-signed localmail is unreachable by this channel today: {help}"
+            help.contains("single private origin"),
+            "must state the single-origin allowlist constraint: {help}"
         );
-        assert!(
-            help.contains("transparent tunnel"),
-            "must name why: the force-routed sidecar has no MITM leg: {help}"
-        );
-        // The #492 single-origin rule is real, but it governs the SEPARATE
-        // kastellan-worker-mail tool (which does MITM), not this channel —
-        // must say so to avoid conflating the two.
+        // The #492 single-origin rule is inherited verbatim by this channel's
+        // own intercepting sidecar now, not just the separate mail tool.
         assert!(help.contains("#492"), "must reference the constraining issue: {help}");
         assert!(
+            !help.contains("NO EFFECT"),
+            "stale claim: the var now has an effect on this channel's path: {help}"
+        );
+        // The map is global and host-keyed (not per-service): an anchor added
+        // for this channel's origin silently reaches every other worker whose
+        // allowlist resolves to the same address, including the separate
+        // kastellan-worker-mail tool — this must be spelled out so an operator
+        // doesn't conflate the two when reasoning about who an anchor reaches.
+        assert!(
             help.contains("kastellan-worker-mail"),
-            "must name which worker #492's rule actually governs: {help}"
+            "must name the tool that can silently inherit this channel's anchor: {help}"
+        );
+        assert!(
+            help.contains("GLOBAL") || help.contains("global"),
+            "must state the map is global across workers, not scoped to this channel: {help}"
+        );
+        assert!(
+            help.contains("cannot be distinguished"),
+            "must state two services sharing an address are indistinguishable to the map: {help}"
         );
         // Partial-config behaviour: the CHANNEL is disabled, the DAEMON is not.
         // The operator's only signal is a startup log line, so the help must

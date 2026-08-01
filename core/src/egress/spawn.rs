@@ -49,7 +49,14 @@ const STDERR_SETTLE: Duration = Duration::from_millis(250);
 /// long-lived channel sidecar (matrix) gets `0` instead — see [`proxy_policy`].
 const SHORT_LIVED_SIDECAR_CPU_MS: u64 = 10_000;
 
-/// A running sidecar. Drop or `shutdown()` kills it.
+/// A running sidecar. Call [`shutdown`](SidecarHandle::shutdown) or
+/// [`terminate`](SidecarHandle::terminate) to kill it — this type has **no**
+/// `Drop` impl, so simply letting it go out of scope leaks the child process
+/// (`std::process::Child`'s own drop does not kill it). The `Drop`-bearing
+/// wrapper that ties teardown to scope is `egress::net_worker::EgressSidecar`,
+/// which holds one of these and calls `terminate()` from its own `Drop`; a
+/// bare `SidecarHandle` dropped before it is wrapped (or without ever being
+/// wrapped) leaks — tracked as issue #502.
 #[derive(Debug)]
 pub struct SidecarHandle {
     child: Child,
@@ -78,12 +85,76 @@ impl SidecarHandle {
     }
 }
 
+/// The TLS posture of a worker's egress sidecar.
+///
+/// One value rather than two fields, because the two are not independent: an
+/// upstream trust anchor is meaningful ONLY on the re-origination leg, and that
+/// leg exists only when the proxy terminates the worker's TLS. Before #494 this
+/// was a `disable_mitm: bool` beside an `upstream_extra_ca: Option<&Path>`, and
+/// the nonsensical pair (a tunnel handed an anchor it can never consult) had to
+/// be rejected at runtime by [`check_upstream_extra_ca`]. That rule is not gone
+/// — it moved into this type, where the pair cannot be written down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mitm<'a> {
+    /// The proxy terminates the worker's TLS and re-originates upstream. The
+    /// worker trusts the sidecar's per-instance CA (exported beside the UDS);
+    /// the sidecar validates the real origin with webpki plus
+    /// `upstream_extra_ca` when the operator configured one (#491/#492).
+    Intercept { upstream_extra_ca: Option<&'a Path> },
+    /// The proxy relays ciphertext untouched; the worker validates the origin
+    /// itself and never receives our CA. For workers that cannot be made to
+    /// trust a per-instance CA — the browser (Chromium's NSS store) and
+    /// matrix-sdk.
+    Transparent,
+}
+
+impl<'a> Mitm<'a> {
+    /// Whether the sidecar must be told to skip interception.
+    pub(crate) fn is_transparent(&self) -> bool {
+        matches!(self, Mitm::Transparent)
+    }
+
+    /// The upstream trust anchor, if this posture can use one. `Transparent`
+    /// always yields `None` — structurally, not by convention.
+    pub(crate) fn upstream_extra_ca(&self) -> Option<&'a Path> {
+        match self {
+            Mitm::Intercept { upstream_extra_ca } => *upstream_extra_ca,
+            Mitm::Transparent => None,
+        }
+    }
+}
+
+/// Everything [`proxy_policy`] and [`spawn_sidecar`] need to describe one
+/// sidecar. A struct rather than 8-9 positional arguments (#494): the old
+/// signature had `disable_mitm` and `long_lived` adjacent as bare bools, and
+/// transposing them compiled silently into both the wrong TLS posture and the
+/// wrong CPU governance (the #395 SIGKILL shape).
+pub struct SidecarSpawn<'a> {
+    /// The egress-proxy binary.
+    pub binary: &'a Path,
+    /// `host:port` entries this sidecar may dial.
+    pub allowlist: &'a [String],
+    /// Per-worker scratch dir; the UDS and the exported CA live here.
+    pub scratch: &'a Path,
+    /// Worker name, for the proxy's decision rows.
+    pub worker: &'a str,
+    /// SPKI pin JSON (slice #4). Passed opaque; the proxy parses + enforces.
+    pub cert_pins_json: Option<&'a str>,
+    /// TLS posture — see [`Mitm`].
+    pub mitm: Mitm<'a>,
+    /// Lifetime-scoped CPU governance (issue #395). `true` for a channel
+    /// sidecar that outlives many dispatches (no cumulative `RLIMIT_CPU`, which
+    /// would eventually SIGKILL it mid-flight); `false` for a per-tool-call
+    /// sidecar, which keeps the bounded cap as defense-in-depth.
+    pub long_lived: bool,
+}
+
 /// Build the sandbox policy for the proxy: `Net::ProxyEgress` (real outbound +
 /// DNS, self-enforcing), `WorkerNetClient` (permits `socket(2)`), fs_read for
 /// the DNS resolver files + the binary, fs_write for the scratch dir (to create
 /// the UDS), and the env contract.
 ///
-/// `long_lived` selects the CPU governance (issue #395). A channel sidecar
+/// `spec.long_lived` selects the CPU governance (issue #395). A channel sidecar
 /// (matrix) lives 1:1 with a worker that runs for weeks, so a cumulative
 /// `RLIMIT_CPU` would eventually SIGKILL it mid-flight → `cpu_ms: 0` (no cap;
 /// bounded instead by the cgroup `CPUQuota` on Linux / the mem cap). A
@@ -93,36 +164,26 @@ impl SidecarHandle {
 /// `RLIMIT_CPU` is the sole per-process CPU-governance primitive.
 ///
 /// This function is a pure descriptor builder and validates nothing: the
-/// preconditions on `upstream_extra_ca` (absolute, and not paired with
-/// `disable_mitm`) are enforced by [`check_upstream_extra_ca`], which
-/// [`spawn_sidecar`] calls before it builds the policy. Callers reaching for
-/// `proxy_policy` directly must uphold them themselves.
-#[allow(clippy::too_many_arguments)] // descriptor args for the sidecar's SandboxPolicy
-pub fn proxy_policy(
-    binary: &Path,
-    allowlist: &[String],
-    scratch: &Path,
-    worker: &str,
-    cert_pins_json: Option<&str>,
-    disable_mitm: bool,
-    long_lived: bool,
-    upstream_extra_ca: Option<&Path>,
-) -> SandboxPolicy {
-    let uds = scratch.join(UDS_FILE_NAME);
-    let allow_json = serde_json::to_string(allowlist).expect("Vec<String> serializes");
+/// precondition on `upstream_extra_ca` (must be absolute) is enforced by
+/// [`check_upstream_extra_ca`], which [`spawn_sidecar`] calls before it builds
+/// the policy. Callers reaching for `proxy_policy` directly must uphold it
+/// themselves.
+pub fn proxy_policy(spec: &SidecarSpawn<'_>) -> SandboxPolicy {
+    let uds = spec.scratch.join(UDS_FILE_NAME);
+    let allow_json = serde_json::to_string(spec.allowlist).expect("Vec<String> serializes");
     let mut env = vec![
         (ENV_UDS.to_string(), uds.to_string_lossy().into_owned()),
         (ENV_ALLOWLIST.to_string(), allow_json),
-        (ENV_WORKER.to_string(), worker.to_string()),
+        (ENV_WORKER.to_string(), spec.worker.to_string()),
     ];
     // Pins are static operator config (slice #4). Omit the key entirely when
     // absent so the no-pin path is byte-identical to slice #3b.
-    if let Some(pins) = cert_pins_json.filter(|s| !s.trim().is_empty()) {
+    if let Some(pins) = spec.cert_pins_json.filter(|s| !s.trim().is_empty()) {
         env.push((ENV_PINS.to_string(), pins.to_string()));
     }
-    // Omit the disable-MITM key entirely when false so the no-flag path is
-    // byte-identical to the default MITM path (mirrors the pins pattern).
-    if disable_mitm {
+    // Omit the disable-MITM key entirely when intercepting so the MITM path is
+    // byte-identical to the pre-#494 default (mirrors the pins pattern).
+    if spec.mitm.is_transparent() {
         env.push((ENV_DISABLE_MITM.to_string(), "1".to_string()));
     }
     // Operator-provided extra CA for the re-origination leg (#491). Omit the key
@@ -130,23 +191,23 @@ pub fn proxy_policy(
     // value is `to_string_lossy` (as ENV_UDS above is) while the fs_read bind
     // below keeps the exact bytes, so a non-UTF-8 path would disagree — the
     // proxy then can't open the mangled path and startup fails closed.
-    if let Some(ca) = upstream_extra_ca {
+    if let Some(ca) = spec.mitm.upstream_extra_ca() {
         env.push((ENV_UPSTREAM_EXTRA_CA.to_string(), ca.to_string_lossy().into_owned()));
     }
     let mut fs_read = vec![
-        binary.to_path_buf(),
+        spec.binary.to_path_buf(),
         PathBuf::from("/etc/resolv.conf"),
         PathBuf::from("/etc/hosts"),
         PathBuf::from("/etc/nsswitch.conf"),
     ];
     // The proxy reads the extra CA at startup (before lock_down); it must be
     // bound into the jail's fs_read to be openable.
-    if let Some(ca) = upstream_extra_ca {
+    if let Some(ca) = spec.mitm.upstream_extra_ca() {
         fs_read.push(ca.to_path_buf());
     }
     SandboxPolicy {
         fs_read,
-        fs_write: vec![scratch.to_path_buf()],
+        fs_write: vec![spec.scratch.to_path_buf()],
         net: Net::ProxyEgress,
         // CPU governance is lifetime-scoped (issue #395). A long-lived channel
         // sidecar (matrix, weeks) gets no cumulative RLIMIT_CPU — same
@@ -156,7 +217,7 @@ pub fn proxy_policy(
         // A short-lived per-tool-call sidecar lives only for its one dispatch,
         // so it keeps the bounded cap as defense-in-depth (the only CPU primitive
         // on macOS, where there is no cgroup quota).
-        cpu_ms: if long_lived { 0 } else { SHORT_LIVED_SIDECAR_CPU_MS },
+        cpu_ms: if spec.long_lived { 0 } else { SHORT_LIVED_SIDECAR_CPU_MS },
         mem_mb: 256,
         profile: Profile::WorkerNetClient,
         cpu_quota_pct: None,
@@ -168,42 +229,24 @@ pub fn proxy_policy(
     }
 }
 
-/// Reject an `upstream_extra_ca` that cannot do what the caller intends, before
-/// anything is spawned:
+/// Reject an anchor that cannot do what the caller intends, before anything is
+/// spawned: a **relative** path. The CA is bound into the proxy jail via
+/// `SandboxPolicy.fs_read`, and both backends reject relative `fs_read` entries
+/// — so the failure would name the sandbox rather than the misconfigured field.
+/// (A *nonexistent* absolute path is deliberately NOT rejected: `canonicalize_one`
+/// tolerates `NotFound` and the Linux bind is `--ro-bind-try`, leaving the proxy
+/// — the authority on the PEM's content — to fail closed on it at startup.)
 ///
-/// * A **relative** path. The CA is bound into the proxy jail via
-///   `SandboxPolicy.fs_read`, and both backends reject relative `fs_read`
-///   entries — so the failure would name the sandbox rather than the
-///   misconfigured field. (A *nonexistent* absolute path is deliberately NOT
-///   rejected here: `canonicalize_one` tolerates `NotFound` and the Linux bind is
-///   `--ro-bind-try`, leaving the proxy — the authority on the PEM's content —
-///   to fail closed on it at startup.)
-/// * A path paired with `disable_mitm`. A transparent tunnel never re-originates
-///   TLS, so it never consults the upstream root store. Accepting the pair would
-///   leave an operator believing a private self-signed origin is reachable when
-///   in fact the sidecar validates no upstream certificate at all — exactly the
-///   false "the force-routed path reaches it" belief #491 was opened to correct.
-///   Fail loud instead.
-///
-/// Split out as a pure function so both preconditions are unit-testable without
-/// a sandbox or a built proxy binary.
-fn check_upstream_extra_ca(
-    disable_mitm: bool,
-    upstream_extra_ca: Option<&Path>,
-) -> anyhow::Result<()> {
-    let Some(ca) = upstream_extra_ca else {
+/// The old second rule ("never paired with a transparent tunnel") is gone
+/// because [`Mitm`] makes that pair unrepresentable.
+fn check_upstream_extra_ca(mitm: Mitm<'_>) -> anyhow::Result<()> {
+    let Some(ca) = mitm.upstream_extra_ca() else {
         return Ok(());
     };
     if !ca.is_absolute() {
         anyhow::bail!(
             "upstream extra CA path must be absolute (it is bound into the proxy jail via \
              fs_read, which rejects relative paths): {ca:?}"
-        );
-    }
-    if disable_mitm {
-        anyhow::bail!(
-            "upstream extra CA {ca:?} was given to a transparent-tunnel (disable_mitm) sidecar, \
-             which never re-originates TLS and so would never use it"
         );
     }
     Ok(())
@@ -239,45 +282,29 @@ fn stderr_note(tail: Option<&crate::worker_stderr::StderrTail>) -> String {
 /// ([`check_upstream_extra_ca`]), on spawn failure, on the proxy exiting before
 /// it is ready, or on the readiness timeout.
 ///
-/// `long_lived` scopes the sidecar's CPU cap — see [`proxy_policy`]. Pass `true`
-/// for a channel sidecar that outlives many dispatches (matrix), `false` for a
-/// per-tool-call sidecar (web-fetch) so it gets a bounded `RLIMIT_CPU` back.
-#[allow(clippy::too_many_arguments)] // mirrors `proxy_policy`'s descriptor args + `backend`
+/// `spec.long_lived` scopes the sidecar's CPU cap — see [`proxy_policy`]. Pass
+/// `true` for a channel sidecar that outlives many dispatches (matrix), `false`
+/// for a per-tool-call sidecar (web-fetch) so it gets a bounded `RLIMIT_CPU`
+/// back.
 pub fn spawn_sidecar(
     backend: &dyn SandboxBackend,
-    binary: &Path,
-    allowlist: &[String],
-    scratch: &Path,
-    worker: &str,
-    cert_pins_json: Option<&str>,
-    disable_mitm: bool,
-    long_lived: bool,
-    upstream_extra_ca: Option<&Path>,
+    spec: &SidecarSpawn<'_>,
 ) -> anyhow::Result<SidecarHandle> {
-    check_upstream_extra_ca(disable_mitm, upstream_extra_ca)?;
-    if let Some(ca) = upstream_extra_ca {
+    check_upstream_extra_ca(spec.mitm)?;
+    if let Some(ca) = spec.mitm.upstream_extra_ca() {
         // Operator-visible record that this sidecar's upstream trust is wider
         // than webpki. The proxy logs its own WARN, but only to its stderr —
         // drained to `debug` below — so without this the daemon log would never
         // carry the fact at a level an operator reads.
         tracing::warn!(
-            worker,
+            worker = spec.worker,
             extra_ca = %ca.display(),
             "egress sidecar trusts an operator-provided upstream extra CA on its re-origination \
              leg (widens trust beyond webpki for EVERY host this sidecar may reach)"
         );
     }
-    let policy = proxy_policy(
-        binary,
-        allowlist,
-        scratch,
-        worker,
-        cert_pins_json,
-        disable_mitm,
-        long_lived,
-        upstream_extra_ca,
-    );
-    let uds_path = scratch.join(UDS_FILE_NAME);
+    let policy = proxy_policy(spec);
+    let uds_path = spec.scratch.join(UDS_FILE_NAME);
     let _ = std::fs::remove_file(&uds_path);
 
     // Derive the worker-side lockdown env (KASTELLAN_SECCOMP_PROFILE +
@@ -289,7 +316,7 @@ pub fn spawn_sidecar(
     // resolution") on Linux. Literal-IP tunnels never resolve, which is why
     // the hermetic suites stayed green while real-hostname egress was broken.
     let derived = crate::tool_host::derive_lockdown_env(&policy);
-    let program = binary.to_string_lossy();
+    let program = spec.binary.to_string_lossy();
     let mut child = backend
         .spawn_under_policy(&derived, &program, &[])
         .map_err(|e| anyhow::anyhow!("spawn egress-proxy sidecar: {e}"))?;
@@ -308,7 +335,7 @@ pub fn spawn_sidecar(
     // Slice #3a: the sidecar also exports its per-instance MITM CA next to the
     // UDS. Wait for BOTH so the host never binds a worker before the CA it must
     // trust exists on disk.
-    let ca_path = scratch.join(CA_FILE_NAME);
+    let ca_path = spec.scratch.join(CA_FILE_NAME);
     let deadline = Instant::now() + READY_TIMEOUT;
     while !(uds_path.exists() && ca_path.exists()) {
         // The proxy fails CLOSED on bad operator config (a malformed pin set, an
@@ -338,209 +365,4 @@ pub fn spawn_sidecar(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn policy_uses_proxy_egress_and_net_client() {
-        let p = proxy_policy(Path::new("/opt/proxy"), &["example.com".into()], Path::new("/scratch"), "web-fetch", None, false, false, None);
-        assert!(matches!(p.net, Net::ProxyEgress));
-        assert!(matches!(p.profile, Profile::WorkerNetClient));
-        assert!(p.fs_read.contains(&PathBuf::from("/etc/resolv.conf")));
-        assert!(p.fs_write.contains(&PathBuf::from("/scratch")));
-        // env carries the UDS path + allowlist + worker name.
-        let env: std::collections::HashMap<_, _> = p.env.into_iter().collect();
-        assert_eq!(env[ENV_UDS], "/scratch/egress.sock");
-        assert_eq!(env[ENV_ALLOWLIST], r#"["example.com"]"#);
-        assert_eq!(env[ENV_WORKER], "web-fetch");
-    }
-
-    /// Regression pin for the live-gate bug (5b-4a): the sidecar spawn must
-    /// derive the worker-prelude lockdown env from the policy. Without it the
-    /// proxy self-applied Landlock WITHOUT the fs_read grants, so post-lockdown
-    /// glibc could not read /etc/resolv.conf|hosts|nsswitch.conf and every
-    /// DNS-needing CONNECT failed EAI_AGAIN on Linux (hermetic literal-IP
-    /// suites stayed green, hiding it) — and ran with no seccomp at all.
-    /// `spawn_sidecar` feeds `proxy_policy` through `derive_lockdown_env`;
-    /// this pins what that derivation must yield for the proxy's policy.
-    #[test]
-    fn derived_proxy_policy_carries_lockdown_env_for_dns() {
-        let p = proxy_policy(Path::new("/opt/proxy"), &["matrix.example.org:443".into()], Path::new("/scratch"), "matrix", None, true, true, None);
-        let d = crate::tool_host::derive_lockdown_env(&p);
-        let env: std::collections::HashMap<_, _> = d.env.into_iter().collect();
-        assert_eq!(env["KASTELLAN_SECCOMP_PROFILE"], "net_client");
-        let ro: Vec<String> = serde_json::from_str(&env["KASTELLAN_LANDLOCK_RO"]).unwrap();
-        for path in ["/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"] {
-            assert!(ro.iter().any(|r| r == path), "Landlock RO must grant {path}");
-        }
-        let rw: Vec<String> = serde_json::from_str(&env["KASTELLAN_LANDLOCK_RW"]).unwrap();
-        assert!(rw.iter().any(|r| r == "/scratch"), "Landlock RW must grant the scratch dir");
-        // Long-lived sidecar: no cumulative RLIMIT_CPU (cpu_ms == 0 ⇒ env omitted).
-        assert!(!env.contains_key("KASTELLAN_CPU_MS"), "no CPU rlimit for a long-lived sidecar");
-    }
-
-    /// Issue #395: the CPU cap is lifetime-scoped. A long-lived channel sidecar
-    /// (matrix, weeks) must carry NO cumulative RLIMIT_CPU — a bounded cap would
-    /// eventually SIGKILL it mid-flight now that the lockdown env actually
-    /// reaches the proxy (post `e70174b`).
-    #[test]
-    fn proxy_policy_long_lived_has_no_cpu_cap() {
-        let p = proxy_policy(
-            Path::new("/opt/proxy"), &["matrix.example.org:443".into()],
-            Path::new("/scratch"), "matrix", None, true, true, None,
-        );
-        assert_eq!(p.cpu_ms, 0, "long-lived sidecar must have no cumulative CPU cap");
-    }
-
-    /// Issue #395: a short-lived per-tool-call sidecar (web-fetch) lives 1:1 with
-    /// its single dispatch, so it keeps a bounded RLIMIT_CPU as defense-in-depth
-    /// — the only per-process CPU-governance primitive on macOS. This is the
-    /// path `e70174b` had regressed to `0` blanket-wide.
-    #[test]
-    fn proxy_policy_short_lived_keeps_bounded_cpu_cap() {
-        let p = proxy_policy(
-            Path::new("/opt/proxy"), &["example.com".into()],
-            Path::new("/scratch"), "web-fetch", None, false, false, None,
-        );
-        assert_eq!(
-            p.cpu_ms, SHORT_LIVED_SIDECAR_CPU_MS,
-            "short-lived sidecar must keep a bounded CPU cap",
-        );
-        assert!(p.cpu_ms > 0);
-    }
-
-    /// The short-lived cap must survive lockdown-env derivation as
-    /// `KASTELLAN_CPU_MS` (the wire form the worker prelude reads for
-    /// `setrlimit(RLIMIT_CPU)`) — the long-lived case omits it entirely (pinned
-    /// by `derived_proxy_policy_carries_lockdown_env_for_dns`).
-    #[test]
-    fn derived_short_lived_policy_carries_cpu_ms_env() {
-        let p = proxy_policy(
-            Path::new("/opt/proxy"), &["example.com".into()],
-            Path::new("/scratch"), "web-fetch", None, false, false, None,
-        );
-        let d = crate::tool_host::derive_lockdown_env(&p);
-        let env: std::collections::HashMap<_, _> = d.env.into_iter().collect();
-        assert_eq!(
-            env["KASTELLAN_CPU_MS"],
-            SHORT_LIVED_SIDECAR_CPU_MS.to_string(),
-            "short-lived sidecar must derive a CPU rlimit env",
-        );
-    }
-
-    #[test]
-    fn proxy_policy_omits_pins_env_when_none() {
-        let p = proxy_policy(Path::new("/bin/proxy"), &["example.com".into()], Path::new("/scratch"), "web-fetch", None, false, false, None);
-        let env: std::collections::HashMap<_, _> = p.env.into_iter().collect();
-        assert!(!env.contains_key(ENV_PINS));
-    }
-
-    #[test]
-    fn proxy_policy_includes_pins_env_when_set() {
-        let pins = r#"{"api.anthropic.com":["sha256/AAAA"]}"#;
-        let p = proxy_policy(Path::new("/bin/proxy"), &["example.com".into()], Path::new("/scratch"), "web-fetch", Some(pins), false, false, None);
-        let env: std::collections::HashMap<_, _> = p.env.into_iter().collect();
-        assert_eq!(env[ENV_PINS], pins);
-    }
-
-    #[test]
-    fn proxy_policy_sets_disable_mitm_env_when_requested() {
-        let p = proxy_policy(
-            Path::new("/bin/proxy"), &["example.com:443".into()],
-            Path::new("/scratch"), "browser-driver", None, true, false, None,
-        );
-        let env: std::collections::HashMap<_, _> = p.env.into_iter().collect();
-        assert_eq!(env[ENV_DISABLE_MITM], "1");
-    }
-
-    #[test]
-    fn proxy_policy_omits_disable_mitm_env_when_false() {
-        let p = proxy_policy(
-            Path::new("/bin/proxy"), &["example.com:443".into()],
-            Path::new("/scratch"), "web-fetch", None, false, false, None,
-        );
-        let env: std::collections::HashMap<_, _> = p.env.into_iter().collect();
-        assert!(!env.contains_key(ENV_DISABLE_MITM));
-    }
-
-    #[test]
-    fn proxy_policy_includes_upstream_extra_ca_env_and_fs_read_when_set() {
-        let ca = PathBuf::from("/etc/localmail/ca.pem");
-        let p = proxy_policy(
-            Path::new("/bin/proxy"), &["127.0.0.1:8443".into()],
-            Path::new("/scratch"), "mail", None, false, false, Some(&ca),
-        );
-        let env: std::collections::HashMap<_, _> = p.env.iter().cloned().collect();
-        assert_eq!(env[ENV_UPSTREAM_EXTRA_CA], "/etc/localmail/ca.pem");
-        assert!(p.fs_read.contains(&ca), "the extra CA must be bound into the proxy jail");
-    }
-
-    #[test]
-    fn proxy_policy_omits_upstream_extra_ca_when_none() {
-        let p = proxy_policy(
-            Path::new("/bin/proxy"), &["example.com".into()],
-            Path::new("/scratch"), "web-fetch", None, false, false, None,
-        );
-        let env: std::collections::HashMap<_, _> = p.env.iter().cloned().collect();
-        assert!(!env.contains_key(ENV_UPSTREAM_EXTRA_CA));
-        assert!(!p.fs_read.contains(&PathBuf::from("/etc/localmail/ca.pem")));
-    }
-
-    /// The default (no extra CA) must stay unconditionally spawnable, in either
-    /// MITM posture — the precondition check may not gate the existing paths.
-    #[test]
-    fn check_upstream_extra_ca_accepts_absent_ca_in_either_posture() {
-        assert!(check_upstream_extra_ca(false, None).is_ok());
-        assert!(check_upstream_extra_ca(true, None).is_ok());
-    }
-
-    #[test]
-    fn check_upstream_extra_ca_accepts_absolute_path_under_mitm() {
-        let ca = PathBuf::from("/etc/localmail/ca.pem");
-        assert!(check_upstream_extra_ca(false, Some(&ca)).is_ok());
-    }
-
-    /// A relative path would be rejected far downstream by the Linux backend's
-    /// `fs_read` validation, naming the sandbox instead of the field. Catch it
-    /// here, before anything is spawned.
-    #[test]
-    fn check_upstream_extra_ca_rejects_relative_path() {
-        let ca = PathBuf::from("certs/ca.pem");
-        let err = check_upstream_extra_ca(false, Some(&ca)).expect_err("relative path must fail");
-        assert!(err.to_string().contains("absolute"), "unhelpful error: {err}");
-    }
-
-    /// A transparent tunnel never re-originates TLS, so an extra upstream anchor
-    /// can do nothing. Silently ignoring it would leave the operator believing a
-    /// self-signed private origin is reachable — fail loud instead.
-    #[test]
-    fn check_upstream_extra_ca_rejects_pairing_with_disable_mitm() {
-        let ca = PathBuf::from("/etc/localmail/ca.pem");
-        let err =
-            check_upstream_extra_ca(true, Some(&ca)).expect_err("disable_mitm pairing must fail");
-        assert!(err.to_string().contains("disable_mitm"), "unhelpful error: {err}");
-    }
-
-    /// With no drain thread there is nothing to report, and the note must say so
-    /// rather than claim a clean startup. (The populated case is covered by the
-    /// sandbox-gated `sidecar_with_unreadable_extra_ca_fails_fast_with_reason`
-    /// in `core/tests/egress_proxy_e2e.rs`, which needs a real proxy binary.)
-    #[test]
-    fn stderr_note_without_a_tail_says_nothing_was_captured() {
-        assert_eq!(stderr_note(None), "no stderr captured");
-    }
-
-    /// A tail that already has lines is reported immediately — the settle poll
-    /// must not delay the common case where the drain already flushed.
-    #[test]
-    fn stderr_note_reports_captured_lines() {
-        let tail = crate::worker_stderr::StderrTail::new(4);
-        crate::worker_stderr::drain_reader(
-            0,
-            std::io::Cursor::new(b"Error: build upstream TLS config: upstream extra CA: read\n"),
-            Some(&tail),
-        );
-        let note = stderr_note(Some(&tail));
-        assert!(note.contains("upstream extra CA"), "note lost the reason: {note}");
-    }
-}
+mod tests;

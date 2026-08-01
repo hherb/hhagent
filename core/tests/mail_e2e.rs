@@ -215,6 +215,7 @@ fn mail_policy_force_routes_and_enforces_its_endpoint_allowlist() {
     use std::time::{Duration, Instant};
 
     use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
+    use kastellan_core::egress::spawn::Mitm;
     use kastellan_sandbox::Net;
     use kastellan_tests_common::egress_forcing::{
         assert_connect_established, minted_uds, short_scratch_root,
@@ -278,8 +279,7 @@ fn mail_policy_force_routes_and_enforces_its_endpoint_allowlist() {
             worker_name: "mail",
             secret_fingerprints: &[],
             cert_pins_json: None,
-            disable_mitm: false,
-            upstream_extra_ca: None,
+            mitm: Mitm::Intercept { upstream_extra_ca: None },
         };
         let mut worker = spawn_forced_net_worker(&params, &scratch_root, sink)
             .expect("force-routed mail worker + sidecar spawn");
@@ -367,6 +367,7 @@ async fn run_forced_mail_search_over_tls(
     use std::sync::{Arc, Mutex};
 
     use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
+    use kastellan_core::egress::spawn::Mitm;
     use kastellan_sandbox::Net;
     use kastellan_tests_common::egress_forcing::short_scratch_root;
     use kastellan_tests_common::mock_localmail::spawn_mock_localmail_tls;
@@ -414,8 +415,8 @@ async fn run_forced_mail_search_over_tls(
         worker_name: "mail",
         secret_fingerprints: &[],
         cert_pins_json: None,
-        disable_mitm: false, // MITM ON — mail's real posture
-        upstream_extra_ca: with_extra_ca.then_some(ca_path.as_path()),
+        // MITM ON — mail's real posture.
+        mitm: Mitm::Intercept { upstream_extra_ca: with_extra_ca.then_some(ca_path.as_path()) },
     };
     let mut worker = spawn_forced_net_worker(&params, &scratch_root, sink)
         .expect("force-routed mail worker + sidecar spawn");
@@ -507,9 +508,14 @@ fn force_routed_search_round_trips_through_mitm_sidecar() {
 /// `is_err()` alone would be satisfied by ANY failure (worker crash, PG hiccup,
 /// dispatch timeout), so the control would silently stop being a control the day
 /// something upstream of TLS broke. So we also pin the failure to the
-/// re-origination leg: on an upstream handshake failure the proxy emits an
-/// allowed-but-failed decision whose reason is `mitm_failed: …`
-/// (`classify_mitm_error`), which the host maps into the audit row's payload.
+/// re-origination leg, and pin it *precisely*: the assertion matches
+/// `mitm_failed: origin TLS handshake` rather than the bare `mitm_failed:`
+/// prefix. `classify_mitm_error` (`workers/egress-proxy/src/proxy.rs`) stamps
+/// that prefix onto every non-pin intercept failure, and `mitm.rs` reaches it
+/// from five sites — including `worker TLS handshake: …`, which fires BEFORE the
+/// origin is dialled, and `dial origin …: connection refused`. Matching the bare
+/// prefix would therefore also accept broken per-instance CA provisioning or an
+/// origin that never bound, neither of which is what this control tests.
 #[test]
 fn force_routed_search_fails_without_upstream_extra_ca() {
     use kastellan_tests_common::egress_proxy_bin_or_skip;
@@ -539,10 +545,11 @@ fn force_routed_search_fails_without_upstream_extra_ca() {
         assert!(
             rows.iter().any(|r| r.payload["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.starts_with("mitm_failed:"))),
-            "the failure must be the proxy's upstream handshake rejecting the \
-             self-signed origin (a `mitm_failed: …` decision), not an incidental \
-             error; got {:?}",
+                .is_some_and(|reason| reason.starts_with("mitm_failed: origin TLS handshake"))),
+            "the failure must be the proxy's UPSTREAM handshake rejecting the \
+             self-signed origin (a `mitm_failed: origin TLS handshake: …` decision) — \
+             a bare `mitm_failed:` would also match a worker-side handshake or a \
+             refused dial, which this control is not about; got {:?}",
             rows.iter().map(|r| (r.action.clone(), r.payload.clone())).collect::<Vec<_>>()
         );
     });
@@ -573,6 +580,7 @@ fn force_routed_search_against_real_localmail() {
     use std::sync::{Arc, Mutex};
 
     use kastellan_core::egress::net_worker::{spawn_forced_net_worker, NetWorkerSpawn};
+    use kastellan_core::egress::spawn::Mitm;
     use kastellan_sandbox::Net;
     use kastellan_tests_common::egress_forcing::short_scratch_root;
     use kastellan_tests_common::egress_proxy_bin_or_skip;
@@ -645,8 +653,7 @@ fn force_routed_search_against_real_localmail() {
             worker_name: "mail",
             secret_fingerprints: &[],
             cert_pins_json: None,
-            disable_mitm: false,
-            upstream_extra_ca: Some(ca_path.as_path()),
+            mitm: Mitm::Intercept { upstream_extra_ca: Some(ca_path.as_path()) },
         };
         let mut worker = spawn_forced_net_worker(&params, &scratch_root, sink)
             .expect("force-routed mail worker + sidecar spawn");

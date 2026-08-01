@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kastellan_core::egress::persistent_net::{spawn_net_transport, NetTransportSpawn};
+use kastellan_core::egress::spawn::Mitm;
 use kastellan_core::worker_lifecycle::{PersistentFactory, PersistentTransport, PersistentWorker};
 use kastellan_sandbox::{Net, Profile, SandboxBackend, SandboxBackends, SandboxPolicy};
 use kastellan_tests_common::microvm::{firecracker_backend, image_dir, skip_if_no_microvm};
@@ -176,7 +177,8 @@ fn net_demo_tls_probe_through_vm_survives_respawn() {
                 base_policy: base,
                 allowlist: &allow,
                 worker_name: "net-demo",
-                extra_ca: Some(&ca_path),
+                mitm: Mitm::Transparent,
+                worker_extra_ca: Some(&ca_path),
             };
             let t = spawn_net_transport(&params, &scratch, |_row| {})?;
             Ok(Box::new(t) as Box<dyn PersistentTransport>)

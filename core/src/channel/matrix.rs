@@ -44,6 +44,7 @@ use kastellan_sandbox::SandboxBackend;
 
 use crate::channel::polled_driver::PolledWorkerDriver;
 use crate::egress::persistent_net::{spawn_net_transport, NetTransportSpawn};
+use crate::egress::spawn::Mitm;
 use crate::worker_lifecycle::force_route::ForceRoutingConfig;
 use crate::worker_lifecycle::persistent::{
     ClientTransport, PersistentFactory, PersistentTransport, PersistentWorker,
@@ -302,7 +303,12 @@ pub fn spawn_matrix_worker(
                     base_policy: policy.clone(),
                     allowlist: &allowlist,
                     worker_name: "matrix",
-                    extra_ca: None,
+                    // matrix-sdk terminates its own TLS through `ProxyBridge`
+                    // and cannot be made to trust a per-instance CA, so this
+                    // sidecar tunnels rather than intercepts. Unlike the email
+                    // channel, which intercepts (see channel::email).
+                    mitm: Mitm::Transparent,
+                    worker_extra_ca: None,
                 };
                 let sink = (eg.routing.make_sink)();
                 // On the fail-closed path the sidecar's Drop removes only the UDS,

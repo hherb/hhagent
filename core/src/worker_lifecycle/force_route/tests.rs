@@ -230,6 +230,29 @@ fn disable_mitm_only_for_transparent_tunnel_workers() {
 }
 
 #[test]
+fn mitm_for_gives_transparent_workers_no_anchor_and_refuses_a_configured_one() {
+    let ca = std::path::PathBuf::from("/etc/kastellan/localmail.pem");
+    assert_eq!(mitm_for(MATRIX_TOOL, None).unwrap(), Mitm::Transparent);
+    assert_eq!(mitm_for(BROWSER_DRIVER_TOOL, None).unwrap(), Mitm::Transparent);
+    let err = mitm_for(MATRIX_TOOL, Some(&ca)).expect_err("anchor on a tunnel must refuse");
+    assert!(err.contains("silently inert"), "unhelpful error: {err}");
+    assert!(err.contains(MATRIX_TOOL), "error must name the worker: {err}");
+}
+
+#[test]
+fn mitm_for_gives_intercepting_workers_the_selected_anchor() {
+    let ca = std::path::PathBuf::from("/etc/kastellan/localmail.pem");
+    assert_eq!(
+        mitm_for("mail", Some(&ca)).unwrap(),
+        Mitm::Intercept { upstream_extra_ca: Some(ca.as_path()) }
+    );
+    assert_eq!(
+        mitm_for("web-fetch", None).unwrap(),
+        Mitm::Intercept { upstream_extra_ca: None }
+    );
+}
+
+#[test]
 fn allowlist_net_is_force_routable() {
     assert!(policy_net_is_force_routable(&Net::Allowlist(vec![
         "api.example.com:443".into()

@@ -53,6 +53,7 @@ use std::time::{Duration, Instant};
 
 use kastellan_core::channel::matrix::build_matrix_vm_policy;
 use kastellan_core::egress::persistent_net::{spawn_net_transport, NetTransportSpawn};
+use kastellan_core::egress::spawn::Mitm;
 use kastellan_core::worker_lifecycle::{PersistentFactory, PersistentTransport, PersistentWorker};
 use kastellan_protocol::client::Client;
 use kastellan_sandbox::{SandboxBackend, SandboxBackends};
@@ -239,7 +240,8 @@ fn vm_bot_factory(
             base_policy: policy,
             allowlist: &allow,
             worker_name: "matrix",
-            extra_ca: None,
+            mitm: Mitm::Transparent,
+            worker_extra_ca: None,
         };
         let t = spawn_net_transport(&params, &scratch, |_row| {})?;
         Ok(Box::new(t) as Box<dyn PersistentTransport>)
