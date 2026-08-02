@@ -208,7 +208,16 @@ impl std::fmt::Display for MalformedInvoke {
 /// model *contradicting its own declarations* — a competence signal,
 /// not an attack barrier, since a hostile planner would simply declare
 /// a matching high ceiling. The floor (I2, `step.classification >=
-/// floor`) is unaffected and still enforced.
+/// floor`) still governs every step the *model* wrote.
+///
+/// One carve-out, because it is easy to state this too broadly: an
+/// `invoke_skill` plan's steps are not model-written. L3 expansion
+/// stamps each expanded step's `classification` with `plan.data_ceiling`
+/// (`memory::l3_invoke::agent` / `l3py_invoke::agent`) and runs *before*
+/// the reviewer (`scheduler::inner_loop` step 1b), so on a defaulted
+/// plan those steps carry rank 3 and I2 passes vacuously for them too —
+/// all three invariants, not two. Nothing else reads `classification`,
+/// so the effect is confined to this review stage.
 ///
 /// The genuinely restrictive fix is to resolve an absent ceiling
 /// against the task's `classification_floor` instead of a constant,
@@ -248,9 +257,10 @@ pub struct Plan {
     ///
     /// When the model omits the field — which local planners do fairly
     /// often on terminal (`task_complete`) plans — it is filled by
-    /// [`default_data_ceiling`], which **widens** rather than narrows:
-    /// see that function for why `Secret` is the most permissive value
-    /// a ceiling can take, what it costs, and the follow-up
+    /// `default_data_ceiling` (private, so deliberately not an
+    /// intra-doc link), which **widens** rather than narrows: see that
+    /// function for why `Secret` is the most permissive value a ceiling
+    /// can take, what it costs, and the follow-up
     /// ([#506](https://github.com/hherb/kastellan/issues/506)) that
     /// replaces the constant with a floor-resolved value.
     ///

@@ -87,9 +87,9 @@ A `task_complete` plan still needs `"steps": []` written out explicitly —
 omitting the key is not the same as an empty list, and the plan is
 discarded even when your answer is correct. `data_ceiling` likewise must
 always be present: state the most sensitive class of data the plan
-touches. Omitting it does not make the plan safer — it is recorded as a
-defect and the plan runs with no ceiling constraint at all, so the one
-declaration that bounds what the plan may touch is simply missing.
+touches. Omitting it does not make the plan safer — it leaves the one
+declaration that bounds what the plan may touch undeclared, and the
+omission is logged against your plan as a defect. State it every time.
 
 So the minimum terminal plan is:
 

@@ -46,9 +46,12 @@
 //!    lenient error's `line`/`column` are computed over `&raw[first_brace..]`,
 //!    so "line 1 column 12" indexes the JSON body, not the model output
 //!    an operator is scrolling through — a fenced plan's first line of
-//!    JSON is line 1 here but line 2 there. Only the brace-less case
-//!    reports positions in the whole input, because there the strict
-//!    path produced them.
+//!    JSON is line 1 here but line 2 there. In practice only the
+//!    brace-less case reports positions in the whole input, because
+//!    there the strict path produced them. (The `None` arm of the
+//!    stream-deserializer falls back to the strict error too, but it is
+//!    unreachable: the slice always begins with the `{` we anchored on,
+//!    so the iterator always yields a value or an error, never nothing.)
 //!
 //!    An earlier version re-emitted the *strict* error in both cases,
 //!    for "a stable error type". That was actively harmful: a model
@@ -201,13 +204,21 @@ mod tests {
                    \"data_ceiling\": \"Public\"\n}\n```";
         let err = parse_plan_lenient(raw).expect_err("`steps` is required");
         let msg = err.to_string();
+        // `steps` is OUR field name, so naming it is a contract we own —
+        // unlike serde_json's phrasing around it, which a patch bump may
+        // reword. The second assertion is the masking check, expressed as
+        // "not the strict-path error" rather than as the literal
+        // "expected value at line 1 column 1" for the same reason.
         assert!(
             msg.contains("steps"),
             "error must name the missing field, got: {msg}"
         );
-        assert!(
-            !msg.contains("expected value at line 1 column 1"),
-            "the strict-path error masked the real one again: {msg}"
+        let strict = serde_json::from_str::<Plan>(raw)
+            .expect_err("the strict path must also fail on this input");
+        assert_ne!(
+            msg,
+            strict.to_string(),
+            "the strict-path error masked the real one again"
         );
     }
 
@@ -215,11 +226,19 @@ mod tests {
     /// input genuinely is not JSON, and the strict wording is correct.
     #[test]
     fn input_without_any_brace_still_reports_the_strict_error() {
-        let err = parse_plan_lenient("I'm sorry, I cannot help with that.")
-            .expect_err("prose is not a plan");
-        assert!(
-            err.to_string().contains("expected value"),
-            "unexpected error for brace-less input: {err}"
+        let raw = "I'm sorry, I cannot help with that.";
+        let err = parse_plan_lenient(raw).expect_err("prose is not a plan");
+        // Equality with the strict error, not `contains("expected
+        // value")`: this half of contract point 5 says the brace-less
+        // case reports the strict-path error *itself*, which is a
+        // stronger statement than any wording match and survives serde
+        // rewording. The sibling tests assert the inequality.
+        let strict = serde_json::from_str::<Plan>(raw)
+            .expect_err("the strict path must also fail on brace-less prose");
+        assert_eq!(
+            err.to_string(),
+            strict.to_string(),
+            "brace-less input must surface the strict-path error verbatim"
         );
     }
 

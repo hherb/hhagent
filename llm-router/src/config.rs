@@ -28,8 +28,13 @@
 //! | `KASTELLAN_LLM_DISABLE_THINKING` | Suppress the local model's thinking block | `1` (on) |
 //!
 //! `KASTELLAN_LLM_DISABLE_THINKING` accepts `1`/`true`/`yes`/`on` and
-//! `0`/`false`/`no`/`off` (trimmed, case-insensitive) and **rejects
-//! anything else with a config error**. That last part is a deliberate
+//! `0`/`false`/`no`/`off` (trimmed, case-insensitive) and **rejects any
+//! other non-empty value with a config error**. Empty is the one
+//! exception, and it is not special-cased here: `read_env` treats an
+//! empty value as *absent* for every var in this table, so a stray
+//! `export KASTELLAN_LLM_DISABLE_THINKING=` falls through to the
+//! default — which for this var is `on`, i.e. the safe direction.
+//! Rejecting the rest is a deliberate
 //! divergence from `kastellan-core`'s canonical `env_flag_enabled`
 //! dialect, which reads an unrecognised value as *off*: those flags all
 //! default off, so a typo there fails safe, whereas this one defaults
@@ -342,6 +347,28 @@ mod tests {
         assert!(
             err.to_string().contains("KASTELLAN_LLM_DISABLE_THINKING"),
             "error should name the offending var: {err}"
+        );
+    }
+
+    /// The one value that is neither accepted nor rejected: empty.
+    ///
+    /// `read_env` treats an empty var as absent for every router var, so
+    /// a stray `export KASTELLAN_LLM_DISABLE_THINKING=` does NOT error —
+    /// it falls through to the default. Pinned because the module docs
+    /// otherwise read as "rejects anything that is not one of the eight
+    /// spellings", and because the fall-through direction is the
+    /// load-bearing part: this var defaults **on**, so an emptied value
+    /// keeps thinking suppressed rather than silently re-enabling it.
+    #[test]
+    fn empty_disable_thinking_falls_through_to_the_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _all = clear_all();
+        let _scope = EnvScope::new(&[("KASTELLAN_LLM_DISABLE_THINKING", Some(""))]);
+        let cfg = RouterConfig::from_env()
+            .expect("an empty value is absent, not invalid");
+        assert!(
+            cfg.disable_thinking,
+            "empty must fall through to the default (on), not to off"
         );
     }
 
