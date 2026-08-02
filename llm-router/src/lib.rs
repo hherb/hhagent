@@ -56,6 +56,7 @@ pub mod error;
 pub mod messages;
 pub mod policy;
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 pub use backend::Backend;
@@ -275,7 +276,20 @@ impl Router {
             "dispatching chat-completion"
         );
 
-        let resp = self.http.post(&url).json(request).send().await?;
+        // Thinking suppression is a property of the *local leg*, not of
+        // any one caller, so it is applied here rather than at each call
+        // site — every local completion gets it or none does. An
+        // explicit `chat_template_kwargs` from the caller always wins;
+        // the config only fills a gap it left.
+        let request = if self.config.disable_thinking
+            && request.chat_template_kwargs.is_none()
+        {
+            Cow::Owned(request.clone().without_thinking())
+        } else {
+            Cow::Borrowed(request)
+        };
+
+        let resp = self.http.post(&url).json(request.as_ref()).send().await?;
         let status = resp.status();
 
         if !status.is_success() {

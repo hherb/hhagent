@@ -81,11 +81,50 @@ pub struct ChatRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+
+    /// Extra keyword arguments forwarded to the backend's chat
+    /// *template* (not to sampling). This is the de-facto OpenAI-compat
+    /// extension both Ollama and vLLM honour; it is the only portable
+    /// way to reach a reasoning model's `enable_thinking` switch.
+    ///
+    /// Left `None` the field is not serialised at all, so a backend
+    /// that has never heard of it sees a byte-identical payload. Set it
+    /// with [`ChatRequest::without_thinking`] rather than by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 impl ChatRequest {
     pub fn new(model: impl Into<String>, messages: Vec<ChatMessage>) -> Self {
-        Self { model: model.into(), messages, max_tokens: None, temperature: None }
+        Self {
+            model: model.into(),
+            messages,
+            max_tokens: None,
+            temperature: None,
+            chat_template_kwargs: None,
+        }
+    }
+
+    /// Ask the backend's chat template to skip the model's thinking
+    /// block (`chat_template_kwargs: {"enable_thinking": false}`).
+    ///
+    /// A reasoning model that thinks freely can spend the whole
+    /// generation budget — and far more wall-clock than any sane
+    /// request timeout — on `reasoning` while emitting an empty
+    /// `content`. Measured on the DGX with the 26B local planner and a
+    /// ~16k-token prompt: 222 s and 15 094 chars of reasoning for
+    /// 1 519 chars of plan, versus 51 s with this set. Both failure
+    /// modes downstream (transport timeout, and a `content` so empty
+    /// that plan decoding reports `expected value at line 1 column 1`)
+    /// trace back to it.
+    ///
+    /// A backend that does not implement the switch ignores the key,
+    /// which is why this is safe to set unconditionally on the local
+    /// leg.
+    pub fn without_thinking(mut self) -> Self {
+        self.chat_template_kwargs =
+            Some(serde_json::json!({ "enable_thinking": false }));
+        self
     }
 }
 
@@ -192,10 +231,57 @@ mod tests {
             messages: vec![ChatMessage::user("hi")],
             max_tokens: Some(42),
             temperature: Some(0.7),
+            chat_template_kwargs: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(s.contains("\"max_tokens\":42"), "max_tokens missing: {s}");
         assert!(s.contains("\"temperature\":0.7"), "temperature missing: {s}");
+    }
+
+    /// An untouched request must stay byte-identical on the wire — a
+    /// backend that has never heard of `chat_template_kwargs` must not
+    /// start seeing it just because the field exists in the struct.
+    #[test]
+    fn chat_template_kwargs_is_absent_unless_asked_for() {
+        let req = ChatRequest::new("m", vec![ChatMessage::user("hi")]);
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(
+            !s.contains("chat_template_kwargs"),
+            "chat_template_kwargs leaked into an untouched request: {s}"
+        );
+    }
+
+    /// The exact wire shape both Ollama and vLLM look for. Pinned
+    /// because a typo here fails silently: the backend ignores the
+    /// unknown key and the model thinks anyway.
+    #[test]
+    fn without_thinking_emits_the_enable_thinking_false_kwarg() {
+        let req =
+            ChatRequest::new("m", vec![ChatMessage::user("hi")]).without_thinking();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(
+            v["chat_template_kwargs"]["enable_thinking"],
+            serde_json::Value::Bool(false),
+            "unexpected wire shape: {v}"
+        );
+    }
+
+    /// `without_thinking` must not disturb anything else the caller set.
+    #[test]
+    fn without_thinking_preserves_the_other_fields() {
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::user("hi")],
+            max_tokens: Some(8192),
+            temperature: Some(0.2),
+            chat_template_kwargs: None,
+        }
+        .without_thinking();
+        assert_eq!(req.model, "m");
+        assert_eq!(req.max_tokens, Some(8192));
+        assert_eq!(req.temperature, Some(0.2));
+        assert_eq!(req.messages.len(), 1);
     }
 
     #[test]

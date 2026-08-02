@@ -193,6 +193,7 @@ fn router_pointing_at(base_url: &str) -> Arc<Router> {
         frontier_url: None,
         frontier_model: None,
         timeout: Duration::from_secs(2),
+        disable_thinking: true,
     };
     Arc::new(Router::new(cfg).expect("build router"))
 }

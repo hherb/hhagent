@@ -81,6 +81,27 @@ A plan is a JSON object with these fields, in order:
 }
 ```
 
+**`steps` and `data_ceiling` are REQUIRED on EVERY plan, including
+terminal ones.** This is the single most common way a plan is rejected.
+A `task_complete` plan still needs `"steps": []` written out explicitly —
+omitting the key is not the same as an empty list, and the plan is
+discarded even when your answer is correct. `data_ceiling` likewise must
+always be present; if you omit it the plan is forced to `"Secret"`, the
+most restrictive class, which may block the very answer you just wrote.
+
+So the minimum terminal plan is:
+
+```json
+{
+    "context":      "<...>",
+    "decision":     "task_complete",
+    "rationale":    "<...>",
+    "steps":        [],
+    "result":       {"kind": "text", "body": "<your answer>"},
+    "data_ceiling": "Personal"
+}
+```
+
 The `refused` field is normally `null`. Populate it only on constitutional refusal (see §"Constitutional Principles" below).
 
 The `floor_request` field is normally `null`. Populate it as a

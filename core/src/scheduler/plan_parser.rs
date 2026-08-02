@@ -31,9 +31,25 @@
 //!    character *before* the real JSON body (e.g. "expected shape is
 //!    `{tool, method, params}`: ```json\n{…real plan…}\n```"), the
 //!    stream-deserializer will try to parse from that earlier `{`,
-//!    fail, and the helper re-emits the strict-path error. The failure
-//!    mode is "fail decode → failed plan iteration", never "succeed
-//!    with the wrong JSON value picked from later in the response".
+//!    fail, and the decode fails. The failure mode is "fail decode →
+//!    failed plan iteration", never "succeed with the wrong JSON value
+//!    picked from later in the response".
+//! 5. **The reported error describes the failure that matters.** When
+//!    the input contains no `{` at all it cannot be JSON, and the
+//!    strict-path error ("expected value at line 1 column 1") is the
+//!    honest description. When the input *does* contain a `{`, the
+//!    lenient path's error is the informative one — "missing field
+//!    `steps`", "invalid type", a byte offset — and it is what callers
+//!    see.
+//!
+//!    An earlier version re-emitted the *strict* error in both cases,
+//!    for "a stable error type". That was actively harmful: a model
+//!    returning a well-formed fenced plan that merely omitted a
+//!    required field was reported as `expected value at line 1 column
+//!    1`, i.e. "your output wasn't JSON" — pointing every reader at the
+//!    fence instead of the field. It cost a full live debugging session
+//!    on the DGX before the raw output was captured and the real error
+//!    (`missing field 'steps'`) became visible.
 
 use crate::cassandra::types::Plan;
 
@@ -41,8 +57,13 @@ use crate::cassandra::types::Plan;
 ///
 /// Tries strict JSON parse first; on failure, finds the first `{` and
 /// asks `serde_json::Deserializer` to stream-parse one JSON value from
-/// that offset. Returns the strict-path error when neither succeeds so
-/// the failure shape stays identical to the pre-lenient code path.
+/// that offset.
+///
+/// On failure the returned error is the one that describes what
+/// actually went wrong: the *lenient*-path error when the input
+/// contained a `{` (so the useful "missing field …" / "invalid type …"
+/// diagnostic survives), and the strict-path error only when there was
+/// no `{` at all and the input therefore could not have been JSON.
 ///
 /// # Examples
 ///
@@ -72,11 +93,14 @@ pub fn parse_plan_lenient(raw: &str) -> Result<Plan, serde_json::Error> {
         serde_json::Deserializer::from_str(&raw[start..]).into_iter::<Plan>();
     match it.next() {
         Some(Ok(plan)) => Ok(plan),
-        // The first JSON value at or after `start` was not parseable;
-        // re-emit the *strict-path* error so callers see a stable
-        // error type — not the lenient path's possibly-different
-        // wording — for the diagnostic.
-        Some(Err(_)) | None => serde_json::from_str::<Plan>(raw),
+        // The input DID contain a `{`, so "expected value at line 1
+        // column 1" (what the strict path says about the fence) is not
+        // the failure worth reporting — the lenient path's error is.
+        // See contract point 5 in the module docs.
+        Some(Err(e)) => Err(e),
+        // Nothing at all after the `{` — no value to describe. The
+        // strict error is as good as anything here.
+        None => serde_json::from_str::<Plan>(raw),
     }
 }
 
@@ -104,6 +128,77 @@ mod tests {
         assert!(plan.steps.is_empty());
         assert_eq!(plan.data_ceiling, DataClass::Public);
         assert!(plan.refused.is_none());
+    }
+
+    /// A plan omitting `data_ceiling` must still parse, and must land
+    /// on the most restrictive class — never on `Public`, which would
+    /// let a forgetful model widen its own ceiling by omission.
+    #[test]
+    fn omitted_data_ceiling_defaults_fail_closed_to_secret() {
+        let raw = r#"{
+            "context": "c",
+            "decision": "task_complete",
+            "rationale": "r",
+            "steps": [],
+            "result": {"kind": "text", "body": "answer"}
+        }"#;
+        let plan = parse_plan_lenient(raw)
+            .expect("a plan omitting data_ceiling must still parse");
+        assert_eq!(plan.data_ceiling, DataClass::Secret);
+        assert_eq!(
+            plan.data_ceiling.rank(),
+            3,
+            "the default must be the most restrictive rank, not merely non-Public"
+        );
+    }
+
+    /// An explicitly stated ceiling must survive untouched — the
+    /// default fills a gap, it does not override the model.
+    #[test]
+    fn explicit_data_ceiling_is_not_overridden_by_the_default() {
+        let plan = parse_plan_lenient(canonical_plan_json())
+            .expect("canonical plan parses");
+        assert_eq!(plan.data_ceiling, DataClass::Public);
+    }
+
+    /// The regression this module's contract point 5 exists for: a
+    /// fenced, well-formed plan that omits a required field must report
+    /// the MISSING FIELD, not "expected value at line 1 column 1".
+    ///
+    /// The masked wording sent a live debugging session after the fence
+    /// (and after "the model returned nothing") when the model had in
+    /// fact returned a complete, correct answer.
+    #[test]
+    fn missing_required_field_reports_the_field_not_the_fence() {
+        // Shape observed live from the 26B local planner: a terminal
+        // plan with context/decision/rationale/result but no `steps`.
+        let raw = "```json\n{\n  \"context\": \"c\",\n  \
+                   \"decision\": \"task_complete\",\n  \
+                   \"rationale\": \"r\",\n  \
+                   \"result\": {\"kind\": \"text\", \"body\": \"answer\"},\n  \
+                   \"data_ceiling\": \"Public\"\n}\n```";
+        let err = parse_plan_lenient(raw).expect_err("`steps` is required");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("steps"),
+            "error must name the missing field, got: {msg}"
+        );
+        assert!(
+            !msg.contains("expected value at line 1 column 1"),
+            "the strict-path error masked the real one again: {msg}"
+        );
+    }
+
+    /// The other half of contract point 5: with no `{` anywhere the
+    /// input genuinely is not JSON, and the strict wording is correct.
+    #[test]
+    fn input_without_any_brace_still_reports_the_strict_error() {
+        let err = parse_plan_lenient("I'm sorry, I cannot help with that.")
+            .expect_err("prose is not a plan");
+        assert!(
+            err.to_string().contains("expected value"),
+            "unexpected error for brace-less input: {err}"
+        );
     }
 
     #[test]
@@ -162,22 +257,18 @@ mod tests {
     }
 
     #[test]
-    fn invalid_json_inside_fence_returns_strict_error() {
-        // The lenient path tries to parse starting at the first `{`.
-        // If that parse also fails, the helper re-emits the *strict
-        // path's* error — not the lenient path's — so callers see a
-        // stable diagnostic regardless of which path was tried.
+    fn invalid_json_inside_fence_reports_the_lenient_path_error() {
+        // The input contains a `{`, so the lenient path's error is the
+        // one that describes the real failure. Was previously pinned to
+        // the strict-path wording ("line 1 column 1"); that masking is
+        // what contract point 5 removed — it described the fence rather
+        // than the malformed object inside it.
         let raw = "```json\n{not actually JSON}\n```";
         let err = parse_plan_lenient(raw).expect_err("must error");
-        // serde's strict error for non-JSON content starts with
-        // "expected value at line 1 column 1" — the lenient path's
-        // error (had we surfaced it) would have started at a deeper
-        // line/column. Confirming the strict-path wording is what
-        // pins the error-stability contract.
         let msg = err.to_string();
         assert!(
-            msg.contains("line 1 column 1"),
-            "expected strict-path error position; got {msg}"
+            msg.contains("key must be a string"),
+            "expected the lenient path's description of the bad object; got {msg}"
         );
     }
 
@@ -208,12 +299,15 @@ mod tests {
         );
         let err = parse_plan_lenient(&raw)
             .expect_err("must error: earlier `{` in prose poisons the lenient anchor");
-        // Strict-path error position confirms the strict-path error
-        // was re-emitted (not the lenient path's deeper position).
+        // The load-bearing assertion is that this FAILS rather than
+        // silently parsing the second `{`. The wording now comes from
+        // the lenient path (contract point 5) — it describes the prose
+        // pseudo-object the anchor landed on, which is the accurate
+        // diagnosis of what went wrong.
         let msg = err.to_string();
         assert!(
-            msg.contains("line 1 column 1"),
-            "expected strict-path error position; got {msg}"
+            msg.contains("key must be a string"),
+            "expected the lenient path's description of the prose object; got {msg}"
         );
     }
 
