@@ -25,7 +25,18 @@
 //! | `KASTELLAN_LLM_FRONTIER_URL` | Base URL of the frontier backend | unset (frontier disabled) |
 //! | `KASTELLAN_LLM_FRONTIER_MODEL` | Default model on the frontier backend | unset |
 //! | `KASTELLAN_LLM_TIMEOUT_MS` | Request timeout, milliseconds | 180_000 |
-//! | `KASTELLAN_LLM_DISABLE_THINKING` | Suppress the local model's thinking block (`1`/`0`) | `1` |
+//! | `KASTELLAN_LLM_DISABLE_THINKING` | Suppress the local model's thinking block | `1` (on) |
+//!
+//! `KASTELLAN_LLM_DISABLE_THINKING` accepts `1`/`true`/`yes`/`on` and
+//! `0`/`false`/`no`/`off` (trimmed, case-insensitive) and **rejects
+//! anything else with a config error**. That last part is a deliberate
+//! divergence from `kastellan-core`'s canonical `env_flag_enabled`
+//! dialect, which reads an unrecognised value as *off*: those flags all
+//! default off, so a typo there fails safe, whereas this one defaults
+//! **on** — a typo read as "off" would silently restore the runaway
+//! thinking this switch exists to prevent, and nothing downstream names
+//! thinking when it does. (`llm-router` cannot call `env_flag_enabled`
+//! regardless: `core` depends on this crate, not the reverse.)
 //!
 //! The frontier URL/model are deliberately *not* defaulted. Phase 0
 //! refuses to dispatch to the frontier even when set; setting the
@@ -296,6 +307,10 @@ mod tests {
     #[test]
     fn disable_thinking_accepts_both_boolean_spellings() {
         let _lock = ENV_LOCK.lock().unwrap();
+        // `from_env` reads every router var, so an ambient
+        // `KASTELLAN_LLM_TIMEOUT_MS=abc` would fail this test for an
+        // unrelated reason. Clear the lot first.
+        let _all = clear_all();
         for (raw, want) in [
             ("0", false),
             ("false", false),
@@ -317,6 +332,9 @@ mod tests {
     #[test]
     fn from_env_rejects_non_boolean_disable_thinking() {
         let _lock = ENV_LOCK.lock().unwrap();
+        // Clear first, so the error we assert on can only have come from
+        // this var (see `disable_thinking_accepts_both_boolean_spellings`).
+        let _all = clear_all();
         let _scope =
             EnvScope::new(&[("KASTELLAN_LLM_DISABLE_THINKING", Some("maybe"))]);
         let err = RouterConfig::from_env()

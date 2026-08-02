@@ -72,10 +72,12 @@ information is incomplete, still emit task_complete and give the best answer \
 you can, briefly noting what remains uncertain. Do not issue another search \
 or tool call.";
 
-/// How much of a failed completion to put in the decode-failure log
-/// line. Enough to see whether the model emitted prose, a truncated
-/// object, or nothing at all — while keeping one bad plan from
-/// dominating the log. The full text is still on `AgentError::Decode`.
+/// How much of a failed completion to put in the decode-failure
+/// `debug!` line. Enough to see whether the model emitted prose, a
+/// truncated object, or nothing at all — while keeping one bad plan
+/// from dominating the log. `debug!`, not `warn!`, because the text is
+/// user data; see the call site. The full text is still on
+/// `AgentError::Decode`.
 const RAW_HEAD_CHARS: usize = 600;
 
 /// Returned alongside the decoded `Plan`. The inner loop writes
@@ -268,8 +270,23 @@ impl RouterAgent {
                 finish_reason = ?resp.choices.first().and_then(|c| c.finish_reason.as_deref()),
                 prompt_tokens = ?resp.usage.as_ref().and_then(|u| u.prompt_tokens),
                 completion_tokens = ?resp.usage.as_ref().and_then(|u| u.completion_tokens),
+                "plan decode failed"
+            );
+            // The model's own words are held at `debug!` on purpose. A
+            // planner completion restates recalled memories and prior
+            // step output verbatim — on the mail tasks this arc exists
+            // for, that is the user's correspondence — and the daemon
+            // log (`~/.local/state/kastellan/*.out`) is a plaintext file
+            // with none of the access control the `audit_log` table has.
+            // The `warn!` above already carries what actually broke the
+            // case open: `detail` now names the real error (the parser
+            // no longer masks it), and `raw_len`/`has_brace`/
+            // `finish_reason` separate an EMPTY completion from a merely
+            // non-JSON one. Raise the level only when those are not
+            // enough. Full fidelity stays on `AgentError::Decode.raw`.
+            tracing::debug!(
                 raw_head = %raw.chars().take(RAW_HEAD_CHARS).collect::<String>(),
-                "plan decode failed; head of the raw model output follows"
+                "head of the raw model output that failed to decode"
             );
             AgentError::Decode { detail: e.to_string(), raw: raw.clone() }
         })?;
