@@ -193,6 +193,22 @@ impl std::fmt::Display for MalformedInvoke {
 /// The terminal signal: `decision == "task_complete"` AND
 /// `steps.is_empty()` AND `result.is_some()`. The reviewer trivially
 /// approves these (no actions to evaluate); the inner loop returns
+/// Fail-closed default for [`Plan::data_ceiling`] — the most
+/// restrictive [`DataClass`], so a plan that omits the field can only
+/// ever be *more* constrained than one that states it.
+///
+/// Warns on every call: a defaulted ceiling is a model slip, not an
+/// operator policy, and an unexplained `Secret` ceiling on an
+/// everyday task is otherwise baffling to debug.
+fn default_data_ceiling() -> DataClass {
+    tracing::warn!(
+        defaulted_to = "Secret",
+        "plan omitted `data_ceiling`; defaulting fail-closed to the most \
+         restrictive class. The model should emit it explicitly."
+    );
+    DataClass::Secret
+}
+
 /// `Outcome::Completed(result)`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
@@ -202,6 +218,24 @@ pub struct Plan {
     pub steps: Vec<PlannedStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+    /// The most sensitive class of data this plan may touch.
+    ///
+    /// Defaults to [`DataClass::Secret`] — the most restrictive rank —
+    /// when the model omits the field, which local planners do fairly
+    /// often on terminal (`task_complete`) plans. Defaulting is
+    /// deliberately **fail-closed**: an omitted ceiling over-restricts,
+    /// so forgetting the field can never *widen* what a plan is allowed
+    /// to touch. The alternative (rejecting the plan) threw away
+    /// otherwise-correct answers over a missing field.
+    ///
+    /// `default_data_ceiling` warns on every use, so silent
+    /// over-restriction is visible to an operator rather than being
+    /// mistaken for a policy decision the model made.
+    ///
+    /// NOTE: `steps` above is deliberately **not** defaulted. An empty
+    /// `steps` is meaningful (it marks a terminal plan), so defaulting
+    /// it would turn a *truncated* plan into a silently-terminal one.
+    #[serde(default = "default_data_ceiling")]
     pub data_ceiling: DataClass,
     /// Present iff the agent self-declared a constitutional refusal.
     /// Drives `Outcome::Refused` short-circuit; surfaced in the
