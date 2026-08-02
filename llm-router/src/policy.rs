@@ -96,6 +96,7 @@ mod tests {
             ],
             max_tokens: Some(8192),
             temperature: Some(0.9),
+            chat_template_kwargs: None,
         };
         assert_eq!(p.pick(&req2), Backend::Local);
     }

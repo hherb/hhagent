@@ -25,6 +25,7 @@
 //! | `KASTELLAN_LLM_FRONTIER_URL` | Base URL of the frontier backend | unset (frontier disabled) |
 //! | `KASTELLAN_LLM_FRONTIER_MODEL` | Default model on the frontier backend | unset |
 //! | `KASTELLAN_LLM_TIMEOUT_MS` | Request timeout, milliseconds | 180_000 |
+//! | `KASTELLAN_LLM_DISABLE_THINKING` | Suppress the local model's thinking block (`1`/`0`) | `1` |
 //!
 //! The frontier URL/model are deliberately *not* defaulted. Phase 0
 //! refuses to dispatch to the frontier even when set; setting the
@@ -95,6 +96,19 @@ pub struct RouterConfig {
     pub frontier_url: Option<String>,
     pub frontier_model: Option<String>,
     pub timeout: Duration,
+    /// Ask the local backend's chat template to suppress the model's
+    /// thinking block on every chat completion (see
+    /// [`crate::messages::ChatRequest::without_thinking`]). Defaults to
+    /// `true`: a reasoning model left to think freely on a large prompt
+    /// overruns any sane request timeout, and the failure surfaces as a
+    /// transport error or an empty completion rather than as anything
+    /// that names thinking. Backends without the switch ignore the key,
+    /// so the default is inert for them.
+    ///
+    /// Set `KASTELLAN_LLM_DISABLE_THINKING=0` to let the model think —
+    /// appropriate when the local model is not a reasoning model, or
+    /// when reasoning quality matters more than latency.
+    pub disable_thinking: bool,
 }
 
 impl Default for RouterConfig {
@@ -108,6 +122,7 @@ impl Default for RouterConfig {
             frontier_url: None,
             frontier_model: None,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            disable_thinking: true,
         }
     }
 }
@@ -147,6 +162,18 @@ impl RouterConfig {
                 ))
             })?;
             cfg.timeout = Duration::from_millis(ms);
+        }
+        if let Some(v) = read_env("KASTELLAN_LLM_DISABLE_THINKING")? {
+            cfg.disable_thinking = match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => {
+                    return Err(RouterError::Config(format!(
+                        "KASTELLAN_LLM_DISABLE_THINKING must be one of \
+                         1/0/true/false/yes/no/on/off, got {v:?}"
+                    )))
+                }
+            };
         }
         Ok(cfg)
     }
@@ -226,6 +253,7 @@ mod tests {
             ("KASTELLAN_LLM_FRONTIER_URL", None),
             ("KASTELLAN_LLM_FRONTIER_MODEL", None),
             ("KASTELLAN_LLM_TIMEOUT_MS", None),
+            ("KASTELLAN_LLM_DISABLE_THINKING", None),
         ])
     }
 
@@ -259,6 +287,44 @@ mod tests {
         assert!(cfg.frontier_url.is_none());
         assert!(cfg.frontier_model.is_none());
         assert_eq!(cfg.timeout, Duration::from_millis(DEFAULT_TIMEOUT_MS));
+        // Default-ON: a reasoning model left to think freely overruns the
+        // request timeout on a large prompt, and the resulting failure
+        // names neither thinking nor the model.
+        assert!(cfg.disable_thinking);
+    }
+
+    #[test]
+    fn disable_thinking_accepts_both_boolean_spellings() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        for (raw, want) in [
+            ("0", false),
+            ("false", false),
+            ("FALSE", false),
+            ("no", false),
+            ("off", false),
+            ("1", true),
+            ("true", true),
+            ("  True  ", true),
+            ("yes", true),
+            ("on", true),
+        ] {
+            let _scope = EnvScope::new(&[("KASTELLAN_LLM_DISABLE_THINKING", Some(raw))]);
+            let cfg = RouterConfig::from_env().unwrap();
+            assert_eq!(cfg.disable_thinking, want, "for input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn from_env_rejects_non_boolean_disable_thinking() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _scope =
+            EnvScope::new(&[("KASTELLAN_LLM_DISABLE_THINKING", Some("maybe"))]);
+        let err = RouterConfig::from_env()
+            .expect_err("a non-boolean must fail loudly, not silently default");
+        assert!(
+            err.to_string().contains("KASTELLAN_LLM_DISABLE_THINKING"),
+            "error should name the offending var: {err}"
+        );
     }
 
     #[test]

@@ -151,6 +151,7 @@ fn router_pointing_at(base_url: &str) -> Router {
         frontier_url: None,
         frontier_model: None,
         timeout: Duration::from_secs(2),
+        disable_thinking: true,
     };
     Router::new(cfg).expect("build router")
 }

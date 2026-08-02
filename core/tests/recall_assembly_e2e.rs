@@ -128,6 +128,7 @@ fn pg_recall_builder_round_trips_against_seeded_pool_and_mock_embedding() {
             embedding_url: mock_url,
             embedding_model: "test-embedding-model".into(),
             timeout: Duration::from_millis(5000),
+            disable_thinking: true,
         };
         let router = Arc::new(Router::new(router_cfg).expect("Router::new"));
 

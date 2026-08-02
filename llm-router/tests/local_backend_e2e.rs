@@ -183,6 +183,16 @@ fn header_content_length(headers: &str) -> Option<usize> {
 }
 
 fn router_pointing_at(base_url: &str) -> Router {
+    router_pointing_at_with_thinking_disabled(base_url, true)
+}
+
+/// `router_pointing_at` with the thinking-suppression switch chosen
+/// explicitly. The no-argument form keeps the *production* default
+/// (`true`) so these tests exercise the payload real deployments send.
+fn router_pointing_at_with_thinking_disabled(
+    base_url: &str,
+    disable_thinking: bool,
+) -> Router {
     let cfg = RouterConfig {
         local_url: base_url.to_string(),
         local_model: "local-default".into(),
@@ -193,6 +203,7 @@ fn router_pointing_at(base_url: &str) -> Router {
         // Tight timeout so a hung mock fails the test fast rather than
         // waiting for the production 30 s default.
         timeout: Duration::from_secs(2),
+        disable_thinking,
     };
     Router::new(cfg).expect("build router")
 }
@@ -248,6 +259,76 @@ async fn happy_path_round_trips_request_and_response() {
     // `temperature` did *not* appear on the wire.
     assert!(!served.body.contains("max_tokens"));
     assert!(!served.body.contains("temperature"));
+    // ...but the thinking-suppression kwarg DID, because the router was
+    // built with the production default. The caller never asked for it:
+    // `dispatch_local` adds it on the local leg.
+    assert_eq!(
+        parsed.chat_template_kwargs,
+        Some(serde_json::json!({"enable_thinking": false})),
+        "expected the local leg to suppress thinking: {}",
+        served.body
+    );
+}
+
+/// The switch is what decides, not the call site: with it off the
+/// payload must be exactly what the caller built. Without this arm a
+/// hard-coded `without_thinking()` in `dispatch_local` would pass every
+/// other test in this file.
+#[tokio::test]
+async fn thinking_kwarg_is_absent_when_the_switch_is_off() {
+    let canned_body = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let (base_url, served_rx) =
+        spawn_one_shot_mock(CannedResponse::ok_json(canned_body)).await;
+
+    let router = router_pointing_at_with_thinking_disabled(&base_url, false);
+    let req = ChatRequest::new("test-model", vec![ChatMessage::user("say hi")]);
+    router.send(&req).await.expect("send succeeds");
+
+    let served = served_rx.await.expect("mock served the request");
+    assert!(
+        !served.body.contains("chat_template_kwargs"),
+        "switch was off but the kwarg was still sent: {}",
+        served.body
+    );
+}
+
+/// An explicit caller-set value must survive: the config fills a gap,
+/// it does not overwrite intent.
+#[tokio::test]
+async fn caller_supplied_chat_template_kwargs_are_not_overwritten() {
+    let canned_body = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let (base_url, served_rx) =
+        spawn_one_shot_mock(CannedResponse::ok_json(canned_body)).await;
+
+    // Switch ON, but the caller already expressed a (contrary) intent.
+    let router = router_pointing_at_with_thinking_disabled(&base_url, true);
+    let mut req = ChatRequest::new("test-model", vec![ChatMessage::user("say hi")]);
+    req.chat_template_kwargs = Some(serde_json::json!({"enable_thinking": true}));
+    router.send(&req).await.expect("send succeeds");
+
+    let served = served_rx.await.expect("mock served the request");
+    let parsed: ChatRequest =
+        serde_json::from_str(&served.body).expect("body decodes as ChatRequest");
+    assert_eq!(
+        parsed.chat_template_kwargs,
+        Some(serde_json::json!({"enable_thinking": true})),
+        "config clobbered the caller's explicit kwargs: {}",
+        served.body
+    );
 }
 
 #[tokio::test]
@@ -330,6 +411,7 @@ async fn router_send_routes_to_pick_backend_choice() {
         frontier_url: Some("https://example.invalid/v1".into()),
         frontier_model: Some("frontier-model".into()),
         timeout: Duration::from_secs(2),
+        disable_thinking: true,
     };
     let router = Router::with_policy(cfg, Arc::new(AlwaysFrontier)).unwrap();
 
