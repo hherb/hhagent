@@ -72,6 +72,12 @@ information is incomplete, still emit task_complete and give the best answer \
 you can, briefly noting what remains uncertain. Do not issue another search \
 or tool call.";
 
+/// How much of a failed completion to put in the decode-failure log
+/// line. Enough to see whether the model emitted prose, a truncated
+/// object, or nothing at all — while keeping one bad plan from
+/// dominating the log. The full text is still on `AgentError::Decode`.
+const RAW_HEAD_CHARS: usize = 600;
+
 /// Returned alongside the decoded `Plan`. The inner loop writes
 /// these fields into the `plan.formulate` audit-log row payload.
 #[derive(Clone, Debug)]
@@ -229,6 +235,11 @@ impl RouterAgent {
             ],
             max_tokens: None,
             temperature: Some(0.0),
+            // Left None so the router's `disable_thinking` config decides
+            // (default: suppress). The planner has no reason to override
+            // it — the plan is JSON, not prose, and a reasoning model that
+            // thinks freely here overruns the request timeout.
+            chat_template_kwargs: None,
         };
 
         let start = std::time::Instant::now();
@@ -242,9 +253,25 @@ impl RouterAgent {
         // Tolerant of markdown-fenced JSON (```json … ```) and short
         // model preambles before the JSON body. See
         // `super::plan_parser::parse_plan_lenient` for the contract.
-        let plan: Plan = parse_plan_lenient(&raw).map_err(|e| AgentError::Decode {
-            detail: e.to_string(),
-            raw: raw.clone(),
+        let plan: Plan = parse_plan_lenient(&raw).map_err(|e| {
+            // `AgentError::Decode` carries `raw`, but its `#[error(...)]`
+            // Display renders only `detail` — so without this the model
+            // output that actually failed to decode reaches nobody, and
+            // the operator cannot tell an EMPTY completion (a reasoning
+            // model that spent its whole budget thinking) from a merely
+            // non-JSON one. Both render as the same
+            // `expected value at line 1 column 1`.
+            tracing::warn!(
+                detail = %e,
+                raw_len = raw.len(),
+                has_brace = raw.contains('{'),
+                finish_reason = ?resp.choices.first().and_then(|c| c.finish_reason.as_deref()),
+                prompt_tokens = ?resp.usage.as_ref().and_then(|u| u.prompt_tokens),
+                completion_tokens = ?resp.usage.as_ref().and_then(|u| u.completion_tokens),
+                raw_head = %raw.chars().take(RAW_HEAD_CHARS).collect::<String>(),
+                "plan decode failed; head of the raw model output follows"
+            );
+            AgentError::Decode { detail: e.to_string(), raw: raw.clone() }
         })?;
 
         // recall_count is `usize` → `u32` via `as`; the cap_and_split
