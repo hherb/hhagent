@@ -68,6 +68,16 @@ echo "==> build release binaries (incl. live-matrix worker)"
 bash scripts/build-release.sh
 
 # ---- 3. install (preserving the Matrix env) ---------------------------------
+# Byte offset of the core log BEFORE the install restarts the daemon, so step 5
+# reads only THIS start's lines. The unit is `StandardOutput=append:` (see
+# supervisor/src/systemd_user/builder.rs), so the file only ever grows and an
+# offset stays valid across the restart — which is what lets the verify step
+# stop mistaking a previous boot's "channel bus running" for this one's.
+CORE_LOG_OFFSET=0
+if [ -f "$CORE_LOG" ]; then
+  CORE_LOG_OFFSET="$(wc -c < "$CORE_LOG" | tr -d ' ')"
+fi
+
 echo "==> install"
 if [ -n "$HS" ] && [ -n "$MX_USER" ]; then
   ./target/release/kastellan-cli install --matrix-homeserver-url "$HS" --matrix-user "$MX_USER"
@@ -92,6 +102,12 @@ if [ "$RELOGIN" -eq 1 ]; then
   echo "    matrix probe (initial login from keyring secret '$SECRET_NAME')"
   "$CLI" matrix probe --homeserver "$HS" --user "$MX_USER" --secret "$SECRET_NAME"
   echo "==> start core"
+  # Re-capture: this start, not the install's, is the one to verify. Without
+  # this the window would still contain the pre-relogin start's lines — and on
+  # the --relogin path those describe precisely the state we just wiped.
+  if [ -f "$CORE_LOG" ]; then
+    CORE_LOG_OFFSET="$(wc -c < "$CORE_LOG" | tr -d ' ')"
+  fi
   systemctl --user start kastellan-core.service
 fi
 
@@ -102,21 +118,57 @@ echo -n "    services: "
 systemctl --user is-active kastellan.target kastellan-core kastellan-postgres | paste -sd' '
 
 if [ -n "$HS" ] && [ -n "$MX_USER" ] && [ -f "$CORE_LOG" ]; then
-  # Most recent matrix lifecycle line anywhere in the log. NOTE: this is not
-  # scoped to *this* daemon start — on a normal (non-relogin) upgrade a stale
-  # "channel bus running" from a prior boot can be read if the new start has not
-  # logged its status yet within the wait above. The --relogin path wipes the
-  # store and restarts, so there it reflects the current start.
+  # Most recent matrix channel lifecycle line from THIS daemon start: read only
+  # past CORE_LOG_OFFSET (captured before the install restarted the core). A
+  # shrunken file means someone rotated/truncated it under us — read the whole
+  # thing then, and accept the old stale-line caveat rather than reading nothing.
+  #
+  # Since #514 the supervisor's messages no longer name the channel (it is a
+  # structured `channel` field), so match the field and the message on the same
+  # JSON line rather than a "matrix …" message prefix that no longer exists.
   # `|| true`: with `set -euo pipefail` a no-match grep exits 1 and would abort
   # the script here, making the "(not yet in the log)" fallback below unreachable.
-  last="$(grep -aoE '"message":"(matrix channel bus running|matrix worker spawn/login failed[^"]*)"' "$CORE_LOG" 2>/dev/null | tail -1 || true)"
+  matrix_status_line() {
+    local since="$CORE_LOG_OFFSET"
+    if [ "$(wc -c < "$CORE_LOG" | tr -d ' ')" -lt "$since" ]; then
+      since=0
+    fi
+    tail -c "+$((since + 1))" "$CORE_LOG" 2>/dev/null \
+      | grep -a '"channel":"matrix"' \
+      | grep -aoE '"message":"(channel bus running|channel bring-up failed; retrying|CHANNEL DISABLED[^"]*|CHANNEL STILL DOWN[^"]*)"' \
+      | tail -1 || true
+  }
+
+  # Bring-up now RETRIES with capped backoff (1s → ×2 → 60s), so the answer is
+  # eventually-consistent rather than final at the first look: a "retrying" line
+  # is a snapshot, not a verdict. Poll until the channel is up or a fatal line
+  # lands. CHANNEL_WAIT covers ~1+2+4+8+16s of backoff with room to spare; a
+  # login failure still failing after that really is broken, not transient.
+  CHANNEL_WAIT="${CHANNEL_WAIT:-45}"
+  last=""
+  for _ in $(seq 1 "$CHANNEL_WAIT"); do
+    last="$(matrix_status_line)"
+    case "$last" in
+      *"channel bus running"*|*"CHANNEL DISABLED"*) break ;;
+    esac
+    sleep 1
+  done
+
   case "$last" in
     *"channel bus running"*)
       echo "    ✅ Matrix channel is up." ;;
-    *"spawn/login failed"*)
-      echo "    ⚠️  Matrix channel did NOT start." >&2
+    *"CHANNEL DISABLED"*)
+      # Fatal classification: the supervisor will NOT retry (a statically-dead
+      # homeserver under force-routing — #459). No amount of waiting helps.
+      echo "    ❌ Matrix channel is DISABLED and will not be retried." >&2
+      echo "       Fix what the log's \`error\` field names, then restart the daemon:" >&2
+      echo "       grep -a 'CHANNEL DISABLED' $CORE_LOG | tail -1" >&2
+      exit 1 ;;
+    *"CHANNEL STILL DOWN"*|*"channel bring-up failed; retrying"*)
+      echo "    ⚠️  Matrix channel did NOT come up within ${CHANNEL_WAIT}s (still retrying)." >&2
       echo "       If this was a matrix-sdk major upgrade, re-run with --relogin" >&2
       echo "       (add -pwd <password> if the keyring secret is also stale)." >&2
+      echo "       The daemon keeps retrying meanwhile; watch: tail -f $CORE_LOG" >&2
       exit 1 ;;
     *)
       echo "    (channel status not yet in the log — check: tail -f $CORE_LOG)" ;;

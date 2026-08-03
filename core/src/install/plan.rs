@@ -219,11 +219,22 @@ pub fn render_email_help() -> String {
 #
 # All five are required together once you set the first one. A partial config
 # does NOT silently skip the channel and does NOT take the daemon down: the
-# daemon logs a loud "EMAIL CHANNEL DISABLED" error naming every missing
-# variable, then comes up with Matrix and the scheduler running and the email
-# channel OFF. Grep the startup log for that line before assuming the channel
-# is live. (This is the fallback channel; a typo in it must never remove the
-# primary one.)
+# daemon logs a loud "@@CHANNEL_DISABLED@@" error (on a line carrying
+# channel="email") naming every missing variable, then comes up with Matrix and
+# the scheduler running and the email channel OFF. That one is NOT retried —
+# the process environment cannot change under a running daemon — so fix the
+# config and restart. Grep the startup log for that phrase before assuming the
+# channel is live. (This is the fallback channel; a typo in it must never
+# remove the primary one.)
+#
+# A TRANSIENT failure is handled differently since #514: a worker-spawn or
+# LISTEN/NOTIFY failure is RETRIED with capped backoff (1s -> x2 -> 60s cap)
+# until the channel comes up, so a blip during startup no longer leaves the
+# channel off for the life of the process. Every attempt is durable in
+# audit_log as channel.boot_failed, and success as channel.started:
+#   SELECT ts, payload FROM audit_log
+#    WHERE action IN ('channel.started','channel.boot_failed')
+#      AND payload->>'channel' = 'email' ORDER BY ts DESC LIMIT 20;
 #KASTELLAN_EMAIL_ENDPOINT=https://10.0.0.3:8443
 #KASTELLAN_EMAIL_SUBSCRIPTION=kastellan
 #KASTELLAN_EMAIL_ADDRESS=kastellan@example.org
@@ -269,7 +280,10 @@ pub fn render_email_help() -> String {
 # when a second worker's sidecar silently inherits the first's anchor. Don't
 # conflate this channel with the kastellan-worker-mail tool.
 "#
-    .to_string()
+    // Substituted rather than `format!`-interpolated so the raw block above stays
+    // free of brace escaping (it contains none today, but a future `${...}` shell
+    // snippet in this help would silently break a format string).
+    .replace("@@CHANNEL_DISABLED@@", crate::channel::boot_supervisor::CHANNEL_DISABLED_LOG_PHRASE)
 }
 
 /// Render the `kastellan.env` EnvironmentFile contents.
@@ -819,13 +833,29 @@ mod tests {
         // Partial-config behaviour: the CHANNEL is disabled, the DAEMON is not.
         // The operator's only signal is a startup log line, so the help must
         // name it verbatim and must NOT still claim the daemon aborts.
+        //
+        // Asserted against the CONST the supervisor's `error!` interpolates, not
+        // against a literal typed here: a literal is what let the help go on
+        // telling operators to grep for `EMAIL CHANNEL DISABLED` after #514 moved
+        // the line into `boot_supervisor` and dropped the channel name from the
+        // message. A literal here would have stayed green through exactly that.
         assert!(
-            help.contains("EMAIL CHANNEL DISABLED"),
-            "must name the exact startup log line to grep for: {help}"
+            help.contains(crate::channel::boot_supervisor::CHANNEL_DISABLED_LOG_PHRASE),
+            "must name the exact startup log phrase to grep for: {help}"
+        );
+        assert!(
+            !help.contains("@@CHANNEL_DISABLED@@"),
+            "the placeholder must be substituted, not shipped to the operator: {help}"
         );
         assert!(
             !help.contains("aborts daemon startup"),
             "stale claim: a partial config no longer aborts the daemon: {help}"
+        );
+        // Transient failures are retried since #514; help that implies any
+        // failure is terminal would send an operator restarting for no reason.
+        assert!(
+            help.contains("RETRIED") && help.contains("channel.boot_failed"),
+            "must state transient bring-up failures retry and where the record lands: {help}"
         );
     }
 

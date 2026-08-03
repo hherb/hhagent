@@ -268,3 +268,49 @@ async fn a_supervisor_without_an_audit_sink_still_starts_and_stops_the_channel()
     sup.shutdown().await;
     assert_eq!(stopped.load(Ordering::SeqCst), 1, "the channel started and was stopped once");
 }
+
+/// Shutdown that lands before the task's first poll must stop the loop
+/// **without starting an attempt**. An attempt spawns a sandboxed worker (and,
+/// under force-routing, its 1:1 egress sidecar), so one started here would be
+/// abandoned the instant it completed — the very shape #502 is about.
+///
+/// This is the `try_recv` guard at the top of the loop, and nothing else covers
+/// it: the `select!` below is `biased` with the attempt FIRST (deliberately, so
+/// an already-completed bring-up is never dropped unstopped), which means
+/// without the guard the first iteration calls `attempt()` before shutdown is
+/// ever looked at.
+///
+/// `flavor = "current_thread"` is load-bearing, not decoration: it is what
+/// makes the ordering deterministic. `tokio::spawn` only *queues* the task, and
+/// `shutdown()` sends on the oneshot before its `join().await` — the first
+/// thing that can yield to the supervisor. On a multi-thread runtime the task
+/// could be polled in between and the test would flake.
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_before_the_first_poll_starts_no_attempt() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&attempts);
+    let sink = RecordingSink::default();
+
+    // A script that would succeed if it ever ran, so a failure here means the
+    // guard let an attempt through — not that the attempt happened to error.
+    let script = scripted(vec![BootOutcome::Started(StartedChannel::new(|| async {}))]);
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        DowntimeEscalator::default(),
+        Some(sink.sink()),
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            script()
+        },
+    );
+
+    sup.shutdown().await;
+
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "no worker (and no sidecar) may be spawned once shutdown has arrived"
+    );
+    assert!(sink.events().is_empty(), "an attempt never made is not an event: {:?}", sink.events());
+}

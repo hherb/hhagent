@@ -308,8 +308,9 @@ fn dropping_a_bare_sidecar_handle_kills_the_child() {
 /// rather than calling `libc::kill` keeps this crate free of a `libc`
 /// dependency it does not otherwise need; the flag and its meaning are
 /// identical on Linux and macOS (POSIX), unlike the coreutils *output* skew
-/// that has bitten shell-driven tests here before.
-#[cfg(unix)]
+/// that has bitten shell-driven tests here before. Deliberately not
+/// `#[cfg(unix)]`-gated: kastellan is Linux + macOS only, and a cfg here
+/// would gate the helper without gating its only caller.
 fn pid_is_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .arg("-0")

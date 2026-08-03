@@ -58,7 +58,23 @@ mod tests;
 /// Cap on the `cause` string before it becomes a durable `audit_log` value.
 /// See [`crate::channel::audit_text`] for why a sink bounds this itself rather
 /// than trusting the value's producer.
+///
+/// Shared with the email channel's skipped-id sink (`main::email_boot`) so both
+/// durable text fields are bounded identically — one cap, one set of edge cases.
 pub const AUDIT_CAUSE_CAP_CHARS: usize = 256;
+
+/// The phrase the [`BootOutcome::Fatal`] `error!` line opens with, and
+/// therefore the string an operator greps for.
+///
+/// A `const` rather than a literal typed twice, because operator-facing help
+/// text (`crate::install::plan::render_email_help`) tells the operator to grep
+/// for exactly this — and that pairing has already drifted once: the line used
+/// to read `EMAIL CHANNEL DISABLED` from `email_boot`, and #514 moved it here,
+/// dropping the channel name out of the *message* and into a structured
+/// `channel` field. The help text kept naming the old string, so the documented
+/// grep matched nothing. Interpolating one const in both places makes that
+/// particular drift unrepresentable.
+pub const CHANNEL_DISABLED_LOG_PHRASE: &str = "CHANNEL DISABLED";
 
 /// A running channel, plus the one thing the supervisor ever does to it: stop
 /// it.
@@ -264,9 +280,9 @@ async fn run<F, Fut>(
                 error!(
                     channel = %label,
                     error = %format!("{e:#}"),
-                    "CHANNEL DISABLED — it did NOT start and will NOT be retried, because no \
-                     retry can fix what `error` names. The rest of the daemon is running \
-                     normally. Fix what `error` names, then restart the daemon."
+                    "{CHANNEL_DISABLED_LOG_PHRASE} — it did NOT start and will NOT be retried, \
+                     because no retry can fix what `error` names. The rest of the daemon is \
+                     running normally. Fix what `error` names, then restart the daemon."
                 );
                 emit(
                     &audit,

@@ -89,7 +89,12 @@ use kastellan_sandbox::{SandboxBackend, SandboxBackends};
 /// a future worker change (or a compromised worker) to keep bounding it
 /// before it lands permanently in `audit_log`. Comfortably above the
 /// worker's own 200-char cap so today's values pass through untouched.
-const AUDIT_REASON_CAP_CHARS: usize = 256;
+///
+/// Aliased to the supervisor's cap rather than a second `256` typed here: both
+/// bound an unbounded, externally-originated string on its way into the same
+/// column, so one number and one set of edge cases is the honest arrangement.
+const AUDIT_REASON_CAP_CHARS: usize =
+    kastellan_core::channel::boot_supervisor::AUDIT_CAUSE_CAP_CHARS;
 
 /// Truncate `reason` to [`AUDIT_REASON_CAP_CHARS`] on a `char` boundary
 /// (never mid-UTF-8-codepoint — `reason` may echo arbitrary upstream text).
