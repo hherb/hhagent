@@ -188,27 +188,62 @@ impl std::fmt::Display for MalformedInvoke {
     }
 }
 
+/// Stand-in used when a plan omits [`Plan::data_ceiling`] — accepted
+/// and flagged rather than rejected.
+///
+/// **This is not fail-closed, and must not be described as such.**
+/// `Secret` is the most *sensitive* `DataClass`, but `data_ceiling` is
+/// a **ceiling**, so the most sensitive value is the most *permissive*
+/// one: it is the maximum rank, so both invariants that read the field
+/// pass vacuously for a defaulted plan —
+/// [`I1`](super::deterministic) (`ceiling >= floor`) can never fire at
+/// rank 3 whatever the floor, and `I3` (`step.classification <=
+/// ceiling`) can never fire because no step class outranks it. A plan
+/// that omits the field is therefore **not ceiling-constrained at
+/// all**.
+///
+/// That is a deliberate, bounded trade: rejecting the plan (the prior
+/// behaviour) threw away otherwise-correct terminal answers over a
+/// missing field, and the two ceiling invariants only ever catch a
+/// model *contradicting its own declarations* — a competence signal,
+/// not an attack barrier, since a hostile planner would simply declare
+/// a matching high ceiling. The floor (I2, `step.classification >=
+/// floor`) still governs every step the *model* wrote.
+///
+/// One carve-out, because it is easy to state this too broadly: an
+/// `invoke_skill` plan's steps are not model-written. L3 expansion
+/// stamps each expanded step's `classification` with `plan.data_ceiling`
+/// (`memory::l3_invoke::agent` / `l3py_invoke::agent`) and runs *before*
+/// the reviewer (`scheduler::inner_loop` step 1b), so on a defaulted
+/// plan those steps carry rank 3 and I2 passes vacuously for them too —
+/// all three invariants, not two. Nothing else reads `classification`,
+/// so the effect is confined to this review stage.
+///
+/// The genuinely restrictive fix is to resolve an absent ceiling
+/// against the task's `classification_floor` instead of a constant,
+/// which needs deserialization context this function does not have —
+/// tracked in [#506](https://github.com/hherb/kastellan/issues/506).
+///
+/// Warns on every call so a defaulted ceiling is visible as a model
+/// slip rather than read as a policy decision. Note the warning reaches
+/// the daemon log only: the serialized plan in the `plan.formulate`
+/// audit row records the value with no provenance, which is part of
+/// what #506 fixes.
+fn default_data_ceiling() -> DataClass {
+    tracing::warn!(
+        defaulted_to = "Secret",
+        "plan omitted `data_ceiling`; accepting it with the MOST PERMISSIVE \
+         ceiling (rank 3), so the plan is not ceiling-constrained. The model \
+         should emit the field explicitly."
+    );
+    DataClass::Secret
+}
+
 /// One agent-formulated plan, reviewed as a unit.
 ///
 /// The terminal signal: `decision == "task_complete"` AND
 /// `steps.is_empty()` AND `result.is_some()`. The reviewer trivially
 /// approves these (no actions to evaluate); the inner loop returns
-/// Fail-closed default for [`Plan::data_ceiling`] — the most
-/// restrictive [`DataClass`], so a plan that omits the field can only
-/// ever be *more* constrained than one that states it.
-///
-/// Warns on every call: a defaulted ceiling is a model slip, not an
-/// operator policy, and an unexplained `Secret` ceiling on an
-/// everyday task is otherwise baffling to debug.
-fn default_data_ceiling() -> DataClass {
-    tracing::warn!(
-        defaulted_to = "Secret",
-        "plan omitted `data_ceiling`; defaulting fail-closed to the most \
-         restrictive class. The model should emit it explicitly."
-    );
-    DataClass::Secret
-}
-
 /// `Outcome::Completed(result)`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
@@ -220,17 +255,14 @@ pub struct Plan {
     pub result: Option<serde_json::Value>,
     /// The most sensitive class of data this plan may touch.
     ///
-    /// Defaults to [`DataClass::Secret`] — the most restrictive rank —
-    /// when the model omits the field, which local planners do fairly
-    /// often on terminal (`task_complete`) plans. Defaulting is
-    /// deliberately **fail-closed**: an omitted ceiling over-restricts,
-    /// so forgetting the field can never *widen* what a plan is allowed
-    /// to touch. The alternative (rejecting the plan) threw away
-    /// otherwise-correct answers over a missing field.
-    ///
-    /// `default_data_ceiling` warns on every use, so silent
-    /// over-restriction is visible to an operator rather than being
-    /// mistaken for a policy decision the model made.
+    /// When the model omits the field — which local planners do fairly
+    /// often on terminal (`task_complete`) plans — it is filled by
+    /// `default_data_ceiling` (private, so deliberately not an
+    /// intra-doc link), which **widens** rather than narrows: see that
+    /// function for why `Secret` is the most permissive value a ceiling
+    /// can take, what it costs, and the follow-up
+    /// ([#506](https://github.com/hherb/kastellan/issues/506)) that
+    /// replaces the constant with a floor-resolved value.
     ///
     /// NOTE: `steps` above is deliberately **not** defaulted. An empty
     /// `steps` is meaningful (it marks a terminal plan), so defaulting

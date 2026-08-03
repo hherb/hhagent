@@ -39,8 +39,19 @@
 //!    strict-path error ("expected value at line 1 column 1") is the
 //!    honest description. When the input *does* contain a `{`, the
 //!    lenient path's error is the informative one — "missing field
-//!    `steps`", "invalid type", a byte offset — and it is what callers
+//!    `steps`", "invalid type", a position — and it is what callers
 //!    see.
+//!
+//!    **Read those positions against the anchor, not the response.** A
+//!    lenient error's `line`/`column` are computed over `&raw[first_brace..]`,
+//!    so "line 1 column 12" indexes the JSON body, not the model output
+//!    an operator is scrolling through — a fenced plan's first line of
+//!    JSON is line 1 here but line 2 there. In practice only the
+//!    brace-less case reports positions in the whole input, because
+//!    there the strict path produced them. (The `None` arm of the
+//!    stream-deserializer falls back to the strict error too, but it is
+//!    unreachable: the slice always begins with the `{` we anchored on,
+//!    so the iterator always yields a value or an error, never nothing.)
 //!
 //!    An earlier version re-emitted the *strict* error in both cases,
 //!    for "a stable error type". That was actively harmful: a model
@@ -64,6 +75,10 @@ use crate::cassandra::types::Plan;
 /// contained a `{` (so the useful "missing field …" / "invalid type …"
 /// diagnostic survives), and the strict-path error only when there was
 /// no `{` at all and the input therefore could not have been JSON.
+///
+/// A lenient error's reported line/column are relative to the first `{`
+/// — see contract point 5 in the module docs before quoting one at an
+/// operator.
 ///
 /// # Examples
 ///
@@ -130,11 +145,20 @@ mod tests {
         assert!(plan.refused.is_none());
     }
 
-    /// A plan omitting `data_ceiling` must still parse, and must land
-    /// on the most restrictive class — never on `Public`, which would
-    /// let a forgetful model widen its own ceiling by omission.
+    /// A plan omitting `data_ceiling` must still parse, and lands on
+    /// `Secret`.
+    ///
+    /// `Secret` is the most *sensitive* class but — because this field
+    /// is a **ceiling** — the most *permissive* value it can hold: at
+    /// rank 3 both `I1` (`ceiling >= floor`) and `I3`
+    /// (`step.classification <= ceiling`) pass vacuously, so a
+    /// defaulted plan is not ceiling-constrained. That is the accepted
+    /// trade (see `cassandra::types::default_data_ceiling`), pinned
+    /// here so it stays a deliberate choice; the floor-resolved
+    /// replacement is
+    /// [#506](https://github.com/hherb/kastellan/issues/506).
     #[test]
-    fn omitted_data_ceiling_defaults_fail_closed_to_secret() {
+    fn omitted_data_ceiling_is_accepted_at_the_most_permissive_ceiling() {
         let raw = r#"{
             "context": "c",
             "decision": "task_complete",
@@ -148,7 +172,8 @@ mod tests {
         assert_eq!(
             plan.data_ceiling.rank(),
             3,
-            "the default must be the most restrictive rank, not merely non-Public"
+            "the default is the MAXIMUM rank — i.e. the loosest ceiling, \
+             not a restrictive one"
         );
     }
 
@@ -179,13 +204,21 @@ mod tests {
                    \"data_ceiling\": \"Public\"\n}\n```";
         let err = parse_plan_lenient(raw).expect_err("`steps` is required");
         let msg = err.to_string();
+        // `steps` is OUR field name, so naming it is a contract we own —
+        // unlike serde_json's phrasing around it, which a patch bump may
+        // reword. The second assertion is the masking check, expressed as
+        // "not the strict-path error" rather than as the literal
+        // "expected value at line 1 column 1" for the same reason.
         assert!(
             msg.contains("steps"),
             "error must name the missing field, got: {msg}"
         );
-        assert!(
-            !msg.contains("expected value at line 1 column 1"),
-            "the strict-path error masked the real one again: {msg}"
+        let strict = serde_json::from_str::<Plan>(raw)
+            .expect_err("the strict path must also fail on this input");
+        assert_ne!(
+            msg,
+            strict.to_string(),
+            "the strict-path error masked the real one again"
         );
     }
 
@@ -193,11 +226,19 @@ mod tests {
     /// input genuinely is not JSON, and the strict wording is correct.
     #[test]
     fn input_without_any_brace_still_reports_the_strict_error() {
-        let err = parse_plan_lenient("I'm sorry, I cannot help with that.")
-            .expect_err("prose is not a plan");
-        assert!(
-            err.to_string().contains("expected value"),
-            "unexpected error for brace-less input: {err}"
+        let raw = "I'm sorry, I cannot help with that.";
+        let err = parse_plan_lenient(raw).expect_err("prose is not a plan");
+        // Equality with the strict error, not `contains("expected
+        // value")`: this half of contract point 5 says the brace-less
+        // case reports the strict-path error *itself*, which is a
+        // stronger statement than any wording match and survives serde
+        // rewording. The sibling tests assert the inequality.
+        let strict = serde_json::from_str::<Plan>(raw)
+            .expect_err("the strict path must also fail on brace-less prose");
+        assert_eq!(
+            err.to_string(),
+            strict.to_string(),
+            "brace-less input must surface the strict-path error verbatim"
         );
     }
 
@@ -265,10 +306,18 @@ mod tests {
         // than the malformed object inside it.
         let raw = "```json\n{not actually JSON}\n```";
         let err = parse_plan_lenient(raw).expect_err("must error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("key must be a string"),
-            "expected the lenient path's description of the bad object; got {msg}"
+        // Asserted against the strict error computed here rather than
+        // against a literal like "key must be a string": that wording is
+        // a serde_json implementation detail a patch bump may reword,
+        // whereas "the reported error is NOT the one the strict path
+        // would have given" *is* contract point 5, and stays true however
+        // serde phrases either side.
+        let strict = serde_json::from_str::<Plan>(raw)
+            .expect_err("the strict path must also fail on this input");
+        assert_ne!(
+            err.to_string(),
+            strict.to_string(),
+            "the strict-path error masked the lenient one again"
         );
     }
 
@@ -284,9 +333,9 @@ mod tests {
     fn earlier_stray_open_brace_in_prose_yields_decode_error_not_misparse() {
         // Pins the "first `{` wins" contract documented at module top:
         // if a model emits prose that contains a `{` before the real
-        // JSON body, the lenient path anchors on the *earlier* `{`,
-        // fails to parse it, and re-emits the strict-path error. The
-        // failure mode is "fail decode" (counted as a failed plan
+        // JSON body, the lenient path anchors on the *earlier* `{` and
+        // fails to parse it, so the decode fails. The failure mode is
+        // "fail decode" (counted as a failed plan
         // iteration), NEVER "succeed with the wrong value extracted
         // from later in the response". A future refactor that gets
         // fancier with extraction (e.g. skipping non-JSON-looking
@@ -300,14 +349,16 @@ mod tests {
         let err = parse_plan_lenient(&raw)
             .expect_err("must error: earlier `{` in prose poisons the lenient anchor");
         // The load-bearing assertion is that this FAILS rather than
-        // silently parsing the second `{`. The wording now comes from
-        // the lenient path (contract point 5) — it describes the prose
-        // pseudo-object the anchor landed on, which is the accurate
-        // diagnosis of what went wrong.
-        let msg = err.to_string();
-        assert!(
-            msg.contains("key must be a string"),
-            "expected the lenient path's description of the prose object; got {msg}"
+        // silently parsing the second `{`. Secondarily (contract point
+        // 5) the reported error describes the prose pseudo-object the
+        // anchor landed on, not the fence — pinned by differing from the
+        // strict-path error rather than by a serde_json wording literal.
+        let strict = serde_json::from_str::<Plan>(&raw)
+            .expect_err("the strict path must also fail on this input");
+        assert_ne!(
+            err.to_string(),
+            strict.to_string(),
+            "the strict-path error masked the lenient one again"
         );
     }
 

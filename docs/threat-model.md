@@ -99,6 +99,24 @@ The two sandbox rows together implement the "parent denies + child denies again"
 
 Redeemed secret plaintext never appears in the request snapshot (`payload.req` of any `tool:<name>` row, snapshotted *before* `secret://<8-hex>` substitution — issue #147) nor in any `actor='policy'` row (issue #146 / Item 31). It does **not** follow that the audit log is free of secrets: a worker that is legitimately handed a secret may echo it into its own output, which lands in `payload.result`. That field is the worker's response, not the request, and is out of scope of the redaction invariant — the worker is the authorized consumer, so an operator with `audit_log` read access can recover any secret a worker chose to emit. Containing worker-emitted plaintext is the egress proxy's and the injection guard's job, not the audit redactor's.
 
+### User data in the daemon log
+
+The `audit_log` invariants above cover the database, not the daemon's own
+tracing output (`~/.local/state/kastellan/*.out` under the supervised
+deployment) — a plaintext file readable by anything running as the agent's OS
+user, with none of the `audit_log` table's role gating. Anything logged there
+is *more* exposed than the same bytes in Postgres, not less, so log statements
+carrying model or worker payloads are held at `debug!` rather than `warn!`.
+
+The live case is `scheduler::agent`'s plan-decode failure path: a planner
+completion restates recalled memories and prior step output verbatim, so on a
+mail task the failed plan contains the user's correspondence. The `warn!` there
+carries only structural facts (`detail`, `raw_len`, `has_brace`,
+`finish_reason`, token counts) — enough to tell an empty completion from a
+non-JSON one, which is the discrimination that matters — while the raw head
+sits at `debug!`. Raising the log level to triage a live planner fault is
+therefore a deliberate act that widens exposure for the duration.
+
 ### Injection-screening of planner-bound tool output (and its split-slice limit)
 
 Successful tool output is fed back to the planner (#338), so every worker
