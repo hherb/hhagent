@@ -1,37 +1,83 @@
 //! Matrix channel bring-up for the `kastellan` binary entrypoint.
 //!
-//! Extracted verbatim from `async fn main`'s "Channel bus (comms slice #2 —
-//! Matrix)" block (Item 9b, to keep `main.rs` under the 500-LOC cap). The one
-//! structural change is the extract-function boundary itself: the block's local
-//! `matrix_bus` is now this function's return value, and the three daemon-scope
-//! values it read (`pool`, `sandboxes`, `force_routing`) are now parameters.
-//! Behaviour is otherwise identical — same env gate, same 60s login timeout,
-//! same fail-soft posture (any spawn/login/connect failure logs and returns
-//! `None`, leaving the daemon a byte-identical Matrix-less build).
+//! Originally extracted verbatim from `async fn main`'s "Channel bus (comms
+//! slice #2 — Matrix)" block (Item 9b, to keep `main.rs` under the 500-LOC
+//! cap). Since #514 the module has one further job: it no longer decides what
+//! to do about a failure, it only *classifies* it. [`attempt`] performs one
+//! bring-up and returns a
+//! [`BootOutcome`](kastellan_core::channel::boot_supervisor::BootOutcome);
+//! [`supervise_matrix_channel`] hands that to a
+//! [`ChannelSupervisor`](kastellan_core::channel::boot_supervisor::ChannelSupervisor),
+//! which retries with capped backoff until the channel comes up.
+//!
+//! That inversion is the whole fix. This module used to log
+//! `channel not started` and return `None` on any failure, so a blip in the
+//! first seconds of daemon startup — a sidecar cgroup refused because the user
+//! manager happened to be restarting, an initial sync whose CONNECT failed
+//! before the proxy path was usable — left the bot deaf for the life of the
+//! process, with every unit `active` and nothing further in the log. It cost
+//! 12 hours of missed messages on 2026-08-03.
+//!
+//! What is deliberately unchanged: the env gate (unset ⇒ the daemon is
+//! byte-identical to a Matrix-less build), the per-OS backend selection, the
+//! `MatrixEgress` wiring, and the 60-second login timeout that bounds a single
+//! attempt.
 
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use tracing::{error, info};
+use tracing::info;
 
+use kastellan_core::channel::boot_supervisor::pg_sink::pg_boot_audit_sink;
+use kastellan_core::channel::boot_supervisor::{
+    BootOutcome, ChannelSupervisor, DowntimeEscalator, StartedChannel,
+};
 use kastellan_core::channel::ChannelBus;
 use kastellan_core::worker_lifecycle::force_route::ForceRoutingConfig;
+use kastellan_core::worker_lifecycle::RestartBackoff;
 use kastellan_sandbox::{SandboxBackend, SandboxBackends};
 
-/// Spawn the Matrix channel bus if `KASTELLAN_MATRIX_HOMESERVER_URL` is set.
+/// Bound on a single login attempt. The worker's `matrix.init` blocks until
+/// the SDK has logged in and completed a first sync, so without this an
+/// unreachable homeserver would hold an attempt open indefinitely and the
+/// supervisor would never get to retry.
+const MATRIX_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Pure: refuse a homeserver that can never work, *before* spending an attempt
+/// on it. `Some(Fatal)` ⇒ do not start and do not retry; `None` ⇒ proceed.
 ///
-/// Gated on the homeserver env var (surfaced via
-/// [`kastellan_core::channel::matrix::daemon_spawn_config_from_env`]): unset ⇒
-/// returns `None` and the daemon is byte-identical to a Matrix-less build. When
-/// set, spawns the sandboxed live worker (which restores its persisted session —
-/// the one-time initial login is done separately with `kastellan-cli matrix
-/// probe`) and runs a [`ChannelBus`] over the DB-backed pairing/authorizer + the
-/// tasks-queue event/completion seams. Authorization is fail-closed at the bus:
-/// only DB-paired peers' messages are enqueued.
+/// A `localhost`-NAME homeserver is statically dead once egress is
+/// force-routed (#459): the proxy resolves the name to loopback and
+/// range-denies every CONNECT, so no number of attempts can succeed. Returning
+/// [`BootOutcome::Fatal`] rather than `Retry` is what stops #514's retry loop
+/// from becoming the respawn loop that check was added to prevent.
 ///
-/// Fail-soft: an unreachable homeserver (or any spawn/login/connect error)
-/// logs and returns `None` rather than aborting startup — the channel is an
-/// add-on, not a bring-up precondition.
+/// Split out of [`attempt`] so the classification — the part the fix depends
+/// on — is testable without a sandbox, a pool or a homeserver. The predicate
+/// itself is `channel::matrix::policy`'s and is tested there.
+fn classify_homeserver(homeserver_url: &str, forced: bool) -> Option<BootOutcome> {
+    kastellan_core::channel::matrix::forced_localhost_homeserver(homeserver_url, forced)
+        .map(|detail| BootOutcome::Fatal(anyhow::anyhow!("{detail}")))
+}
+
+/// One Matrix bring-up attempt: spawn the sandboxed live worker (which
+/// restores its persisted session — the one-time initial login is done
+/// separately with `kastellan-cli matrix probe`), then run a [`ChannelBus`]
+/// over the DB-backed pairing/authorizer + the tasks-queue event/completion
+/// seams. Authorization is fail-closed at the bus: only DB-paired peers'
+/// messages are enqueued.
+///
+/// Every failure is classified, never swallowed:
+///
+/// * unset homeserver env ⇒ [`BootOutcome::NotConfigured`] (silent);
+/// * a statically-dead homeserver ⇒ [`BootOutcome::Fatal`];
+/// * spawn/login failure, a panicked spawn task, the login timeout, and a
+///   `PgCompletedTasks::connect` failure ⇒ [`BootOutcome::Retry`]. All four
+///   are conditions a later attempt can plausibly find resolved — the observed
+///   #514 trigger was one of them.
+///
+/// Takes owned parameters because the supervisor calls it once per attempt
+/// from a `'static` task.
 ///
 /// * `pool` — daemon-scoped runtime pool (cloned into the authorizer, pairing
 ///   service, events, and completion seams).
@@ -41,106 +87,155 @@ use kastellan_sandbox::{SandboxBackend, SandboxBackends};
 ///   5c invariant: the egress proxy needs a real network route).
 /// * `force_routing` — the resolved egress force-routing config; `Some` ⇒ each
 ///   (re)spawn gets a 1:1 transparent-tunnel sidecar via `MatrixEgress`.
-pub(crate) async fn spawn_matrix_channel(
+async fn attempt(
+    pool: PgPool,
+    sandboxes: SandboxBackends,
+    force_routing: Option<Arc<ForceRoutingConfig>>,
+) -> BootOutcome {
+    let Some(spawn_cfg) = kastellan_core::channel::matrix::daemon_spawn_config_from_env(
+        std::env::current_exe().ok().as_deref().and_then(|p| p.parent()),
+    ) else {
+        return BootOutcome::NotConfigured;
+    };
+
+    // VM mode counts as always-forced: the Firecracker plan refuses to boot a
+    // Net::Allowlist worker without the egress proxy.
+    #[cfg(target_os = "linux")]
+    let vm_mode = spawn_cfg.use_microvm;
+    #[cfg(not(target_os = "linux"))]
+    let vm_mode = false;
+    if let Some(fatal) =
+        classify_homeserver(&spawn_cfg.homeserver_url, force_routing.is_some() || vm_mode)
+    {
+        return fatal;
+    }
+
+    // Worker backend: Firecracker VM when the operator opted in
+    // (KASTELLAN_MATRIX_USE_MICROVM=1, Linux); else the host jail. The SIDECAR
+    // backend always stays the host bwrap/Seatbelt (5c invariant — the egress
+    // proxy needs a real network route; a VM here would boot a proxy with none).
+    #[cfg(target_os = "linux")]
+    let sidecar_backend: Arc<dyn SandboxBackend> = Arc::clone(&sandboxes.bwrap);
+    #[cfg(target_os = "linux")]
+    let backend: Arc<dyn SandboxBackend> = if spawn_cfg.use_microvm {
+        Arc::clone(&sandboxes.firecracker)
+    } else {
+        Arc::clone(&sandboxes.bwrap)
+    };
+    #[cfg(target_os = "macos")]
+    let sidecar_backend: Arc<dyn SandboxBackend> = Arc::clone(&sandboxes.seatbelt);
+    #[cfg(target_os = "macos")]
+    let backend: Arc<dyn SandboxBackend> = Arc::clone(&sandboxes.seatbelt);
+
+    let egress = force_routing.as_ref().map(|fr| kastellan_core::channel::matrix::MatrixEgress {
+        sidecar_backend: Arc::clone(&sidecar_backend),
+        routing: Arc::clone(fr),
+    });
+
+    // The worker's login is blocking (matrix.init waits for the SDK's login +
+    // first sync), so run it on a blocking thread under a bounded timeout: it
+    // doesn't block an async worker thread, and an unreachable homeserver
+    // yields a Retry instead of holding the attempt open. On timeout the
+    // blocking task is left to drain against the SDK's own HTTP timeouts (a
+    // blocking task cannot be force-cancelled).
+    let spawn = tokio::task::spawn_blocking(move || {
+        kastellan_core::channel::matrix::spawn_matrix_worker(
+            backend,
+            kastellan_core::channel::ChannelId("matrix".to_string()),
+            &spawn_cfg,
+            egress,
+        )
+    });
+    let worker = match tokio::time::timeout(MATRIX_LOGIN_TIMEOUT, spawn).await {
+        Ok(Ok(Ok(worker))) => worker,
+        Ok(Ok(Err(e))) => return BootOutcome::Retry(e.context("matrix worker spawn/login failed")),
+        Ok(Err(join_err)) => {
+            return BootOutcome::Retry(anyhow::anyhow!(
+                "matrix worker spawn task panicked: {join_err}"
+            ))
+        }
+        Err(_elapsed) => {
+            return BootOutcome::Retry(anyhow::anyhow!(
+                "matrix worker login timed out ({}s)",
+                MATRIX_LOGIN_TIMEOUT.as_secs()
+            ))
+        }
+    };
+
+    info!(identity = %worker.identity, "matrix worker logged in; starting channel bus");
+    let authorizer = Arc::new(kastellan_core::channel::auth::DbPeerAuthorizer::new(pool.clone()));
+    let pairing = Arc::new(kastellan_core::channel::pairing::DbPairingService::new(pool.clone()));
+    let events = Arc::new(kastellan_core::channel::bus::PgChannelEvents::new(pool.clone()));
+    match kastellan_core::channel::bus::PgCompletedTasks::connect(pool.clone()).await {
+        Ok(completed) => BootOutcome::Started(StartedChannel::from_bus(ChannelBus::spawn(
+            vec![Box::new(worker.channel)],
+            authorizer,
+            Some(pairing),
+            events,
+            Box::new(completed),
+        ))),
+        Err(e) => {
+            BootOutcome::Retry(e.context("matrix: PgCompletedTasks::connect (LISTEN/NOTIFY) failed"))
+        }
+    }
+}
+
+/// Supervise the Matrix channel: retry [`attempt`] with capped backoff until
+/// it comes up — forever, unless the channel is unconfigured or statically
+/// dead.
+///
+/// Returns immediately. The first attempt runs inside the supervisor task, so
+/// a hung homeserver no longer delays daemon startup at all; previously the
+/// 60-second login timeout was spent inline before `main` reached the email
+/// channel or the shutdown wait.
+///
+/// The returned handle must be `shutdown()`-ed by `main`: it stops the retry
+/// loop and, if the channel did come up, the bus with it.
+pub(crate) fn supervise_matrix_channel(
     pool: &PgPool,
     sandboxes: &SandboxBackends,
     force_routing: &Option<Arc<ForceRoutingConfig>>,
-) -> Option<ChannelBus> {
-    let mut matrix_bus: Option<ChannelBus> = None;
-    if let Some(spawn_cfg) = kastellan_core::channel::matrix::daemon_spawn_config_from_env(
-        std::env::current_exe().ok().as_deref().and_then(|p| p.parent()),
-    ) {
-        // #459: a `localhost`-NAME homeserver is statically dead once egress
-        // is force-routed (the proxy resolves the name → loopback →
-        // range-denies every CONNECT), and the spawn path would respawn-loop
-        // on it forever. Refuse the channel up front — fail-soft, daemon
-        // unaffected. VM mode counts as always-forced: the Firecracker plan
-        // refuses to boot a Net::Allowlist worker without the egress proxy.
-        #[cfg(target_os = "linux")]
-        let vm_mode = spawn_cfg.use_microvm;
-        #[cfg(not(target_os = "linux"))]
-        let vm_mode = false;
-        if let Some(detail) = kastellan_core::channel::matrix::forced_localhost_homeserver(
-            &spawn_cfg.homeserver_url,
-            force_routing.is_some() || vm_mode,
-        ) {
-            error!(%detail, "matrix homeserver misconfigured; channel not started");
-            return None;
-        }
-        // The worker's login is blocking (matrix.init waits for the SDK's login +
-        // first sync), so run it on a blocking thread under a bounded timeout: an
-        // unreachable homeserver fails-soft (channel not started) instead of
-        // hanging daemon startup, and it doesn't block an async worker thread. On
-        // timeout the blocking task is left to drain against the SDK's own HTTP
-        // timeouts (a blocking task can't be force-cancelled).
-        // Worker backend: Firecracker VM when the operator opted in
-        // (KASTELLAN_MATRIX_USE_MICROVM=1, Linux); else the host jail. The SIDECAR
-        // backend always stays the host bwrap/Seatbelt (5c invariant — the egress
-        // proxy needs a real network route; a VM here would boot a proxy with none).
-        #[cfg(target_os = "linux")]
-        let sidecar_backend: Arc<dyn SandboxBackend> = Arc::clone(&sandboxes.bwrap);
-        #[cfg(target_os = "linux")]
-        let backend: Arc<dyn SandboxBackend> = if spawn_cfg.use_microvm {
-            Arc::clone(&sandboxes.firecracker)
-        } else {
-            Arc::clone(&sandboxes.bwrap)
-        };
-        #[cfg(target_os = "macos")]
-        let sidecar_backend: Arc<dyn SandboxBackend> = Arc::clone(&sandboxes.seatbelt);
-        #[cfg(target_os = "macos")]
-        let backend: Arc<dyn SandboxBackend> = Arc::clone(&sandboxes.seatbelt);
+) -> ChannelSupervisor {
+    let pool = pool.clone();
+    let sandboxes = sandboxes.clone();
+    let force_routing = force_routing.clone();
+    let audit = pg_boot_audit_sink(pool.clone(), "matrix");
+    ChannelSupervisor::spawn(
+        "matrix",
+        RestartBackoff::default(),
+        DowntimeEscalator::default(),
+        Some(audit),
+        move || attempt(pool.clone(), sandboxes.clone(), force_routing.clone()),
+    )
+}
 
-        let egress = force_routing.as_ref().map(|fr| {
-            kastellan_core::channel::matrix::MatrixEgress {
-                sidecar_backend: Arc::clone(&sidecar_backend),
-                routing: Arc::clone(fr),
-            }
-        });
-        let spawn = tokio::task::spawn_blocking(move || {
-            kastellan_core::channel::matrix::spawn_matrix_worker(
-                backend,
-                kastellan_core::channel::ChannelId("matrix".to_string()),
-                &spawn_cfg,
-                egress,
-            )
-        });
-        const MATRIX_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-        match tokio::time::timeout(MATRIX_LOGIN_TIMEOUT, spawn).await {
-            Ok(Ok(Ok(worker))) => {
-                info!(identity = %worker.identity, "matrix worker logged in; starting channel bus");
-                let authorizer = Arc::new(
-                    kastellan_core::channel::auth::DbPeerAuthorizer::new(pool.clone()),
-                );
-                let pairing = Arc::new(
-                    kastellan_core::channel::pairing::DbPairingService::new(pool.clone()),
-                );
-                let events = Arc::new(kastellan_core::channel::bus::PgChannelEvents::new(pool.clone()));
-                match kastellan_core::channel::bus::PgCompletedTasks::connect(pool.clone()).await {
-                    Ok(completed) => {
-                        matrix_bus = Some(kastellan_core::channel::ChannelBus::spawn(
-                            vec![Box::new(worker.channel)],
-                            authorizer,
-                            Some(pairing),
-                            events,
-                            Box::new(completed),
-                        ));
-                        info!("matrix channel bus running");
-                    }
-                    Err(e) => {
-                        error!(error = %e, "matrix: PgCompletedTasks::connect failed; channel not started");
-                    }
-                }
-            }
-            Ok(Ok(Err(e))) => {
-                error!(error = %format!("{e:#}"), "matrix worker spawn/login failed; channel not started");
-            }
-            Ok(Err(join_err)) => {
-                error!(error = %join_err, "matrix worker spawn task panicked; channel not started");
-            }
-            Err(_elapsed) => {
-                error!("matrix worker login timed out (60s); channel not started");
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The classification #514's fix depends on: a `localhost`-NAME homeserver
+    /// under force-routing can NEVER succeed (the proxy resolves the name to
+    /// loopback and range-denies every CONNECT), so it must be FATAL. Were it
+    /// merely retryable, the new supervisor would spin on it forever —
+    /// precisely the respawn loop #459's check exists to prevent.
+    #[test]
+    fn a_force_routed_localhost_homeserver_is_fatal_not_retryable() {
+        let outcome = classify_homeserver("http://localhost:8008", true);
+        assert!(matches!(outcome, Some(BootOutcome::Fatal(_))), "{outcome:?}");
     }
-    matrix_bus
+
+    /// The same URL without force-routing is reachable — the worker resolves
+    /// localhost itself (dev conduit) — so nothing is refused up front.
+    #[test]
+    fn a_localhost_homeserver_without_force_routing_is_not_refused() {
+        assert!(classify_homeserver("http://localhost:8008", false).is_none());
+    }
+
+    /// A routable homeserver is never refused up front: an unreachable one is
+    /// a *transient* condition and belongs to the retry loop, not to this
+    /// static check.
+    #[test]
+    fn a_routable_homeserver_is_not_refused() {
+        assert!(classify_homeserver("https://matrix.kastellan.dev", true).is_none());
+    }
 }

@@ -479,38 +479,39 @@ async fn main() -> Result<()> {
     info!("scheduler spawned (lane_fast + lane_long)");
 
     // ── Channel bus (comms slice #2 — Matrix). ──
-    // Gated on KASTELLAN_MATRIX_HOMESERVER_URL (checked inside): unset ⇒ `None`,
-    // and the daemon is byte-identical to a Matrix-less build. When set, spawns
-    // the sandboxed live worker and runs a ChannelBus over the DB-backed
-    // pairing/authorizer + the tasks-queue event/completion seams. Fail-soft:
-    // any spawn/login/connect failure logs and yields `None`. See
-    // `main/matrix_boot.rs`.
-    let matrix_bus = matrix_boot::spawn_matrix_channel(&pool, &sandboxes, &force_routing).await;
+    // Gated on KASTELLAN_MATRIX_HOMESERVER_URL (checked inside): unset ⇒ the
+    // supervisor task returns immediately and the daemon is byte-identical to
+    // a Matrix-less build. When set, it spawns the sandboxed live worker and
+    // runs a ChannelBus over the DB-backed pairing/authorizer + the tasks-queue
+    // event/completion seams — retrying with capped backoff until that
+    // succeeds (#514), so a transient failure in the startup window no longer
+    // leaves the bot deaf for the life of the process. A statically-dead
+    // homeserver still stops, loudly. Returns without awaiting: bring-up now
+    // proceeds in the background rather than holding startup for up to the
+    // 60s login timeout. See `main/matrix_boot.rs`.
+    let matrix = matrix_boot::supervise_matrix_channel(&pool, &sandboxes, &force_routing);
 
     // ── Channel bus (Phase 2 slice #5 — email fallback). ──
-    // Gated on KASTELLAN_EMAIL_ENDPOINT (checked inside): unset ⇒ `None` and
-    // the daemon is byte-identical to an email-less build. A set-but-partial
-    // config, a worker spawn failure, or a listener failure logs a loud
-    // `error!` naming what's wrong and yields `None` — the EMAIL CHANNEL does
-    // not start, the daemon does. Deliberately NOT an abort: this is the
-    // FALLBACK channel (it exists because Matrix has no homeserver failover),
-    // so a typo in its config must never take Matrix, the scheduler, and the
-    // graceful-shutdown path below down with it. Design §6 says the daemon
-    // refuses to start *the email channel*, not the daemon. The function
-    // returns `Option`, not `Result`, so no future `?` can reinstate the
-    // abort. See `main/email_boot.rs`.
-    let email_bus = email_boot::spawn_email_channel(&pool, &sandboxes, &force_routing).await;
+    // Gated on KASTELLAN_EMAIL_ENDPOINT (checked inside): unset ⇒ the daemon is
+    // byte-identical to an email-less build. Same supervision as Matrix, with
+    // one classification difference: a set-but-PARTIAL config is FATAL (the
+    // environment cannot change under a running daemon, so retrying would spin
+    // while telling the operator to restart), whereas a worker spawn failure
+    // is retried. Deliberately never an abort: this is the FALLBACK channel
+    // (it exists because Matrix has no homeserver failover), so a typo in its
+    // config must not take Matrix, the scheduler, and the graceful-shutdown
+    // path below down with it. Nothing on that path returns `Result`, so no
+    // future `?` can reinstate the abort. See `main/email_boot.rs`.
+    let email = email_boot::supervise_email_channel(&pool, &sandboxes, &force_routing);
 
     bootstrap::wait_for_shutdown().await?;
 
-    // Stop the channel buses first so no further inbound messages are enqueued
-    // and each worker's stdin closes (clean worker exit).
-    if let Some(bus) = matrix_bus {
-        bus.shutdown().await;
-    }
-    if let Some(bus) = email_bus {
-        bus.shutdown().await;
-    }
+    // Stop the channel supervisors first: each stops its bus if it started one,
+    // so no further inbound messages are enqueued and each worker's stdin
+    // closes (clean worker exit). Unconditional — a supervisor that never
+    // started a channel, or is still retrying, shuts down to a no-op.
+    matrix.shutdown().await;
+    email.shutdown().await;
 
     // Stop the scheduler before the audit-mirror so any final audit
     // rows it writes during graceful drain land in the mirror's
