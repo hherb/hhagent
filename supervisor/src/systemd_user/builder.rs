@@ -170,10 +170,12 @@ pub fn build_unit_file(spec: &ServiceSpec) -> String {
     out.push('\n');
 
     // [Install] section: this is what `systemctl --user enable` resolves to
-    // decide where to drop the symlink, and the driver enables every unit it
-    // installs (#508 — see `super::SystemdUser::install`). So this section is
-    // load-bearing for reboot survival, not an optional courtesy: emitting the
-    // wrong `WantedBy=` here links the unit under the wrong target.
+    // decide where to drop the symlink, and since #508 the driver enables what
+    // it installs — `install` this unit, `install_target` the `.target` (whose
+    // `Wants=` then pulls the members in, so members are deliberately left
+    // unenabled). So this section is load-bearing for reboot survival, not an
+    // optional courtesy: the wrong `WantedBy=` links the unit under the wrong
+    // target. See `super::SystemdUser::install`.
     out.push_str("[Install]\n");
     // A target member is wanted by its target; a standalone service is
     // wanted by default.target so `enable` starts it at login.

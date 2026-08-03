@@ -142,11 +142,14 @@ Severity is bounded and worth stating precisely: I1/I3 only ever catch a model c
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
-| DGX (native aarch64, real bwrap + KVM + live PG 18) | `fix/508-systemd-enable-units` | **2952 / 0 / 53** across 162 binaries, `TEST_EXIT=0` | `CLIPPY_EXIT=0` (whole workspace) | exactly 4, all `KASTELLAN_GLINER_RELEX_ENABLE` |
-| DGX | `c5ba7637` ≡ `main` content | **2950 / 0 / 53** (the baseline #508 is +2 over) | exit 0 | exactly 4, same tier |
+| DGX (native aarch64, real bwrap + KVM + live PG 18) | `c1942f23` (`fix/509-review-followups`) | **2956 / 0 / 53**, `TEST_EXIT=0` | `CLIPPY_EXIT=0` (whole workspace) | exactly 4, all `KASTELLAN_GLINER_RELEX_ENABLE` |
+| DGX | `4e1d30ca` ≡ `main` (#509) | **2952 / 0 / 53** across 162 binaries | exit 0 | exactly 4, same tier |
+| DGX | `c5ba7637` ≡ pre-#508 `main` | **2950 / 0 / 53** (the baseline #508 was +2 over) | exit 0 | exactly 4, same tier |
 | Mac (Apple Silicon, Seatbelt, PG-gated suites separately) | `#507` fix commit | **2830 / 1 / 23** | exit 0 | not verified (run omitted `--nocapture`) |
 
-**#508's Mac coverage is partial by construction and that is worth stating plainly:** both tests it adds are `cfg(target_os = "linux")`, so a Mac full-workspace run would show **no count change at all** and was not repeated (the IDE's rust-analyzer holds `target/debug/.cargo-lock` — [[mac-cargo-buildlock-prefer-dgx]]). What *was* run on the Mac: the whole `kastellan-supervisor` suite green including the real `launchctl` target round-trip, plus `clippy -p kastellan-supervisor -p kastellan-core --all-targets -D warnings` exit 0 and `cargo check -p kastellan-core` exit 0. The DGX is the authoritative host for this change.
+**Both hosts are load-bearing for this arc, in opposite directions — check both.** #508's two tests are `cfg(target_os = "linux")`, so the DGX is authoritative there and a Mac full-workspace run shows no count change at all. The #509 follow-up inverts that for half its diff: the same staging-path fix landed in `launchd_agents.rs`, whose three new tests are macOS-only and **invisible to the DGX** ([[cfg-linux-e2e-deadcode-dgx-clippy]], mirror direction). So the +4 on the DGX row is the four systemd-side tests, and the Mac carries the other three.
+
+Mac verification for the follow-up (the IDE's rust-analyzer holds `target/debug/.cargo-lock`, so these are per-crate, not full-workspace — [[mac-cargo-buildlock-prefer-dgx]]): `cargo test -p kastellan-supervisor -- --nocapture` **80 / 0**, no `[SKIP]`, including the real `launchctl` round-trip and all three new launchd staging tests; `clippy -p kastellan-supervisor --all-targets -D warnings` exit 0 **and the same crate cross-linted for `aarch64-unknown-linux-gnu`** exit 0 (pure-Rust crate, so this type-checks the cfg-linux half from the Mac — [[cross-clippy-pure-rust-crates]]); `clippy -p kastellan-core --all-targets -D warnings` exit 0.
 
 The single Mac failure in the `#507` row is `egress_force_routing_e2e::forced_coupling_enforces_allowlist_and_ingests_decisions` — the load-sensitive sidecar-budget flake described above; it **passed on the DGX**, alongside its PG sibling, confirming host/load specificity rather than a code defect.
 
