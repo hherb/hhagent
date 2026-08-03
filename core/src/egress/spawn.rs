@@ -49,18 +49,36 @@ const STDERR_SETTLE: Duration = Duration::from_millis(250);
 /// long-lived channel sidecar (matrix) gets `0` instead — see [`proxy_policy`].
 const SHORT_LIVED_SIDECAR_CPU_MS: u64 = 10_000;
 
-/// A running sidecar. Call [`shutdown`](SidecarHandle::shutdown) or
-/// [`terminate`](SidecarHandle::terminate) to kill it — this type has **no**
-/// `Drop` impl, so simply letting it go out of scope leaks the child process
-/// (`std::process::Child`'s own drop does not kill it). The `Drop`-bearing
-/// wrapper that ties teardown to scope is `egress::net_worker::EgressSidecar`,
-/// which holds one of these and calls `terminate()` from its own `Drop`; a
-/// bare `SidecarHandle` dropped before it is wrapped (or without ever being
-/// wrapped) leaks — tracked as issue #502.
+/// A running sidecar. Dropping it kills and reaps the child and removes the
+/// UDS; [`shutdown`](SidecarHandle::shutdown) and
+/// [`terminate`](SidecarHandle::terminate) do the same thing explicitly.
+///
+/// The `Drop` is load-bearing, not a convenience (issue #502). Every spawn
+/// path builds a bare handle first and only later wraps it in the
+/// `Drop`-bearing `egress::net_worker::EgressSidecar` — after the *worker*
+/// has also spawned. If that second spawn fails, the bare handle is dropped
+/// by `?` on the error path, and without this impl that drop was a no-op
+/// (`std::process::Child`'s own drop does not kill the child), so the proxy
+/// survived for as long as the spawning thread lived — which for a
+/// long-lived channel's persistent supervisor thread is effectively forever.
+/// Both channel families retry that path in a loop, so the leak accumulated
+/// one `kastellan-worker-egress-proxy` per failed attempt, per channel.
 #[derive(Debug)]
 pub struct SidecarHandle {
     child: Child,
     pub uds_path: PathBuf,
+}
+
+impl Drop for SidecarHandle {
+    fn drop(&mut self) {
+        // Idempotent with an explicit `terminate()`/`shutdown()` — a second
+        // `kill`/`wait` on a reaped child and a `remove_file` on a gone path
+        // both error harmlessly, and every error here is ignored by design.
+        // `EgressSidecar::drop` still calls `terminate()` explicitly because
+        // it needs the proxy dead *before* it removes the scratch dir, and a
+        // field's drop glue runs only after that body returns.
+        self.terminate();
+    }
 }
 
 impl SidecarHandle {

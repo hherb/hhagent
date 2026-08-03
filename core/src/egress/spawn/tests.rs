@@ -267,3 +267,56 @@ fn stderr_note_reports_captured_lines() {
     let note = stderr_note(Some(&tail));
     assert!(note.contains("upstream extra CA"), "note lost the reason: {note}");
 }
+
+/// Dropping a bare [`SidecarHandle`] must kill the child process (#502).
+///
+/// This is the exact shape every spawn path hits on its error branch: the
+/// sidecar is up, the *worker* spawn then fails, and `?` drops a handle that
+/// was never wrapped in the `Drop`-bearing `EgressSidecar`. Without
+/// `SidecarHandle`'s own `Drop` that was a silent no-op — `std::process::Child`
+/// does not kill on drop — and #514's bring-up retry loop would have
+/// accumulated one leaked proxy per attempt for the length of an outage.
+///
+/// Uses a plain long-`sleep` child rather than a real proxy: what is under
+/// test is the drop glue, not anything about the proxy, and this keeps the
+/// test hermetic (no sandbox, no binary discovery, no UDS).
+#[test]
+fn dropping_a_bare_sidecar_handle_kills_the_child() {
+    use std::process::{Command, Stdio};
+
+    let child = Command::new("sleep")
+        .arg("300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn a sleep child");
+    let pid = child.id();
+    assert!(pid_is_alive(pid), "the child must be running before the drop");
+
+    // The UDS path need not exist — `terminate` removes it best-effort.
+    let handle = SidecarHandle {
+        child,
+        uds_path: std::path::PathBuf::from("/nonexistent/kastellan-test.sock"),
+    };
+    drop(handle);
+
+    assert!(!pid_is_alive(pid), "dropping the handle must kill and reap the sidecar (pid {pid})");
+}
+
+/// `kill -0 <pid>` succeeds only for a live, signalable process. Shelling out
+/// rather than calling `libc::kill` keeps this crate free of a `libc`
+/// dependency it does not otherwise need; the flag and its meaning are
+/// identical on Linux and macOS (POSIX), unlike the coreutils *output* skew
+/// that has bitten shell-driven tests here before.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
