@@ -233,17 +233,9 @@ fn install_errors_when_environment_file_missing() {
 // error paths, the `.tmp.<pid>.<n>` suffix staying AFTER `.plist` so the
 // staging file is not itself a loadable agent) lives with the shared
 // helper in `crate::atomic_write` and runs on both hosts. What is left
-// here is the wiring: that `install` actually publishes through it.
-
-/// Names in `dir` that mark an in-flight atomic write.
-fn staging_files(dir: &Path) -> Vec<String> {
-    fs::read_dir(dir)
-        .expect("read agents dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains(".tmp."))
-        .collect()
-}
+// here is the wiring: that `install` publishes through it, leaving the
+// agents dir holding exactly the plist and nothing else — anything else
+// in that directory is something launchd may try to load.
 
 #[test]
 fn install_publishes_the_plist_and_leaves_no_staging_file_behind() {
@@ -251,10 +243,10 @@ fn install_publishes_the_plist_and_leaves_no_staging_file_behind() {
     let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
     sup.install(&minimal_spec("svc")).expect("install");
 
-    assert!(sup.plist_path("svc").exists());
-    assert!(
-        staging_files(dir.path()).is_empty(),
-        "staging files left after a successful write: {:?}",
-        staging_files(dir.path())
-    );
+    let names: Vec<String> = fs::read_dir(dir.path())
+        .expect("read agents dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["svc.plist"]);
 }

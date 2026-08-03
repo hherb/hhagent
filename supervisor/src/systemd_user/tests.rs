@@ -239,16 +239,19 @@ fn install_target_writes_target_unit_and_members_into_units_dir() {
 // The staging contract itself (unique-per-writer names, cleanup on the
 // error paths, `.target` not collapsing onto `.service`) lives with the
 // shared helper in `crate::atomic_write` and runs on both hosts. What is
-// left here is the wiring: that `install` actually publishes through it.
+// left here is the wiring: that the driver publishes through it, leaving
+// the units dir holding exactly the units and nothing else.
 
-/// Names in `dir` that mark an in-flight atomic write.
-fn staging_files(dir: &Path) -> Vec<String> {
-    fs::read_dir(dir)
+/// Every name in `dir`, sorted — so a leftover staging file fails the
+/// assertion by being present, not by being looked for.
+fn dir_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
         .expect("read units dir")
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains(".tmp."))
-        .collect()
+        .collect();
+    names.sort();
+    names
 }
 
 #[test]
@@ -257,19 +260,15 @@ fn install_publishes_the_unit_and_leaves_no_staging_file_behind() {
     let sup = SystemdUser::with_units_dir(dir.path().to_path_buf());
     sup.install(&minimal_spec("kastellan-test")).expect("install");
 
-    assert!(dir.path().join("kastellan-test.service").exists());
-    assert!(
-        staging_files(dir.path()).is_empty(),
-        "staging files left after a successful write: {:?}",
-        staging_files(dir.path())
-    );
+    assert_eq!(dir_names(dir.path()), vec!["kastellan-test.service"]);
 }
 
 #[test]
 fn install_target_publishes_the_target_unit_without_staging_leftovers() {
     // `install_target` writes N member units and then the `.target`
     // through the same helper; the `.target` is the path that used to be
-    // staged as `<name>.service.tmp`.
+    // staged as `<name>.service.tmp`, colliding with a like-named
+    // `.service`.
     let dir = TestRoot::new("staging-target");
     let sup = SystemdUser::with_units_dir(dir.path().to_path_buf());
     let target = TargetSpec {
@@ -278,11 +277,8 @@ fn install_target_publishes_the_target_unit_without_staging_leftovers() {
     };
     sup.install_target(&target, &[minimal_spec("kastellan-test-member")]).expect("install_target");
 
-    assert!(dir.path().join("kastellan-test.target").exists());
-    assert!(dir.path().join("kastellan-test-member.service").exists());
-    assert!(
-        staging_files(dir.path()).is_empty(),
-        "staging files left after install_target: {:?}",
-        staging_files(dir.path())
+    assert_eq!(
+        dir_names(dir.path()),
+        vec!["kastellan-test-member.service", "kastellan-test.target"]
     );
 }
