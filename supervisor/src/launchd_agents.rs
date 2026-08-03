@@ -102,6 +102,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::bounded_command::{run_capped, CappedOutcome};
@@ -416,6 +417,32 @@ pub fn probe() -> Result<(), SupervisorError> {
     )))
 }
 
+/// Unique staging path for an atomic write of `path`.
+///
+/// Appends `.tmp.<pid>.<n>` to the whole file name. The former
+/// `path.with_extension("plist.tmp")` was a pure function of the
+/// destination, so two concurrent writers of one agent raced on a single
+/// tmp file and the loser's `rename` failed `ENOENT` — the same hazard
+/// the systemd backend carried (#508/#509 review). The suffix stays
+/// *after* `.plist` so the staging file is not itself a loadable agent.
+/// (Kept in step with `systemd_user::tmp_path_for`; [#104] tracks
+/// de-duplicating this pattern across the workspace.)
+///
+/// [#104]: https://github.com/hherb/kastellan/issues/104
+fn tmp_path_for(path: &Path) -> Result<PathBuf, SupervisorError> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .ok_or_else(|| SupervisorError::Io(format!("{} has no file name", path.display())))?;
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    Ok(path.with_file_name(tmp_name))
+}
+
 /// Atomically write `bytes` to `path` via write-to-tmp + fsync + rename.
 ///
 /// launchd reads the plist file once at bootstrap time, but a
@@ -424,23 +451,36 @@ pub fn probe() -> Result<(), SupervisorError> {
 /// see a half-written file. Atomic rename keeps the observable state
 /// binary: either the old contents are visible, or the new ones —
 /// never a torn read.
+///
+/// Every error path removes the staging file: with a unique tmp name a
+/// retry no longer overwrites the previous attempt's leftover, so without
+/// this a repeatedly-failing install would litter `~/Library/LaunchAgents/`.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SupervisorError> {
-    let tmp = path.with_extension("plist.tmp");
-    {
-        let mut f = fs::File::create(&tmp)
-            .map_err(|e| SupervisorError::Io(format!("create {}: {e}", tmp.display())))?;
-        f.write_all(bytes)
-            .map_err(|e| SupervisorError::Io(format!("write {}: {e}", tmp.display())))?;
-        f.sync_all()
-            .map_err(|e| SupervisorError::Io(format!("fsync {}: {e}", tmp.display())))?;
+    let tmp = tmp_path_for(path)?;
+    if let Err(e) = write_and_sync(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, path).map_err(|e| {
-        SupervisorError::Io(format!(
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(SupervisorError::Io(format!(
             "rename {} -> {}: {e}",
             tmp.display(),
             path.display()
-        ))
-    })?;
+        )));
+    }
+    Ok(())
+}
+
+/// Create `tmp`, write `bytes`, and fsync it. Split out of [`write_atomic`]
+/// so the caller has a single error seam to clean up behind.
+fn write_and_sync(tmp: &Path, bytes: &[u8]) -> Result<(), SupervisorError> {
+    let mut f = fs::File::create(tmp)
+        .map_err(|e| SupervisorError::Io(format!("create {}: {e}", tmp.display())))?;
+    f.write_all(bytes)
+        .map_err(|e| SupervisorError::Io(format!("write {}: {e}", tmp.display())))?;
+    f.sync_all()
+        .map_err(|e| SupervisorError::Io(format!("fsync {}: {e}", tmp.display())))?;
     Ok(())
 }
 

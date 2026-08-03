@@ -21,13 +21,20 @@ use kastellan_supervisor::{ServiceSpec, ServiceStatus, Supervisor, TargetSpec};
 /// The counter is load-bearing, not decoration. Every test in this binary
 /// shares a pid *and* the same three prefixes, so a bare `pid + nanos`
 /// suffix leaves the clock as the only discriminator — and two tests
-/// running in parallel can read the same tick, produce the same unit
-/// name, and race on one `<name>.service.tmp`: whoever renames second
-/// gets `ENOENT`, surfacing as a bogus `install_target` I/O error in an
-/// unrelated test. The process-wide `AtomicU64` makes uniqueness
-/// deterministic instead of clock-granularity-dependent, mirroring
-/// `TestRoot` in `src/systemd_user/tests.rs` (issue #104 tracks the same
-/// pattern elsewhere in the workspace).
+/// running in parallel can read the same tick and produce the same unit
+/// name. The symptom that exposed it was a race on one
+/// `<name>.service.tmp`, surfacing as a bogus `install_target` I/O error
+/// in an unrelated test; that staging path is now unique per writer
+/// (`systemd_user::tmp_path_for`), but a shared unit name would still
+/// collide on the live manager itself. The process-wide `AtomicU64` makes
+/// uniqueness deterministic instead of clock-granularity-dependent,
+/// mirroring `TestRoot` in `src/systemd_user/tests.rs` (issue #104 tracks
+/// the same pattern elsewhere in the workspace).
+///
+/// See `systemd_user_smoke.rs` for how to sweep leftovers from a run that
+/// was killed hard enough to skip `Guard`'s Drop — since #508 that can
+/// include an enable symlink under `default.target.wants/`, which the user
+/// manager fails to start on every login until it is removed.
 fn unique(prefix: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);

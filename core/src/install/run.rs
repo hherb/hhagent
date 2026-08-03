@@ -139,6 +139,18 @@ pub fn run_install(args: InstallArgs) -> Result<(), String> {
 
     if args.no_start {
         eprintln!("--no-start: units installed but not started. Start with: systemctl --user start kastellan.target");
+        // The units ARE enabled (`install_target` did that, #508), but this
+        // early return skips the linger call below — so on a headless host
+        // the per-user manager still won't be running at boot to act on it.
+        // Say so here: the operator sees this message, not the comment.
+        #[cfg(target_os = "linux")]
+        eprintln!(
+            "--no-start also skips `loginctl enable-linger`: on a headless host \
+             (one nobody logs into) the units are armed but the per-user systemd \
+             manager won't be up at boot to start them. For reboot persistence \
+             run: loginctl enable-linger {}",
+            layout.user
+        );
         return Ok(());
     }
 

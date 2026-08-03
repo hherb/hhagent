@@ -185,17 +185,27 @@ pub enum SupervisorError {
 /// unit, and reloads. `status` is read-only and never errors when the
 /// service is missing — it returns [`ServiceStatus::NotInstalled`].
 ///
-/// # Install implies auto-start at boot
+/// # Install implies auto-start
 ///
 /// Every backend must leave an installed service **armed to start itself
-/// after a reboot**, independently of whether it is running now. The two
-/// backends reach that guarantee differently — launchd declaratively via
-/// the unconditional `RunAtLoad=true` in the plist, systemd imperatively
-/// via `systemctl --user enable` — but the observable contract is the
-/// same, and `uninstall` must undo it. Honouring this on one OS only is a
+/// when the user's service manager next comes up**, independently of
+/// whether it is running now. The two backends reach that guarantee
+/// differently — launchd declaratively via the unconditional
+/// `RunAtLoad=true` in the plist, systemd imperatively via `systemctl
+/// --user enable` — but the observable contract is the same, and
+/// `uninstall` must undo it. Honouring this on one OS only is a
 /// cross-platform-parity break, which is precisely what
 /// [#508](https://github.com/hherb/kastellan/issues/508) was: kastellan
 /// came back on macOS and silently did not on Linux.
+///
+/// **What this contract does not cover:** getting that manager up on a host
+/// nobody logs into. Arming the unit is the backend's job; starting the
+/// per-user manager is the host's, and *neither* platform gets it for free
+/// — Linux needs `loginctl enable-linger` (the installer runs it; see
+/// `kastellan-core`'s `install::run`), and macOS needs a logged-in GUI
+/// session, because launchd loads `~/Library/LaunchAgents/` at login
+/// rather than at boot. So "survives a reboot" is this contract *plus* a
+/// host-level arrangement, and `install` can honour only the first half.
 pub trait Supervisor {
     fn install(&self, spec: &ServiceSpec) -> Result<(), SupervisorError>;
     fn start(&self, name: &str) -> Result<(), SupervisorError>;

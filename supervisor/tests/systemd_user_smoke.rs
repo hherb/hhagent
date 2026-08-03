@@ -39,16 +39,30 @@ fn skip_if_no_user_manager() -> bool {
 
 /// Generate a unique, easily-greppable service name for this run.
 ///
-/// The `kastellan-supervisor-test-` prefix lets a maintainer find and
-/// remove leftovers from a crashed test with a single `find` command.
-///
-/// The `AtomicU64` is load-bearing: every test here shares a pid and a
+/// The `AtomicU64` is load-bearing: every test here shares a pid *and* a
 /// prefix, so a bare `pid + nanos` suffix leaves the clock as the only
-/// discriminator, and two tests running in parallel can read the same
-/// tick and then race on one `<name>.service.tmp` — whoever renames
-/// second gets `ENOENT`. The counter makes uniqueness deterministic
-/// rather than clock-granularity-dependent (cf. `TestRoot` in
+/// discriminator and two parallel tests can read the same tick. The
+/// symptom that first exposed it was a race on one `<name>.service.tmp`;
+/// that staging path is now unique per writer (`systemd_user::tmp_path_for`),
+/// but two tests sharing a *unit name* would still collide on the live
+/// manager — enabling, uninstalling and disabling each other's unit. The
+/// counter makes uniqueness deterministic rather than
+/// clock-granularity-dependent (cf. `TestRoot` in
 /// `src/systemd_user/tests.rs`; issue #104 tracks the pattern elsewhere).
+///
+/// **Cleaning up after a crashed run.** `TestUnitGuard`'s Drop covers a
+/// panic but not a SIGKILL, and since #508 `install` also *enables* the
+/// unit — so a hard-killed run can strand a symlink in the operator's real
+/// `default.target.wants/`, which the user manager then fails to start on
+/// every login (a stray unit file alone was merely inert). Both live under
+/// `~/.config/systemd/user`, and `target_smoke.rs` uses its own
+/// `kastellan-test-` prefix, so a sweep needs both patterns:
+///
+/// ```sh
+/// find ~/.config/systemd/user \
+///   \( -name 'kastellan-supervisor-test-*' -o -name 'kastellan-test-*' \) -delete
+/// systemctl --user daemon-reload
+/// ```
 fn unique_service_name() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
