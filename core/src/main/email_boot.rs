@@ -78,13 +78,7 @@ const AUDIT_REASON_CAP_CHARS: usize = 256;
 /// A no-op for anything at or under the cap, which covers every value the
 /// worker emits today.
 fn cap_reason(reason: &str) -> String {
-    if reason.chars().count() <= AUDIT_REASON_CAP_CHARS {
-        reason.to_string()
-    } else {
-        let mut capped: String = reason.chars().take(AUDIT_REASON_CAP_CHARS).collect();
-        capped.push_str("...(truncated)");
-        capped
-    }
+    kastellan_core::channel::audit_text::cap_chars(reason, AUDIT_REASON_CAP_CHARS)
 }
 
 /// Build the [`AckOnlyAudit`] closure `spawn_email_worker` invokes for every
@@ -245,42 +239,5 @@ pub(crate) async fn spawn_email_channel(
             log_channel_disabled(&e.context("PgCompletedTasks::connect (LISTEN/NOTIFY) failed"));
             None
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cap_reason_passes_short_input_through_unchanged() {
-        assert_eq!(cap_reason("no usable From address"), "no usable From address");
-    }
-
-    #[test]
-    fn cap_reason_passes_input_at_exactly_the_cap_through_unchanged() {
-        let at_cap = "a".repeat(AUDIT_REASON_CAP_CHARS);
-        assert_eq!(cap_reason(&at_cap), at_cap);
-    }
-
-    #[test]
-    fn cap_reason_truncates_an_oversized_upstream_error_body() {
-        // Simulates `describe_email_error`'s `localmail {status}: {body}` shape
-        // with a body well past its own 200-char worker-side cap — this sink
-        // must not rely on that cap holding.
-        let huge = format!("localmail 500: {}", "x".repeat(5_000));
-        let capped = cap_reason(&huge);
-        assert!(capped.chars().count() <= AUDIT_REASON_CAP_CHARS + "...(truncated)".len());
-        assert!(capped.ends_with("...(truncated)"), "{capped}");
-        assert!(huge.len() > capped.len(), "must actually shrink an oversized reason");
-    }
-
-    #[test]
-    fn cap_reason_truncates_on_a_char_boundary_not_mid_utf8_codepoint() {
-        // Multi-byte chars (e.g. from a non-ASCII upstream error message)
-        // straddling the cap must not panic or produce an invalid `String`.
-        let multibyte = "€".repeat(AUDIT_REASON_CAP_CHARS + 10);
-        let capped = cap_reason(&multibyte); // would panic on a mid-codepoint byte slice
-        assert!(capped.starts_with('€'));
     }
 }

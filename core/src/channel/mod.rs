@@ -18,7 +18,9 @@
 //! async pump over the [`Channel`] transport seam + the DB seams, so the whole
 //! inbound→enqueue→complete→reply loop is testable with fakes (no network, no PG).
 
+pub mod audit_text;
 pub mod auth;
+pub mod boot_supervisor;
 pub mod bus;
 pub mod email;
 pub mod ingest;
