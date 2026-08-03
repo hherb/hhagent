@@ -235,8 +235,13 @@ fn install_target_writes_target_unit_and_members_into_units_dir() {
 }
 
 // ---------- atomic-write staging (#509 review) ----------
+//
+// The staging contract itself (unique-per-writer names, cleanup on the
+// error paths, `.target` not collapsing onto `.service`) lives with the
+// shared helper in `crate::atomic_write` and runs on both hosts. What is
+// left here is the wiring: that `install` actually publishes through it.
 
-/// Count files in `dir` whose name marks them as an in-flight atomic write.
+/// Names in `dir` that mark an in-flight atomic write.
 fn staging_files(dir: &Path) -> Vec<String> {
     fs::read_dir(dir)
         .expect("read units dir")
@@ -247,39 +252,7 @@ fn staging_files(dir: &Path) -> Vec<String> {
 }
 
 #[test]
-fn tmp_path_keeps_the_whole_unit_name_including_a_target_suffix() {
-    // The former `with_extension("service.tmp")` REPLACED the final
-    // `.`-component, so `kastellan.target` staged through
-    // `kastellan.service.tmp` — the very path a like-named `.service`
-    // would have used. The staging name must preserve the destination's
-    // own suffix, or two different units share one staging path.
-    let svc = tmp_path_for(Path::new("/units/kastellan.service")).expect("tmp for service");
-    let tgt = tmp_path_for(Path::new("/units/kastellan.target")).expect("tmp for target");
-    let svc_name = svc.file_name().unwrap().to_string_lossy().into_owned();
-    let tgt_name = tgt.file_name().unwrap().to_string_lossy().into_owned();
-
-    assert!(svc_name.starts_with("kastellan.service.tmp."), "{svc_name}");
-    assert!(tgt_name.starts_with("kastellan.target.tmp."), "{tgt_name}");
-    assert_ne!(svc, tgt);
-    // Both stay in the destination's directory: the rename must not cross
-    // a filesystem boundary, or it stops being atomic.
-    assert_eq!(svc.parent(), Some(Path::new("/units")));
-    assert_eq!(tgt.parent(), Some(Path::new("/units")));
-}
-
-#[test]
-fn tmp_path_is_unique_per_call_for_one_destination() {
-    // The staging path must be a function of the WRITER, not of the
-    // destination — otherwise two concurrent writers of one unit race on
-    // a single tmp file and the loser's rename fails ENOENT.
-    let p = Path::new("/units/kastellan.service");
-    let a = tmp_path_for(p).expect("first");
-    let b = tmp_path_for(p).expect("second");
-    assert_ne!(a, b, "two writers of one unit must not share a staging path");
-}
-
-#[test]
-fn successful_install_leaves_no_staging_file_behind() {
+fn install_publishes_the_unit_and_leaves_no_staging_file_behind() {
     let dir = TestRoot::new("staging-clean");
     let sup = SystemdUser::with_units_dir(dir.path().to_path_buf());
     sup.install(&minimal_spec("kastellan-test")).expect("install");
@@ -293,24 +266,23 @@ fn successful_install_leaves_no_staging_file_behind() {
 }
 
 #[test]
-fn failed_write_removes_its_staging_file() {
-    // Cleanup on the error path is not optional now that staging names are
-    // unique: a deterministic name meant a retry overwrote the previous
-    // attempt's leftover, whereas a unique one would accumulate a file per
-    // failed write. Force the failure at the rename by parking a
-    // *directory* where the unit file belongs — rename(2) refuses to
-    // replace a directory with a file.
-    let dir = TestRoot::new("staging-failed");
-    fs::create_dir_all(dir.path().join("kastellan-test.service")).expect("blocking dir");
+fn install_target_publishes_the_target_unit_without_staging_leftovers() {
+    // `install_target` writes N member units and then the `.target`
+    // through the same helper; the `.target` is the path that used to be
+    // staged as `<name>.service.tmp`.
+    let dir = TestRoot::new("staging-target");
     let sup = SystemdUser::with_units_dir(dir.path().to_path_buf());
+    let target = TargetSpec {
+        name: "kastellan-test".into(),
+        members: vec!["kastellan-test-member".into()],
+    };
+    sup.install_target(&target, &[minimal_spec("kastellan-test-member")]).expect("install_target");
 
-    let err = sup
-        .install(&minimal_spec("kastellan-test"))
-        .expect_err("rename over a directory must fail");
-    assert!(matches!(err, SupervisorError::Io(_)), "{err}");
+    assert!(dir.path().join("kastellan-test.target").exists());
+    assert!(dir.path().join("kastellan-test-member.service").exists());
     assert!(
         staging_files(dir.path()).is_empty(),
-        "failed write left its staging file behind: {:?}",
+        "staging files left after install_target: {:?}",
         staging_files(dir.path())
     );
 }

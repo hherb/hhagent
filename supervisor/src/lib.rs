@@ -21,6 +21,14 @@ pub mod systemd_user;
 #[cfg(target_os = "macos")]
 pub mod launchd_agents;
 
+/// Staging + rename used by both backends to publish a generated file.
+/// Gated to the two platforms that have a backend, so it is never dead
+/// code on the `NotYetImplemented` fallback — and deliberately *not*
+/// gated per backend, so one implementation serves both and its tests
+/// run on both hosts.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod atomic_write;
+
 pub mod specs;
 
 /// Cross-platform helper to run a child process under a wall-clock

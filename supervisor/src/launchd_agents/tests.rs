@@ -228,6 +228,12 @@ fn install_errors_when_environment_file_missing() {
 }
 
 // ---------- atomic-write staging (#509 review) ----------
+//
+// The staging contract itself (unique-per-writer names, cleanup on the
+// error paths, the `.tmp.<pid>.<n>` suffix staying AFTER `.plist` so the
+// staging file is not itself a loadable agent) lives with the shared
+// helper in `crate::atomic_write` and runs on both hosts. What is left
+// here is the wiring: that `install` actually publishes through it.
 
 /// Names in `dir` that mark an in-flight atomic write.
 fn staging_files(dir: &Path) -> Vec<String> {
@@ -240,51 +246,15 @@ fn staging_files(dir: &Path) -> Vec<String> {
 }
 
 #[test]
-fn tmp_path_is_unique_per_call_and_keeps_the_plist_suffix_first() {
-    // Mirrors `systemd_user::tests`: the staging path must be a function of
-    // the WRITER, not the destination, or two concurrent writers of one
-    // agent race on a single tmp file. The `.tmp.<pid>.<n>` part stays
-    // AFTER `.plist` so the staging file is not itself a loadable agent.
-    let p = Path::new("/agents/com.example.svc.plist");
-    let a = tmp_path_for(p).expect("first");
-    let b = tmp_path_for(p).expect("second");
-    assert_ne!(a, b, "two writers of one agent must not share a staging path");
-
-    let name = a.file_name().unwrap().to_string_lossy().into_owned();
-    assert!(name.starts_with("com.example.svc.plist.tmp."), "{name}");
-    assert!(!name.ends_with(".plist"), "staging file must not look loadable: {name}");
-    assert_eq!(a.parent(), Some(Path::new("/agents")));
-}
-
-#[test]
-fn successful_install_leaves_no_staging_file_behind() {
+fn install_publishes_the_plist_and_leaves_no_staging_file_behind() {
     let dir = TestRoot::new("staging-clean");
     let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
     sup.install(&minimal_spec("svc")).expect("install");
 
+    assert!(sup.plist_path("svc").exists());
     assert!(
         staging_files(dir.path()).is_empty(),
         "staging files left after a successful write: {:?}",
-        staging_files(dir.path())
-    );
-}
-
-#[test]
-fn failed_write_removes_its_staging_file() {
-    // Force the rename to fail by parking a directory where the plist
-    // belongs, then assert the staging file was cleaned up rather than
-    // accumulating one per failed attempt.
-    let dir = TestRoot::new("staging-failed");
-    let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
-    fs::create_dir_all(sup.plist_path("svc")).expect("blocking dir");
-
-    let err = sup
-        .install(&minimal_spec("svc"))
-        .expect_err("rename over a directory must fail");
-    assert!(matches!(err, SupervisorError::Io(_)), "{err}");
-    assert!(
-        staging_files(dir.path()).is_empty(),
-        "failed write left its staging file behind: {:?}",
         staging_files(dir.path())
     );
 }
