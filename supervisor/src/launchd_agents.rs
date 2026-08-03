@@ -67,7 +67,7 @@
 //!
 //! | Public API | Linux (`systemctl --user`)         | macOS (`launchctl`)                                  |
 //! | ---------- | ---------------------------------- | ---------------------------------------------------- |
-//! | `install`  | write unit + `daemon-reload`       | write plist (no launchctl)                           |
+//! | `install`  | write unit + `daemon-reload` + `enable` | write plist (no launchctl)                      |
 //! | `start`    | `start <name>.service`             | `bootstrap gui/<uid> <plist-path>` (load + run)      |
 //! | `stop`     | `stop <name>.service`              | `bootout gui/<uid>/<label>` (unload + stop)          |
 //! | `uninstall`| best-effort stop/disable + remove  | best-effort `bootout` + remove plist                 |
@@ -79,6 +79,14 @@
 //! both, so a `stop` followed by a `start` re-runs the program from
 //! the persisted plist on disk. This is consistent with the Linux
 //! semantic of "stop preserves the unit file, start re-activates it".
+//!
+//! `RunAtLoad=true` is also what satisfies the [`crate::Supervisor`]
+//! "install implies auto-start at boot" contract here: launchd loads
+//! every plist in `~/Library/LaunchAgents/` at login, and runs those
+//! that ask for it. The systemd backend needs an explicit
+//! `systemctl --user enable` for the same guarantee — it had none until
+//! [#508](https://github.com/hherb/kastellan/issues/508), so macOS
+//! survived a reboot and Linux did not.
 //!
 //! ### No native ordering — readiness-based bundles
 //!

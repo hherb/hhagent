@@ -2,8 +2,24 @@
 //!
 //! Generates a `<name>.service` unit file from a [`crate::ServiceSpec`],
 //! writes it to `~/.config/systemd/user/`, and drives `systemctl --user`
-//! for the lifecycle (`daemon-reload`, `start`, `stop`, `disable`, plus
-//! `is-active` for status queries).
+//! for the lifecycle (`daemon-reload`, `enable`, `start`, `stop`,
+//! `disable`, plus `is-active` for status queries).
+//!
+//! ### Surviving a reboot (#508)
+//!
+//! Writing a unit file only makes the unit *known*. At boot the per-user
+//! manager starts `default.target` and pulls in whatever is linked below
+//! it, so [`Supervisor::install`] and [`Supervisor::install_target`] also
+//! run `systemctl --user enable`, creating that link from the unit's
+//! `[Install] WantedBy=` directive. Without it a rebooted host comes up
+//! with nothing running, and `loginctl enable-linger` does not help —
+//! lingering starts the user *manager*, not units that nothing wants.
+//!
+//! This is the Linux half of a cross-platform contract: the launchd
+//! backend gets the same guarantee declaratively, from the unconditional
+//! `RunAtLoad=true` in every generated plist. Both are established at
+//! *install* time, so a service is armed for the next boot as soon as it
+//! is installed, whether or not it is started now.
 //!
 //! Why user-level only:
 //!   - `systemctl --user` does not need root and runs against the
@@ -103,6 +119,26 @@ impl SystemdUser {
     fn daemon_reload(&self) -> Result<(), SupervisorError> {
         run_systemctl_user(&["daemon-reload"]).map(|_| ())
     }
+
+    /// Run `systemctl --user enable <unit>`, linking it into the target
+    /// named by its `[Install] WantedBy=` directive.
+    ///
+    /// `unit` must carry its suffix (`foo.service`, `kastellan.target`).
+    ///
+    /// **This is what makes the unit come back after a reboot** (#508).
+    /// Writing the unit file only makes it *known* to the user manager;
+    /// at boot the manager starts `default.target`, and pulls in solely
+    /// what is linked below it. Without this call nothing is linked, so
+    /// a rebooted host runs nothing — and `loginctl enable-linger` does
+    /// not help, because lingering starts the user *manager*, not units
+    /// that nothing wants.
+    ///
+    /// Errors are propagated rather than swallowed: a silent failure
+    /// here reproduces exactly the bug this call exists to fix, and the
+    /// operator would not learn about it until the next reboot.
+    fn enable(&self, unit: &str) -> Result<(), SupervisorError> {
+        run_systemctl_user(&["enable", unit]).map(|_| ())
+    }
 }
 
 impl Default for SystemdUser {
@@ -114,12 +150,18 @@ impl Default for SystemdUser {
 impl Supervisor for SystemdUser {
     fn install(&self, spec: &ServiceSpec) -> Result<(), SupervisorError> {
         self.write_unit_file(spec)?;
-        // Only run daemon-reload when we're writing into the real
-        // user units dir — pointless otherwise (the live manager
-        // doesn't scan custom dirs anyway), and it lets unit tests
-        // run without a live --user manager.
+        // Only talk to the live manager when we're writing into the real
+        // user units dir — pointless otherwise (it doesn't scan custom
+        // dirs anyway), and it lets unit tests run without a live --user
+        // manager.
         if self.is_default_units_dir() {
+            // Reload first so the manager can see the file we just wrote;
+            // `enable` reads its `[Install]` section.
             self.daemon_reload()?;
+            // Then link it under `[Install] WantedBy=` so it starts itself
+            // after a reboot — the launchd backend gets this for free from
+            // its unconditional `RunAtLoad=true`, and Linux must ask (#508).
+            self.enable(&format!("{}.service", spec.name))?;
         }
         Ok(())
     }
@@ -222,6 +264,12 @@ impl Supervisor for SystemdUser {
         write_atomic(&path, build_target_unit(target).as_bytes())?;
         if self.is_default_units_dir() {
             self.daemon_reload()?;
+            // Enable the *target* only. It is the boot entry point — the
+            // unit carrying `WantedBy=default.target` — and its own
+            // `Wants=<member>.service` line pulls every member in whenever
+            // it starts. Enabling the members as well would add a second
+            // link expressing the same edge, so we don't (#508).
+            self.enable(&format!("{}.target", target.name))?;
         }
         Ok(())
     }
@@ -249,6 +297,12 @@ impl Supervisor for SystemdUser {
         // Stop the target (propagates to members via PartOf=), then
         // remove every member unit and the target unit file.
         let _ = run_systemctl_user(&["stop", &format!("{}.target", target.name)]);
+        // Undo `install_target`'s enable while the unit file is still on
+        // disk — `disable` resolves the `[Install]` section to know which
+        // links to drop, so removing the file first would strand the
+        // `default.target.wants/` symlink. Best-effort, mirroring
+        // `uninstall`: the target may never have been enabled.
+        let _ = run_systemctl_user(&["disable", &format!("{}.target", target.name)]);
         for name in target.members.iter().rev() {
             // Best-effort: keep tearing down remaining members even if one
             // member's uninstall errors (e.g. its unit file is already gone).

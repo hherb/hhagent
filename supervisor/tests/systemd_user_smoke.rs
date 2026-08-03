@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kastellan_supervisor::systemd_user::{probe, SystemdUser};
@@ -40,12 +41,27 @@ fn skip_if_no_user_manager() -> bool {
 ///
 /// The `kastellan-supervisor-test-` prefix lets a maintainer find and
 /// remove leftovers from a crashed test with a single `find` command.
+///
+/// The `AtomicU64` is load-bearing: every test here shares a pid and a
+/// prefix, so a bare `pid + nanos` suffix leaves the clock as the only
+/// discriminator, and two tests running in parallel can read the same
+/// tick and then race on one `<name>.service.tmp` — whoever renames
+/// second gets `ENOENT`. The counter makes uniqueness deterministic
+/// rather than clock-granularity-dependent (cf. `TestRoot` in
+/// `src/systemd_user/tests.rs`; issue #104 tracks the pattern elsewhere).
 fn unique_service_name() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("kastellan-supervisor-test-{}-{}", std::process::id(), nanos)
+    format!(
+        "kastellan-supervisor-test-{}-{}-{}",
+        std::process::id(),
+        nanos,
+        n
+    )
 }
 
 /// RAII guard that ensures we always uninstall the test unit, even
@@ -165,6 +181,95 @@ fn install_start_status_stop_uninstall_round_trip() {
     assert!(
         !stdout.contains(&name),
         "systemctl still lists the unit after uninstall:\n{stdout}"
+    );
+}
+
+/// Ask the live user manager whether `unit` is enabled.
+///
+/// `systemctl --user is-enabled` prints the canonical state on stdout
+/// (`enabled` / `disabled` / `static` / …) and uses the exit code to
+/// signal it as well. We trust stdout and ignore the exit code, exactly
+/// as [`SystemdUser::status`] does for `is-active` — a unit that has been
+/// removed prints nothing and exits non-zero, which trims to the empty
+/// string and is therefore distinguishable from `"enabled"`.
+fn is_enabled_state(unit: &str) -> String {
+    let out = Command::new("systemctl")
+        .args(["--user", "is-enabled", unit])
+        .output()
+        .expect("spawn systemctl is-enabled");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn install_enables_the_unit_so_it_comes_back_after_a_reboot() {
+    // Regression test for #508. Installing a unit is not enough to make
+    // it start again after a reboot: the user manager starts
+    // `default.target`, and only units linked into `default.target.wants/`
+    // by `systemctl --user enable` are pulled in. Without the enable, a
+    // rebooted Linux host comes up with kastellan simply not running —
+    // while macOS comes back, because `RunAtLoad=true` in the plist is
+    // unconditional. This test pins the parity.
+    if skip_if_no_user_manager() {
+        return;
+    }
+    let sup = SystemdUser::new();
+    let name = unique_service_name();
+    let _guard = TestUnitGuard {
+        sup: SystemdUser::new(),
+        name: name.clone(),
+    };
+
+    let spec = ServiceSpec {
+        name: name.clone(),
+        program: PathBuf::from("/usr/bin/sleep"),
+        args: vec!["30".into()],
+        env: vec![],
+        working_dir: None,
+        keep_alive: false,
+        stdout_log: None,
+        stderr_log: None,
+        after: vec![],
+        part_of: None,
+        restart_backoff: None,
+        environment_file: None,
+    };
+
+    sup.install(&spec).expect("install");
+
+    let unit = format!("{name}.service");
+    assert_eq!(
+        is_enabled_state(&unit),
+        "enabled",
+        "install must enable the unit, or it will not start after a reboot"
+    );
+
+    // The enable must be what the generated `[Install] WantedBy=` asks
+    // for: a standalone service (`part_of: None`) is wanted by
+    // `default.target`, so that is where the symlink belongs. Asserting
+    // the link itself — not just systemctl's summary word — is what
+    // actually proves the boot path is wired.
+    let wants_link = sup
+        .units_dir()
+        .join("default.target.wants")
+        .join(format!("{name}.service"));
+    assert!(
+        wants_link.exists(),
+        "expected a default.target.wants symlink at {}",
+        wants_link.display()
+    );
+
+    // Symmetry: uninstall must leave nothing behind. `uninstall` already
+    // ran a best-effort `disable`, so the link must be gone with the unit.
+    sup.uninstall(&name).expect("uninstall");
+    assert_ne!(
+        is_enabled_state(&unit),
+        "enabled",
+        "uninstall must leave the unit disabled"
+    );
+    assert!(
+        !wants_link.exists(),
+        "uninstall left a dangling symlink at {}",
+        wants_link.display()
     );
 }
 

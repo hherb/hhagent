@@ -143,6 +143,21 @@ pub fn run_install(args: InstallArgs) -> Result<(), String> {
     }
 
     // Linger so --user services persist on a headless box (Linux only).
+    //
+    // Surviving a reboot needs BOTH halves, and neither works alone:
+    //   1. linger, here — starts the per-user systemd manager at boot
+    //      instead of at first login (a headless box has no login);
+    //   2. `systemctl --user enable`, run by `install_target` above —
+    //      links `kastellan.target` under `default.target`, giving that
+    //      manager something to start (#508).
+    // Until (2) existed, this call looked like it delivered reboot
+    // persistence and did not: the manager came up with nothing wanted.
+    //
+    // Note `--no-start` returns before this, so it arms the units for the
+    // next boot (2) without setting linger (1). That is deliberate —
+    // lingering is a host-level change an operator asking for "install but
+    // don't start" has not asked for; on a desktop session it is not needed
+    // at all, since login starts the manager.
     #[cfg(target_os = "linux")]
     {
         let _ = Command::new("loginctl").arg("enable-linger").arg(&layout.user).status();
