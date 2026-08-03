@@ -157,7 +157,6 @@ nothing, so it is unit-testable without threads or sleeps.
 
 ```rust
 record_failure(now) -> Option<Duration>   // Some(downtime) ⇒ log loudly now
-reset()                                   // on success
 ```
 
 Fires the first time downtime passes a threshold, then at most once per repeat
@@ -201,9 +200,10 @@ how many attempts it took.
 TDD, hermetic, no network and no DB:
 
 **`DowntimeEscalator`** (synthetic `Instant`s): below threshold → `None`; first
-crossing fires with the elapsed downtime; a second failure inside the repeat
-interval stays silent; past the repeat interval fires again; `reset()` clears
-the first-failure mark so the next outage starts fresh.
+crossing fires with the elapsed downtime *measured from the first failure*; a
+second failure inside the repeat interval stays silent; past the repeat
+interval it fires again. There is deliberately no `reset()` — the retry loop
+exits on success, so an escalator never outlives the outage it is tracking.
 
 **`ChannelSupervisor`** (scripted `BootOutcome`s, a probe `StartedChannel`, a
 1 ms backoff):
