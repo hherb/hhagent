@@ -1,0 +1,270 @@
+//! Behaviour tests for the bring-up supervisor.
+//!
+//! Hermetic: no network, no database, no sandbox. Every attempt is a scripted
+//! [`BootOutcome`] and the "channel" is a probe that records whether it was
+//! shut down — which is what makes the retry *policy* (the thing #514 is
+//! about) testable at all, independently of anything a channel does.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use super::*;
+
+/// 1 ms base and cap, so the retry loop spins fast enough for a test without
+/// any test waiting on a realistic backoff.
+fn fast_backoff() -> RestartBackoff {
+    RestartBackoff {
+        base: Duration::from_millis(1),
+        factor_num: 1,
+        factor_den: 1,
+        cap: Duration::from_millis(1),
+    }
+}
+
+/// Records every audit event the supervisor emits, in order.
+#[derive(Clone, Default)]
+struct RecordingSink(Arc<Mutex<Vec<BootAudit>>>);
+
+impl RecordingSink {
+    fn sink(&self) -> BootAuditSink {
+        let events = Arc::clone(&self.0);
+        Box::new(move |ev| {
+            events.lock().expect("audit sink mutex").push(ev);
+            Box::pin(async {})
+        })
+    }
+
+    fn events(&self) -> Vec<BootAudit> {
+        self.0.lock().expect("audit sink mutex").clone()
+    }
+
+    /// Poll until at least `n` events have been recorded. Polling rather than
+    /// sleeping a fixed time keeps the test fast when the loop is fast and
+    /// non-flaky when the machine is loaded.
+    async fn wait_for(&self, n: usize) {
+        for _ in 0..500 {
+            if self.events().len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("expected at least {n} audit events, saw {:?}", self.events());
+    }
+
+    /// Poll until a `Started` row appears; returns its attempt count.
+    async fn wait_for_started(&self) -> u32 {
+        for _ in 0..500 {
+            if let Some(BootAudit::Started { attempts }) =
+                self.events().into_iter().find(|e| matches!(e, BootAudit::Started { .. }))
+            {
+                return attempts;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("channel never started; saw {:?}", self.events());
+    }
+}
+
+/// A scripted attempt sequence: each call pops the next outcome. Running past
+/// the end panics the supervisor task, which is deliberate — it is how a test
+/// asserts "the loop stopped" rather than merely "the loop was slow".
+fn scripted(
+    outcomes: Vec<BootOutcome>,
+) -> impl Fn() -> futures::future::BoxFuture<'static, BootOutcome> + Send + 'static {
+    let queue = Arc::new(Mutex::new(VecDeque::from(outcomes)));
+    move || {
+        let next = queue.lock().expect("script mutex").pop_front();
+        Box::pin(async move { next.expect("attempted more times than the script allows") })
+    }
+}
+
+/// The #514 fix itself: two transient failures must not be the end of it.
+#[tokio::test]
+async fn retries_until_the_channel_comes_up() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::clone(&stopped);
+    let sink = RecordingSink::default();
+
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        DowntimeEscalator::default(),
+        Some(sink.sink()),
+        scripted(vec![
+            BootOutcome::Retry(anyhow::anyhow!("sidecar cgroup refused")),
+            BootOutcome::Retry(anyhow::anyhow!("tunnel error: unsuccessful")),
+            BootOutcome::Started(StartedChannel::new(move || {
+                probe.fetch_add(1, Ordering::SeqCst);
+                async {}
+            })),
+        ]),
+    );
+
+    assert_eq!(sink.wait_for_started().await, 3, "two failures then success is three attempts");
+
+    sup.shutdown().await;
+    assert_eq!(
+        stopped.load(Ordering::SeqCst),
+        1,
+        "the running channel must be shut down exactly once"
+    );
+}
+
+/// A statically-dead configuration must stop the loop. The script holds one
+/// outcome, so a second attempt would panic the task and fail the join —
+/// which is what proves it stopped rather than retried.
+#[tokio::test]
+async fn a_fatal_outcome_stops_the_loop() {
+    let sink = RecordingSink::default();
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        DowntimeEscalator::default(),
+        Some(sink.sink()),
+        scripted(vec![BootOutcome::Fatal(anyhow::anyhow!("homeserver is statically dead"))]),
+    );
+
+    sink.wait_for(1).await;
+    sup.shutdown().await;
+
+    let events = sink.events();
+    assert_eq!(events.len(), 1, "a fatal outcome is audited once and never retried: {events:?}");
+    match &events[0] {
+        BootAudit::Failed { fatal, retry_in_ms, cause, .. } => {
+            assert!(*fatal);
+            assert!(retry_in_ms.is_none(), "there is no next attempt to schedule");
+            assert!(cause.contains("statically dead"), "{cause}");
+        }
+        other => panic!("expected a Failed row, got {other:?}"),
+    }
+}
+
+/// An unconfigured channel is the default for most deployments: no retries,
+/// and nothing written anywhere.
+#[tokio::test]
+async fn an_unconfigured_channel_stops_silently() {
+    let sink = RecordingSink::default();
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        DowntimeEscalator::default(),
+        Some(sink.sink()),
+        scripted(vec![BootOutcome::NotConfigured]),
+    );
+
+    sup.shutdown().await;
+    assert!(sink.events().is_empty(), "an absent channel is not an event: {:?}", sink.events());
+}
+
+/// Shutdown must not wait out the backoff delay — with a 60 s production cap,
+/// a daemon stop would otherwise hang for up to a minute per channel.
+#[tokio::test]
+async fn shutdown_while_backing_off_returns_promptly() {
+    let slow = RestartBackoff {
+        base: Duration::from_secs(600),
+        factor_num: 1,
+        factor_den: 1,
+        cap: Duration::from_secs(600),
+    };
+    let sink = RecordingSink::default();
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        slow,
+        DowntimeEscalator::default(),
+        Some(sink.sink()),
+        scripted(vec![BootOutcome::Retry(anyhow::anyhow!("down"))]),
+    );
+
+    // Wait for the failure to be recorded, so we are certainly inside the
+    // 10-minute sleep rather than racing the first attempt.
+    sink.wait_for(1).await;
+    tokio::time::timeout(Duration::from_secs(5), sup.shutdown())
+        .await
+        .expect("shutdown must not wait out the backoff delay");
+}
+
+/// The durable record: one row per failed attempt, numbered, carrying the
+/// delay before the next one, then one row on success.
+#[tokio::test]
+async fn every_failed_attempt_is_audited_with_its_attempt_number() {
+    let sink = RecordingSink::default();
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        DowntimeEscalator::default(),
+        Some(sink.sink()),
+        scripted(vec![
+            BootOutcome::Retry(anyhow::anyhow!("first")),
+            BootOutcome::Retry(anyhow::anyhow!("second")),
+            BootOutcome::Started(StartedChannel::new(|| async {})),
+        ]),
+    );
+
+    sink.wait_for_started().await;
+    sup.shutdown().await;
+
+    let events = sink.events();
+    assert_eq!(events.len(), 3, "{events:?}");
+    match &events[0] {
+        BootAudit::Failed { attempt, fatal, cause, retry_in_ms } => {
+            assert_eq!(*attempt, 1);
+            assert!(!*fatal);
+            assert!(cause.contains("first"), "{cause}");
+            assert!(retry_in_ms.is_some(), "a retryable failure carries its next delay");
+        }
+        other => panic!("expected a Failed row, got {other:?}"),
+    }
+    assert!(matches!(&events[1], BootAudit::Failed { attempt: 2, .. }), "{events:?}");
+    assert!(matches!(&events[2], BootAudit::Started { attempts: 3 }), "{events:?}");
+}
+
+/// A supervisor with no sink runs identically — the audit seam is optional, so
+/// a caller without a pool (or a test) is not forced to invent one.
+///
+/// Also pins the ordering guarantee the loop's `biased` select exists for: a
+/// bring-up that has already completed is never discarded in favour of
+/// shutdown, so `stop` is called even when shutdown lands right behind the
+/// success. Counting *attempts* (rather than watching an audit row) is what
+/// makes that observable with no sink — and it is sound because the loop
+/// consumes the outcome in the same poll that produces it, with no await in
+/// between.
+#[tokio::test]
+async fn a_supervisor_without_an_audit_sink_still_starts_and_stops_the_channel() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::clone(&stopped);
+    let counter = Arc::clone(&attempts);
+
+    let script = scripted(vec![
+        BootOutcome::Retry(anyhow::anyhow!("transient")),
+        BootOutcome::Started(StartedChannel::new(move || {
+            probe.fetch_add(1, Ordering::SeqCst);
+            async {}
+        })),
+    ]);
+
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        DowntimeEscalator::default(),
+        None,
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            script()
+        },
+    );
+
+    // Both scripted outcomes consumed ⇒ the channel is up and parked.
+    for _ in 0..500 {
+        if attempts.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "the loop must have retried once and started");
+
+    sup.shutdown().await;
+    assert_eq!(stopped.load(Ordering::SeqCst), 1, "the channel started and was stopped once");
+}

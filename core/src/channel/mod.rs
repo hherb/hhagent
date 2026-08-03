@@ -168,6 +168,19 @@ pub mod actions {
     /// acks them (`polled_driver::run`) is DB-free by design. See
     /// [`super::polled_driver::AckOnlyAudit`].
     pub const SKIPPED_ACK_ONLY: &str = "channel.skipped_ack_only";
+    /// A channel bus came up. Payload carries the channel and how many
+    /// bring-up attempts it took, so "did it have to retry?" is answerable
+    /// after the fact — `attempts: 1` is the healthy shape (#514).
+    pub const BOOT_STARTED: &str = "channel.started";
+    /// A channel bring-up attempt failed. Payload carries the channel, the
+    /// attempt number, the delay before the next attempt (absent when the
+    /// failure is fatal and there will be none), and the capped cause.
+    ///
+    /// This is the durable record of a deaf window. Before #514 the only
+    /// trace was one `channel not started` line in a daemon log that rotates,
+    /// and the failure was not noticed until someone messaged the bot and got
+    /// silence — 12 hours later, in the case that prompted this.
+    pub const BOOT_FAILED: &str = "channel.boot_failed";
 }
 
 #[cfg(test)]
