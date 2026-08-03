@@ -184,6 +184,18 @@ pub enum SupervisorError {
 /// `start`/`stop` toggle the running state, `uninstall` stops, removes the
 /// unit, and reloads. `status` is read-only and never errors when the
 /// service is missing — it returns [`ServiceStatus::NotInstalled`].
+///
+/// # Install implies auto-start at boot
+///
+/// Every backend must leave an installed service **armed to start itself
+/// after a reboot**, independently of whether it is running now. The two
+/// backends reach that guarantee differently — launchd declaratively via
+/// the unconditional `RunAtLoad=true` in the plist, systemd imperatively
+/// via `systemctl --user enable` — but the observable contract is the
+/// same, and `uninstall` must undo it. Honouring this on one OS only is a
+/// cross-platform-parity break, which is precisely what
+/// [#508](https://github.com/hherb/kastellan/issues/508) was: kastellan
+/// came back on macOS and silently did not on Linux.
 pub trait Supervisor {
     fn install(&self, spec: &ServiceSpec) -> Result<(), SupervisorError>;
     fn start(&self, name: &str) -> Result<(), SupervisorError>;

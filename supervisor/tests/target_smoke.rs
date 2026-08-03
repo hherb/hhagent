@@ -11,16 +11,31 @@
 //! manager is unreachable, mirroring `systemd_user_smoke.rs`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kastellan_supervisor::{ServiceSpec, ServiceStatus, Supervisor, TargetSpec};
 
+/// Generate a unique, easily-greppable service name for this run.
+///
+/// The counter is load-bearing, not decoration. Every test in this binary
+/// shares a pid *and* the same three prefixes, so a bare `pid + nanos`
+/// suffix leaves the clock as the only discriminator — and two tests
+/// running in parallel can read the same tick, produce the same unit
+/// name, and race on one `<name>.service.tmp`: whoever renames second
+/// gets `ENOENT`, surfacing as a bogus `install_target` I/O error in an
+/// unrelated test. The process-wide `AtomicU64` makes uniqueness
+/// deterministic instead of clock-granularity-dependent, mirroring
+/// `TestRoot` in `src/systemd_user/tests.rs` (issue #104 tracks the same
+/// pattern elsewhere in the workspace).
 fn unique(prefix: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{prefix}-{}-{}", std::process::id(), nanos)
+    format!("{prefix}-{}-{}-{}", std::process::id(), nanos, n)
 }
 
 fn dummy_spec(name: &str, target: &str, after: Vec<String>) -> ServiceSpec {
@@ -124,6 +139,93 @@ mod linux {
         sup.uninstall_target(&target).expect("uninstall_target");
         assert_eq!(sup.status(&pg).unwrap(), ServiceStatus::NotInstalled);
         assert_eq!(sup.status(&core).unwrap(), ServiceStatus::NotInstalled);
+    }
+
+    /// Ask the live user manager whether `unit` is enabled. Trusts stdout
+    /// and ignores the exit code (a removed unit prints nothing), mirroring
+    /// `systemd_user_smoke.rs`.
+    fn is_enabled_state(unit: &str) -> String {
+        let out = std::process::Command::new("systemctl")
+            .args(["--user", "is-enabled", unit])
+            .output()
+            .expect("spawn systemctl is-enabled");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn install_target_enables_the_target_so_the_bundle_comes_back_after_a_reboot() {
+        // Regression test for #508 — the leg that actually matters in a real
+        // deployment. `kastellan.target` is the boot entry point: it is what
+        // carries `WantedBy=default.target`, and its `Wants=` line pulls the
+        // members in. If the target is never enabled, a rebooted host runs
+        // nothing, and `loginctl enable-linger` does not help — lingering
+        // starts the user *manager*, but with nothing wanted by
+        // `default.target` there is nothing for it to start.
+        if let Err(e) = probe() {
+            eprintln!("\n[SKIP] systemctl --user probe failed: {e}\n");
+            return;
+        }
+        let sup = SystemdUser::new();
+        let target_name = unique("kastellan-test-target");
+        let pg = unique("kastellan-test-pg");
+        let core = unique("kastellan-test-core");
+        let target = TargetSpec {
+            name: target_name.clone(),
+            members: vec![pg.clone(), core.clone()],
+        };
+        let _guard = Guard {
+            sup: SystemdUser::new(),
+            target: target.clone(),
+        };
+
+        let members = [
+            dummy_spec(&pg, &target_name, vec![]),
+            dummy_spec(&core, &target_name, vec![pg.clone()]),
+        ];
+        sup.install_target(&target, &members).expect("install_target");
+
+        let unit = format!("{target_name}.target");
+        assert_eq!(
+            is_enabled_state(&unit),
+            "enabled",
+            "install_target must enable the target, or the bundle will not \
+             come back after a reboot"
+        );
+        let wants_link = sup
+            .units_dir()
+            .join("default.target.wants")
+            .join(&unit);
+        assert!(
+            wants_link.exists(),
+            "expected a default.target.wants symlink at {}",
+            wants_link.display()
+        );
+
+        // Members are deliberately NOT enabled: the target unit already
+        // carries an explicit `Wants=<member>.service` line, which pulls them
+        // in whenever the target starts. Enabling them as well would add a
+        // second, redundant link expressing the same edge — pinned here so a
+        // later change has to be deliberate rather than accidental.
+        assert_ne!(
+            is_enabled_state(&format!("{core}.service")),
+            "enabled",
+            "members are pulled in by the target's Wants=, not by their own \
+             enable link"
+        );
+
+        // Symmetry: tearing the target down must not leave a dangling
+        // symlink in the user's real `default.target.wants/`.
+        sup.uninstall_target(&target).expect("uninstall_target");
+        assert_ne!(
+            is_enabled_state(&unit),
+            "enabled",
+            "uninstall_target must disable the target"
+        );
+        assert!(
+            !wants_link.exists(),
+            "uninstall_target left a dangling symlink at {}",
+            wants_link.display()
+        );
     }
 }
 
