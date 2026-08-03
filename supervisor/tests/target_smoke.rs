@@ -25,11 +25,12 @@ use kastellan_supervisor::{ServiceSpec, ServiceStatus, Supervisor, TargetSpec};
 /// name. The symptom that exposed it was a race on one
 /// `<name>.service.tmp`, surfacing as a bogus `install_target` I/O error
 /// in an unrelated test; that staging path is now unique per writer
-/// (`systemd_user::tmp_path_for`), but a shared unit name would still
-/// collide on the live manager itself. The process-wide `AtomicU64` makes
-/// uniqueness deterministic instead of clock-granularity-dependent,
-/// mirroring `TestRoot` in `src/systemd_user/tests.rs` (issue #104 tracks
-/// the same pattern elsewhere in the workspace).
+/// (the crate's shared `atomic_write` helper), but a shared unit name
+/// would still collide on the live manager itself. The process-wide
+/// `AtomicU64` makes uniqueness deterministic instead of
+/// clock-granularity-dependent, mirroring `TestRoot` in
+/// `src/systemd_user/tests.rs` (issue #104 tracks the same pattern
+/// elsewhere in the workspace).
 ///
 /// See `systemd_user_smoke.rs` for how to sweep leftovers from a run that
 /// was killed hard enough to skip `Guard`'s Drop — since #508 that can

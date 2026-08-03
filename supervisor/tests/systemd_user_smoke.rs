@@ -43,11 +43,11 @@ fn skip_if_no_user_manager() -> bool {
 /// prefix, so a bare `pid + nanos` suffix leaves the clock as the only
 /// discriminator and two parallel tests can read the same tick. The
 /// symptom that first exposed it was a race on one `<name>.service.tmp`;
-/// that staging path is now unique per writer (`systemd_user::tmp_path_for`),
-/// but two tests sharing a *unit name* would still collide on the live
-/// manager — enabling, uninstalling and disabling each other's unit. The
-/// counter makes uniqueness deterministic rather than
-/// clock-granularity-dependent (cf. `TestRoot` in
+/// that staging path is now unique per writer (the crate's shared
+/// `atomic_write` helper), but two tests sharing a *unit name* would
+/// still collide on the live manager — enabling, uninstalling and
+/// disabling each other's unit. The counter makes uniqueness
+/// deterministic rather than clock-granularity-dependent (cf. `TestRoot` in
 /// `src/systemd_user/tests.rs`; issue #104 tracks the pattern elsewhere).
 ///
 /// **Cleaning up after a crashed run.** `TestUnitGuard`'s Drop covers a
