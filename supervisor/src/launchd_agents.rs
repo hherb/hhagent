@@ -99,11 +99,11 @@
 //! `ServiceSpec.part_of` are therefore **ignored** by `build_plist`.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use crate::atomic_write::write_atomic;
 use crate::bounded_command::{run_capped, CappedOutcome};
 use crate::{ServiceSpec, ServiceStatus, Supervisor, SupervisorError};
 
@@ -414,34 +414,6 @@ pub fn probe() -> Result<(), SupervisorError> {
     Err(SupervisorError::Probe(format!(
         "launchctl print-disabled {domain} failed: {stderr}{hint}"
     )))
-}
-
-/// Atomically write `bytes` to `path` via write-to-tmp + fsync + rename.
-///
-/// launchd reads the plist file once at bootstrap time, but a
-/// concurrent reader (another `launchctl bootstrap` against a stale
-/// path, or `plutil -p` from a debugging maintainer) could otherwise
-/// see a half-written file. Atomic rename keeps the observable state
-/// binary: either the old contents are visible, or the new ones —
-/// never a torn read.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SupervisorError> {
-    let tmp = path.with_extension("plist.tmp");
-    {
-        let mut f = fs::File::create(&tmp)
-            .map_err(|e| SupervisorError::Io(format!("create {}: {e}", tmp.display())))?;
-        f.write_all(bytes)
-            .map_err(|e| SupervisorError::Io(format!("write {}: {e}", tmp.display())))?;
-        f.sync_all()
-            .map_err(|e| SupervisorError::Io(format!("fsync {}: {e}", tmp.display())))?;
-    }
-    fs::rename(&tmp, path).map_err(|e| {
-        SupervisorError::Io(format!(
-            "rename {} -> {}: {e}",
-            tmp.display(),
-            path.display()
-        ))
-    })?;
-    Ok(())
 }
 
 /// Build the `gui/<uid>` domain target string used by `launchctl`.

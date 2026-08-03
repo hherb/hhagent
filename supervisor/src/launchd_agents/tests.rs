@@ -226,3 +226,27 @@ fn install_errors_when_environment_file_missing() {
     let err = sup.install(&spec).expect_err("missing env file");
     assert!(matches!(err, SupervisorError::Io(_)), "{err}");
 }
+
+// ---------- atomic-write staging (#509 review) ----------
+//
+// The staging contract itself (unique-per-writer names, cleanup on the
+// error paths, the `.tmp.<pid>.<n>` suffix staying AFTER `.plist` so the
+// staging file is not itself a loadable agent) lives with the shared
+// helper in `crate::atomic_write` and runs on both hosts. What is left
+// here is the wiring: that `install` publishes through it, leaving the
+// agents dir holding exactly the plist and nothing else — anything else
+// in that directory is something launchd may try to load.
+
+#[test]
+fn install_publishes_the_plist_and_leaves_no_staging_file_behind() {
+    let dir = TestRoot::new("staging-clean");
+    let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
+    sup.install(&minimal_spec("svc")).expect("install");
+
+    let names: Vec<String> = fs::read_dir(dir.path())
+        .expect("read agents dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["svc.plist"]);
+}

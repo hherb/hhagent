@@ -169,9 +169,20 @@ pub fn build_unit_file(spec: &ServiceSpec) -> String {
     out.push_str(&format!("TimeoutStopSec={}\n", DEFAULT_TIMEOUT_STOP_SEC));
     out.push('\n');
 
-    // [Install] section so `systemctl --user enable` works if the caller
-    // ever wants it. We don't enable by default — that's a separate
-    // policy decision.
+    // [Install] section: this is what `systemctl --user enable` resolves to
+    // decide where to drop the symlink, and since #508 the driver enables what
+    // it installs. Which units that covers is worth being precise about:
+    //
+    //   - a standalone service (`install`) and the bundle's `.target`
+    //     (`install_target`) are enabled, so for them this section is
+    //     load-bearing for reboot survival, not an optional courtesy — the
+    //     wrong `WantedBy=` links the unit under the wrong target;
+    //   - a target *member* is never enabled (the target's own `Wants=` pulls
+    //     it in), so its `WantedBy=<target>.target` is currently inert. It is
+    //     emitted anyway so a member stays correct if someone enables it by
+    //     hand, and so the two paths through this function agree.
+    //
+    // See `super::SystemdUser::install` and `install_target`.
     out.push_str("[Install]\n");
     // A target member is wanted by its target; a standalone service is
     // wanted by default.target so `enable` starts it at login.

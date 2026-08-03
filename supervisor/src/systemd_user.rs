@@ -44,10 +44,10 @@
 //! alongside their code in [`builder`].
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::atomic_write::write_atomic;
 use crate::{ServiceSpec, ServiceStatus, Supervisor, SupervisorError, TargetSpec};
 
 mod builder;
@@ -451,33 +451,6 @@ pub fn probe() -> Result<(), SupervisorError> {
         "systemctl --user show-environment failed: {}{hint}",
         stderr.trim()
     )))
-}
-
-/// Atomically write `bytes` to `path` via write-to-tmp + rename.
-///
-/// systemd's daemon-reload reads each unit file in one shot, but a
-/// concurrent reader (e.g. another `systemctl --user` invocation)
-/// could otherwise see a half-written file. Atomic rename keeps the
-/// observable state binary: either the old contents are visible, or
-/// the new ones — never a torn read.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SupervisorError> {
-    let tmp = path.with_extension("service.tmp");
-    {
-        let mut f = fs::File::create(&tmp)
-            .map_err(|e| SupervisorError::Io(format!("create {}: {e}", tmp.display())))?;
-        f.write_all(bytes)
-            .map_err(|e| SupervisorError::Io(format!("write {}: {e}", tmp.display())))?;
-        f.sync_all()
-            .map_err(|e| SupervisorError::Io(format!("fsync {}: {e}", tmp.display())))?;
-    }
-    fs::rename(&tmp, path).map_err(|e| {
-        SupervisorError::Io(format!(
-            "rename {} -> {}: {e}",
-            tmp.display(),
-            path.display()
-        ))
-    })?;
-    Ok(())
 }
 
 /// Run `systemctl --user <args>` with stdio captured. Maps non-zero

@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kastellan_supervisor::default_supervisor;
@@ -139,6 +140,18 @@ pub fn run_install(args: InstallArgs) -> Result<(), String> {
 
     if args.no_start {
         eprintln!("--no-start: units installed but not started. Start with: systemctl --user start kastellan.target");
+        // The units ARE enabled (`install_target` did that, #508), but this
+        // early return skips the linger call below — so on a headless host
+        // the per-user manager still won't be running at boot to act on it.
+        // Say so here: the operator sees this message, not the comment.
+        #[cfg(target_os = "linux")]
+        eprintln!(
+            "--no-start also skips `loginctl enable-linger`: on a headless host \
+             (one nobody logs into) the units are armed but the per-user systemd \
+             manager won't be up at boot to start them. For reboot persistence \
+             run: loginctl enable-linger {}",
+            layout.user
+        );
         return Ok(());
     }
 
@@ -261,16 +274,64 @@ fn service_state(svc: &str) -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// Unique staging path beside `dest`, for a replace-by-rename.
+///
+/// Appends `.tmp-install.<pid>.<n>` to the **whole** file name. The former
+/// `dest.with_extension("tmp-install")` was a pure function of the
+/// destination, so two concurrent `kastellan-cli install` runs picked the
+/// same staging path and the loser's `rename` failed `ENOENT` — the same
+/// hazard `kastellan_supervisor::atomic_write` fixes for unit files, in
+/// the same install flow. (`with_extension` also *replaces* the final
+/// `.`-component, which is harmless for today's extensionless binaries
+/// and wrong in general.)
+///
+/// Not shared with the supervisor's copy: that one publishes bytes, these
+/// callers publish a `fs::copy` and a `symlink`. [#104] tracks
+/// de-duplicating the `pid`-suffix pattern across the workspace.
+///
+/// [#104]: https://github.com/hherb/kastellan/issues/104
+fn staging_path(dest: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    // Both callers pass `<dir>/<name>`, so `file_name()` is always Some;
+    // the fallback keeps this total rather than adding a `Result` for a
+    // case neither caller can produce.
+    let mut name = dest.file_name().unwrap_or(dest.as_os_str()).to_os_string();
+    name.push(format!(
+        ".tmp-install.{}.{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    dest.with_file_name(name)
+}
+
+/// Copy `src` over `dest` atomically, executable-bit set.
+///
+/// Every failure removes the staging file. That is mandatory now that the
+/// staging name is unique: a deterministic name meant the next attempt
+/// overwrote the previous one's leftover, whereas a unique name would
+/// leave one more file per failed install — and these land in the
+/// operator's `~/.local/bin`, where the litter is executable.
 fn copy_exec(src: &Path, dest: &Path) -> Result<(), String> {
-    let tmp = dest.with_extension("tmp-install");
-    fs::copy(src, &tmp).map_err(|e| format!("copy {} -> {}: {e}", src.display(), tmp.display()))?;
+    let tmp = staging_path(dest);
+    let published = stage_exec(src, &tmp).and_then(|()| {
+        fs::rename(&tmp, dest).map_err(|e| format!("rename into {}: {e}", dest.display()))
+    });
+    if published.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    published
+}
+
+/// Copy `src` to the staging path and make it executable. Split out of
+/// [`copy_exec`] so the caller has a single error seam to clean up behind.
+fn stage_exec(src: &Path, tmp: &Path) -> Result<(), String> {
+    fs::copy(src, tmp).map_err(|e| format!("copy {} -> {}: {e}", src.display(), tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+        fs::set_permissions(tmp, fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
     }
-    fs::rename(&tmp, dest).map_err(|e| format!("rename into {}: {e}", dest.display()))?;
     Ok(())
 }
 
@@ -325,13 +386,22 @@ fn symlink_replace(target: &Path, link: &Path) -> Result<(), String> {
     if let Some(parent) = link.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    // symlink() fails if the path exists, so stage a temp link and rename over.
-    let tmp = link.with_extension("tmp-install");
-    let _ = fs::remove_file(&tmp);
-    symlink(target, &tmp)
-        .map_err(|e| format!("symlink {} -> {}: {e}", tmp.display(), target.display()))?;
-    fs::rename(&tmp, link).map_err(|e| format!("rename symlink into {}: {e}", link.display()))?;
-    Ok(())
+    // symlink() fails if the path exists, so stage a temp link and rename
+    // over. The staging path is unique per writer, so — unlike the former
+    // destination-derived name — there is nothing to unlink first: doing so
+    // would delete a *concurrent* writer's staging link. Failures clean up
+    // after themselves for the same reason `copy_exec` does.
+    let tmp = staging_path(link);
+    let published = symlink(target, &tmp)
+        .map_err(|e| format!("symlink {} -> {}: {e}", tmp.display(), target.display()))
+        .and_then(|()| {
+            fs::rename(&tmp, link)
+                .map_err(|e| format!("rename symlink into {}: {e}", link.display()))
+        });
+    if published.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    published
 }
 
 fn run_checked(cmd: &mut Command, label: &str) -> Result<(), String> {
@@ -438,3 +508,6 @@ fn total_system_memory_bytes() -> Option<u64> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests;

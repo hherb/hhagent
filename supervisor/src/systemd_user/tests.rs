@@ -233,3 +233,52 @@ fn install_target_writes_target_unit_and_members_into_units_dir() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------- atomic-write staging (#509 review) ----------
+//
+// The staging contract itself (unique-per-writer names, cleanup on the
+// error paths, `.target` not collapsing onto `.service`) lives with the
+// shared helper in `crate::atomic_write` and runs on both hosts. What is
+// left here is the wiring: that the driver publishes through it, leaving
+// the units dir holding exactly the units and nothing else.
+
+/// Every name in `dir`, sorted — so a leftover staging file fails the
+/// assertion by being present, not by being looked for.
+fn dir_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("read units dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn install_publishes_the_unit_and_leaves_no_staging_file_behind() {
+    let dir = TestRoot::new("staging-clean");
+    let sup = SystemdUser::with_units_dir(dir.path().to_path_buf());
+    sup.install(&minimal_spec("kastellan-test")).expect("install");
+
+    assert_eq!(dir_names(dir.path()), vec!["kastellan-test.service"]);
+}
+
+#[test]
+fn install_target_publishes_the_target_unit_without_staging_leftovers() {
+    // `install_target` writes N member units and then the `.target`
+    // through the same helper; the `.target` is the path that used to be
+    // staged as `<name>.service.tmp`, colliding with a like-named
+    // `.service`.
+    let dir = TestRoot::new("staging-target");
+    let sup = SystemdUser::with_units_dir(dir.path().to_path_buf());
+    let target = TargetSpec {
+        name: "kastellan-test".into(),
+        members: vec!["kastellan-test-member".into()],
+    };
+    sup.install_target(&target, &[minimal_spec("kastellan-test-member")]).expect("install_target");
+
+    assert_eq!(
+        dir_names(dir.path()),
+        vec!["kastellan-test-member.service", "kastellan-test.target"]
+    );
+}
