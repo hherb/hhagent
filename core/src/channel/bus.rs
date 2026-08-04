@@ -14,6 +14,7 @@ use kastellan_db::tasks::{self, Lane};
 
 use super::auth::{AuthDecision, PeerAuthorizer};
 use super::ingest::{screen_and_classify, InboundDecision};
+use super::pump_liveness::DeathBell;
 use super::route::reply_for_completed_task;
 use super::{actions, Channel, ChannelId, IncomingMessage, OutgoingMessage, PeerId};
 
@@ -287,6 +288,10 @@ pub async fn handle_completed(
 /// A running bus. Owns the spawned pump tasks; `shutdown()` aborts them.
 pub struct ChannelBus {
     handles: Vec<JoinHandle<()>>,
+    /// Rung by whichever pump ends first. Read by the channel supervisor
+    /// through [`death_signal`](Self::death_signal) — see [`DeathBell`] for why
+    /// the bus reports its own death rather than being polled for liveness.
+    bell: DeathBell,
 }
 
 impl ChannelBus {
@@ -303,6 +308,12 @@ impl ChannelBus {
     ) -> Self {
         let mut handles = Vec::new();
         let mut senders: HashMap<ChannelId, mpsc::Sender<OutgoingMessage>> = HashMap::new();
+        // Every pump below takes a guard off this bell. Each of them has at
+        // least one terminal exit — a `break`, a `while let` that ends, a panic
+        // — and before #517 all of them were silent: the bus kept looking
+        // healthy while nothing pumped. The guard is held, never called, so no
+        // pump has to remember to report exits it does not know it has.
+        let bell = DeathBell::new();
 
         for mut ch in channels {
             let id = ch.id();
@@ -312,7 +323,9 @@ impl ChannelBus {
             let authorizer = authorizer.clone();
             let pairing = pairing.clone();
             let events = events.clone();
+            let life = bell.guard();
             handles.push(tokio::spawn(async move {
+                let _life = life;
                 loop {
                     tokio::select! {
                         inbound = ch.recv() => match inbound {
@@ -359,14 +372,39 @@ impl ChannelBus {
 
         // Outbound pump: NOTIFY → load → route → push into the per-channel sender.
         let events_out = events.clone();
+        let life = bell.guard();
         handles.push(tokio::spawn(async move {
+            let _life = life;
             while let Some(id) = completed.next_completed().await {
                 handle_completed(&*completed, &*events_out, &senders, id).await;
             }
             info!("outbound pump stopped");
         }));
 
-        Self { handles }
+        Self { handles, bell }
+    }
+
+    /// A future that completes as soon as **any** pump task has ended — by
+    /// returning, by panicking, or by being aborted.
+    ///
+    /// This is what turns "the channel is up" from a one-time observation into
+    /// a supervised claim (#517). Every pump has a terminal exit that nothing
+    /// used to watch: `next_completed` returning `None` (replies stop going
+    /// out), a per-channel task's `break` on a closed `recv` (inbound stops
+    /// coming in), or a panic in either. All three leave the daemon looking
+    /// perfectly healthy — the units are `active`, Postgres is fine, and the
+    /// log is quiet because there is nothing left to log. That is #514's
+    /// signature reached after boot instead of during it, which is why the
+    /// answer is the same one: hand it to the supervisor and let it restart.
+    ///
+    /// Deliberately **not** "which pump died". A dead pump means a degraded
+    /// channel whatever its name, and the recovery — stop the bus, bring the
+    /// channel back up — is identical either way.
+    ///
+    /// `'static`, so the supervisor can hold it across awaits while also owning
+    /// the bus it is about to stop.
+    pub fn death_signal(&self) -> futures::future::BoxFuture<'static, ()> {
+        self.bell.signal()
     }
 
     /// Abort all pump tasks (called on daemon shutdown), then join them so any

@@ -24,13 +24,23 @@ pub const DEFAULT_THRESHOLD: Duration = Duration::from_secs(300);
 /// while the channel is still down.
 pub const DEFAULT_REPEAT: Duration = Duration::from_secs(1800);
 
+/// How long a channel must stay up before its eventual death is treated as a
+/// fresh outage rather than a continuation of the last one (#517).
+///
+/// Deliberately equal to the backoff cap: "stayed up longer than the longest
+/// retry delay" is the same threshold read from either side.
+pub const STABLE_UPTIME: Duration = Duration::from_secs(60);
+
 /// Tracks how long a channel has been failing and answers one question:
-/// should *this* failure be reported loudly?
+/// should *this* failure be reported loudly? — plus, since #517, where the
+/// current outage begins and ends.
 pub struct DowntimeEscalator {
     /// Continuous downtime required before the first escalation.
     threshold: Duration,
     /// Minimum gap between escalations, once the first has fired.
     repeat: Duration,
+    /// How long a channel must stay up for its death to open a *new* outage.
+    stable_uptime: Duration,
     /// When the current outage started. `None` until the first failure.
     first_failure: Option<Instant>,
     /// When the last escalation fired, if any.
@@ -45,9 +55,40 @@ impl Default for DowntimeEscalator {
 
 impl DowntimeEscalator {
     /// Escalate after `threshold` of continuous downtime, then at most once
-    /// per `repeat`.
+    /// per `repeat`. Uses the default [`STABLE_UPTIME`].
     pub fn new(threshold: Duration, repeat: Duration) -> Self {
-        Self { threshold, repeat, first_failure: None, last_escalated: None }
+        Self {
+            threshold,
+            repeat,
+            stable_uptime: STABLE_UPTIME,
+            first_failure: None,
+            last_escalated: None,
+        }
+    }
+
+    /// Override how long counts as "stayed up" (see
+    /// [`ran_long_enough`](Self::ran_long_enough)). Exists so a test can make a
+    /// death stable or flapping without waiting a minute, the same reason
+    /// `threshold` and `repeat` are parameters rather than constants.
+    pub fn with_stable_uptime(mut self, stable_uptime: Duration) -> Self {
+        self.stable_uptime = stable_uptime;
+        self
+    }
+
+    /// Did a channel that has now died run long enough to count as having
+    /// *worked*?
+    ///
+    /// This is the flap guard, and without it supervising liveness would be a
+    /// worse bug than the one it fixes: a channel whose pumps die on startup
+    /// would reset the failure counter on every attempt and restart at full
+    /// speed forever, spawning a sandboxed worker per iteration. Answering
+    /// `false` keeps the death inside the current outage, so the backoff keeps
+    /// growing to its cap and the escalator keeps counting — a flapping channel
+    /// is treated exactly like one that will not come up, which is what it is.
+    ///
+    /// Pure, and owns no clock: the caller measures `ran`.
+    pub fn ran_long_enough(&self, ran: Duration) -> bool {
+        ran >= self.stable_uptime
     }
 
     /// Record a failed bring-up attempt that happened at `now`.
@@ -78,6 +119,23 @@ impl DowntimeEscalator {
         }
         self.last_escalated = Some(now);
         Some(downtime)
+    }
+
+    /// Record that the channel is up again, ending the current outage (#517).
+    ///
+    /// Before liveness supervision this could not happen: bring-up succeeded
+    /// once and the loop ended, so the escalator only ever counted upward.
+    /// Now a channel can come back and later die again, and without this the
+    /// second outage would be timed from the *first* one's opening failure —
+    /// reporting hours of "downtime" the channel actually spent working, which
+    /// is precisely the number an operator would act on.
+    ///
+    /// Clearing `last_escalated` too is what re-arms the first escalation: a
+    /// fresh outage earns a fresh loud line rather than being silenced by a
+    /// repeat interval left over from the previous one.
+    pub fn record_success(&mut self) {
+        self.first_failure = None;
+        self.last_escalated = None;
     }
 }
 
@@ -151,5 +209,98 @@ mod tests {
         let mut esc = DowntimeEscalator::new(Duration::ZERO, REPEAT);
 
         assert_eq!(esc.record_failure(base), Some(Duration::ZERO));
+    }
+
+    /// A channel that ran past the threshold worked, whatever killed it later.
+    #[test]
+    fn an_uptime_past_the_threshold_is_stable() {
+        let esc = DowntimeEscalator::new(THRESHOLD, REPEAT);
+        assert!(esc.ran_long_enough(STABLE_UPTIME + Duration::from_secs(1)));
+        assert!(esc.ran_long_enough(Duration::from_secs(3600)));
+    }
+
+    /// Exactly at the threshold counts as stable — the boundary is inclusive,
+    /// stated here so a later `>` versus `>=` edit is a test failure rather
+    /// than a silent policy change.
+    #[test]
+    fn an_uptime_exactly_at_the_threshold_is_stable() {
+        assert!(DowntimeEscalator::new(THRESHOLD, REPEAT).ran_long_enough(STABLE_UPTIME));
+    }
+
+    /// The flap: up for a moment, then dead again. Treating this as success
+    /// would reset the backoff on every iteration and spin.
+    #[test]
+    fn an_uptime_below_the_threshold_is_a_flap() {
+        let esc = DowntimeEscalator::new(THRESHOLD, REPEAT);
+        assert!(!esc.ran_long_enough(Duration::ZERO));
+        assert!(!esc.ran_long_enough(STABLE_UPTIME - Duration::from_millis(1)));
+    }
+
+    /// The override a test uses to make a death stable (or not) without
+    /// waiting out the real minute.
+    #[test]
+    fn with_stable_uptime_overrides_the_default() {
+        let esc = DowntimeEscalator::new(THRESHOLD, REPEAT).with_stable_uptime(Duration::ZERO);
+        assert!(esc.ran_long_enough(Duration::ZERO), "a zero threshold makes every death stable");
+
+        let esc = DowntimeEscalator::new(THRESHOLD, REPEAT).with_stable_uptime(Duration::MAX);
+        assert!(
+            !esc.ran_long_enough(Duration::from_secs(86_400)),
+            "an unreachable threshold makes every death a flap"
+        );
+    }
+
+    /// The channel came back, so the next outage is a NEW one: its downtime is
+    /// measured from its own first failure, not from the previous outage's.
+    #[test]
+    fn record_success_times_the_next_outage_from_itself() {
+        let base = Instant::now();
+        let mut esc = DowntimeEscalator::new(THRESHOLD, REPEAT);
+
+        esc.record_failure(base);
+        esc.record_success();
+
+        // A failure 1000 s after the ORIGINAL outage opened, but the first of
+        // this one: well inside the threshold, so still quiet.
+        assert_eq!(esc.record_failure(base + Duration::from_secs(1000)), None);
+        // And it escalates on ITS own schedule — threshold past 1000, not past 0.
+        assert_eq!(
+            esc.record_failure(base + Duration::from_secs(1301)),
+            Some(Duration::from_secs(301))
+        );
+    }
+
+    /// Recovery also re-arms the loud line. Without clearing `last_escalated`,
+    /// a channel that had already escalated, recovered, and gone down again
+    /// would stay silent through the new outage until the old repeat interval
+    /// happened to elapse — quietest exactly when something is clearly wrong.
+    #[test]
+    fn record_success_re_arms_the_first_escalation() {
+        let base = Instant::now();
+        let mut esc = DowntimeEscalator::new(THRESHOLD, REPEAT);
+
+        esc.record_failure(base);
+        assert!(esc.record_failure(base + Duration::from_secs(301)).is_some());
+        esc.record_success();
+
+        // New outage, 100 s later; it must escalate after ITS threshold even
+        // though the repeat interval since the last escalation has not elapsed.
+        esc.record_failure(base + Duration::from_secs(401));
+        assert_eq!(
+            esc.record_failure(base + Duration::from_secs(702)),
+            Some(Duration::from_secs(301))
+        );
+    }
+
+    /// Recovery with no outage in progress is a no-op, not a panic — the
+    /// supervisor calls it on every successful start, including the first.
+    #[test]
+    fn record_success_on_a_healthy_escalator_is_harmless() {
+        let base = Instant::now();
+        let mut esc = DowntimeEscalator::new(THRESHOLD, REPEAT);
+
+        esc.record_success();
+
+        assert_eq!(esc.record_failure(base), None);
     }
 }

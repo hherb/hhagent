@@ -27,6 +27,7 @@ pub mod ingest;
 pub mod matrix;
 pub mod pairing;
 pub mod polled_driver;
+pub mod pump_liveness;
 pub mod respawn_alarm;
 pub mod route;
 
@@ -181,6 +182,15 @@ pub mod actions {
     /// and the failure was not noticed until someone messaged the bot and got
     /// silence — 12 hours later, in the case that prompted this.
     pub const BOOT_FAILED: &str = "channel.boot_failed";
+    /// A channel that had come up stopped working on its own and is being
+    /// restarted (#517). Payload carries the channel, how long it ran
+    /// (`ran_ms`) and the delay before the restart attempt.
+    ///
+    /// Separate from [`BOOT_FAILED`] on purpose: that row means the channel
+    /// never came up, this one means it did and then went deaf — a pump ended,
+    /// which until #517 was permanent and produced no row at all. `ran_ms` is
+    /// what tells a sustained outage apart from a flapping channel.
+    pub const CHANNEL_DIED: &str = "channel.died";
 }
 
 #[cfg(test)]

@@ -46,6 +46,14 @@ pub fn pg_boot_audit_sink(pool: PgPool, channel: &str) -> BootAuditSink {
                         "cause": cause,
                     }),
                 ),
+                BootAudit::Died { ran_ms, retry_in_ms } => (
+                    actions::CHANNEL_DIED,
+                    serde_json::json!({
+                        "channel": channel,
+                        "ran_ms": ran_ms,
+                        "retry_in_ms": retry_in_ms,
+                    }),
+                ),
             };
             if let Err(e) = kastellan_db::audit::insert(&pool, "channel", action, payload).await {
                 warn!(error = %e, action, "channel bring-up audit insert failed (non-fatal)");

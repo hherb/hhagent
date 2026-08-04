@@ -165,7 +165,9 @@ fn classify_spawn_error(e: anyhow::Error) -> BootOutcome {
     BootOutcome::Retry(e.context("the email worker failed to start"))
 }
 
-/// One email bring-up attempt: read the config, spawn the sandboxed worker
+/// One email bring-up attempt: read the config, open the LISTEN/NOTIFY
+/// connection (cheap and outage-sensitive, so it goes first — #517), spawn the
+/// sandboxed worker
 /// (force-routed through a real 1:1 **intercepting** sidecar whenever
 /// `force_routing` is `Some` — the `Some`/`None` branching mirrors
 /// `matrix_boot::attempt`'s `MatrixEgress` wiring exactly, but the TLS posture
@@ -219,6 +221,22 @@ async fn attempt(
         routing: Arc::clone(fr),
     });
 
+    // LISTEN/NOTIFY first, BEFORE the worker (#517) — same reasoning as
+    // `matrix_boot::attempt`: a channel is now restarted when its pumps die,
+    // the reachable cause of that is a sustained Postgres outage, and this is
+    // the step such an outage fails. Spawning a sandboxed worker (and its
+    // sidecar) first would mean building and tearing down the expensive half on
+    // every retry of an outage the cheap half could have detected immediately.
+    let completed = match kastellan_core::channel::bus::PgCompletedTasks::connect(pool.clone()).await
+    {
+        Ok(completed) => completed,
+        Err(e) => {
+            return BootOutcome::Retry(
+                e.context("email: PgCompletedTasks::connect (LISTEN/NOTIFY) failed"),
+            )
+        }
+    };
+
     let audit_ack_only =
         Some(email_skipped_audit_sink(pool.clone(), tokio::runtime::Handle::current()));
 
@@ -237,18 +255,13 @@ async fn attempt(
     let authorizer = Arc::new(kastellan_core::channel::auth::DbPeerAuthorizer::new(pool.clone()));
     let pairing = Arc::new(kastellan_core::channel::pairing::DbPairingService::new(pool.clone()));
     let events = Arc::new(kastellan_core::channel::bus::PgChannelEvents::new(pool.clone()));
-    match kastellan_core::channel::bus::PgCompletedTasks::connect(pool.clone()).await {
-        Ok(completed) => BootOutcome::Started(StartedChannel::from_bus(ChannelBus::spawn(
-            vec![Box::new(spawned.channel)],
-            authorizer,
-            Some(pairing),
-            events,
-            Box::new(completed),
-        ))),
-        Err(e) => {
-            BootOutcome::Retry(e.context("email: PgCompletedTasks::connect (LISTEN/NOTIFY) failed"))
-        }
-    }
+    BootOutcome::Started(StartedChannel::from_bus(ChannelBus::spawn(
+        vec![Box::new(spawned.channel)],
+        authorizer,
+        Some(pairing),
+        events,
+        Box::new(completed),
+    )))
 }
 
 /// Supervise the email channel: retry [`attempt`] with capped backoff until it

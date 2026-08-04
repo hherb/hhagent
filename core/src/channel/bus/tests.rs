@@ -402,3 +402,99 @@ async fn evidence_bearing_unpaired_peer_never_reaches_the_pairing_carve_out() {
     assert!(actions.iter().any(|(a, _)| a == actions::REJECTED_UNPAIRED),
             "still audited as rejected_unpaired: no active pairing, not a bad-evidence case");
 }
+
+// ---------------------------------------------------------------------------
+// Pump liveness (#517): a pump that ENDS must be audible, because the
+// supervisor above the bus otherwise parks forever on a channel that has gone
+// deaf — every unit `active`, Postgres healthy, and the log silent.
+// ---------------------------------------------------------------------------
+
+/// A completed-task stream that has ENDED — the shape `PgCompletedTasks` takes
+/// when `PgListener::recv()` errors (a *failed reconnect*, since sqlx already
+/// reconnects transparently; i.e. a sustained Postgres outage).
+struct EndedCompleted;
+#[async_trait::async_trait]
+impl CompletedTasks for EndedCompleted {
+    async fn next_completed(&mut self) -> Option<i64> {
+        None
+    }
+    async fn load(&self, _id: i64) -> anyhow::Result<Option<(Value, Option<Value>)>> {
+        Ok(None)
+    }
+}
+
+/// The healthy steady state: a live LISTEN with nothing completing yet. Parks
+/// rather than ending, so the outbound pump stays alive the way a real one does
+/// between tasks.
+struct ParkingCompleted;
+#[async_trait::async_trait]
+impl CompletedTasks for ParkingCompleted {
+    async fn next_completed(&mut self) -> Option<i64> {
+        std::future::pending().await
+    }
+    async fn load(&self, _id: i64) -> anyhow::Result<Option<(Value, Option<Value>)>> {
+        Ok(None)
+    }
+}
+
+/// Build a bus over one parked channel plus the given completion source, and
+/// hand back the bus and the inbound sender (kept alive by the caller — dropping
+/// it is how a test kills the *inbound* pump).
+fn bus_over(
+    completed: Box<dyn CompletedTasks>,
+) -> (ChannelBus, mpsc::Sender<IncomingMessage>) {
+    let (inbound_tx, inbound_rx) = mpsc::channel::<IncomingMessage>(1);
+    let channel = RefusingChannel { id: ChannelId("email".into()), inbound_rx };
+    let bus = ChannelBus::spawn(
+        vec![Box::new(channel)],
+        Arc::new(StaticPairings::new()),
+        None,
+        Arc::new(FakeEvents::default()),
+        completed,
+    );
+    (bus, inbound_tx)
+}
+
+/// Issue #517, exit 1: the outbound pump returns, so replies stop going out for
+/// the life of the process. The bus must say so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_outbound_pump_fires_the_death_signal() {
+    let (bus, _inbound_tx) = bus_over(Box::new(EndedCompleted));
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), bus.death_signal())
+        .await
+        .expect("an ended outbound pump must fire the death signal");
+
+    bus.shutdown().await;
+}
+
+/// Issue #517, exit 2: the per-channel task breaks when `recv()` yields `None`
+/// (its driver thread has exited), so inbound is dead. Same signal — the
+/// supervisor does not care *which* pump stopped, only that one did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_inbound_fires_the_death_signal() {
+    let (bus, inbound_tx) = bus_over(Box::new(ParkingCompleted));
+
+    // Closing the transport is what makes `recv()` return `None`.
+    drop(inbound_tx);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), bus.death_signal())
+        .await
+        .expect("a closed inbound must fire the death signal");
+
+    bus.shutdown().await;
+}
+
+/// The other half, and the one that would make this feature a *worse* bug than
+/// the one it fixes: a bus whose pumps are all running must stay quiet, or the
+/// supervisor tears a healthy channel down and rebuilds it in a loop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_healthy_bus_does_not_signal_death() {
+    let (bus, _inbound_tx) = bus_over(Box::new(ParkingCompleted));
+
+    let waited =
+        tokio::time::timeout(std::time::Duration::from_millis(200), bus.death_signal()).await;
+
+    assert!(waited.is_err(), "no pump ended, so the bus must not report a death");
+    bus.shutdown().await;
+}

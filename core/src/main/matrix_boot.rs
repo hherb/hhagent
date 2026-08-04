@@ -60,12 +60,16 @@ fn classify_homeserver(homeserver_url: &str, forced: bool) -> Option<BootOutcome
         .map(|detail| BootOutcome::Fatal(anyhow::anyhow!("{detail}")))
 }
 
-/// One Matrix bring-up attempt: spawn the sandboxed live worker (which
-/// restores its persisted session — the one-time initial login is done
-/// separately with `kastellan-cli matrix probe`), then run a [`ChannelBus`]
-/// over the DB-backed pairing/authorizer + the tasks-queue event/completion
-/// seams. Authorization is fail-closed at the bus: only DB-paired peers'
-/// messages are enqueued.
+/// One Matrix bring-up attempt: open the LISTEN/NOTIFY connection, spawn the
+/// sandboxed live worker (which restores its persisted session — the one-time
+/// initial login is done separately with `kastellan-cli matrix probe`), then
+/// run a [`ChannelBus`] over the DB-backed pairing/authorizer + the tasks-queue
+/// event/completion seams. Authorization is fail-closed at the bus: only
+/// DB-paired peers' messages are enqueued.
+///
+/// The **cheap, outage-sensitive step goes first** (#517) — see the comment at
+/// that call for why the order is load-bearing now that a channel is restarted
+/// whenever its pumps die.
 ///
 /// Every failure is classified, never swallowed:
 ///
@@ -132,6 +136,25 @@ async fn attempt(
         routing: Arc::clone(fr),
     });
 
+    // LISTEN/NOTIFY first, BEFORE the worker (#517). Since a channel is now
+    // restarted whenever its pumps die, and the reachable cause of that is a
+    // sustained Postgres outage (sqlx reconnects transparently, so an `Err`
+    // from the listener means the *reconnect* failed), this attempt runs
+    // repeatedly during exactly the outage that makes this step fail. In the
+    // other order every one of those retries would spawn a sandboxed worker,
+    // sit through a login and an initial sync, and only then fail on the cheap
+    // step and tear it all down again. Costs one pool connection held across
+    // the login, which the 60 s timeout already bounds.
+    let completed = match kastellan_core::channel::bus::PgCompletedTasks::connect(pool.clone()).await
+    {
+        Ok(completed) => completed,
+        Err(e) => {
+            return BootOutcome::Retry(
+                e.context("matrix: PgCompletedTasks::connect (LISTEN/NOTIFY) failed"),
+            )
+        }
+    };
+
     // The worker's login is blocking (matrix.init waits for the SDK's login +
     // first sync), so run it on a blocking thread under a bounded timeout: it
     // doesn't block an async worker thread, and an unreachable homeserver
@@ -166,18 +189,13 @@ async fn attempt(
     let authorizer = Arc::new(kastellan_core::channel::auth::DbPeerAuthorizer::new(pool.clone()));
     let pairing = Arc::new(kastellan_core::channel::pairing::DbPairingService::new(pool.clone()));
     let events = Arc::new(kastellan_core::channel::bus::PgChannelEvents::new(pool.clone()));
-    match kastellan_core::channel::bus::PgCompletedTasks::connect(pool.clone()).await {
-        Ok(completed) => BootOutcome::Started(StartedChannel::from_bus(ChannelBus::spawn(
-            vec![Box::new(worker.channel)],
-            authorizer,
-            Some(pairing),
-            events,
-            Box::new(completed),
-        ))),
-        Err(e) => {
-            BootOutcome::Retry(e.context("matrix: PgCompletedTasks::connect (LISTEN/NOTIFY) failed"))
-        }
-    }
+    BootOutcome::Started(StartedChannel::from_bus(ChannelBus::spawn(
+        vec![Box::new(worker.channel)],
+        authorizer,
+        Some(pairing),
+        events,
+        Box::new(completed),
+    )))
 }
 
 /// Supervise the Matrix channel: retry [`attempt`] with capped backoff until
