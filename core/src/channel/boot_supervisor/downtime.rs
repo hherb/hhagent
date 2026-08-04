@@ -121,7 +121,15 @@ impl DowntimeEscalator {
         Some(downtime)
     }
 
-    /// Record that the channel is up again, ending the current outage (#517).
+    /// Record that the channel had been working, ending the current outage
+    /// (#517).
+    ///
+    /// Called when a channel that stayed up past [`ran_long_enough`](Self::ran_long_enough)
+    /// dies — **not** when one starts. That looks backwards and is not: a start
+    /// proves nothing (a flapping channel starts every time round the loop, and
+    /// resetting there would silence the escalator exactly when it is needed),
+    /// whereas an uptime the caller has already measured is evidence. The death
+    /// is simply the first moment that evidence exists.
     ///
     /// Before liveness supervision this could not happen: bring-up succeeded
     /// once and the loop ended, so the escalator only ever counted upward.
@@ -293,7 +301,8 @@ mod tests {
     }
 
     /// Recovery with no outage in progress is a no-op, not a panic — the
-    /// supervisor calls it on every successful start, including the first.
+    /// supervisor calls it on the death of every channel that had been working,
+    /// including the first, when there may have been no outage at all.
     #[test]
     fn record_success_on_a_healthy_escalator_is_harmless() {
         let base = Instant::now();

@@ -101,7 +101,6 @@ pub const AUDIT_CAUSE_CAP_CHARS: usize = 256;
 /// particular drift unrepresentable.
 pub const CHANNEL_DISABLED_LOG_PHRASE: &str = "CHANNEL DISABLED";
 
-
 /// A supervised channel bring-up: the retry loop, plus the handle that stops
 /// both it and whatever it started.
 pub struct ChannelSupervisor {
@@ -263,25 +262,26 @@ async fn run<F, Fut>(
                 // and the `attempts` figure in the next `Started` row, so the
                 // two arms below have to say different things:
                 //
-                //   * A channel that STAYED UP and then died ends the outage.
-                //     Its death is not a failed attempt — it is what opens the
-                //     next outage — so the counter resets and is NOT bumped,
-                //     and the restart is attempt 1 at the base delay. Counting
-                //     it would make a clean first-try recovery read, in
-                //     `audit_log`, exactly like one that needed a retry.
+                //   * A channel that STAYED UP and then died ends the outage —
+                //     its death is not a failed attempt — so the counter resets
+                //     and is NOT bumped, and the restart is attempt 1 at the
+                //     base delay. Counting it would make a clean first-try
+                //     recovery read, in `audit_log`, exactly like one that
+                //     needed a retry. Whether it *opens* the next outage is a
+                //     separate question, and the answer is no: see
+                //     [`Outage::Ends`].
                 //   * A channel that died on arrival is flapping: it never
                 //     became healthy, so the death belongs to the outage
                 //     already in progress and must be counted. Otherwise the
                 //     backoff resets on every iteration and the supervisor
                 //     spins, spawning a sandboxed worker each time round.
-                let delay = if escalator.ran_long_enough(ran) {
+                let (delay, outage) = if escalator.ran_long_enough(ran) {
                     failures = 0;
-                    escalator.record_success();
-                    backoff.next_delay(failures)
+                    (backoff.next_delay(failures), Outage::Ends)
                 } else {
                     let delay = backoff.next_delay(failures);
                     failures += 1;
-                    delay
+                    (delay, Outage::Continues)
                 };
                 let ran_ms = ran.as_millis() as u64;
                 let retry_in_ms = delay.as_millis() as u64;
@@ -292,12 +292,11 @@ async fn run<F, Fut>(
                     "channel stopped working after running; restarting it"
                 );
                 emit(&audit, BootAudit::Died { ran_ms, retry_in_ms }).await;
-                // The outage clock starts HERE, at the death — that is when
-                // messages stopped being received, which is the number an
-                // operator acts on. `max(1)` because a stable death reset the
-                // counter without bumping it, and it is still the first
-                // restart-worthy event of the outage it just opened.
-                escalate_if_due(&mut escalator, &label, failures.max(1));
+                // `failures` is the figure to report: the flapping arm has just
+                // bumped it, and the stable arm cannot escalate at all
+                // ([`Outage::Ends`] never yields a downtime), so the zero it
+                // passes is never rendered.
+                escalate_if_due(&mut escalator, &label, outage, failures);
                 if !wait_or_shutdown(delay, &mut shutdown).await {
                     return;
                 }
@@ -344,7 +343,7 @@ async fn run<F, Fut>(
                     },
                 )
                 .await;
-                escalate_if_due(&mut escalator, &label, failures);
+                escalate_if_due(&mut escalator, &label, Outage::Continues, failures);
                 if !wait_or_shutdown(delay, &mut shutdown).await {
                     return;
                 }
@@ -353,15 +352,52 @@ async fn run<F, Fut>(
     }
 }
 
-/// Emit the loud line if this failure has earned one.
+/// How one restart-worthy event relates to the outage the escalator is timing.
 ///
-/// Shared by the two arms that can fail — a bring-up that will not succeed and
-/// a channel that keeps dying — because from an operator's side they are the
-/// same event: the channel has been unusable for this long and is not fixing
-/// itself. Splitting the escalation policy across two call sites is how the
-/// two drift.
-fn escalate_if_due(escalator: &mut DowntimeEscalator, label: &str, attempts: u32) {
-    if let Some(down) = escalator.record_failure(Instant::now()) {
+/// The distinction exists because a death is not always a *failure*: a channel
+/// that had been working for hours and then stopped has just ended a period of
+/// health, whereas a failed bring-up (or the death of a channel that never got
+/// going) extends an outage already in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outage {
+    /// A bring-up attempt failed, or a channel died without ever having stayed
+    /// up long enough to count as having worked. Extends the outage in
+    /// progress, opening one dated from now if there was none.
+    Continues,
+    /// A channel that HAD been working stopped. Ends the outage the escalator
+    /// was timing — and, deliberately, does **not** open the next one.
+    ///
+    /// Opening it here reads more precise, because the outage really does begin
+    /// at the death. But nothing would ever close it: the escalator is only
+    /// told about health when a *stable* channel dies, so a channel that came
+    /// straight back and then worked for four hours would still be carrying
+    /// this instant when it next flapped — and would report those four healthy
+    /// hours as downtime, in the one line whose text asserts that nothing sent
+    /// to the channel has been received for that long. The next outage is
+    /// therefore opened by the first restart attempt that actually fails, which
+    /// is the only version that stays correct when the restart SUCCEEDS. The
+    /// price is that a real outage is dated one backoff delay late (1 s for the
+    /// first restart, 60 s at the cap); the price of the eager version is
+    /// unbounded.
+    Ends,
+}
+
+/// Fold one restart-worthy event into the outage bookkeeping, and emit the loud
+/// line if it has earned one.
+///
+/// The **only** place either half of [`DowntimeEscalator`]'s outage state is
+/// driven from. Shared by the two arms that can fail — a bring-up that will not
+/// succeed and a channel that keeps dying — because from an operator's side
+/// they are the same event: the channel has been unusable for this long and is
+/// not fixing itself. Splitting the escalation policy across two call sites is
+/// how the two drift.
+fn escalate_if_due(
+    escalator: &mut DowntimeEscalator,
+    label: &str,
+    outage: Outage,
+    attempts: u32,
+) {
+    if let Some(down) = note_outage(escalator, outage, Instant::now()) {
         error!(
             channel = %label,
             down_secs = down.as_secs(),
@@ -370,6 +406,30 @@ fn escalate_if_due(escalator: &mut DowntimeEscalator, label: &str, attempts: u32
              and it is still not staying up. The daemon is otherwise healthy; the cause is on \
              the preceding attempts' `error` field."
         );
+    }
+}
+
+/// The pure half of [`escalate_if_due`]: update the outage bookkeeping for one
+/// event and answer "does this one earn the loud line?".
+///
+/// Split from the logging so the sequence that has no other test seam — a
+/// channel that died, came back, worked for hours, and then flapped — can be
+/// exercised without a runtime, a channel or a log capture. Escalation is a log
+/// line and nothing else, so without this it is unobservable to a test.
+fn note_outage(
+    escalator: &mut DowntimeEscalator,
+    outage: Outage,
+    now: Instant,
+) -> Option<std::time::Duration> {
+    match outage {
+        // Ends the outage and opens nothing — see [`Outage::Ends`] for why the
+        // next one has to wait for a restart that actually fails. `now` is
+        // deliberately unused on this arm.
+        Outage::Ends => {
+            escalator.record_success();
+            None
+        }
+        Outage::Continues => escalator.record_failure(now),
     }
 }
 
