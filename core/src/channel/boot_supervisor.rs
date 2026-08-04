@@ -358,7 +358,7 @@ async fn run<F, Fut>(
 /// that had been working for hours and then stopped has just ended a period of
 /// health, whereas a failed bring-up (or the death of a channel that never got
 /// going) extends an outage already in progress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum Outage {
     /// A bring-up attempt failed, or a channel died without ever having stayed
     /// up long enough to count as having worked. Extends the outage in
@@ -391,12 +391,7 @@ enum Outage {
 /// they are the same event: the channel has been unusable for this long and is
 /// not fixing itself. Splitting the escalation policy across two call sites is
 /// how the two drift.
-fn escalate_if_due(
-    escalator: &mut DowntimeEscalator,
-    label: &str,
-    outage: Outage,
-    attempts: u32,
-) {
+fn escalate_if_due(escalator: &mut DowntimeEscalator, label: &str, outage: Outage, attempts: u32) {
     if let Some(down) = note_outage(escalator, outage, Instant::now()) {
         error!(
             channel = %label,
