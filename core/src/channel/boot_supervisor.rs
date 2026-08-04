@@ -180,8 +180,11 @@ async fn run<F, Fut>(
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = BootOutcome> + Send + 'static,
 {
-    // Failed attempts so far. Doubles as the `RestartBackoff` exponent, so the
-    // first retry waits `base` rather than `base * factor`.
+    // Restart-worthy events since the channel was last healthy: failed
+    // bring-up attempts, plus (since #517) the deaths of channels that never
+    // stayed up long enough to count as having worked. Doubles as the
+    // `RestartBackoff` exponent, so the first retry waits `base` rather than
+    // `base * factor`, and as the `attempts` figure in the next `Started` row.
     let mut failures: u32 = 0;
 
     loop {
