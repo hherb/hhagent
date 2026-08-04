@@ -61,6 +61,7 @@ pub mod embedding;
 pub mod egress_forcing;
 pub mod env;
 pub mod guards;
+pub mod installable;
 pub mod microvm;
 pub mod mock_localmail;
 pub mod pg;

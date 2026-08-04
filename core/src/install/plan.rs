@@ -352,14 +352,30 @@ pub fn required_binaries() -> &'static [&'static str] {
 
 /// On-demand workers: copied when present in the build dir, skipped (with
 /// a log line) when not — their absence only disables that one tool.
+///
+/// **This list is load-bearing for deployability.** The daemon discovers a
+/// worker as a `current_exe()`-relative sibling, so a binary missing here is
+/// never copied into `bin_dir` and its tool is silently absent from the
+/// registry — one `ERROR` line at startup, and otherwise a completely healthy
+/// install. The list lagged the workspace by five workers before issue #504
+/// caught it; `tests-common::installable` now fails the build when a new
+/// `workers/*` binary is neither listed here nor explicitly exempted.
 pub fn optional_binaries() -> &'static [&'static str] {
     &[
         "kastellan-worker-shell-exec",
         "kastellan-worker-web-fetch",
         "kastellan-worker-web-search",
+        "kastellan-worker-web-research",
         "kastellan-worker-python-exec",
         "kastellan-worker-matrix",
+        "kastellan-worker-mail",
+        "kastellan-worker-email-in",
         "kastellan-worker-lockdown-exec",
+        // The two trusted sidecars. Not tools themselves: a worker reaches
+        // them over a UDS the sandbox binds in, and both are resolved by the
+        // same exe-relative discovery as everything above.
+        "kastellan-worker-embed-broker",
+        "kastellan-worker-search-broker",
     ]
 }
 
