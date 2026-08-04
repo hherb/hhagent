@@ -203,6 +203,15 @@ are gated by whatever #518 lands.
 Log line: `warn!` with `ran_ms` + `retry_in_ms`. Not `error!` — the supervisor is
 handling it, and the escalator already owns "this is not resolving by itself".
 
+**One limitation, stated rather than glossed:** the sink writes through the same
+pool whose loss causes the death. So a channel that dies because Postgres went
+away writes **no** `channel.died` row, and none of the `boot_failed` rows for
+the retries that follow, until Postgres is back. For that case the daemon log is
+the record. The rows remain durable evidence for every death Postgres survives
+(a panicking pump, a closed inbound transport) and for the bring-up failures
+#514 was about — which is why they are still worth writing, but not why anyone
+should rely on them to detect a database outage.
+
 ### 7. Cheap step first in `attempt` (both boot modules)
 
 `attempt` currently spawns and logs in the worker **first** and connects

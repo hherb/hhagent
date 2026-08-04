@@ -12,6 +12,20 @@
 //! A failure to *write* the row is logged and swallowed. An unavailable
 //! Postgres must not stop the supervisor from retrying the channel — that
 //! would trade the bug for a worse one.
+//!
+//! **Which means these rows are missing in exactly one important case, and it
+//! is worth being precise rather than reassuring about it (#517):** the
+//! reachable cause of a *pump death* is a sustained Postgres outage — sqlx
+//! reconnects transparently, so the listener only gives up when the reconnect
+//! itself keeps failing. The sink needs the same pool. So a channel that dies
+//! because Postgres went away writes **no** [`BootAudit::Died`] row and no
+//! `boot_failed` rows for the retries that follow; they appear only once
+//! Postgres is back, from that point on. The durable record of *that* outage is
+//! the daemon log (`~/.local/state/kastellan/*.out`), not `audit_log`.
+//!
+//! The rows remain the durable record for every death Postgres survives — a
+//! panicking pump, an inbound transport that closed — and for the bring-up
+//! failures #514 was about, which is why they are still worth writing.
 
 use futures::future::BoxFuture;
 use sqlx::PgPool;
