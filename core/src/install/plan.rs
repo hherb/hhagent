@@ -358,8 +358,9 @@ pub fn required_binaries() -> &'static [&'static str] {
 /// never copied into `bin_dir` and its tool is silently absent from the
 /// registry — one `ERROR` line at startup, and otherwise a completely healthy
 /// install. The list lagged the workspace by five workers before issue #504
-/// caught it; `tests-common::installable` now fails the build when a new
-/// `workers/*` binary is neither listed here nor explicitly exempted.
+/// caught it; `tests-common::installable` now fails the build when **any**
+/// binary the workspace declares is neither listed here nor explicitly
+/// exempted — so adding a worker crate forces the question to be answered.
 pub fn optional_binaries() -> &'static [&'static str] {
     &[
         "kastellan-worker-shell-exec",
