@@ -350,17 +350,35 @@ pub fn required_binaries() -> &'static [&'static str] {
     ]
 }
 
-/// On-demand workers: copied when present in the build dir, skipped (with
-/// a log line) when not — their absence only disables that one tool.
+/// On-demand binaries: copied when present in the build dir, skipped (with
+/// a log line) when not.
 ///
 /// **This list is load-bearing for deployability.** The daemon discovers a
 /// worker as a `current_exe()`-relative sibling, so a binary missing here is
-/// never copied into `bin_dir` and its tool is silently absent from the
-/// registry — one `ERROR` line at startup, and otherwise a completely healthy
-/// install. The list lagged the workspace by five workers before issue #504
-/// caught it; `tests-common::installable` now fails the build when **any**
-/// binary the workspace declares is neither listed here nor explicitly
-/// exempted — so adding a worker crate forces the question to be answered.
+/// never copied into `bin_dir` and the capability it backs is silently
+/// absent — an otherwise completely healthy install, every unit `active`.
+/// How loudly the absence shows up differs by entry kind:
+///
+///   * **Tool workers** (everything but the two brokers) are resolved
+///     unconditionally while the registry is assembled, so a missing binary
+///     costs exactly one startup `ERROR` naming the tool
+///     (`worker misconfigured; skipping`), and disables only that tool.
+///   * **The trusted sidecars** (`embed-broker`, `search-broker`) are not
+///     tools and are not resolved this way. `broker::config::from_env`
+///     treats "binary absent" as the legitimate never-opted-in state and
+///     logs **nothing** at any level, so their absence is entirely silent
+///     until an operator opts a worker into broker mode — at which point
+///     `assemble_registry` refuses the *consuming* worker by name (#459),
+///     with the spawn chokepoint fail-closed behind it.
+///     One sidecar can back several tools: `search-broker` serves both
+///     `web-search` (`KASTELLAN_WEB_SEARCH_USE_BROKER`) and `web-research`
+///     (`KASTELLAN_WEB_RESEARCH_USE_SEARCH_BROKER`), so a single missing
+///     binary can refuse more than one tool.
+///
+/// The list lagged the workspace by five workers before issue #504 caught
+/// it; `tests-common::installable` now fails the build when **any** binary
+/// the workspace declares is neither listed here nor explicitly exempted —
+/// so adding a worker crate forces the question to be answered.
 pub fn optional_binaries() -> &'static [&'static str] {
     &[
         "kastellan-worker-shell-exec",

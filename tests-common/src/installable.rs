@@ -30,8 +30,8 @@
 //! # What this guard asserts
 //!
 //! One structural property, in the same spirit as [`crate::provisioning`]:
-//! **every `[[bin]]` any workspace member declares is accounted for** —
-//! present in `required_binaries()`, in `optional_binaries()`, or in
+//! **every binary any workspace member builds is accounted for** — present
+//! in `required_binaries()`, in `optional_binaries()`, or in
 //! [`tests::NOT_INSTALLED`] with a written reason.
 //!
 //! Deliberately the whole workspace, not just `workers/*`. The invariant
@@ -46,6 +46,37 @@
 //! guard only insists the call is made **consciously**, in code, rather than
 //! by forgetting a list exists. Adding a worker crate now fails this test
 //! until its author writes down one of three answers.
+//!
+//! # "Every binary" means all three of Cargo's discovery modes
+//!
+//! A crate can produce a binary three ways, and a guard that understood only
+//! some of them would go quietly blind on the rest — reproducing #504
+//! through a door it was not watching:
+//!
+//!   * an explicit `[[bin]]` section, named by its `name` key (a crate may
+//!     declare several, as `prelude` does);
+//!   * `src/main.rs` — the package-named default binary;
+//!   * **auto-discovery** (`autobins`, on by default): any `src/bin/*.rs` or
+//!     `src/bin/*/main.rs`, named after the file stem or directory.
+//!
+//! The third is why [`tests::declared_bin_names`] takes candidates gathered
+//! from the filesystem rather than a single `has_src_main` flag. Explicit
+//! sections and auto-discovery overlap — every binary in this workspace is
+//! *currently* declared explicitly, and `prelude` declares names that differ
+//! from its file stems — so candidates are suppressed by claimed **path**
+//! first and name second, the way Cargo merges them. Get that wrong in the
+//! other direction and the guard invents binaries that do not exist.
+//!
+//! # Why a real TOML parser
+//!
+//! An earlier draft hand-rolled a line scanner to avoid a dev-dep. That was
+//! the wrong trade twice over: `toml` is already a workspace pin `core`
+//! depends on, so there was no new dependency to avoid; and this guard's
+//! failure mode is a silent **false pass**, which is precisely what a line
+//! scanner delivers — a commented-out `# "workers/retired",` parses as a
+//! live member, exactly the shape of the #479 bug where a `contains()` check
+//! was satisfied by a `# shellcheck source=` comment instead of the real
+//! line. The parser is the guard's eyes; it does not get to be approximate.
 //!
 //! # Why here, and not in `core`'s own unit tests
 //!
@@ -112,105 +143,154 @@ mod tests {
             .to_path_buf()
     }
 
+    /// Parse a manifest, failing loudly. `who` names the crate in the panic:
+    /// a guard that cannot read a manifest must say which one.
+    fn parse(manifest: &str, who: &str) -> toml::Table {
+        manifest
+            .parse::<toml::Table>()
+            .unwrap_or_else(|e| panic!("parse {who} manifest: {e}"))
+    }
+
     /// Workspace member paths, in declaration order.
-    ///
-    /// A deliberately small hand-rolled scan rather than a `toml` dependency:
-    /// it reads one array of string literals out of the root manifest, and
-    /// pulling a parser into the dev-dep graph to do that would cost more
-    /// than it explains. Comments and trailing commas are tolerated; anything
-    /// else about the manifest is ignored.
     fn workspace_members(root_manifest: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut inside = false;
-        for line in root_manifest.lines() {
-            let t = line.trim();
-            if !inside {
-                // `members = [` — the array may open on the same line.
-                if t.starts_with("members") && t.contains('[') {
-                    inside = true;
-                }
-                continue;
-            }
-            if t.starts_with(']') {
-                break;
-            }
-            if let Some(name) = quoted_value(t) {
-                out.push(name);
-            }
-        }
-        out
-    }
-
-    /// The first double-quoted run in `line`, if any. Used for both member
-    /// paths and `name = "…"` values.
-    fn quoted_value(line: &str) -> Option<String> {
-        let rest = line.split_once('"')?.1;
-        let (val, _) = rest.split_once('"')?;
-        Some(val.to_string())
-    }
-
-    /// Binary names a crate produces, from its manifest text plus whether it
-    /// has a `src/main.rs`.
-    ///
-    /// Two shapes, because both occur in this workspace and a guard that
-    /// understood only one would go quietly blind on the other:
-    ///
-    ///   * explicit `[[bin]]` sections — one binary per section, named by its
-    ///     `name = "…"` key (a crate may declare several, as `prelude` does);
-    ///   * no `[[bin]]` at all but a `src/main.rs` — Cargo's default binary,
-    ///     named after the package.
-    ///
-    /// Pure: the caller does the filesystem work and passes the answers in,
-    /// so the parsing is unit-testable against literals.
-    fn declared_bin_names(manifest: &str, package_name: &str, has_src_main: bool) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut in_bin_section = false;
-        for line in manifest.lines() {
-            let t = line.trim();
-            if t.starts_with("[[bin]]") {
-                in_bin_section = true;
-                continue;
-            }
-            // Any other section header closes the one we were in. `[[bin]]`
-            // itself is caught above, so this cannot swallow a sibling.
-            if t.starts_with('[') {
-                in_bin_section = false;
-                continue;
-            }
-            if in_bin_section && t.starts_with("name") {
-                if let Some(n) = quoted_value(t) {
-                    out.push(n);
-                    // Only the first `name` in a section names the binary;
-                    // stay in the section so a stray key cannot re-trigger.
-                    in_bin_section = false;
-                }
-            }
-        }
-        if out.is_empty() && has_src_main {
-            out.push(package_name.to_string());
-        }
-        out
+        let doc = parse(root_manifest, "workspace root");
+        let members = doc
+            .get("workspace")
+            .and_then(|w| w.get("members"))
+            .and_then(|m| m.as_array())
+            .expect("root manifest has [workspace] members = [...]");
+        members
+            .iter()
+            .map(|m| {
+                m.as_str()
+                    .expect("workspace member entries are strings")
+                    .to_string()
+            })
+            .collect()
     }
 
     /// The `package.name` of a manifest.
+    fn package_name(manifest: &str, who: &str) -> Option<String> {
+        parse(manifest, who)
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .map(str::to_string)
+    }
+
+    /// Manifest-relative target paths, compared the way Cargo resolves them:
+    /// separator-normalised and without a leading `./`.
+    fn normalize_path(p: &str) -> String {
+        p.replace('\\', "/")
+            .trim_start_matches("./")
+            .to_string()
+    }
+
+    /// `(binary name, manifest-relative path)` for every target Cargo would
+    /// **auto-discover** in `dir`, sorted for determinism.
     ///
-    /// Scoped to the `[package]` section rather than "the first `name` key",
-    /// because a dependency named `name-something` sitting above `[[bin]]`
-    /// would otherwise be returned as the package name — a guard that reads
-    /// the wrong name reports a binary that does not exist.
-    fn package_name(manifest: &str) -> Option<String> {
-        let mut in_package = false;
-        for line in manifest.lines() {
-            let t = line.trim();
-            if t.starts_with('[') {
-                in_package = t.starts_with("[package]");
-                continue;
+    /// The filesystem half of the three discovery modes: `src/main.rs` plus
+    /// `src/bin/*.rs` and `src/bin/*/main.rs`. Whether any of these survive
+    /// is [`declared_bin_names`]'s call — an explicit `[[bin]]` claiming the
+    /// same path absorbs the candidate rather than adding a second target.
+    fn auto_bin_candidates(dir: &Path, package_name: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if dir.join("src").join("main.rs").is_file() {
+            out.push((package_name.to_string(), "src/main.rs".to_string()));
+        }
+        let bin_dir = dir.join("src").join("bin");
+        match std::fs::read_dir(&bin_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry =
+                        entry.unwrap_or_else(|e| panic!("read {}: {e}", bin_dir.display()));
+                    let path = entry.path();
+                    let file_name = entry.file_name();
+                    let file_name = file_name.to_string_lossy();
+                    if path.is_dir() {
+                        // `src/bin/<dir>/main.rs` ⇒ a binary named `<dir>`.
+                        if path.join("main.rs").is_file() {
+                            out.push((
+                                file_name.to_string(),
+                                format!("src/bin/{file_name}/main.rs"),
+                            ));
+                        }
+                    } else if let Some(stem) = file_name.strip_suffix(".rs") {
+                        out.push((stem.to_string(), format!("src/bin/{stem}.rs")));
+                    }
+                }
             }
-            if in_package && t.starts_with("name") {
-                return quoted_value(t);
+            // No `src/bin` at all is the common case, not a problem. Any
+            // other error is: a guard that cannot see the directory must not
+            // conclude it is empty.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("read {}: {e}", bin_dir.display()),
+        }
+        out.sort();
+        out
+    }
+
+    /// Binary names a crate produces: its explicit `[[bin]]` sections plus
+    /// whichever of `auto_candidates` Cargo's auto-discovery would still add.
+    ///
+    /// Pure: the caller does the filesystem work and passes the answers in,
+    /// so the resolution is unit-testable against literals.
+    fn declared_bin_names(
+        manifest: &str,
+        package_name: &str,
+        auto_candidates: &[(String, String)],
+    ) -> Vec<String> {
+        let doc = parse(manifest, package_name);
+
+        let mut names: Vec<String> = Vec::new();
+        let mut claimed_paths: BTreeSet<String> = BTreeSet::new();
+        if let Some(bins) = doc.get("bin").and_then(|b| b.as_array()) {
+            for (i, bin) in bins.iter().enumerate() {
+                let name = bin.get("name").and_then(|n| n.as_str()).unwrap_or_else(|| {
+                    panic!("{package_name}: [[bin]] #{i} has no `name` key — the guard \
+                            cannot account for a binary it cannot name")
+                });
+                names.push(name.to_string());
+                if let Some(p) = bin.get("path").and_then(|p| p.as_str()) {
+                    claimed_paths.insert(normalize_path(p));
+                }
             }
         }
-        None
+
+        // `autobins = false` switches auto-discovery off wholesale.
+        let autobins = doc
+            .get("package")
+            .and_then(|p| p.get("autobins"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !autobins {
+            return names;
+        }
+
+        let explicit: BTreeSet<String> = names.iter().cloned().collect();
+        for (name, path) in auto_candidates {
+            // Path first: `prelude` declares `src/bin/lockdown_probe.rs` under
+            // the name `kastellan-lockdown-probe`, so a name-only check would
+            // invent a phantom `lockdown_probe` target.
+            if claimed_paths.contains(&normalize_path(path)) || explicit.contains(name) {
+                continue;
+            }
+            names.push(name.clone());
+        }
+        names
+    }
+
+    /// Every binary one workspace member builds, resolved against the real
+    /// manifest and the real directory layout.
+    fn member_binaries(member: &str) -> Vec<String> {
+        let dir = repo_root().join(member);
+        let manifest_path = dir.join("Cargo.toml");
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
+        let pkg = package_name(&manifest, member)
+            .unwrap_or_else(|| panic!("no package name in {}", manifest_path.display()));
+        let auto = auto_bin_candidates(&dir, &pkg);
+        declared_bin_names(&manifest, &pkg, &auto)
     }
 
     /// Every binary every workspace member builds.
@@ -227,14 +307,7 @@ mod tests {
 
         let mut bins = BTreeSet::new();
         for member in &members {
-            let dir = root.join(member);
-            let manifest_path = dir.join("Cargo.toml");
-            let manifest = std::fs::read_to_string(&manifest_path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
-            let pkg = package_name(&manifest)
-                .unwrap_or_else(|| panic!("no package name in {}", manifest_path.display()));
-            let has_main = Path::new(&dir.join("src").join("main.rs")).exists();
-            bins.extend(declared_bin_names(&manifest, &pkg, has_main));
+            bins.extend(member_binaries(member));
         }
         bins
     }
@@ -321,6 +394,49 @@ mod tests {
         }
     }
 
+    // ---- the scan's eyes, against the real tree ---------------------------
+    //
+    // The `src/bin` half of discovery is only worth having if it actually
+    // sees a `src/bin`. These pin it against the two crates in this tree that
+    // have one, in both directions: it must find the directory, and it must
+    // not invent targets from files an explicit `[[bin]]` already claims.
+
+    #[test]
+    fn the_src_bin_scan_is_not_blind() {
+        let core = repo_root().join("core");
+        let candidates = auto_bin_candidates(&core, "kastellan-core");
+        assert!(
+            candidates.contains(&(
+                "kastellan-cli".to_string(),
+                "src/bin/kastellan-cli/main.rs".to_string()
+            )),
+            "auto-discovery missed core's src/bin/kastellan-cli/ directory: {candidates:?}"
+        );
+        assert!(
+            candidates.contains(&("kastellan-core".to_string(), "src/main.rs".to_string())),
+            "auto-discovery missed core's src/main.rs: {candidates:?}"
+        );
+    }
+
+    /// `core` declares both its binaries explicitly, one of them over
+    /// `src/main.rs`. The package-named candidate must be absorbed, not
+    /// added: a phantom `kastellan-core` binary would be unaccounted for and
+    /// would fail the guard for a reason that does not exist.
+    #[test]
+    fn explicit_sections_absorb_the_default_binary() {
+        assert_eq!(member_binaries("core"), vec!["kastellan", "kastellan-cli"]);
+    }
+
+    /// `prelude` is the crate that proves path-before-name dedup is needed:
+    /// both its `[[bin]]` names differ from their `src/bin/*.rs` stems.
+    #[test]
+    fn explicit_sections_absorb_src_bin_files_by_path() {
+        assert_eq!(
+            member_binaries("workers/prelude"),
+            vec!["kastellan-lockdown-probe", "kastellan-worker-lockdown-exec"]
+        );
+    }
+
     // ---- parser unit tests ------------------------------------------------
     //
     // The scans above are the guard's eyes: if they silently parse nothing,
@@ -344,7 +460,7 @@ path = "src/bin/exec.rs"
 name-like-key = "1"
 "#;
         assert_eq!(
-            declared_bin_names(manifest, "kastellan-worker-prelude", false),
+            declared_bin_names(manifest, "kastellan-worker-prelude", &[]),
             vec!["kastellan-lockdown-probe", "kastellan-worker-lockdown-exec"]
         );
     }
@@ -352,23 +468,82 @@ name-like-key = "1"
     #[test]
     fn declared_bin_names_falls_back_to_the_package_default_binary() {
         let manifest = "[package]\nname = \"kastellan-worker-new\"\n";
+        let main_only = [("kastellan-worker-new".to_string(), "src/main.rs".to_string())];
         assert_eq!(
-            declared_bin_names(manifest, "kastellan-worker-new", true),
+            declared_bin_names(manifest, "kastellan-worker-new", &main_only),
             vec!["kastellan-worker-new"]
         );
-        // No `src/main.rs` and no `[[bin]]` ⇒ a library crate, no binary.
-        assert!(declared_bin_names(manifest, "kastellan-worker-new", false).is_empty());
+        // No `src/main.rs`, no `src/bin`, no `[[bin]]` ⇒ a library crate.
+        assert!(declared_bin_names(manifest, "kastellan-worker-new", &[]).is_empty());
+    }
+
+    /// The #504 shape the earlier draft could not see: a crate that ships a
+    /// second binary as a bare `src/bin/*.rs` with no `[[bin]]` section.
+    /// Cargo builds it; before this, the guard did not know it existed.
+    #[test]
+    fn declared_bin_names_covers_bare_src_bin_autodiscovery() {
+        let manifest = "[package]\nname = \"kastellan-worker-new\"\n";
+        let auto = [
+            ("kastellan-worker-new".to_string(), "src/main.rs".to_string()),
+            ("helper-tool".to_string(), "src/bin/helper-tool.rs".to_string()),
+        ];
+        assert_eq!(
+            declared_bin_names(manifest, "kastellan-worker-new", &auto),
+            vec!["kastellan-worker-new", "helper-tool"]
+        );
+    }
+
+    /// Dedup is by path first. An explicit section renaming a `src/bin` file
+    /// must absorb it, or the guard reports a binary Cargo never builds.
+    #[test]
+    fn declared_bin_names_dedupes_autodiscovery_by_claimed_path() {
+        let manifest = r#"
+[package]
+name = "kastellan-worker-prelude"
+
+[[bin]]
+name = "kastellan-lockdown-probe"
+path = "./src/bin/lockdown_probe.rs"
+"#;
+        let auto = [(
+            "lockdown_probe".to_string(),
+            "src/bin/lockdown_probe.rs".to_string(),
+        )];
+        assert_eq!(
+            declared_bin_names(manifest, "kastellan-worker-prelude", &auto),
+            vec!["kastellan-lockdown-probe"]
+        );
+    }
+
+    #[test]
+    fn declared_bin_names_honours_autobins_false() {
+        let manifest = "[package]\nname = \"pkg\"\nautobins = false\n";
+        let auto = [("stray".to_string(), "src/bin/stray.rs".to_string())];
+        assert!(declared_bin_names(manifest, "pkg", &auto).is_empty());
     }
 
     #[test]
     fn workspace_members_parses_the_array() {
-        let root = "[workspace]\nmembers = [\n    \"core\",\n    # a comment\n    \"workers/mail\",\n]\nresolver = \"2\"\n";
+        let root = r#"
+[workspace]
+members = [
+    "core",
+    # a comment
+    # "workers/retired",
+    "workers/mail",
+]
+resolver = "2"
+"#;
+        // The commented-out member is a comment, not a member. A line scanner
+        // that took the first quoted run per line saw it as live (#479's shape).
         assert_eq!(workspace_members(root), vec!["core", "workers/mail"]);
     }
 
     #[test]
-    fn package_name_stops_before_bin_sections() {
+    fn package_name_ignores_bin_and_dependency_sections() {
         let manifest = "[package]\nname = \"pkg\"\n\n[[bin]]\nname = \"other\"\n";
-        assert_eq!(package_name(manifest).as_deref(), Some("pkg"));
+        assert_eq!(package_name(manifest, "t").as_deref(), Some("pkg"));
+        let dep_first = "[dependencies]\nname-like = \"1\"\n\n[package]\nname = \"pkg\"\n";
+        assert_eq!(package_name(dep_first, "t").as_deref(), Some("pkg"));
     }
 }
