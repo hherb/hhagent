@@ -5,14 +5,29 @@
 //! differences forced by the email channel's own design
 //! (`docs/superpowers/specs/2026-07-28-email-fallback-channel-design.md`):
 //!
+//! Since #514 both modules also share their *shape*: [`attempt`] performs one
+//! bring-up and classifies the result as a
+//! [`BootOutcome`](kastellan_core::channel::boot_supervisor::BootOutcome),
+//! and [`supervise_email_channel`] hands that to a
+//! [`ChannelSupervisor`](kastellan_core::channel::boot_supervisor::ChannelSupervisor)
+//! that retries with capped backoff. What differs is the *classification* —
+//! see point 1.
+//!
 //! 1. **The email CHANNEL refuses to start; the DAEMON does not.**
 //!    [`kastellan_core::channel::email::config::EmailConfig::from_env`]
 //!    refuses a PARTIAL config (`Err`, not `Ok(None)`) precisely so a missing
 //!    `KASTELLAN_EMAIL_AUTHSERV_ID` etc. is loud instead of quietly
 //!    rejecting every message and looking like a delivery bug — see that
-//!    function's module docs. This function turns that `Err`, and a
-//!    `spawn_email_worker` `Err`, into a **prominent `error!` plus `None`**:
-//!    the email channel does not come up, everything else does.
+//!    function's module docs. That `Err` becomes
+//!    [`BootOutcome::Fatal`](kastellan_core::channel::boot_supervisor::BootOutcome::Fatal):
+//!    the supervisor prints the loud "fix it, then restart the daemon" line
+//!    and stops. It does **not** retry, because the process environment
+//!    cannot change under a running daemon, so a retry loop there would spin
+//!    forever while telling the operator to restart.
+//!
+//!    A worker *spawn* failure is classified the other way (`Retry`) — it is
+//!    a sandbox/egress condition, and the failure that prompted #514 was
+//!    exactly that shape.
 //!
 //!    That is a deliberate correction (final whole-branch review, Important
 //!    5). An earlier version propagated both through `?`, aborting daemon
@@ -30,36 +45,39 @@
 //!    skipped `main.rs`'s graceful shutdown sequence (bus shutdowns →
 //!    scheduler → audit mirror → `pool.close()`).
 //!
-//!    The posture DIFFERENCE from Matrix is real and kept: Matrix fails soft
-//!    over an unreachable homeserver because that is a transient outage,
-//!    whereas `email.init` does no network I/O at all (see
-//!    `workers/email-in/src/handler.rs`), so any failure here is a
-//!    deployment/config problem (bad worker_bin, sandbox refusal, egress
-//!    misconfig) and is logged at `error!` accordingly, naming every missing
-//!    variable so one restart is enough to fix it.
+//!    The posture DIFFERENCE from Matrix is real and kept, and #514 sharpened
+//!    rather than erased it: `email.init` does no network I/O at all (see
+//!    `workers/email-in/src/handler.rs`), so a *config* failure here can only
+//!    be a deployment fact and is fatal, where Matrix's equivalent failure
+//!    (an unreachable homeserver) is transient and retried. The two modules
+//!    now share one retry mechanism and disagree only about which errors feed
+//!    it — which is where the disagreement belongs.
 //! 2. **No microVM branch.** [`kastellan_core::channel::email::config::EmailConfig`]
 //!    has no `use_microvm` field in this slice — the worker always runs on
 //!    the host jail backend (bwrap on Linux, Seatbelt on macOS), which is
 //!    also the sidecar backend (the same 5c invariant Matrix documents: the
 //!    egress proxy needs a real network route; a VM sidecar would have none).
 //!
-//! The final `PgCompletedTasks::connect` step behaves the same way (matching
-//! Matrix exactly) — a LISTEN/NOTIFY bring-up hiccup on an already-open pool
-//! is a generic DB-listener concern, not an email-channel-specific
-//! misconfiguration — so every arm of this module now converges on one
-//! outcome: `None` plus a loud, unmistakable `error!` (see
-//! `log_channel_disabled`). The single exception is an **unset**
-//! `KASTELLAN_EMAIL_ENDPOINT`, which is silent by design: the channel is
-//! simply not configured, which is the default and not a problem to report.
+//! The final `PgCompletedTasks::connect` step is classified the same way
+//! Matrix classifies it — `Retry`, because a LISTEN/NOTIFY bring-up hiccup on
+//! an already-open pool is a generic DB-listener concern, not an
+//! email-channel-specific misconfiguration. An **unset**
+//! `KASTELLAN_EMAIL_ENDPOINT` stays silent by design: the channel is simply
+//! not configured, which is the default and not a problem to report.
 
 use std::sync::Arc;
 
 use sqlx::PgPool;
 use tracing::{error, info};
 
+use kastellan_core::channel::boot_supervisor::pg_sink::pg_boot_audit_sink;
+use kastellan_core::channel::boot_supervisor::{
+    BootOutcome, ChannelSupervisor, DowntimeEscalator, StartedChannel,
+};
 use kastellan_core::channel::polled_driver::AckOnlyAudit;
 use kastellan_core::channel::{ChannelBus, ChannelId};
 use kastellan_core::worker_lifecycle::force_route::ForceRoutingConfig;
+use kastellan_core::worker_lifecycle::RestartBackoff;
 use kastellan_sandbox::{SandboxBackend, SandboxBackends};
 
 /// Cap on `reason`'s length before it becomes a durable `audit_log` payload
@@ -71,20 +89,19 @@ use kastellan_sandbox::{SandboxBackend, SandboxBackends};
 /// a future worker change (or a compromised worker) to keep bounding it
 /// before it lands permanently in `audit_log`. Comfortably above the
 /// worker's own 200-char cap so today's values pass through untouched.
-const AUDIT_REASON_CAP_CHARS: usize = 256;
+///
+/// Aliased to the supervisor's cap rather than a second `256` typed here: both
+/// bound an unbounded, externally-originated string on its way into the same
+/// column, so one number and one set of edge cases is the honest arrangement.
+const AUDIT_REASON_CAP_CHARS: usize =
+    kastellan_core::channel::boot_supervisor::AUDIT_CAUSE_CAP_CHARS;
 
 /// Truncate `reason` to [`AUDIT_REASON_CAP_CHARS`] on a `char` boundary
 /// (never mid-UTF-8-codepoint — `reason` may echo arbitrary upstream text).
 /// A no-op for anything at or under the cap, which covers every value the
 /// worker emits today.
 fn cap_reason(reason: &str) -> String {
-    if reason.chars().count() <= AUDIT_REASON_CAP_CHARS {
-        reason.to_string()
-    } else {
-        let mut capped: String = reason.chars().take(AUDIT_REASON_CAP_CHARS).collect();
-        capped.push_str("...(truncated)");
-        capped
-    }
+    kastellan_core::channel::audit_text::cap_chars(reason, AUDIT_REASON_CAP_CHARS)
 }
 
 /// Build the [`AckOnlyAudit`] closure `spawn_email_worker` invokes for every
@@ -122,70 +139,66 @@ fn email_skipped_audit_sink(pool: PgPool, handle: tokio::runtime::Handle) -> Ack
     })
 }
 
-
-/// Loud, unmistakable log line for every "the email channel is NOT running"
-/// outcome. Kept in one place so no failure arm can accidentally word it in a
-/// way an operator could read as "the channel came up".
+/// Pure: a configuration error can never be fixed without an operator edit
+/// **plus a restart**, because the process environment is immutable for this
+/// daemon's lifetime. Fatal, therefore — and the message the supervisor prints
+/// for a fatal outcome says exactly that, which is what
+/// `log_channel_disabled` used to say here.
 ///
-/// Deliberately shouty and explicit about the two facts that matter: the
-/// channel is **off**, and the daemon is **fine**. `cause` carries the
-/// underlying error, which for a config problem names every missing variable
-/// (`email::config::parse_email_config`).
-fn log_channel_disabled(cause: &anyhow::Error) {
-    error!(
-        error = %format!("{cause:#}"),
-        "EMAIL CHANNEL DISABLED — it did NOT start and NO email will be received. \
-         The rest of the daemon (Matrix, scheduler, tools) is running normally. \
-         Fix what `error` names, then restart the daemon to enable the channel."
-    );
+/// This is the one classification that differs from Matrix's, and it is the
+/// reason the email channel keeps its distinct posture after #514: Matrix
+/// fails soft over an unreachable homeserver because that is a transient
+/// outage, whereas a half-set `KASTELLAN_EMAIL_*` block is a deployment fact
+/// that no amount of retrying will change.
+fn classify_config_error(e: anyhow::Error) -> BootOutcome {
+    BootOutcome::Fatal(e.context("email channel configuration is incomplete or invalid"))
 }
 
-/// Spawn the email channel bus if `KASTELLAN_EMAIL_ENDPOINT` is set.
+/// Pure: a worker spawn failure is a sandbox/egress condition, not a
+/// configuration one, so it is retryable.
 ///
-/// Gated on [`kastellan_core::channel::email::config::EmailConfig::from_env`]:
-/// unset ⇒ `None` with **no log noise at all** (the channel is simply absent
-/// and the daemon is byte-identical to an email-less build). Fully configured
-/// ⇒ the sandboxed worker is spawned (force-routed through a real 1:1
-/// intercepting sidecar whenever `force_routing` is `Some` — the `Some`/`None`
-/// branching mirrors `matrix_boot::spawn_matrix_channel`'s `MatrixEgress`
-/// wiring exactly, but the TLS posture does NOT: Matrix's sidecar stays a
-/// transparent tunnel (matrix-sdk terminates its own TLS end-to-end), while
-/// this one always intercepts (`Mitm::Intercept`) so an operator's
-/// upstream-extra-CA anchor can reach a self-signed localmail — passing
-/// `None` here would silently degrade the worker onto the HOST network
-/// namespace, see [`kastellan_core::channel::email::EmailEgress`]'s docs) and
-/// a real audit closure is wired so every skipped id lands in `audit_log`.
+/// This is not a theoretical distinction — the failure that prompted #514 was
+/// exactly this shape: `systemd-run --scope` refused to create the sidecar's
+/// cgroup because the user manager was itself shutting down. The next attempt
+/// absorbs it.
+fn classify_spawn_error(e: anyhow::Error) -> BootOutcome {
+    BootOutcome::Retry(e.context("the email worker failed to start"))
+}
+
+/// One email bring-up attempt: read the config, spawn the sandboxed worker
+/// (force-routed through a real 1:1 **intercepting** sidecar whenever
+/// `force_routing` is `Some` — the `Some`/`None` branching mirrors
+/// `matrix_boot::attempt`'s `MatrixEgress` wiring exactly, but the TLS posture
+/// does NOT: Matrix's sidecar stays a transparent tunnel, while this one
+/// always intercepts (`Mitm::Intercept`) so an operator's upstream-extra-CA
+/// anchor can reach a self-signed localmail; passing `None` here would
+/// silently degrade the worker onto the HOST network namespace, see
+/// [`kastellan_core::channel::email::EmailEgress`]'s docs), wire the skipped-id
+/// audit closure, and run a [`ChannelBus`] over it.
 ///
-/// **Every failure arm returns `None` after a loud
-/// [`log_channel_disabled`]** — a set-but-partial config, a worker spawn
-/// failure, and a `PgCompletedTasks::connect` failure alike. None of them
-/// aborts the daemon; see the module docs' point 1 for why that is the
-/// correct posture for a *fallback* channel. There is no `Err` variant to
-/// return, which is what makes it impossible for a future caller to
-/// re-introduce the abort with a stray `?`.
+/// Classification, which is the whole of this function's policy:
 ///
-/// * `pool` — daemon-scoped runtime pool (cloned into the authorizer, pairing
-///   service, events, completion seams, and the skipped-id audit sink).
-/// * `sandboxes` — the per-OS backend bundle; the email worker always runs on
-///   the host jail (bwrap/Seatbelt) — there is no microVM option in this
-///   slice.
-/// * `force_routing` — the resolved egress force-routing config; `Some` ⇒
-///   each (re)spawn gets a 1:1 intercepting sidecar via `EmailEgress` (see
-///   that type's docs for why its TLS posture differs from Matrix's).
-pub(crate) async fn spawn_email_channel(
-    pool: &PgPool,
-    sandboxes: &SandboxBackends,
-    force_routing: &Option<Arc<ForceRoutingConfig>>,
-) -> Option<ChannelBus> {
+/// * unset `KASTELLAN_EMAIL_ENDPOINT` ⇒ [`BootOutcome::NotConfigured`],
+///   silently — the default for every deployment without the email fallback;
+/// * a set-but-PARTIAL config ⇒ [`classify_config_error`] ⇒ fatal;
+/// * a worker spawn failure ⇒ [`classify_spawn_error`] ⇒ retry;
+/// * a `PgCompletedTasks::connect` failure ⇒ retry (a LISTEN/NOTIFY bring-up
+///   hiccup on an already-open pool is a generic DB-listener condition, not an
+///   email misconfiguration — the same reading Matrix gives it).
+///
+/// There is still no `Err` variant anywhere on this path, so no future `?` can
+/// reintroduce the daemon-aborting behaviour this module's docs argue against.
+async fn attempt(
+    pool: PgPool,
+    sandboxes: SandboxBackends,
+    force_routing: Option<Arc<ForceRoutingConfig>>,
+) -> BootOutcome {
     let cfg = match kastellan_core::channel::email::config::EmailConfig::from_env() {
         // Unset ⇒ channel absent. Silent on purpose: this is the default for
         // every deployment that doesn't use the email fallback.
-        Ok(None) => return None,
+        Ok(None) => return BootOutcome::NotConfigured,
         Ok(Some(cfg)) => cfg,
-        Err(e) => {
-            log_channel_disabled(&e.context("email channel configuration is incomplete or invalid"));
-            return None;
-        }
+        Err(e) => return classify_config_error(e),
     };
 
     // Worker backend: always the host jail — no microVM option for this
@@ -217,70 +230,90 @@ pub(crate) async fn spawn_email_channel(
         audit_ack_only,
     ) {
         Ok(s) => s,
-        Err(e) => {
-            log_channel_disabled(&e.context("the email worker failed to start"));
-            return None;
-        }
+        Err(e) => return classify_spawn_error(e),
     };
 
     info!(identity = %spawned.identity, "email worker started; starting channel bus");
-    let authorizer =
-        Arc::new(kastellan_core::channel::auth::DbPeerAuthorizer::new(pool.clone()));
-    let pairing =
-        Arc::new(kastellan_core::channel::pairing::DbPairingService::new(pool.clone()));
+    let authorizer = Arc::new(kastellan_core::channel::auth::DbPeerAuthorizer::new(pool.clone()));
+    let pairing = Arc::new(kastellan_core::channel::pairing::DbPairingService::new(pool.clone()));
     let events = Arc::new(kastellan_core::channel::bus::PgChannelEvents::new(pool.clone()));
     match kastellan_core::channel::bus::PgCompletedTasks::connect(pool.clone()).await {
-        Ok(completed) => {
-            let bus = ChannelBus::spawn(
-                vec![Box::new(spawned.channel)],
-                authorizer,
-                Some(pairing),
-                events,
-                Box::new(completed),
-            );
-            info!("email channel bus running");
-            Some(bus)
-        }
+        Ok(completed) => BootOutcome::Started(StartedChannel::from_bus(ChannelBus::spawn(
+            vec![Box::new(spawned.channel)],
+            authorizer,
+            Some(pairing),
+            events,
+            Box::new(completed),
+        ))),
         Err(e) => {
-            log_channel_disabled(&e.context("PgCompletedTasks::connect (LISTEN/NOTIFY) failed"));
-            None
+            BootOutcome::Retry(e.context("email: PgCompletedTasks::connect (LISTEN/NOTIFY) failed"))
         }
     }
+}
+
+/// Supervise the email channel: retry [`attempt`] with capped backoff until it
+/// comes up, unless it is unconfigured or its configuration is unusable.
+///
+/// Returns immediately; the returned handle must be `shutdown()`-ed by `main`,
+/// which stops the retry loop and, if the channel came up, the bus with it.
+///
+/// The daemon is never aborted by anything on this path — see the module docs'
+/// point 1 for why that is the correct posture for a *fallback* channel.
+pub(crate) fn supervise_email_channel(
+    pool: &PgPool,
+    sandboxes: &SandboxBackends,
+    force_routing: &Option<Arc<ForceRoutingConfig>>,
+) -> ChannelSupervisor {
+    let pool = pool.clone();
+    let sandboxes = sandboxes.clone();
+    let force_routing = force_routing.clone();
+    let audit = pg_boot_audit_sink(pool.clone(), "email");
+    ChannelSupervisor::spawn(
+        "email",
+        RestartBackoff::default(),
+        DowntimeEscalator::default(),
+        Some(audit),
+        move || attempt(pool.clone(), sandboxes.clone(), force_routing.clone()),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A PARTIAL config must be FATAL: the process environment is fixed for
+    /// this daemon's lifetime, so no number of retries can complete it. The
+    /// operator-facing message already says "fix it, then restart" — retrying
+    /// instead would make that message a lie and spin forever.
     #[test]
-    fn cap_reason_passes_short_input_through_unchanged() {
-        assert_eq!(cap_reason("no usable From address"), "no usable From address");
+    fn a_partial_config_is_fatal_not_retryable() {
+        let err = anyhow::anyhow!("KASTELLAN_EMAIL_AUTHSERV_ID is not set");
+        let outcome = classify_config_error(err);
+        assert!(matches!(outcome, BootOutcome::Fatal(_)), "{outcome:?}");
     }
 
+    /// The fatal cause keeps the underlying detail, which for a config problem
+    /// names every missing variable — that is the whole value of the loud line.
     #[test]
-    fn cap_reason_passes_input_at_exactly_the_cap_through_unchanged() {
-        let at_cap = "a".repeat(AUDIT_REASON_CAP_CHARS);
-        assert_eq!(cap_reason(&at_cap), at_cap);
+    fn the_fatal_cause_still_names_the_missing_variable() {
+        let err = anyhow::anyhow!("KASTELLAN_EMAIL_AUTHSERV_ID is not set");
+        match classify_config_error(err) {
+            BootOutcome::Fatal(e) => {
+                let rendered = format!("{e:#}");
+                assert!(rendered.contains("KASTELLAN_EMAIL_AUTHSERV_ID"), "{rendered}");
+                assert!(rendered.contains("incomplete or invalid"), "{rendered}");
+            }
+            other => panic!("expected Fatal, got {other:?}"),
+        }
     }
 
+    /// A worker spawn failure is RETRYABLE — it is the observed #514 trigger
+    /// (`systemd-run --scope` refusing to create the sandbox cgroup while the
+    /// user manager restarts), which the next attempt absorbs.
     #[test]
-    fn cap_reason_truncates_an_oversized_upstream_error_body() {
-        // Simulates `describe_email_error`'s `localmail {status}: {body}` shape
-        // with a body well past its own 200-char worker-side cap — this sink
-        // must not rely on that cap holding.
-        let huge = format!("localmail 500: {}", "x".repeat(5_000));
-        let capped = cap_reason(&huge);
-        assert!(capped.chars().count() <= AUDIT_REASON_CAP_CHARS + "...(truncated)".len());
-        assert!(capped.ends_with("...(truncated)"), "{capped}");
-        assert!(huge.len() > capped.len(), "must actually shrink an oversized reason");
-    }
-
-    #[test]
-    fn cap_reason_truncates_on_a_char_boundary_not_mid_utf8_codepoint() {
-        // Multi-byte chars (e.g. from a non-ASCII upstream error message)
-        // straddling the cap must not panic or produce an invalid `String`.
-        let multibyte = "€".repeat(AUDIT_REASON_CAP_CHARS + 10);
-        let capped = cap_reason(&multibyte); // would panic on a mid-codepoint byte slice
-        assert!(capped.starts_with('€'));
+    fn a_worker_spawn_failure_is_retryable() {
+        let err = anyhow::anyhow!("egress-proxy sidecar exited before becoming ready");
+        let outcome = classify_spawn_error(err);
+        assert!(matches!(outcome, BootOutcome::Retry(_)), "{outcome:?}");
     }
 }
