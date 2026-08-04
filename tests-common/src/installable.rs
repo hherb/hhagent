@@ -1,6 +1,6 @@
-//! Installer-coverage guard: every worker binary the workspace builds is
-//! either **installed** by `kastellan-cli install` or **explicitly opted
-//! out**, with a reason recorded in code (issue #504).
+//! Installer-coverage guard: every binary the workspace builds is either
+//! **installed** by `kastellan-cli install` or **explicitly opted out**,
+//! with a reason recorded in code (issue #504).
 //!
 //! # Why this module exists
 //!
@@ -30,9 +30,16 @@
 //! # What this guard asserts
 //!
 //! One structural property, in the same spirit as [`crate::provisioning`]:
-//! **every `[[bin]]` a `workers/*` workspace member declares is accounted
-//! for** — present in `required_binaries()`, in `optional_binaries()`, or in
+//! **every `[[bin]]` any workspace member declares is accounted for** —
+//! present in `required_binaries()`, in `optional_binaries()`, or in
 //! [`tests::NOT_INSTALLED`] with a written reason.
+//!
+//! Deliberately the whole workspace, not just `workers/*`. The invariant
+//! "a binary operators need must actually be installed" is not
+//! worker-specific: a new `core`-level binary would go missing in exactly
+//! the way `kastellan-worker-mail` did, and scoping the guard to the
+//! directory where the bug happened to be found is how you get to watch it
+//! happen again somewhere else.
 //!
 //! It deliberately does *not* assert which of the three a given binary lands
 //! in. Deciding that a new worker ships to operators is a judgement call; the
@@ -56,9 +63,9 @@ mod tests {
 
     use kastellan_core::install::plan::{optional_binaries, required_binaries};
 
-    /// Worker binaries the installer deliberately does **not** copy, each
-    /// with the reason it is exempt. A name here is a decision, not an
-    /// oversight — which is the entire point of the list.
+    /// Binaries the installer deliberately does **not** copy, each with the
+    /// reason it is exempt. A name here is a decision, not an oversight —
+    /// which is the entire point of the list.
     ///
     /// Keep this in sync with reality in both directions: an entry naming a
     /// binary the workspace no longer builds is stale, and
@@ -86,6 +93,15 @@ mod tests {
              exe-relative sibling, so copying it into bin_dir would not make it findable; \
              deploying the micro-VM launcher needs its own mechanism — issue #519",
         ),
+        // The `sandbox` crate's five probes. All declare `path =
+        // "tests/fixtures/…"`: they exist to be spawned BY the sandbox
+        // integration tests, to check from inside a jail that the containment
+        // really denies what it claims. Never part of a deployment.
+        ("net_probe", "sandbox integration-test fixture: probes network reachability from inside a jail"),
+        ("mem_burner", "sandbox integration-test fixture: allocates until the memory cap OOM-kills it"),
+        ("sid_probe", "sandbox integration-test fixture: reports its session id to check --new-session"),
+        ("mach_probe", "sandbox integration-test fixture: probes macOS mach-lookup denial"),
+        ("uds_probe", "sandbox integration-test fixture: probes AF_UNIX reachability from inside a jail"),
     ];
 
     /// The repository root, derived from this crate's manifest dir.
@@ -176,23 +192,29 @@ mod tests {
         out
     }
 
-    /// The `package.name` of a manifest — the first `name = "…"` that appears
-    /// before any `[[bin]]` section.
+    /// The `package.name` of a manifest.
+    ///
+    /// Scoped to the `[package]` section rather than "the first `name` key",
+    /// because a dependency named `name-something` sitting above `[[bin]]`
+    /// would otherwise be returned as the package name — a guard that reads
+    /// the wrong name reports a binary that does not exist.
     fn package_name(manifest: &str) -> Option<String> {
+        let mut in_package = false;
         for line in manifest.lines() {
             let t = line.trim();
-            if t.starts_with("[[bin]]") {
-                break;
+            if t.starts_with('[') {
+                in_package = t.starts_with("[package]");
+                continue;
             }
-            if t.starts_with("name") {
+            if in_package && t.starts_with("name") {
                 return quoted_value(t);
             }
         }
         None
     }
 
-    /// Every binary every `workers/*` workspace member builds.
-    fn worker_binaries_in_workspace() -> BTreeSet<String> {
+    /// Every binary every workspace member builds.
+    fn workspace_binaries() -> BTreeSet<String> {
         let root = repo_root();
         let root_manifest = std::fs::read_to_string(root.join("Cargo.toml"))
             .expect("workspace root Cargo.toml is readable");
@@ -204,7 +226,7 @@ mod tests {
         );
 
         let mut bins = BTreeSet::new();
-        for member in members.iter().filter(|m| m.starts_with("workers/")) {
+        for member in &members {
             let dir = root.join(member);
             let manifest_path = dir.join("Cargo.toml");
             let manifest = std::fs::read_to_string(&manifest_path)
@@ -224,9 +246,9 @@ mod tests {
 
     /// **The guard.** Every worker binary is installed or explicitly exempt.
     #[test]
-    fn every_worker_binary_is_installed_or_explicitly_opted_out() {
+    fn every_binary_is_installed_or_explicitly_opted_out() {
         let opted_out: BTreeSet<&str> = NOT_INSTALLED.iter().map(|(n, _)| *n).collect();
-        let unaccounted: Vec<String> = worker_binaries_in_workspace()
+        let unaccounted: Vec<String> = workspace_binaries()
             .into_iter()
             .filter(|b| !is_installed(b) && !opted_out.contains(b.as_str()))
             .collect();
@@ -246,7 +268,7 @@ mod tests {
     /// a *re*-introduced binary would slip past the guard above.
     #[test]
     fn opt_out_entries_all_exist() {
-        let built = worker_binaries_in_workspace();
+        let built = workspace_binaries();
         let stale: Vec<&str> = NOT_INSTALLED
             .iter()
             .map(|(n, _)| *n)
@@ -283,6 +305,19 @@ mod tests {
             "kastellan-worker-search-broker",
         ] {
             assert!(is_installed(name), "{name} is not installed by the installer");
+        }
+    }
+
+    /// The scan reaches beyond `workers/`. Without this, narrowing it back to
+    /// worker crates — the exact scoping mistake this guard exists to
+    /// outlast — would still leave every assertion above passing, because
+    /// what it stopped looking at would simply cease to be a finding.
+    #[test]
+    fn the_scan_covers_non_worker_members_too() {
+        let built = workspace_binaries();
+        // `core` (the daemon + operator CLI) and `db` (the schema initialiser).
+        for name in ["kastellan", "kastellan-cli", "kastellan-db-init"] {
+            assert!(built.contains(name), "{name} is built but the scan did not see it");
         }
     }
 
