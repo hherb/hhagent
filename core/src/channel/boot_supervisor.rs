@@ -252,17 +252,34 @@ async fn run<F, Fut>(
                 }
 
                 let ran = started_at.elapsed();
-                // Did it actually work, or is it flapping? Only a channel that
-                // stayed up long enough opens a fresh outage; a channel that
-                // dies on arrival stays inside the current one, so its backoff
-                // keeps growing instead of resetting to the base delay on every
-                // iteration and spinning.
-                if escalator.ran_long_enough(ran) {
+                // Did it actually work, or is it flapping?
+                //
+                // `failures` counts **restart-worthy events since the channel
+                // was last healthy** — failed bring-up attempts and the deaths
+                // of channels that never got going. It drives both the backoff
+                // and the `attempts` figure in the next `Started` row, so the
+                // two arms below have to say different things:
+                //
+                //   * A channel that STAYED UP and then died ends the outage.
+                //     Its death is not a failed attempt — it is what opens the
+                //     next outage — so the counter resets and is NOT bumped,
+                //     and the restart is attempt 1 at the base delay. Counting
+                //     it would make a clean first-try recovery read, in
+                //     `audit_log`, exactly like one that needed a retry.
+                //   * A channel that died on arrival is flapping: it never
+                //     became healthy, so the death belongs to the outage
+                //     already in progress and must be counted. Otherwise the
+                //     backoff resets on every iteration and the supervisor
+                //     spins, spawning a sandboxed worker each time round.
+                let delay = if escalator.ran_long_enough(ran) {
                     failures = 0;
                     escalator.record_success();
-                }
-                let delay = backoff.next_delay(failures);
-                failures += 1;
+                    backoff.next_delay(failures)
+                } else {
+                    let delay = backoff.next_delay(failures);
+                    failures += 1;
+                    delay
+                };
                 let ran_ms = ran.as_millis() as u64;
                 let retry_in_ms = delay.as_millis() as u64;
                 warn!(
@@ -272,7 +289,12 @@ async fn run<F, Fut>(
                     "channel stopped working after running; restarting it"
                 );
                 emit(&audit, BootAudit::Died { ran_ms, retry_in_ms }).await;
-                escalate_if_due(&mut escalator, &label, failures);
+                // The outage clock starts HERE, at the death — that is when
+                // messages stopped being received, which is the number an
+                // operator acts on. `max(1)` because a stable death reset the
+                // counter without bumping it, and it is still the first
+                // restart-worthy event of the outage it just opened.
+                escalate_if_due(&mut escalator, &label, failures.max(1));
                 if !wait_or_shutdown(delay, &mut shutdown).await {
                     return;
                 }

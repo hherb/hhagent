@@ -564,3 +564,73 @@ async fn a_death_racing_shutdown_is_not_recorded_as_a_death() {
     assert_eq!(attempts.load(Ordering::SeqCst), 1, "no restart during shutdown");
     assert_eq!(stopped.load(Ordering::SeqCst), 1, "the channel is stopped exactly once");
 }
+
+/// `attempts` in a `channel.started` row means "restart-worthy events in this
+/// outage, plus this success" — so a channel that had been running, died, and
+/// came straight back must report **1**, not 2.
+///
+/// The death of a channel that worked is not a failed bring-up attempt; it is
+/// what *opens* the outage. Counting it as an attempt makes a clean first-try
+/// recovery read, to the operator querying `audit_log`, exactly like a
+/// recovery that needed a retry.
+#[tokio::test]
+async fn a_first_try_recovery_reports_one_attempt() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let sink = RecordingSink::default();
+
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        DowntimeEscalator::default().with_stable_uptime(Duration::ZERO),
+        Some(sink.sink()),
+        scripted(vec![dying(&stopped), healthy(&stopped)]),
+    );
+
+    sink.wait_for(3).await;
+    let started: Vec<u32> = sink
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            BootAudit::Started { attempts } => Some(attempts),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        vec![1, 1],
+        "a channel that ran, died, and came back on the first try reports attempts: 1 both times"
+    );
+
+    sup.shutdown().await;
+}
+
+/// The counterpart: a channel that is *flapping* has not been healthy in
+/// between, so its restarts really are successive attempts within one outage
+/// and the count must keep climbing. This is what stops the reset above from
+/// being a blanket "deaths are free".
+#[tokio::test]
+async fn a_recovery_after_a_flap_keeps_counting() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let sink = RecordingSink::default();
+
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        DowntimeEscalator::default().with_stable_uptime(Duration::MAX),
+        Some(sink.sink()),
+        scripted(vec![dying(&stopped), dying(&stopped), healthy(&stopped)]),
+    );
+
+    sink.wait_for(5).await;
+    let started: Vec<u32> = sink
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            BootAudit::Started { attempts } => Some(attempts),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started, vec![1, 2, 3], "two flaps in one outage make the third start attempt 3");
+
+    sup.shutdown().await;
+}
