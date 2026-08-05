@@ -76,7 +76,7 @@ pub mod reporting;
 pub mod types;
 
 pub use downtime::DowntimeEscalator;
-pub use reporting::{note_outage, Outage, ReportingPolicy};
+pub use reporting::{note_outage, Outage, ReportingPolicy, Verdict, CHANNEL_FLAPPING_LOG_PHRASE};
 pub use types::{BootAudit, BootAuditSink, BootOutcome, StartedChannel};
 
 #[cfg(test)]
@@ -124,8 +124,9 @@ impl ChannelSupervisor {
     /// * `label` — channel name; appears in every log line and audit row.
     /// * `backoff` — delay schedule. [`RestartBackoff::default()`] is 1 s → ×2
     ///   → 60 s cap, the same schedule supervised workers use.
-    /// * `policy` — decides when an event earns a louder line.
-    ///   [`ReportingPolicy::default()`] is the production configuration.
+    /// * `policy` — decides when an event earns a louder line and when it
+    ///   earns a durable row. [`ReportingPolicy::default()`] is the production
+    ///   configuration.
     /// * `audit` — `None` disables audit rows entirely (tests, and any caller
     ///   with no pool).
     /// * `attempt` — one bring-up try. Called fresh each time, so it must own
@@ -213,8 +214,13 @@ async fn run<F, Fut>(
 
             BootOutcome::Started(mut channel) => {
                 let attempts = failures + 1;
+                // The per-cycle log line is NOT gated: the daemon log is the
+                // per-event record, and it is what an operator reads while a
+                // channel is misbehaving. Only the durable row is rate-limited.
                 info!(channel = %label, attempts, "channel bus running");
-                emit(&audit, BootAudit::Started { attempts }).await;
+                if policy.should_record_start() {
+                    emit(&audit, BootAudit::Started { attempts }).await;
+                }
 
                 let started_at = Instant::now();
                 // Wait for whichever comes first: the daemon shutting down, or
@@ -278,13 +284,14 @@ async fn run<F, Fut>(
                 //     already in progress and must be counted. Otherwise the
                 //     backoff resets on every iteration and the supervisor
                 //     spins, spawning a sandboxed worker each time round.
-                let (delay, outage) = if policy.ran_long_enough(ran) {
+                let stable = policy.ran_long_enough(ran);
+                let delay = if stable {
                     failures = 0;
-                    (backoff.next_delay(failures), Outage::Ends)
+                    backoff.next_delay(failures)
                 } else {
                     let delay = backoff.next_delay(failures);
                     failures += 1;
-                    (delay, Outage::Continues)
+                    delay
                 };
                 let ran_ms = ran.as_millis() as u64;
                 let retry_in_ms = delay.as_millis() as u64;
@@ -294,12 +301,11 @@ async fn run<F, Fut>(
                     retry_in_ms,
                     "channel stopped working after running; restarting it"
                 );
-                emit(&audit, BootAudit::Died { ran_ms, retry_in_ms }).await;
-                // `failures` is the figure to report: the flapping arm has just
-                // bumped it, and the stable arm cannot escalate at all
-                // ([`Outage::Ends`] never yields a downtime), so the zero it
-                // passes is never rendered.
-                escalate_if_due(&mut policy, &label, outage, failures);
+                let verdict = policy.note_death(stable, Instant::now());
+                if verdict.record {
+                    emit(&audit, BootAudit::Died { ran_ms, retry_in_ms }).await;
+                }
+                report(&label, &verdict, failures);
                 if !wait_or_shutdown(delay, &mut shutdown).await {
                     return;
                 }
@@ -336,17 +342,20 @@ async fn run<F, Fut>(
                     error = %format!("{e:#}"),
                     "channel bring-up failed; retrying"
                 );
-                emit(
-                    &audit,
-                    BootAudit::Failed {
-                        attempt: failures,
-                        retry_in_ms: Some(delay.as_millis() as u64),
-                        fatal: false,
-                        cause: cap_chars(&format!("{e:#}"), AUDIT_CAUSE_CAP_CHARS),
-                    },
-                )
-                .await;
-                escalate_if_due(&mut policy, &label, Outage::Continues, failures);
+                let verdict = policy.note_failed_attempt(Instant::now());
+                if verdict.record {
+                    emit(
+                        &audit,
+                        BootAudit::Failed {
+                            attempt: failures,
+                            retry_in_ms: Some(delay.as_millis() as u64),
+                            fatal: false,
+                            cause: cap_chars(&format!("{e:#}"), AUDIT_CAUSE_CAP_CHARS),
+                        },
+                    )
+                    .await;
+                }
+                report(&label, &verdict, failures);
                 if !wait_or_shutdown(delay, &mut shutdown).await {
                     return;
                 }
@@ -355,19 +364,15 @@ async fn run<F, Fut>(
     }
 }
 
-/// Emit the loud line if this event has earned one.
+/// Emit whichever loud lines this event earned.
 ///
-/// Shared by the two arms that can fail — a bring-up that will not succeed and
-/// a channel that keeps dying — because from an operator's side they are the
-/// same event: the channel has been unusable for this long and is not fixing
-/// itself.
-fn escalate_if_due(
-    policy: &mut ReportingPolicy,
-    label: &str,
-    outage: Outage,
-    attempts: u32,
-) {
-    if let Some(down) = policy.note_outage(outage, Instant::now()) {
+/// Two independent alarms with two independent claims, kept separate on
+/// purpose: "nothing has been received for `down_secs`" and "it has restarted
+/// `deaths` times in the last hour" are different facts with different
+/// remedies, and folding a flapping channel's up-time into the downtime clock
+/// is the defect #521's review round removed.
+fn report(label: &str, verdict: &Verdict, attempts: u32) {
+    if let Some(down) = verdict.still_down {
         error!(
             channel = %label,
             down_secs = down.as_secs(),
@@ -375,6 +380,17 @@ fn escalate_if_due(
             "CHANNEL STILL DOWN — nothing sent to this channel has been received for this long, \
              and it is still not staying up. The daemon is otherwise healthy; the cause is on \
              the preceding attempts' `error` field."
+        );
+    }
+    if let Some(deaths) = verdict.flapping {
+        error!(
+            channel = %label,
+            deaths,
+            window_secs = reporting::FLAP_ALARM_WINDOW.as_secs(),
+            "{CHANNEL_FLAPPING_LOG_PHRASE} — this channel keeps coming up and dying again. \
+             Each cycle costs a sandboxed worker, its egress sidecar and a full login, and \
+             a channel that restarts this often is not usefully up. The per-death cause is \
+             in the preceding `channel stopped working after running` lines."
         );
     }
 }

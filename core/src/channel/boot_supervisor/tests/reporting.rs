@@ -1,11 +1,22 @@
 //! ---------------------------------------------------------------------------
-//! Outage bookkeeping (#517 review). Escalation is a log line and nothing else,
-//! so these drive `note_outage` — the pure half of `escalate_if_due` — with
-//! scripted `Instant`s. That is the only seam from which the sequence that
-//! matters here (died → recovered → worked for hours → flapped) is observable.
+//! #518/#522: what gets said, and what gets stored, about a recurring channel
+//! event.
+//!
+//! Two halves. The first drives `note_outage` — the pure half of
+//! `ReportingPolicy::note_failed_attempt`/`note_death` — with scripted
+//! `Instant`s; escalation is a log line and nothing else (#517 review), so
+//! this is the only seam from which the sequence that matters here (died →
+//! recovered → worked for hours → flapped) is observable. The second runs the
+//! real retry loop end to end through `ChannelSupervisor::spawn`, because the
+//! #522 fix is specifically about state surviving actual restarts, which a
+//! pure `ReportingPolicy` test cannot exercise.
 //! ---------------------------------------------------------------------------
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::channel::respawn_alarm::RespawnRateAlarm;
 
 use super::*;
 
@@ -82,5 +93,165 @@ fn a_flapping_death_extends_the_outage_it_is_already_in() {
         note_outage(&mut esc, Outage::Continues, base + Duration::from_secs(301)),
         Some(Duration::from_secs(301)),
         "downtime is measured from the outage's first event, flaps included"
+    );
+}
+
+/// #522, end to end and through the real loop: the alarm must accumulate
+/// ACROSS restarts.
+///
+/// This is the test that fails if the alarm is ever moved inside the retry
+/// loop, which is the mistake `PersistentWorker` makes and the reason a channel
+/// restart could never trip its alarm. Three stable deaths with a threshold of
+/// two: an alarm rebuilt per iteration would see a count of one, every time,
+/// and the third death's row would still be written.
+#[tokio::test]
+async fn the_flap_alarm_accumulates_across_restarts() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let sink = RecordingSink::default();
+
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        // Every death is "stable", which is the #522 band exactly: the
+        // escalator resets on each one and can never fire.
+        ReportingPolicy::default()
+            .with_stable_uptime(Duration::ZERO)
+            .with_flap_alarm(RespawnRateAlarm::new(Duration::from_secs(3600), 2)),
+        Some(sink.sink()),
+        scripted(vec![
+            dying(&stopped),
+            dying(&stopped),
+            dying(&stopped),
+            healthy(&stopped),
+        ]),
+    );
+
+    // `stopped` counts channel stops, and the loop stops a dead channel BEFORE
+    // deciding on its row — so `>= 3` means all three deaths have happened and,
+    // by program order, cycle 2's row was already emitted. The fourth scripted
+    // outcome is healthy and is only stopped by `shutdown()` below, which is
+    // why waiting for 4 here would hang.
+    for _ in 0..500 {
+        if stopped.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sup.shutdown().await;
+
+    let deaths = sink
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e, BootAudit::Died { .. }))
+        .count();
+    assert_eq!(
+        deaths, 2,
+        "the first two deaths are durable and the third is suppressed by the latch; \
+         an alarm rebuilt per restart would record all three: {:?}",
+        sink.events()
+    );
+}
+
+/// The `channel.started` half of the same amplification: inside a death storm
+/// the start row says nothing the paired `channel.died` row's `ran_ms` does not.
+#[tokio::test]
+async fn a_start_inside_a_death_storm_is_not_recorded() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let sink = RecordingSink::default();
+
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        ReportingPolicy::default()
+            .with_stable_uptime(Duration::ZERO)
+            .with_flap_alarm(RespawnRateAlarm::new(Duration::from_secs(3600), 2)),
+        Some(sink.sink()),
+        scripted(vec![dying(&stopped), dying(&stopped), dying(&stopped), healthy(&stopped)]),
+    );
+
+    for _ in 0..500 {
+        if stopped.load(Ordering::SeqCst) >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sup.shutdown().await;
+
+    let starts = sink
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e, BootAudit::Started { .. }))
+        .count();
+    assert_eq!(
+        starts, 2,
+        "the two starts before the alarm latched are durable; the ones inside the storm \
+         are not: {:?}",
+        sink.events()
+    );
+}
+
+/// A fatal failure is never gated. It is terminal, it is one row, and it is the
+/// row that says why the channel will not be retried — the gate exists for
+/// events that repeat, and this one cannot.
+#[tokio::test]
+async fn a_fatal_failure_is_always_recorded() {
+    let sink = RecordingSink::default();
+
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        // A zero threshold escalates on the very first failure, so the
+        // escalator is latched before the fatal outcome is reached.
+        ReportingPolicy::new(DowntimeEscalator::new(Duration::ZERO, Duration::from_secs(1800))),
+        Some(sink.sink()),
+        scripted(vec![
+            BootOutcome::Retry(anyhow::anyhow!("transient")),
+            BootOutcome::Fatal(anyhow::anyhow!("KASTELLAN_EMAIL_ADDRESS is not set")),
+        ]),
+    );
+
+    sink.wait_for(2).await;
+    sup.shutdown().await;
+
+    let events = sink.events();
+    assert!(
+        events.iter().any(|e| matches!(e, BootAudit::Failed { fatal: true, .. })),
+        "the fatal row must survive a latched escalator: {events:?}"
+    );
+}
+
+/// #518 through the real loop: once the outage has been reported, identical
+/// attempts stop being written. A zero threshold escalates on the first
+/// failure, so attempts two onward are inside the repeat interval and silent.
+#[tokio::test]
+async fn failed_attempts_stop_being_recorded_once_the_outage_is_reported() {
+    let sink = RecordingSink::default();
+
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        ReportingPolicy::new(DowntimeEscalator::new(Duration::ZERO, Duration::from_secs(1800))),
+        Some(sink.sink()),
+        scripted(vec![
+            BootOutcome::Retry(anyhow::anyhow!("first")),
+            BootOutcome::Retry(anyhow::anyhow!("second")),
+            BootOutcome::Retry(anyhow::anyhow!("third")),
+            BootOutcome::Started(StartedChannel::new(|| async {})),
+        ]),
+    );
+
+    sink.wait_for_started().await;
+    sup.shutdown().await;
+
+    let failed = sink
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e, BootAudit::Failed { .. }))
+        .count();
+    assert_eq!(
+        failed, 1,
+        "the first attempt escalates and is recorded; the next two are inside the repeat \
+         interval and say nothing new: {:?}",
+        sink.events()
     );
 }

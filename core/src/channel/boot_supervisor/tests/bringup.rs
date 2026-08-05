@@ -112,10 +112,17 @@ async fn shutdown_while_backing_off_returns_promptly() {
         .expect("shutdown must not wait out the backoff delay");
 }
 
-/// The durable record: one row per failed attempt, numbered, carrying the
-/// delay before the next one, then one row on success.
+/// The durable record while the outage is still young: one row per failed
+/// attempt, numbered, carrying the delay before the next one, then one row on
+/// success.
+///
+/// "While young" is the whole caveat: once the outage escalates, identical
+/// attempt rows stop being written (#518) — see
+/// `tests::reporting::failed_attempts_stop_being_recorded_once_the_outage_is_reported`.
+/// This test stays valid because it runs in milliseconds against the default
+/// 300 s escalation threshold, so nothing here is ever gated.
 #[tokio::test]
-async fn every_failed_attempt_is_audited_with_its_attempt_number() {
+async fn failed_attempts_are_audited_with_their_attempt_numbers() {
     let sink = RecordingSink::default();
     let sup = ChannelSupervisor::spawn(
         "test",
