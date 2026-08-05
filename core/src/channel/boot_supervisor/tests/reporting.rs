@@ -19,6 +19,11 @@ use std::time::Duration;
 use crate::channel::respawn_alarm::RespawnRateAlarm;
 
 use super::*;
+// `Outage`/`note_outage` are `pub(super)` in `reporting` (visible to
+// `boot_supervisor` and every descendant, this module included) but are no
+// longer re-exported at the `boot_supervisor` top level, so `use super::*`
+// above no longer brings them in — import them directly from where they live.
+use super::super::reporting::{note_outage, Outage};
 
 /// The regression: a channel that died after working must NOT leave the
 /// escalator timing an outage, because a successful restart never clears it.

@@ -41,8 +41,10 @@
 //!
 //! So a [`StartedChannel`] now carries a liveness signal as well as a shutdown
 //! closure, and a death re-enters this same loop — same backoff, same
-//! escalator, same audit sink, plus a distinct [`BootAudit::Died`] row. Two
-//! things keep *that* from becoming its own failure:
+//! escalator, same audit sink, plus a [`BootAudit::Died`] row *when the
+//! reporting policy says this one earns it* (see [`reporting`]; that gate
+//! did not exist when this paragraph was first written and #518/#522 added
+//! it). Three things keep restart-on-death from becoming its own failure:
 //!
 //! * **The flap guard** ([`DowntimeEscalator::ran_long_enough`]). Only a
 //!   channel that stayed up resets the failure counter; one that dies on
@@ -53,6 +55,17 @@
 //!   others, and it is the per-channel task's drop that tears down the worker
 //!   and its sidecar. The loop therefore stops the channel on *both* exits from
 //!   the wait, which is what keeps a restart from leaking what #502 fixed.
+//! * **The reporting gate** ([`reporting::should_record`], fed by a
+//!   [`RespawnRateAlarm`](crate::channel::respawn_alarm::RespawnRateAlarm)
+//!   that counts deaths across restarts). Without it a channel that flaps
+//!   rather than dying once would write one `channel.died` row and one
+//!   identical `warn!` per cycle for as long as it flapped. This is the #518
+//!   fix for the bring-up stream, extended to liveness by #522 — the
+//!   [`DowntimeEscalator`] alone cannot see this pattern, because every death
+//!   in a flap is *stable* (it ran long enough to count as having worked), so
+//!   it resets the escalator instead of extending it and `CHANNEL STILL DOWN`
+//!   never fires. `CHANNEL FLAPPING` is the alarm that does, once enough
+//!   deaths land inside its window.
 //!
 //! The loop itself is database-free and network-free: audit rows go out
 //! through a boxed closure ([`BootAuditSink`] — the idiom
@@ -76,8 +89,16 @@ pub mod reporting;
 pub mod types;
 
 pub use downtime::DowntimeEscalator;
-pub use reporting::{note_outage, Outage, ReportingPolicy, Verdict, CHANNEL_FLAPPING_LOG_PHRASE};
+pub use reporting::{ReportingPolicy, Verdict, CHANNEL_FLAPPING_LOG_PHRASE};
 pub use types::{BootAudit, BootAuditSink, BootOutcome, StartedChannel};
+// `Outage` and `note_outage` are `pub(super)` in `reporting`, not re-exported
+// here: their only non-test caller is `ReportingPolicy` (which needs no
+// re-export, being a sibling module), and widening them to crate-public API
+// would let an external caller drive an escalator's outage state directly —
+// exactly what `ReportingPolicy` exists to keep encapsulated. `pub(super)`
+// already reaches every descendant of this module, including `tests::reporting`
+// below, which imports them directly from `reporting` rather than through this
+// re-export.
 
 #[cfg(test)]
 mod tests;
@@ -306,14 +327,24 @@ async fn run<F, Fut>(
                     "channel stopped working after running; restarting it"
                 );
                 let verdict = policy.note_death(stable, Instant::now());
-                if verdict.record {
-                    emit(&audit, BootAudit::Died { ran_ms, retry_in_ms }).await;
-                }
                 // `failures` is the figure to report: the flapping arm has just
                 // bumped it, and the stable arm cannot escalate at all
                 // ([`Outage::Ends`] never yields a downtime), so the zero it
                 // passes is never rendered.
+                //
+                // Reported BEFORE the gated `emit` below, not after: `emit`
+                // writes to Postgres and inherits sqlx's pool-acquire timeout,
+                // and the reachable cause of a pump death is Postgres going
+                // away — the one case where that write is slowest is exactly
+                // the case `CHANNEL FLAPPING`/`CHANNEL STILL DOWN` most needs
+                // to reach the log promptly. Nothing depends on this ordering:
+                // `verdict` is already computed before either call runs, and
+                // no test asserts an ordering between a log line and an audit
+                // row — they assert on sink events, not log output.
                 report(&label, &verdict, failures);
+                if verdict.record {
+                    emit(&audit, BootAudit::Died { ran_ms, retry_in_ms }).await;
+                }
                 if !wait_or_shutdown(delay, &mut shutdown).await {
                     return;
                 }
@@ -351,6 +382,11 @@ async fn run<F, Fut>(
                     "channel bring-up failed; retrying"
                 );
                 let verdict = policy.note_failed_attempt(Instant::now());
+                // See the death arm above for why `report` runs before the
+                // gated `emit`: the loud line must not wait on a Postgres
+                // write when Postgres going away is the reachable cause of
+                // the very failure being reported.
+                report(&label, &verdict, failures);
                 if verdict.record {
                     emit(
                         &audit,
@@ -363,7 +399,6 @@ async fn run<F, Fut>(
                     )
                     .await;
                 }
-                report(&label, &verdict, failures);
                 if !wait_or_shutdown(delay, &mut shutdown).await {
                     return;
                 }

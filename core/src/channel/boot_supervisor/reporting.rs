@@ -41,6 +41,27 @@
 //! nature, whereas an unescalated bring-up outage is unbounded: a
 //! permanently-failing `Retry` (a missing worker binary, say) can run for
 //! weeks.
+//!
+//! That ~1470 figure carries an unstated assumption worth stating: it holds
+//! only when every restart in the flap **succeeds on its first try**. Every
+//! death in the #522 band is *stable* (up longer than
+//! [`super::downtime::STABLE_UPTIME`]), so [`note_death`](ReportingPolicy::note_death)
+//! takes [`Outage::Ends`], which clears both `first_failure` and
+//! `last_escalated` (`escalator.record_success()` — see [`super::downtime`]).
+//! [`note_failed_attempt`](ReportingPolicy::note_failed_attempt) gates on
+//! `has_escalated()`, and that latch was just cleared — so if a restart's
+//! *first* attempt fails transiently before a later one succeeds, that failed
+//! attempt is recorded **ungated**, every single cycle of the flap.
+//! `CHANNEL STILL DOWN` correctly never fires in this band (that is the #522
+//! fix working as intended: nothing ever latches long enough to escalate), but
+//! it also means nothing ever *gates* — so a flap whose restarts also fail
+//! transiently writes an unbounded stream of `boot_failed` rows, not the ~53
+//! this section's arithmetic assumes. Deliberately not fixed by OR-ing
+//! `deaths.in_storm()` into that gate: it would be a bare latch read with no
+//! preceding `record()` — the exact stale-latch hazard the
+//! `the_first_death_of_a_fresh_storm_is_recorded` test below exists to
+//! forbid — and it would suppress `cause`, the only forensic field this row
+//! set has. Tracked as a follow-up rather than changed here.
 
 use std::time::{Duration, Instant};
 
@@ -54,7 +75,7 @@ use crate::channel::respawn_alarm::RespawnRateAlarm;
 /// health, whereas a failed bring-up (or the death of a channel that never got
 /// going) extends an outage already in progress.
 #[derive(Debug, Clone, Copy)]
-pub enum Outage {
+pub(super) enum Outage {
     /// A bring-up attempt failed, or a channel died without ever having stayed
     /// up long enough to count as having worked. Extends the outage in
     /// progress, opening one dated from now if there was none.
@@ -85,7 +106,7 @@ pub enum Outage {
 /// channel that died, came back, worked for hours, and then flapped — can be
 /// exercised without a runtime, a channel or a log capture. Escalation is a
 /// log line and nothing else, so without this it is unobservable to a test.
-pub fn note_outage(
+pub(super) fn note_outage(
     escalator: &mut DowntimeEscalator,
     outage: Outage,
     now: Instant,
