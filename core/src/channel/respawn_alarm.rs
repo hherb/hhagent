@@ -89,7 +89,14 @@ impl RespawnRateAlarm {
     /// read AFTER [`record`](Self::record)**: `record` is what clears the latch
     /// when a storm has cleared, so a read taken beforehand can suppress the
     /// first event of a fresh storm — the one event that most deserves a row.
-    pub fn in_storm(&self) -> bool {
+    ///
+    /// `pub(crate)` rather than `pub`, deliberately: that read-after-record
+    /// contract lives in this comment, not in the type system, so a bare latch
+    /// read is an attractive nuisance to any caller that has not absorbed it
+    /// (#523 documents the one in-crate temptation). Keeping it off the
+    /// published API means the only callers are ones this repo's review can
+    /// see.
+    pub(crate) fn in_storm(&self) -> bool {
         self.armed
     }
 

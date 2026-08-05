@@ -1,5 +1,16 @@
 # Channel Event Reporting Gates Implementation Plan
 
+> **As shipped (2026-08-06):** this plan is a historical execution artifact and was
+> executed with **one deviation**: gating `channel.started` — the architecture
+> paragraph's "`channel.died` / `channel.started`" and the whole "**`Started` arm** —
+> gate the row" step below — was a design error, caught mid-branch and **reversed**.
+> `channel.started` shipped **ungated**: the latch a gate would read is only cleared
+> by a *later* death, so the start that ends a storm would be suppressed with the
+> ones inside it, leaving `channel.died` as the last durable row for a healthy
+> channel. See the spec's "Why `channel.started` is not gated" section for the full
+> rationale, and `a_start_during_a_latched_storm_is_still_recorded` for the pin.
+> Everything else shipped as written. Do not transcribe the `Started`-gating text.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stop the channel supervisor writing an unbounded stream of identical audit rows during an outage (#518), and give it an alarm that notices a channel flapping in the 60 s–300 s uptime band that nothing currently escalates (#522).

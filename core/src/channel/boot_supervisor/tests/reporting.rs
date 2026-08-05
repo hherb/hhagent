@@ -171,6 +171,51 @@ async fn the_flap_alarm_accumulates_across_restarts() {
     );
 }
 
+/// The mid-branch reversal, pinned: `channel.started` is NEVER gated. The flap
+/// latch is only ever cleared by a LATER death, so a start recorded while the
+/// alarm is latched is the only durable evidence that a storm ended — a gate on
+/// this arm suppresses exactly the row that says "it is up again", leaving
+/// `channel.died` as the last durable event for a healthy channel.
+///
+/// Threshold 2, so the second death latches the alarm and the third start
+/// lands while the latch is armed. A `Started` arm gated on that latch records
+/// 2 starts, not 3 — and no other test catches that mutation, because every
+/// other test that counts `Started` rows runs below the default threshold of
+/// five deaths and never latches the alarm. (Checked by mutation, not assumed:
+/// gating the `Started` emit on the latch fails this test and nothing else.)
+#[tokio::test]
+async fn a_start_during_a_latched_storm_is_still_recorded() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let sink = RecordingSink::default();
+
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        ReportingPolicy::default()
+            .with_flap_alarm(RespawnRateAlarm::new(Duration::from_secs(3600), 2)),
+        Some(sink.sink()),
+        scripted(vec![dying(&stopped), dying(&stopped), healthy(&stopped)]),
+    );
+
+    // Five sink events: Started, Died, Started, Died (this one latches the
+    // alarm), Started. Under the gated mutation the fifth never arrives, so
+    // `wait_for` itself fails with the event dump.
+    sink.wait_for(5).await;
+    sup.shutdown().await;
+
+    let starts = sink
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e, BootAudit::Started { .. }))
+        .count();
+    assert_eq!(
+        starts, 3,
+        "every start must be durable, latch or no latch — the third lands inside \
+         the storm and is the row that says the channel came back: {:?}",
+        sink.events()
+    );
+}
+
 /// A fatal failure is never gated. It is terminal, it is one row, and it is the
 /// row that says why the channel will not be retried — the gate exists for
 /// events that repeat, and this one cannot.
