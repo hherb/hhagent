@@ -7,7 +7,7 @@
 > [`archive/handover_20260803_pre-prune.md`](archive/handover_20260803_pre-prune.md),
 > which holds the verbose pre-prune version of everything summarised here.
 
-**Last updated:** 2026-08-05 · **`main` HEAD:** `3932672a` · **Active branch:** none — on `main`, tree clean · **Deployed:** `3932672a` live on the DGX 2026-08-05 · **Last gate:** DGX **3028 / 0 / 53** at `3285a5e1`, `TEST_EXIT=0`, clippy `-D warnings` `CLIPPY_EXIT=0`, 4 `[SKIP]` (observed, all the env-gated GLiNER tier)
+**Last updated:** 2026-08-05 · **`main` HEAD:** `29bca5e5` (docs) / `3932672a` (last code merge) · **Active branch:** none — on `main`, tree clean · **Deployed:** `3932672a` live on the DGX 2026-08-05 · **Last gate:** DGX **3028 / 0 / 53** at `3285a5e1`, `TEST_EXIT=0`, clippy `-D warnings` `CLIPPY_EXIT=0`, 4 `[SKIP]` (observed, all the env-gated GLiNER tier)
 
 **🚀 RELEASED (2026-07-19/20): v0.2.0** — [release + tag](https://github.com/hherb/kastellan/releases/tag/v0.2.0) at `b3757cac`; all 20 publishable crates on crates.io. **Operator TODO for FUTURE releases (nothing pending for this one):** add crates.io Trusted-Publishing config (owner `hherb`, repo `hherb/kastellan`, workflow `release.yml`) to the 8 crates created since 0.1.0 — leak-scan, net-classify, matrix-wire, worker-matrix, embed-broker, search-broker, python-exec, web-research — so the next tag publishes hands-free. Gotchas: [[crates-io-release-procedure]].
 
@@ -206,7 +206,8 @@ Severity is bounded and worth stating precisely: I1/I3 only ever catch a model c
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
-| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`e469c703`** — `fix/517-supervise-channel-liveness` tip (#517), squashed into **`3932672a` ≡ `main`** | **3025 / 0 / 53**, `TEST_EXIT=0`, `--nocapture` | `CLIPPY_EXIT=0` (whole workspace) | exactly 4, all `KASTELLAN_GLINER_RELEX_ENABLE` |
+| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`3285a5e1`** — `fix/517-supervise-channel-liveness` review-round tip (#517), squashed into **`3932672a` ≡ `main`** | **3028 / 0 / 53**, `TEST_EXIT=0`, `--nocapture` | `CLIPPY_EXIT=0` (whole workspace) | exactly 4, all `KASTELLAN_GLINER_RELEX_ENABLE` |
+| DGX | `e469c703` (same branch, before the review round) | **3025 / 0 / 53**, `TEST_EXIT=0`, `--nocapture` | `CLIPPY_EXIT=0` | exactly 4, same tier |
 | DGX | `49c3bf40` (same branch, before the `attempts` fix) | **3023 / 0 / 53**, `TEST_EXIT=0`, `--nocapture` | `CLIPPY_EXIT=0` | exactly 4, same tier |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`984dc53a`** — `fix/504-install-all-workers` tip, review round (#504); squashed into **`41b21f36` ≡ `main`** | **3000 / 0 / 53**, `TEST_EXIT=0`, `--nocapture` | `CLIPPY_EXIT=0` (whole workspace) | exactly 4, all `KASTELLAN_GLINER_RELEX_ENABLE` |
 | DGX | `7a25eada` (same branch, before the review round) | **2994 / 0 / 53**, `TEST_EXIT=0` | exit 0 | exactly 4, same tier |
