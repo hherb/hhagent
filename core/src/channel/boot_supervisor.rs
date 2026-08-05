@@ -214,13 +214,17 @@ async fn run<F, Fut>(
 
             BootOutcome::Started(mut channel) => {
                 let attempts = failures + 1;
-                // The per-cycle log line is NOT gated: the daemon log is the
-                // per-event record, and it is what an operator reads while a
-                // channel is misbehaving. Only the durable row is rate-limited.
                 info!(channel = %label, attempts, "channel bus running");
-                if policy.should_record_start() {
-                    emit(&audit, BootAudit::Started { attempts }).await;
-                }
+                // Deliberately NOT gated, unlike `Died`/`Failed`: the latch a
+                // gate would read is only ever cleared by a LATER death, so
+                // the start that ends a storm for good would be suppressed
+                // right along with the ones inside it — leaving `channel.died`
+                // as the last durable row for a channel that is, in fact,
+                // healthy again. A gate here could make "is it up?" wrong,
+                // which is a worse failure than a few extra rows during a
+                // flap that is already loud (`CHANNEL FLAPPING` fires
+                // independently, every `FLAP_ALARM_REPEAT`).
+                emit(&audit, BootAudit::Started { attempts }).await;
 
                 let started_at = Instant::now();
                 // Wait for whichever comes first: the daemon shutting down, or
@@ -305,6 +309,10 @@ async fn run<F, Fut>(
                 if verdict.record {
                     emit(&audit, BootAudit::Died { ran_ms, retry_in_ms }).await;
                 }
+                // `failures` is the figure to report: the flapping arm has just
+                // bumped it, and the stable arm cannot escalate at all
+                // ([`Outage::Ends`] never yields a downtime), so the zero it
+                // passes is never rendered.
                 report(&label, &verdict, failures);
                 if !wait_or_shutdown(delay, &mut shutdown).await {
                     return;

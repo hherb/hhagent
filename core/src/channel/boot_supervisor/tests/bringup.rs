@@ -190,13 +190,20 @@ async fn a_supervisor_without_an_audit_sink_still_starts_and_stops_the_channel()
         },
     );
 
-    // Both scripted outcomes consumed ⇒ the channel is up and parked.
+    // Both scripted outcomes consumed ⇒ the channel is up and parked. Bare
+    // wait rather than `RecordingSink::wait_for` (there is no sink here at
+    // all); panics on fall-through rather than silently exhausting, so a
+    // future regression that stalls the loop is reported as a timeout, not
+    // masked by whatever the next assertion happens to say.
+    let mut both_consumed = false;
     for _ in 0..500 {
         if attempts.load(Ordering::SeqCst) >= 2 {
+            both_consumed = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(both_consumed, "expected both scripted outcomes consumed within 5s, saw {} attempts", attempts.load(Ordering::SeqCst));
     assert_eq!(attempts.load(Ordering::SeqCst), 2, "the loop must have retried once and started");
 
     sup.shutdown().await;

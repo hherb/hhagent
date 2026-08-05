@@ -100,10 +100,14 @@ fn a_flapping_death_extends_the_outage_it_is_already_in() {
 /// ACROSS restarts.
 ///
 /// This is the test that fails if the alarm is ever moved inside the retry
-/// loop, which is the mistake `PersistentWorker` makes and the reason a channel
-/// restart could never trip its alarm. Three stable deaths with a threshold of
-/// two: an alarm rebuilt per iteration would see a count of one, every time,
-/// and the third death's row would still be written.
+/// loop. `PersistentWorker` does not make that mistake for worker respawns —
+/// its own alarm lives on the driver thread and correctly accumulates them —
+/// but a *channel* restart tears down the whole `PersistentWorker`, so an
+/// alarm living at that level could never see a channel-restart pattern
+/// either; see the `deaths` field doc on `ReportingPolicy` for the full
+/// argument. Three stable deaths with a threshold of two: an alarm rebuilt
+/// per iteration would see a count of one, every time, and the third death's
+/// row would still be written.
 #[tokio::test]
 async fn the_flap_alarm_accumulates_across_restarts() {
     let stopped = Arc::new(AtomicUsize::new(0));
@@ -131,12 +135,22 @@ async fn the_flap_alarm_accumulates_across_restarts() {
     // by program order, cycle 2's row was already emitted. The fourth scripted
     // outcome is healthy and is only stopped by `shutdown()` below, which is
     // why waiting for 4 here would hang.
+    //
+    // Bare wait rather than `RecordingSink::wait_for`: it is `stopped`, not the
+    // sink, being polled. Panics on fall-through rather than falling silently
+    // out of the loop — a `for` loop with no assertion of its own gives no
+    // signal if a future regression stops the three deaths from ever
+    // happening, which is exactly the shape of bug #518/#522's review found in
+    // this file's sibling test (since deleted).
+    let mut all_three_died = false;
     for _ in 0..500 {
         if stopped.load(Ordering::SeqCst) >= 3 {
+            all_three_died = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(all_three_died, "expected 3 scripted deaths within 5s, saw {}", stopped.load(Ordering::SeqCst));
     sup.shutdown().await;
 
     let deaths = sink
@@ -148,44 +162,6 @@ async fn the_flap_alarm_accumulates_across_restarts() {
         deaths, 2,
         "the first two deaths are durable and the third is suppressed by the latch; \
          an alarm rebuilt per restart would record all three: {:?}",
-        sink.events()
-    );
-}
-
-/// The `channel.started` half of the same amplification: inside a death storm
-/// the start row says nothing the paired `channel.died` row's `ran_ms` does not.
-#[tokio::test]
-async fn a_start_inside_a_death_storm_is_not_recorded() {
-    let stopped = Arc::new(AtomicUsize::new(0));
-    let sink = RecordingSink::default();
-
-    let sup = ChannelSupervisor::spawn(
-        "test",
-        fast_backoff(),
-        ReportingPolicy::default()
-            .with_stable_uptime(Duration::ZERO)
-            .with_flap_alarm(RespawnRateAlarm::new(Duration::from_secs(3600), 2)),
-        Some(sink.sink()),
-        scripted(vec![dying(&stopped), dying(&stopped), dying(&stopped), healthy(&stopped)]),
-    );
-
-    for _ in 0..500 {
-        if stopped.load(Ordering::SeqCst) >= 4 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    sup.shutdown().await;
-
-    let starts = sink
-        .events()
-        .into_iter()
-        .filter(|e| matches!(e, BootAudit::Started { .. }))
-        .count();
-    assert_eq!(
-        starts, 2,
-        "the two starts before the alarm latched are durable; the ones inside the storm \
-         are not: {:?}",
         sink.events()
     );
 }

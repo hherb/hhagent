@@ -1,10 +1,13 @@
 //! When does a restart-worthy channel event earn an operator's attention, and
 //! when does it earn a durable row in `audit_log`?
 //!
-//! This module is the only place either question is answered. Splitting an
-//! operator-facing policy across call sites is how the answer drifts — #516
-//! and #521 each found one instance of exactly that, in this feature's own
-//! documentation.
+//! This module is the only place either question is answered for every
+//! *recurring* event. (A [`BootOutcome::Fatal`](super::BootOutcome::Fatal) is
+//! the one exception, and deliberately lives outside it: it happens at most
+//! once per channel lifetime, so there is no rate to police — see
+//! `boot_supervisor::report`.) Splitting an operator-facing policy across call
+//! sites is how the answer drifts — #516 and #521 each found one instance of
+//! exactly that, in this feature's own documentation.
 //!
 //! The retry loop in [`super`] stays deliberately ignorant of the policy: it
 //! reports one event to [`ReportingPolicy::note_failed_attempt`] or
@@ -20,14 +23,24 @@
 //! keeps coming up and dying again — the band #522 found where every death is
 //! "stable" (up longer than [`super::downtime::STABLE_UPTIME`] but nowhere
 //! near its escalation threshold), so the escalator resets on every one and
-//! can never fire. [`should_record`] is the single predicate that gates the
-//! durable row for both streams: record the event unless the alarm that owns
-//! its regime is already latched on this episode and did not speak for this
-//! particular event. That is what turns a 24-hour outage into ~57 rows
-//! instead of ~1440, and a 24-hour flap into ~58 rows instead of ~2800 (the
-//! paired `channel.died` and `channel.started` rows both gated), without
-//! inventing a "first N events" counter that would drift from the escalation
-//! policy the moment either changed.
+//! can never fire. [`should_record`] is the predicate that gates the durable
+//! row for `channel.boot_failed` and `channel.died`: record the event unless
+//! the alarm that owns its regime is already latched on this episode and did
+//! not speak for this particular event. That is what turns a 24-hour outage
+//! into ~57 `boot_failed` rows instead of ~1440, without inventing a "first N
+//! events" counter that would drift from the escalation policy the moment
+//! either changed.
+//!
+//! `channel.started` is deliberately **not** gated by either alarm — see
+//! [`super::run`]'s `Started` arm for why a flap-alarm latch is the wrong
+//! predicate for a row that is, precisely, the one that says a storm has
+//! ended. A 24-hour flap at the #522 band's ~61 s cycle is therefore ~1470
+//! rows (~1416 unguarded `started` plus ~53 gated `died`), down from ~2832 —
+//! smaller than the bring-up-outage win, because a flap is loud on its own
+//! terms (`CHANNEL FLAPPING` every [`FLAP_ALARM_REPEAT`]) and short-lived by
+//! nature, whereas an unescalated bring-up outage is unbounded: a
+//! permanently-failing `Retry` (a missing worker binary, say) can run for
+//! weeks.
 
 use std::time::{Duration, Instant};
 
@@ -115,7 +128,7 @@ pub const FLAP_ALARM_THRESHOLD: usize = 5;
 
 /// How often the flap alarm repeats while the storm persists.
 ///
-/// [`DowntimeEscalator::DEFAULT_REPEAT`]'s value, for the same reason: an
+/// [`super::downtime::DEFAULT_REPEAT`]'s value, for the same reason: an
 /// hours-long problem should be a handful of lines rather than one line and
 /// then silence. It matters more here than it does there, because this alarm
 /// also gates the durable row — without a repeat, a flap lasting days would
@@ -162,10 +175,18 @@ pub fn should_record(alarm_latched: bool, alarm_spoke_now: bool) -> bool {
 pub struct ReportingPolicy {
     escalator: DowntimeEscalator,
     /// Counts deaths across restarts. **Owned here, not inside the retry
-    /// loop** — that placement IS the #522 fix. `PersistentWorker` builds its
-    /// alarm inside the object a restart replaces, so the window is discarded
-    /// every cycle and can never accumulate; a channel restart would do exactly
-    /// the same to an alarm the loop owned.
+    /// loop** — that placement IS the #522 fix, for the same reason
+    /// `PersistentWorker`'s own respawn alarm lives on its driver thread
+    /// rather than inside the worker object a respawn replaces: an alarm
+    /// scoped to the thing being torn down and rebuilt can never see a
+    /// pattern across rebuilds of that thing. `PersistentWorker`'s alarm gets
+    /// this right for worker respawns — it correctly accumulates across them,
+    /// for the life of the driver thread — but it cannot also see a *channel*
+    /// restart, because a channel restart tears down the whole
+    /// `PersistentWorker`, driver thread and alarm together. This alarm has
+    /// to live one level higher, in the object a channel restart does not
+    /// replace: `ReportingPolicy`, which the retry loop holds across every
+    /// iteration.
     deaths: RespawnRateAlarm,
 }
 
@@ -210,7 +231,8 @@ impl ReportingPolicy {
     }
 
     /// Is the channel currently inside a death storm the alarm has reported?
-    /// Test-facing; the loop asks [`should_record_start`](Self::should_record_start).
+    /// Test-facing only — nothing in production reads this; the durable-row
+    /// gate for deaths lives entirely inside [`note_death`](Self::note_death).
     #[cfg(test)]
     pub(super) fn in_flap_storm(&self) -> bool {
         self.deaths.in_storm()
@@ -219,8 +241,11 @@ impl ReportingPolicy {
     /// Fold a failed bring-up attempt into the bookkeeping.
     pub fn note_failed_attempt(&mut self, now: Instant) -> Verdict {
         let still_down = note_outage(&mut self.escalator, Outage::Continues, now);
-        // Both inputs are read AFTER recording. See `should_record_start` for
-        // why the order is load-bearing.
+        // Read after recording, matching `note_death` below — but here the
+        // order is NOT actually load-bearing: `record_failure` never clears
+        // `has_escalated`'s latch mid-call the way `RespawnRateAlarm::record`
+        // clears `in_storm`'s, so `!latched || spoke` is invariant either way.
+        // Kept read-after-record anyway, so the two methods read alike.
         Verdict {
             record: should_record(self.escalator.has_escalated(), still_down.is_some()),
             still_down,
@@ -246,25 +271,6 @@ impl ReportingPolicy {
             still_down,
             flapping,
         }
-    }
-
-    /// Does a successful start earn a durable row?
-    ///
-    /// Gated on the death alarm rather than on a start counter because the
-    /// supervisor's `failures` count resets to 0 on every *stable* death — so
-    /// in the #522 band a start-count gate would never engage at all. Inside a
-    /// storm the row is genuinely redundant: the paired `channel.died` row
-    /// carries `ran_ms`, which already proves the channel came up and for how
-    /// long. Outside one — a recovery from a bring-up outage — it is the most
-    /// valuable row there is, and always lands.
-    ///
-    /// Reads the latch with no recording call of its own, so it reflects the
-    /// state left by the previous cycle's death. That is also why every latch
-    /// read in this module happens *after* its recording call: `record` is what
-    /// clears the latch when a storm has cleared, and a read taken beforehand
-    /// would suppress the first event of a fresh storm.
-    pub fn should_record_start(&self) -> bool {
-        should_record(self.deaths.in_storm(), false)
     }
 }
 
@@ -359,25 +365,6 @@ mod tests {
         }
         // But the flap alarm did speak, which is the whole point of #522.
         assert!(policy.in_flap_storm(), "five stable deaths in an hour is a storm");
-    }
-
-    /// A start is suppressed only while the flap alarm is latched. A recovery
-    /// from a bring-up outage — the most valuable row there is — always lands.
-    #[test]
-    fn a_start_is_recorded_unless_the_channel_is_in_a_death_storm() {
-        let base = Instant::now();
-        let mut policy = ReportingPolicy::default().with_flap_alarm(
-            RespawnRateAlarm::new(Duration::from_secs(3600), 2),
-        );
-
-        assert!(policy.should_record_start(), "no deaths at all: record the start");
-
-        policy.note_failed_attempt(base);
-        assert!(policy.should_record_start(), "a bring-up outage does not suppress its recovery");
-
-        policy.note_death(true, base);
-        policy.note_death(true, base + Duration::from_secs(61));
-        assert!(!policy.should_record_start(), "inside a death storm the start row is redundant");
     }
 
     /// The sampling-order trap, pinned. When a storm clears, `record` prunes
