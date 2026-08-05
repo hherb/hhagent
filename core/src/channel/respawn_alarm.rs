@@ -97,8 +97,10 @@ impl RespawnRateAlarm {
     ///
     /// Returns `Some(count)` — where `count` is the number of respawns in the
     /// window including this one — the first time the in-window count reaches
-    /// the threshold for a given storm; returns `None` otherwise (below
-    /// threshold, or already fired for the ongoing storm).
+    /// the threshold for a given storm; or again once `repeat` (if set) has
+    /// elapsed since the previous firing; returns `None` otherwise (below
+    /// threshold, or already fired for the ongoing storm without a repeat, or
+    /// repeat interval not yet elapsed).
     ///
     /// `now` is expected to be monotonically non-decreasing across calls (it is
     /// in the driver, where it is always `Instant::now()`); out-of-order
