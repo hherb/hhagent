@@ -233,12 +233,29 @@ pub fn render_email_help() -> String {
 # channel off for the life of the process. Since #517 the same applies AFTER
 # the channel is up: if it stops working it is restarted the same way, and the
 # death is recorded as @@BOOT_DIED@@ carrying ran_ms (how long it had been
-# working — what tells a real outage apart from a flapping channel). Every
-# attempt is durable in audit_log as @@BOOT_FAILED@@, and success as
-# @@BOOT_STARTED@@:
+# working — what tells a real outage apart from a flapping channel). The
+# first attempts are durable in audit_log as @@BOOT_FAILED@@:
 #   SELECT ts, action, payload FROM audit_log
 #    WHERE action IN ('@@BOOT_STARTED@@','@@BOOT_FAILED@@','@@BOOT_DIED@@')
 #      AND payload->>'channel' = 'email' ORDER BY ts DESC LIMIT 20;
+# @@BOOT_FAILED@@ is RATE-LIMITED by the downtime clock: every attempt until
+# the outage is first reported as CHANNEL STILL DOWN (5 min of continuous
+# downtime), then only on each repeat of that line (every 30 min). A 24-hour
+# outage produces ~57 rows instead of ~1440. @@BOOT_DIED@@
+# is RATE-LIMITED by a separate flap alarm: every death until 5 deaths within
+# an hour first reports @@CHANNEL_FLAPPING@@, then only on each repeat. These are
+# independent: a channel that keeps recovering and dying (e.g., cycles up 61s
+# then dies repeatedly) may never produce CHANNEL STILL DOWN at all, yet will
+# still stop writing @@BOOT_DIED@@ rows once the flap alarm fires — but in
+# that same cycling regime @@BOOT_FAILED@@ rows are NOT rate-limited at all:
+# each stable death resets the downtime clock above (a channel that ran long
+# enough to count as having worked always does, whatever killed it), so if a
+# restart's first attempt then fails transiently before a later one succeeds,
+# that attempt is recorded ungated, every cycle. @@BOOT_STARTED@@
+# is NOT rate-limited: every successful start writes a row, always. So a gap
+# between rows means "still broken, still saying the same thing", NOT
+# "recovered" — look for a @@BOOT_STARTED@@ row for recovery. The daemon log
+# (~/.local/state/kastellan/*.out) is the per-event record.
 # CAVEAT: a channel most often dies because Postgres went away — and the row
 # above needs that same Postgres, so exactly that outage writes no rows until
 # it is over. The daemon log is the record for it.
@@ -300,6 +317,14 @@ pub fn render_email_help() -> String {
     .replace("@@BOOT_STARTED@@", crate::channel::actions::BOOT_STARTED)
     .replace("@@BOOT_FAILED@@", crate::channel::actions::BOOT_FAILED)
     .replace("@@BOOT_DIED@@", crate::channel::actions::CHANNEL_DIED)
+    // Same reason as the three substitutions above: the flap alarm's phrase is
+    // a `const` specifically so it cannot drift from what an operator greps
+    // for (see `CHANNEL_FLAPPING_LOG_PHRASE`'s doc comment) — a literal here
+    // would defeat that the moment either side was renamed.
+    .replace(
+        "@@CHANNEL_FLAPPING@@",
+        crate::channel::boot_supervisor::CHANNEL_FLAPPING_LOG_PHRASE,
+    )
 }
 
 /// Render the `kastellan.env` EnvironmentFile contents.
@@ -893,6 +918,14 @@ mod tests {
         assert!(
             help.contains(crate::channel::boot_supervisor::CHANNEL_DISABLED_LOG_PHRASE),
             "must name the exact startup log phrase to grep for: {help}"
+        );
+        // Same reasoning, for the flap alarm's phrase: asserted through the
+        // const `report()` interpolates, never as a literal typed a second
+        // time here — a literal is exactly what would stay green while the
+        // help and the log line drifted apart.
+        assert!(
+            help.contains(crate::channel::boot_supervisor::CHANNEL_FLAPPING_LOG_PHRASE),
+            "must name the exact flap-alarm log phrase to grep for: {help}"
         );
         assert!(
             !help.contains("@@"),

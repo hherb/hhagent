@@ -41,8 +41,10 @@
 //!
 //! So a [`StartedChannel`] now carries a liveness signal as well as a shutdown
 //! closure, and a death re-enters this same loop — same backoff, same
-//! escalator, same audit sink, plus a distinct [`BootAudit::Died`] row. Two
-//! things keep *that* from becoming its own failure:
+//! escalator, same audit sink, plus a [`BootAudit::Died`] row *when the
+//! reporting policy says this one earns it* (see [`reporting`]; that gate
+//! did not exist when this paragraph was first written and #518/#522 added
+//! it). Three things keep restart-on-death from becoming its own failure:
 //!
 //! * **The flap guard** ([`DowntimeEscalator::ran_long_enough`]). Only a
 //!   channel that stayed up resets the failure counter; one that dies on
@@ -53,6 +55,17 @@
 //!   others, and it is the per-channel task's drop that tears down the worker
 //!   and its sidecar. The loop therefore stops the channel on *both* exits from
 //!   the wait, which is what keeps a restart from leaking what #502 fixed.
+//! * **The reporting gate** ([`reporting::should_record`], fed by a
+//!   [`RespawnRateAlarm`](crate::channel::respawn_alarm::RespawnRateAlarm)
+//!   that counts deaths across restarts). Without it a channel that flaps
+//!   rather than dying once would write one `channel.died` row and one
+//!   identical `warn!` per cycle for as long as it flapped. This is the #518
+//!   fix for the bring-up stream, extended to liveness by #522 — the
+//!   [`DowntimeEscalator`] alone cannot see this pattern, because every death
+//!   in a flap is *stable* (it ran long enough to count as having worked), so
+//!   it resets the escalator instead of extending it and `CHANNEL STILL DOWN`
+//!   never fires. `CHANNEL FLAPPING` is the alarm that does, once enough
+//!   deaths land inside its window.
 //!
 //! The loop itself is database-free and network-free: audit rows go out
 //! through a boxed closure ([`BootAuditSink`] — the idiom
@@ -72,10 +85,20 @@ use crate::worker_lifecycle::RestartBackoff;
 
 pub mod downtime;
 pub mod pg_sink;
+pub mod reporting;
 pub mod types;
 
 pub use downtime::DowntimeEscalator;
+pub use reporting::{ReportingPolicy, Verdict, CHANNEL_FLAPPING_LOG_PHRASE};
 pub use types::{BootAudit, BootAuditSink, BootOutcome, StartedChannel};
+// `Outage` and `note_outage` are `pub(super)` in `reporting`, not re-exported
+// here: their only non-test caller is `ReportingPolicy` (which needs no
+// re-export, being a sibling module), and widening them to crate-public API
+// would let an external caller drive an escalator's outage state directly —
+// exactly what `ReportingPolicy` exists to keep encapsulated. `pub(super)`
+// already reaches every descendant of this module, including `tests::reporting`
+// below, which imports them directly from `reporting` rather than through this
+// re-export.
 
 #[cfg(test)]
 mod tests;
@@ -122,7 +145,9 @@ impl ChannelSupervisor {
     /// * `label` — channel name; appears in every log line and audit row.
     /// * `backoff` — delay schedule. [`RestartBackoff::default()`] is 1 s → ×2
     ///   → 60 s cap, the same schedule supervised workers use.
-    /// * `escalator` — decides when a long outage earns a louder line.
+    /// * `policy` — decides when an event earns a louder line and when it
+    ///   earns a durable row. [`ReportingPolicy::default()`] is the production
+    ///   configuration.
     /// * `audit` — `None` disables audit rows entirely (tests, and any caller
     ///   with no pool).
     /// * `attempt` — one bring-up try. Called fresh each time, so it must own
@@ -130,7 +155,7 @@ impl ChannelSupervisor {
     pub fn spawn<F, Fut>(
         label: impl Into<String>,
         backoff: RestartBackoff,
-        escalator: DowntimeEscalator,
+        policy: ReportingPolicy,
         audit: Option<BootAuditSink>,
         attempt: F,
     ) -> Self
@@ -141,7 +166,7 @@ impl ChannelSupervisor {
         let label = label.into();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let join =
-            tokio::spawn(run(label.clone(), backoff, escalator, audit, attempt, shutdown_rx));
+            tokio::spawn(run(label.clone(), backoff, policy, audit, attempt, shutdown_rx));
         Self { label, shutdown_tx: Some(shutdown_tx), join }
     }
 
@@ -171,7 +196,7 @@ impl ChannelSupervisor {
 async fn run<F, Fut>(
     label: String,
     backoff: RestartBackoff,
-    mut escalator: DowntimeEscalator,
+    mut policy: ReportingPolicy,
     audit: Option<BootAuditSink>,
     attempt: F,
     mut shutdown: oneshot::Receiver<()>,
@@ -211,6 +236,15 @@ async fn run<F, Fut>(
             BootOutcome::Started(mut channel) => {
                 let attempts = failures + 1;
                 info!(channel = %label, attempts, "channel bus running");
+                // Deliberately NOT gated, unlike `Died`/`Failed`: the latch a
+                // gate would read is only ever cleared by a LATER death, so
+                // the start that ends a storm for good would be suppressed
+                // right along with the ones inside it — leaving `channel.died`
+                // as the last durable row for a channel that is, in fact,
+                // healthy again. A gate here could make "is it up?" wrong,
+                // which is a worse failure than a few extra rows during a
+                // flap that is already loud (`CHANNEL FLAPPING` fires
+                // independently, every `FLAP_ALARM_REPEAT`).
                 emit(&audit, BootAudit::Started { attempts }).await;
 
                 let started_at = Instant::now();
@@ -275,13 +309,14 @@ async fn run<F, Fut>(
                 //     already in progress and must be counted. Otherwise the
                 //     backoff resets on every iteration and the supervisor
                 //     spins, spawning a sandboxed worker each time round.
-                let (delay, outage) = if escalator.ran_long_enough(ran) {
+                let stable = policy.ran_long_enough(ran);
+                let delay = if stable {
                     failures = 0;
-                    (backoff.next_delay(failures), Outage::Ends)
+                    backoff.next_delay(failures)
                 } else {
                     let delay = backoff.next_delay(failures);
                     failures += 1;
-                    (delay, Outage::Continues)
+                    delay
                 };
                 let ran_ms = ran.as_millis() as u64;
                 let retry_in_ms = delay.as_millis() as u64;
@@ -291,12 +326,25 @@ async fn run<F, Fut>(
                     retry_in_ms,
                     "channel stopped working after running; restarting it"
                 );
-                emit(&audit, BootAudit::Died { ran_ms, retry_in_ms }).await;
+                let verdict = policy.note_death(stable, Instant::now());
                 // `failures` is the figure to report: the flapping arm has just
                 // bumped it, and the stable arm cannot escalate at all
                 // ([`Outage::Ends`] never yields a downtime), so the zero it
                 // passes is never rendered.
-                escalate_if_due(&mut escalator, &label, outage, failures);
+                //
+                // Reported BEFORE the gated `emit` below, not after: `emit`
+                // writes to Postgres and inherits sqlx's pool-acquire timeout,
+                // and the reachable cause of a pump death is Postgres going
+                // away — the one case where that write is slowest is exactly
+                // the case `CHANNEL FLAPPING`/`CHANNEL STILL DOWN` most needs
+                // to reach the log promptly. Nothing depends on this ordering:
+                // `verdict` is already computed before either call runs, and
+                // no test asserts an ordering between a log line and an audit
+                // row — they assert on sink events, not log output.
+                report(&label, &verdict, failures);
+                if verdict.record {
+                    emit(&audit, BootAudit::Died { ran_ms, retry_in_ms }).await;
+                }
                 if !wait_or_shutdown(delay, &mut shutdown).await {
                     return;
                 }
@@ -333,17 +381,24 @@ async fn run<F, Fut>(
                     error = %format!("{e:#}"),
                     "channel bring-up failed; retrying"
                 );
-                emit(
-                    &audit,
-                    BootAudit::Failed {
-                        attempt: failures,
-                        retry_in_ms: Some(delay.as_millis() as u64),
-                        fatal: false,
-                        cause: cap_chars(&format!("{e:#}"), AUDIT_CAUSE_CAP_CHARS),
-                    },
-                )
-                .await;
-                escalate_if_due(&mut escalator, &label, Outage::Continues, failures);
+                let verdict = policy.note_failed_attempt(Instant::now());
+                // See the death arm above for why `report` runs before the
+                // gated `emit`: the loud line must not wait on a Postgres
+                // write when Postgres going away is the reachable cause of
+                // the very failure being reported.
+                report(&label, &verdict, failures);
+                if verdict.record {
+                    emit(
+                        &audit,
+                        BootAudit::Failed {
+                            attempt: failures,
+                            retry_in_ms: Some(delay.as_millis() as u64),
+                            fatal: false,
+                            cause: cap_chars(&format!("{e:#}"), AUDIT_CAUSE_CAP_CHARS),
+                        },
+                    )
+                    .await;
+                }
                 if !wait_or_shutdown(delay, &mut shutdown).await {
                     return;
                 }
@@ -352,47 +407,15 @@ async fn run<F, Fut>(
     }
 }
 
-/// How one restart-worthy event relates to the outage the escalator is timing.
+/// Emit whichever loud lines this event earned.
 ///
-/// The distinction exists because a death is not always a *failure*: a channel
-/// that had been working for hours and then stopped has just ended a period of
-/// health, whereas a failed bring-up (or the death of a channel that never got
-/// going) extends an outage already in progress.
-#[derive(Debug, Clone, Copy)]
-enum Outage {
-    /// A bring-up attempt failed, or a channel died without ever having stayed
-    /// up long enough to count as having worked. Extends the outage in
-    /// progress, opening one dated from now if there was none.
-    Continues,
-    /// A channel that HAD been working stopped. Ends the outage the escalator
-    /// was timing — and, deliberately, does **not** open the next one.
-    ///
-    /// Opening it here reads more precise, because the outage really does begin
-    /// at the death. But nothing would ever close it: the escalator is only
-    /// told about health when a *stable* channel dies, so a channel that came
-    /// straight back and then worked for four hours would still be carrying
-    /// this instant when it next flapped — and would report those four healthy
-    /// hours as downtime, in the one line whose text asserts that nothing sent
-    /// to the channel has been received for that long. The next outage is
-    /// therefore opened by the first restart attempt that actually fails, which
-    /// is the only version that stays correct when the restart SUCCEEDS. The
-    /// price is that a real outage is dated one backoff delay late (1 s for the
-    /// first restart, 60 s at the cap); the price of the eager version is
-    /// unbounded.
-    Ends,
-}
-
-/// Fold one restart-worthy event into the outage bookkeeping, and emit the loud
-/// line if it has earned one.
-///
-/// The **only** place either half of [`DowntimeEscalator`]'s outage state is
-/// driven from. Shared by the two arms that can fail — a bring-up that will not
-/// succeed and a channel that keeps dying — because from an operator's side
-/// they are the same event: the channel has been unusable for this long and is
-/// not fixing itself. Splitting the escalation policy across two call sites is
-/// how the two drift.
-fn escalate_if_due(escalator: &mut DowntimeEscalator, label: &str, outage: Outage, attempts: u32) {
-    if let Some(down) = note_outage(escalator, outage, Instant::now()) {
+/// Two independent alarms with two independent claims, kept separate on
+/// purpose: "nothing has been received for `down_secs`" and "it has restarted
+/// `deaths` times in the last hour" are different facts with different
+/// remedies, and folding a flapping channel's up-time into the downtime clock
+/// is the defect #521's review round removed.
+fn report(label: &str, verdict: &Verdict, attempts: u32) {
+    if let Some(down) = verdict.still_down {
         error!(
             channel = %label,
             down_secs = down.as_secs(),
@@ -402,29 +425,16 @@ fn escalate_if_due(escalator: &mut DowntimeEscalator, label: &str, outage: Outag
              the preceding attempts' `error` field."
         );
     }
-}
-
-/// The pure half of [`escalate_if_due`]: update the outage bookkeeping for one
-/// event and answer "does this one earn the loud line?".
-///
-/// Split from the logging so the sequence that has no other test seam — a
-/// channel that died, came back, worked for hours, and then flapped — can be
-/// exercised without a runtime, a channel or a log capture. Escalation is a log
-/// line and nothing else, so without this it is unobservable to a test.
-fn note_outage(
-    escalator: &mut DowntimeEscalator,
-    outage: Outage,
-    now: Instant,
-) -> Option<std::time::Duration> {
-    match outage {
-        // Ends the outage and opens nothing — see [`Outage::Ends`] for why the
-        // next one has to wait for a restart that actually fails. `now` is
-        // deliberately unused on this arm.
-        Outage::Ends => {
-            escalator.record_success();
-            None
-        }
-        Outage::Continues => escalator.record_failure(now),
+    if let Some(deaths) = verdict.flapping {
+        error!(
+            channel = %label,
+            deaths,
+            window_secs = reporting::FLAP_ALARM_WINDOW.as_secs(),
+            "{CHANNEL_FLAPPING_LOG_PHRASE} — this channel keeps coming up and dying again. \
+             Each cycle costs a sandboxed worker, its egress sidecar and a full login, and \
+             a channel that restarts this often is not usefully up. The per-death cause is \
+             in the preceding `channel stopped working after running` lines."
+        );
     }
 }
 

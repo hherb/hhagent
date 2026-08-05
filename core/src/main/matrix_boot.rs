@@ -30,7 +30,7 @@ use tracing::info;
 
 use kastellan_core::channel::boot_supervisor::pg_sink::pg_boot_audit_sink;
 use kastellan_core::channel::boot_supervisor::{
-    BootOutcome, ChannelSupervisor, DowntimeEscalator, StartedChannel,
+    BootOutcome, ChannelSupervisor, ReportingPolicy, StartedChannel,
 };
 use kastellan_core::channel::ChannelBus;
 use kastellan_core::worker_lifecycle::force_route::ForceRoutingConfig;
@@ -221,7 +221,7 @@ pub(crate) fn supervise_matrix_channel(
     ChannelSupervisor::spawn(
         "matrix",
         RestartBackoff::default(),
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         Some(audit),
         move || attempt(pool.clone(), sandboxes.clone(), force_routing.clone()),
     )

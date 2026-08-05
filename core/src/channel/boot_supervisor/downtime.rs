@@ -91,6 +91,20 @@ impl DowntimeEscalator {
         ran >= self.stable_uptime
     }
 
+    /// Has this outage already been reported loudly?
+    ///
+    /// The supervisor's audit gate reads this to decide whether a failed
+    /// attempt still earns a durable row: until the outage has been escalated,
+    /// every attempt does, and after it only the escalations do. That is what
+    /// keeps a 24-hour outage to ~57 rows instead of ~1440 (#518) without
+    /// inventing a "first N attempts" constant nobody could derive.
+    ///
+    /// Cleared by [`record_success`](Self::record_success), so a fresh outage
+    /// records its early attempts in full.
+    pub fn has_escalated(&self) -> bool {
+        self.last_escalated.is_some()
+    }
+
     /// Record a failed bring-up attempt that happened at `now`.
     ///
     /// Returns `Some(downtime)` when this failure should be reported loudly,
@@ -311,5 +325,35 @@ mod tests {
         esc.record_success();
 
         assert_eq!(esc.record_failure(base), None);
+    }
+
+    /// The latch the audit gate reads for the bring-up stream: has this outage
+    /// already been reported loudly? Below the threshold it has not, so every
+    /// attempt is still worth a durable row.
+    #[test]
+    fn has_escalated_is_false_until_the_outage_is_reported() {
+        let base = Instant::now();
+        let mut esc = DowntimeEscalator::new(THRESHOLD, REPEAT);
+
+        assert!(!esc.has_escalated(), "a fresh escalator has said nothing");
+        esc.record_failure(base);
+        assert!(!esc.has_escalated(), "inside the threshold it is still quiet");
+        assert!(esc.record_failure(base + Duration::from_secs(301)).is_some());
+        assert!(esc.has_escalated(), "it has now reported this outage");
+    }
+
+    /// Recovery clears the latch, so the NEXT outage records its early attempts
+    /// in full rather than inheriting the previous outage's silence.
+    #[test]
+    fn record_success_clears_the_escalated_latch() {
+        let base = Instant::now();
+        let mut esc = DowntimeEscalator::new(THRESHOLD, REPEAT);
+
+        esc.record_failure(base);
+        assert!(esc.record_failure(base + Duration::from_secs(301)).is_some());
+        assert!(esc.has_escalated());
+
+        esc.record_success();
+        assert!(!esc.has_escalated(), "a recovered channel starts its next outage unreported");
     }
 }
