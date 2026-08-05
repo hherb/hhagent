@@ -124,8 +124,8 @@ impl ChannelSupervisor {
     /// * `label` — channel name; appears in every log line and audit row.
     /// * `backoff` — delay schedule. [`RestartBackoff::default()`] is 1 s → ×2
     ///   → 60 s cap, the same schedule supervised workers use.
-    /// * `policy` — decides when an event earns a louder line and a durable
-    ///   row. [`ReportingPolicy::default()`] is the production configuration.
+    /// * `policy` — decides when an event earns a louder line.
+    ///   [`ReportingPolicy::default()`] is the production configuration.
     /// * `audit` — `None` disables audit rows entirely (tests, and any caller
     ///   with no pool).
     /// * `attempt` — one bring-up try. Called fresh each time, so it must own

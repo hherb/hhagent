@@ -1,14 +1,14 @@
-//! When does a restart-worthy channel event earn an operator's attention, and
-//! when does it earn a durable `audit_log` row?
+//! When does a restart-worthy channel event earn an operator's attention?
 //!
-//! Those are the same question, and this module is the only place either is
-//! answered. Splitting an operator-facing policy across call sites is how the
-//! answers drift — #516 and #521 each found one instance of exactly that, in
-//! this feature's own documentation.
+//! This module is the only place that question is answered. Splitting an
+//! operator-facing policy across call sites is how the answer drifts — #516
+//! and #521 each found one instance of exactly that, in this feature's own
+//! documentation.
 //!
 //! The retry loop in [`super`] stays deliberately ignorant of the policy: it
-//! reports one event, receives a [`Verdict`], and does what it says. It owns
-//! the channel label and therefore the logging; this module owns the deciding.
+//! reports one event to [`ReportingPolicy::note_outage`] and emits the loud
+//! line only when the answer is `Some`. It owns the channel label and
+//! therefore the logging; this module owns the deciding.
 
 use std::time::{Duration, Instant};
 
@@ -44,13 +44,14 @@ pub enum Outage {
     Ends,
 }
 
-/// Update the outage bookkeeping for one event and answer "does this one earn
-/// the loud line?".
+/// The pure half of the escalation decision [`ReportingPolicy::note_outage`]
+/// makes: update the outage bookkeeping for one event and answer "does this
+/// one earn the loud line?".
 ///
-/// Kept as a free function, and `pub` within the crate, because the sequence
-/// that matters here — died, recovered, worked for hours, flapped — has no
-/// other test seam: escalation is a log line and nothing else, so without this
-/// it is unobservable to a test.
+/// Split from the logging so the sequence that has no other test seam — a
+/// channel that died, came back, worked for hours, and then flapped — can be
+/// exercised without a runtime, a channel or a log capture. Escalation is a
+/// log line and nothing else, so without this it is unobservable to a test.
 pub fn note_outage(
     escalator: &mut DowntimeEscalator,
     outage: Outage,
