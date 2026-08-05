@@ -230,11 +230,18 @@ pub fn render_email_help() -> String {
 # A TRANSIENT failure is handled differently since #514: a worker-spawn or
 # LISTEN/NOTIFY failure is RETRIED with capped backoff (1s -> x2 -> 60s cap)
 # until the channel comes up, so a blip during startup no longer leaves the
-# channel off for the life of the process. Every attempt is durable in
-# audit_log as channel.boot_failed, and success as channel.started:
-#   SELECT ts, payload FROM audit_log
-#    WHERE action IN ('channel.started','channel.boot_failed')
+# channel off for the life of the process. Since #517 the same applies AFTER
+# the channel is up: if it stops working it is restarted the same way, and the
+# death is recorded as @@BOOT_DIED@@ carrying ran_ms (how long it had been
+# working — what tells a real outage apart from a flapping channel). Every
+# attempt is durable in audit_log as @@BOOT_FAILED@@, and success as
+# @@BOOT_STARTED@@:
+#   SELECT ts, action, payload FROM audit_log
+#    WHERE action IN ('@@BOOT_STARTED@@','@@BOOT_FAILED@@','@@BOOT_DIED@@')
 #      AND payload->>'channel' = 'email' ORDER BY ts DESC LIMIT 20;
+# CAVEAT: a channel most often dies because Postgres went away — and the row
+# above needs that same Postgres, so exactly that outage writes no rows until
+# it is over. The daemon log is the record for it.
 #KASTELLAN_EMAIL_ENDPOINT=https://10.0.0.3:8443
 #KASTELLAN_EMAIL_SUBSCRIPTION=kastellan
 #KASTELLAN_EMAIL_ADDRESS=kastellan@example.org
@@ -284,6 +291,15 @@ pub fn render_email_help() -> String {
     // free of brace escaping (it contains none today, but a future `${...}` shell
     // snippet in this help would silently break a format string).
     .replace("@@CHANNEL_DISABLED@@", crate::channel::boot_supervisor::CHANNEL_DISABLED_LOG_PHRASE)
+    // Same reason the phrase above is substituted rather than typed twice: this
+    // block tells an operator the exact `action` values to query, and #516's
+    // review found that pairing had already drifted once. Interpolating the
+    // constants makes a renamed — or, as in #517, a NEWLY ADDED — action a
+    // compile-time edit here rather than a query that silently returns less
+    // than the operator thinks it does.
+    .replace("@@BOOT_STARTED@@", crate::channel::actions::BOOT_STARTED)
+    .replace("@@BOOT_FAILED@@", crate::channel::actions::BOOT_FAILED)
+    .replace("@@BOOT_DIED@@", crate::channel::actions::CHANNEL_DIED)
 }
 
 /// Render the `kastellan.env` EnvironmentFile contents.
@@ -879,8 +895,8 @@ mod tests {
             "must name the exact startup log phrase to grep for: {help}"
         );
         assert!(
-            !help.contains("@@CHANNEL_DISABLED@@"),
-            "the placeholder must be substituted, not shipped to the operator: {help}"
+            !help.contains("@@"),
+            "every placeholder must be substituted, not shipped to the operator: {help}"
         );
         assert!(
             !help.contains("aborts daemon startup"),
@@ -888,10 +904,25 @@ mod tests {
         );
         // Transient failures are retried since #514; help that implies any
         // failure is terminal would send an operator restarting for no reason.
-        assert!(
-            help.contains("RETRIED") && help.contains("channel.boot_failed"),
-            "must state transient bring-up failures retry and where the record lands: {help}"
-        );
+        //
+        // The action names are asserted through `channel::actions` rather than
+        // as literals for the same reason as the log phrase above — and #517
+        // showed the *other* half of that drift: adding an action nobody
+        // reflected here left the documented query silently returning less than
+        // the operator believed it did. Iterating the set means a new one is a
+        // failing test, not a quiet omission.
+        assert!(help.contains("RETRIED"), "must state transient bring-up failures retry: {help}");
+        for action in [
+            crate::channel::actions::BOOT_STARTED,
+            crate::channel::actions::BOOT_FAILED,
+            crate::channel::actions::CHANNEL_DIED,
+        ] {
+            assert!(
+                help.contains(action),
+                "the documented audit query must name every channel bring-up/liveness \
+                 action, and is missing {action}: {help}"
+            );
+        }
     }
 
     #[test]

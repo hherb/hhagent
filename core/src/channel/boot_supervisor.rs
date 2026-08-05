@@ -1,4 +1,4 @@
-//! Supervised channel bring-up (#514).
+//! Supervised channels: bring-up (#514) and staying up (#517).
 //!
 //! Bringing a channel up is not one operation but a short chain — spawn a
 //! sandboxed worker (and, when egress is force-routed, its 1:1 sidecar), log
@@ -29,6 +29,31 @@
 //!    loop would emit one identical line per minute for as long as the outage
 //!    lasts.
 //!
+//! ## Staying up (#517)
+//!
+//! Coming up once is not the same as working. The [`ChannelBus`]'s pumps each
+//! have a terminal exit — the completed-task pump returning when its listener
+//! gives up, a per-channel task breaking on a closed `recv`, a panic in either
+//! — and the first version of this module parked on the shutdown oneshot as
+//! soon as an attempt returned [`BootOutcome::Started`], so none of them was
+//! ever noticed. The result was *the same symptom by a different route*: a
+//! silent bot, `active` units, a healthy database and an empty log.
+//!
+//! So a [`StartedChannel`] now carries a liveness signal as well as a shutdown
+//! closure, and a death re-enters this same loop — same backoff, same
+//! escalator, same audit sink, plus a distinct [`BootAudit::Died`] row. Two
+//! things keep *that* from becoming its own failure:
+//!
+//! * **The flap guard** ([`DowntimeEscalator::ran_long_enough`]). Only a
+//!   channel that stayed up resets the failure counter; one that dies on
+//!   arrival stays inside the current outage and keeps backing off. Without it
+//!   a channel that cannot survive its first second would restart at full
+//!   speed forever, spawning a sandboxed worker per iteration.
+//! * **Stopping the corpse.** A channel that lost one pump still has the
+//!   others, and it is the per-channel task's drop that tears down the worker
+//!   and its sidecar. The loop therefore stops the channel on *both* exits from
+//!   the wait, which is what keeps a restart from leaking what #502 fixed.
+//!
 //! The loop itself is database-free and network-free: audit rows go out
 //! through a boxed closure ([`BootAuditSink`] — the idiom
 //! [`crate::channel::polled_driver::AckOnlyAudit`] already uses), so the whole
@@ -38,19 +63,19 @@
 use std::future::Future;
 use std::time::Instant;
 
-use futures::future::BoxFuture;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::channel::audit_text::cap_chars;
-use crate::channel::ChannelBus;
 use crate::worker_lifecycle::RestartBackoff;
 
 pub mod downtime;
 pub mod pg_sink;
+pub mod types;
 
 pub use downtime::DowntimeEscalator;
+pub use types::{BootAudit, BootAuditSink, BootOutcome, StartedChannel};
 
 #[cfg(test)]
 mod tests;
@@ -75,90 +100,6 @@ pub const AUDIT_CAUSE_CAP_CHARS: usize = 256;
 /// grep matched nothing. Interpolating one const in both places makes that
 /// particular drift unrepresentable.
 pub const CHANNEL_DISABLED_LOG_PHRASE: &str = "CHANNEL DISABLED";
-
-/// A running channel, plus the one thing the supervisor ever does to it: stop
-/// it.
-///
-/// Deliberately opaque. The supervisor never names [`ChannelBus`], which keeps
-/// the retry policy independent of the channel layer and lets a test hand it a
-/// probe that records whether shutdown ran.
-pub struct StartedChannel {
-    /// Boxed because the supervisor stores one of these across an await and
-    /// must not be generic over the channel type to do it. `FnOnce` because
-    /// stopping twice is not a thing that should be expressible.
-    shutdown: Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>,
-}
-
-impl StartedChannel {
-    /// Wrap anything whose shutdown is an async, by-value call.
-    pub fn new<F, Fut>(shutdown: F) -> Self
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        Self { shutdown: Box::new(move || Box::pin(shutdown())) }
-    }
-
-    /// The production case: a running [`ChannelBus`].
-    pub fn from_bus(bus: ChannelBus) -> Self {
-        Self::new(move || async move { bus.shutdown().await })
-    }
-
-    /// Stop the channel. Consuming, so it cannot run twice.
-    async fn stop(self) {
-        (self.shutdown)().await;
-    }
-}
-
-impl std::fmt::Debug for StartedChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The payload is a closure; there is nothing useful to render, and a
-        // `Debug` bound is needed only so `BootOutcome` can derive it.
-        f.write_str("StartedChannel")
-    }
-}
-
-/// What one bring-up attempt produced.
-///
-/// The distinction that carries the weight is [`Retry`](Self::Retry) versus
-/// [`Fatal`](Self::Fatal), and the question to ask is: *could a later attempt
-/// succeed with the same process environment?* A refused sandbox cgroup, an
-/// unreachable homeserver and a LISTEN/NOTIFY hiccup are all yes. A missing or
-/// malformed environment variable is no — the environment cannot change under
-/// a running daemon, so the honest response is a loud line telling the
-/// operator to fix it and restart.
-#[derive(Debug)]
-pub enum BootOutcome {
-    /// The channel is not configured. Stop, and say nothing: this is the
-    /// default for every deployment that does not use this channel.
-    NotConfigured,
-    /// The channel is up.
-    Started(StartedChannel),
-    /// Failed in a way a later attempt could plausibly absorb.
-    Retry(anyhow::Error),
-    /// Failed in a way no retry can fix.
-    Fatal(anyhow::Error),
-}
-
-/// One durable record of a bring-up event.
-#[derive(Debug, Clone)]
-pub enum BootAudit {
-    /// The channel came up after `attempts` total attempts (`1` = first try).
-    Started { attempts: u32 },
-    /// An attempt failed. `retry_in_ms` is `None` exactly when `fatal` is
-    /// `true` — there is no next attempt to schedule.
-    Failed { attempt: u32, retry_in_ms: Option<u64>, fatal: bool, cause: String },
-}
-
-/// Where [`BootAudit`] records go. A boxed closure rather than a trait so the
-/// supervisor stays database-free and a test can record into a `Vec`;
-/// production is [`pg_sink::pg_boot_audit_sink`].
-///
-/// `Sync` as well as `Send`: the loop holds a *reference* to the sink across
-/// the await that writes the row, and a `&T` only crosses threads when `T` is
-/// `Sync`. Both real implementations capture `Arc`/`PgPool`/`String`, so this
-/// costs nothing.
-pub type BootAuditSink = Box<dyn Fn(BootAudit) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// A supervised channel bring-up: the retry loop, plus the handle that stops
 /// both it and whatever it started.
@@ -238,8 +179,11 @@ async fn run<F, Fut>(
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = BootOutcome> + Send + 'static,
 {
-    // Failed attempts so far. Doubles as the `RestartBackoff` exponent, so the
-    // first retry waits `base` rather than `base * factor`.
+    // Restart-worthy events since the channel was last healthy: failed
+    // bring-up attempts, plus (since #517) the deaths of channels that never
+    // stayed up long enough to count as having worked. Doubles as the
+    // `RestartBackoff` exponent, so the first retry waits `base` rather than
+    // `base * factor`, and as the `attempts` figure in the next `Started` row.
     let mut failures: u32 = 0;
 
     loop {
@@ -264,16 +208,98 @@ async fn run<F, Fut>(
         match outcome {
             BootOutcome::NotConfigured => return,
 
-            BootOutcome::Started(channel) => {
+            BootOutcome::Started(mut channel) => {
                 let attempts = failures + 1;
                 info!(channel = %label, attempts, "channel bus running");
                 emit(&audit, BootAudit::Started { attempts }).await;
-                // Park until the daemon shuts down, then stop the channel.
-                // A dropped sender means the handle went away, which we treat
-                // as shutdown — hence ignoring the result.
-                let _ = (&mut shutdown).await;
+
+                let started_at = Instant::now();
+                // Wait for whichever comes first: the daemon shutting down, or
+                // the channel reporting that it stopped working (#517). Before
+                // this the loop parked on shutdown alone, so a pump that ended
+                // afterwards left the supervisor watching a corpse — every unit
+                // `active`, the log quiet, #514's signature reached after boot
+                // instead of during it.
+                //
+                // `biased` with SHUTDOWN first — the opposite of the attempt
+                // select above, where a COMPLETED attempt must beat shutdown or
+                // a `Started` channel gets dropped without being stopped.
+                //
+                // What it buys here is narrower than it looks, and worth
+                // stating exactly: it does NOT prevent a restart, because
+                // `wait_or_shutdown` below sees the same signal and returns
+                // before the next attempt either way. It prevents the *record*
+                // of a death that never mattered — a `channel.died` row and its
+                // `warn!` written while the daemon is on its way out, which is
+                // a real sequence (Postgres and the daemon restarting together
+                // kills the listener at about the moment shutdown is signalled)
+                // and would leave an audit trail asserting an outage that was
+                // just a shutdown. It also keeps an extra audit write off the
+                // shutdown path, which #515 shows can be slow.
+                let died = tokio::select! {
+                    biased;
+                    // A dropped sender means the handle went away, which we
+                    // treat as shutdown — hence ignoring the result.
+                    _ = &mut shutdown => false,
+                    _ = channel.wait_for_death() => true,
+                };
+
+                // Both paths: the pump that died has already returned, but its
+                // siblings have not, and the per-channel task's drop is what
+                // tears the worker (and its sidecar) down. Abandoning a
+                // half-dead bus here would leak exactly what #502 fixed.
                 channel.stop().await;
-                return;
+                if !died {
+                    return;
+                }
+
+                let ran = started_at.elapsed();
+                // Did it actually work, or is it flapping?
+                //
+                // `failures` counts **restart-worthy events since the channel
+                // was last healthy** — failed bring-up attempts and the deaths
+                // of channels that never got going. It drives both the backoff
+                // and the `attempts` figure in the next `Started` row, so the
+                // two arms below have to say different things:
+                //
+                //   * A channel that STAYED UP and then died ends the outage —
+                //     its death is not a failed attempt — so the counter resets
+                //     and is NOT bumped, and the restart is attempt 1 at the
+                //     base delay. Counting it would make a clean first-try
+                //     recovery read, in `audit_log`, exactly like one that
+                //     needed a retry. Whether it *opens* the next outage is a
+                //     separate question, and the answer is no: see
+                //     [`Outage::Ends`].
+                //   * A channel that died on arrival is flapping: it never
+                //     became healthy, so the death belongs to the outage
+                //     already in progress and must be counted. Otherwise the
+                //     backoff resets on every iteration and the supervisor
+                //     spins, spawning a sandboxed worker each time round.
+                let (delay, outage) = if escalator.ran_long_enough(ran) {
+                    failures = 0;
+                    (backoff.next_delay(failures), Outage::Ends)
+                } else {
+                    let delay = backoff.next_delay(failures);
+                    failures += 1;
+                    (delay, Outage::Continues)
+                };
+                let ran_ms = ran.as_millis() as u64;
+                let retry_in_ms = delay.as_millis() as u64;
+                warn!(
+                    channel = %label,
+                    ran_ms,
+                    retry_in_ms,
+                    "channel stopped working after running; restarting it"
+                );
+                emit(&audit, BootAudit::Died { ran_ms, retry_in_ms }).await;
+                // `failures` is the figure to report: the flapping arm has just
+                // bumped it, and the stable arm cannot escalate at all
+                // ([`Outage::Ends`] never yields a downtime), so the zero it
+                // passes is never rendered.
+                escalate_if_due(&mut escalator, &label, outage, failures);
+                if !wait_or_shutdown(delay, &mut shutdown).await {
+                    return;
+                }
             }
 
             BootOutcome::Fatal(e) => {
@@ -317,25 +343,102 @@ async fn run<F, Fut>(
                     },
                 )
                 .await;
-                if let Some(down) = escalator.record_failure(Instant::now()) {
-                    error!(
-                        channel = %label,
-                        down_secs = down.as_secs(),
-                        attempts = failures,
-                        "CHANNEL STILL DOWN — nothing sent to this channel has been received for \
-                         this long, and bring-up is still failing. The daemon is otherwise \
-                         healthy; the cause is on the preceding attempts' `error` field."
-                    );
-                }
-                tokio::select! {
-                    // Shutdown first here: there is nothing to lose by
-                    // abandoning a sleep.
-                    biased;
-                    _ = &mut shutdown => return,
-                    _ = tokio::time::sleep(delay) => {}
+                escalate_if_due(&mut escalator, &label, Outage::Continues, failures);
+                if !wait_or_shutdown(delay, &mut shutdown).await {
+                    return;
                 }
             }
         }
+    }
+}
+
+/// How one restart-worthy event relates to the outage the escalator is timing.
+///
+/// The distinction exists because a death is not always a *failure*: a channel
+/// that had been working for hours and then stopped has just ended a period of
+/// health, whereas a failed bring-up (or the death of a channel that never got
+/// going) extends an outage already in progress.
+#[derive(Debug, Clone, Copy)]
+enum Outage {
+    /// A bring-up attempt failed, or a channel died without ever having stayed
+    /// up long enough to count as having worked. Extends the outage in
+    /// progress, opening one dated from now if there was none.
+    Continues,
+    /// A channel that HAD been working stopped. Ends the outage the escalator
+    /// was timing — and, deliberately, does **not** open the next one.
+    ///
+    /// Opening it here reads more precise, because the outage really does begin
+    /// at the death. But nothing would ever close it: the escalator is only
+    /// told about health when a *stable* channel dies, so a channel that came
+    /// straight back and then worked for four hours would still be carrying
+    /// this instant when it next flapped — and would report those four healthy
+    /// hours as downtime, in the one line whose text asserts that nothing sent
+    /// to the channel has been received for that long. The next outage is
+    /// therefore opened by the first restart attempt that actually fails, which
+    /// is the only version that stays correct when the restart SUCCEEDS. The
+    /// price is that a real outage is dated one backoff delay late (1 s for the
+    /// first restart, 60 s at the cap); the price of the eager version is
+    /// unbounded.
+    Ends,
+}
+
+/// Fold one restart-worthy event into the outage bookkeeping, and emit the loud
+/// line if it has earned one.
+///
+/// The **only** place either half of [`DowntimeEscalator`]'s outage state is
+/// driven from. Shared by the two arms that can fail — a bring-up that will not
+/// succeed and a channel that keeps dying — because from an operator's side
+/// they are the same event: the channel has been unusable for this long and is
+/// not fixing itself. Splitting the escalation policy across two call sites is
+/// how the two drift.
+fn escalate_if_due(escalator: &mut DowntimeEscalator, label: &str, outage: Outage, attempts: u32) {
+    if let Some(down) = note_outage(escalator, outage, Instant::now()) {
+        error!(
+            channel = %label,
+            down_secs = down.as_secs(),
+            attempts,
+            "CHANNEL STILL DOWN — nothing sent to this channel has been received for this long, \
+             and it is still not staying up. The daemon is otherwise healthy; the cause is on \
+             the preceding attempts' `error` field."
+        );
+    }
+}
+
+/// The pure half of [`escalate_if_due`]: update the outage bookkeeping for one
+/// event and answer "does this one earn the loud line?".
+///
+/// Split from the logging so the sequence that has no other test seam — a
+/// channel that died, came back, worked for hours, and then flapped — can be
+/// exercised without a runtime, a channel or a log capture. Escalation is a log
+/// line and nothing else, so without this it is unobservable to a test.
+fn note_outage(
+    escalator: &mut DowntimeEscalator,
+    outage: Outage,
+    now: Instant,
+) -> Option<std::time::Duration> {
+    match outage {
+        // Ends the outage and opens nothing — see [`Outage::Ends`] for why the
+        // next one has to wait for a restart that actually fails. `now` is
+        // deliberately unused on this arm.
+        Outage::Ends => {
+            escalator.record_success();
+            None
+        }
+        Outage::Continues => escalator.record_failure(now),
+    }
+}
+
+/// Sleep out the backoff. Returns `false` if shutdown arrived instead, meaning
+/// the caller should stop rather than start another attempt.
+///
+/// `biased` toward shutdown: there is nothing to lose by abandoning a sleep,
+/// and a daemon that is shutting down should not spend up to a minute waiting
+/// to spawn a worker it will immediately abandon.
+async fn wait_or_shutdown(delay: std::time::Duration, shutdown: &mut oneshot::Receiver<()>) -> bool {
+    tokio::select! {
+        biased;
+        _ = &mut *shutdown => false,
+        _ = tokio::time::sleep(delay) => true,
     }
 }
 
