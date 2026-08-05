@@ -221,8 +221,22 @@ it, and it would make genuine short outages back off harder than they should.
 session) and adds `should_record`, the flap constants and the flapping line. Net
 effect on the parent is roughly **451 → 420**, so it stays under the cap.
 
+It also owns a small `ReportingPolicy` that holds *both* alarms and answers one
+question per event (`Verdict { record, still_down, flapping }`). That replaces the
+`DowntimeEscalator` parameter of `ChannelSupervisor::spawn` rather than adding a
+sixth one, so the supervisor never touches either alarm directly and the spec's
+"one place the policy lives" property is enforced by visibility rather than by
+convention. `with_stable_uptime` is re-exposed as a delegating builder, so the
+existing test call sites change by one type name. The two production call sites
+(`main/matrix_boot.rs`, `main/email_boot.rs`) each change one line.
+
 `downtime.rs` stays the pure escalator and `respawn_alarm.rs` stays the pure alarm;
-neither learns about the other.
+neither learns about the other, and neither learns about `ReportingPolicy`.
+
+`Verdict` carries the two alarms as separate `Option` fields rather than one enum:
+on a flapping death both can fire in the same iteration, and inventing a precedence
+rule between "still down" and "flapping" would be a policy decision nobody asked
+for.
 
 ### The operator help is currently wrong after this change
 
