@@ -55,10 +55,21 @@ The cost per cycle is a sandboxed worker, its 1:1 egress sidecar under
 force-routing, and a Matrix login plus initial sync — roughly **1400 restarts/day**
 with nothing louder than a per-cycle `warn!`.
 
-`RespawnRateAlarm` is the right shape and already exists, but it is constructed
-**inside** `PersistentWorker` (`worker_lifecycle/persistent.rs:167`). A channel
-restart builds a whole new `PersistentWorker`, so the alarm's window is discarded
-every cycle and can never accumulate.
+`RespawnRateAlarm` is the right shape and already exists, but the instance that
+exists is the wrong one for this. `PersistentWorker` builds its alarm at
+`worker_lifecycle/persistent.rs:167` — on the driver thread, *before* the job loop,
+where it correctly accumulates across **worker respawns** for that thread's life
+(`:220`'s `std::mem::replace` swaps the *transport*, not the alarm). What it cannot
+see is a **channel** restart, which tears down the whole `PersistentWorker`, driver
+thread and alarm together. So the channel's death-rate alarm has to be owned one
+level up, above the thing a restart replaces.
+
+> **Correction, 2026-08-05.** An earlier draft of this spec — and #522's own text —
+> said `PersistentWorker` "builds its alarm inside the object a restart replaces, so
+> the window is discarded every cycle and can never accumulate." That is false as
+> stated, and a reviewer caught it by reading `persistent.rs`. The *conclusion* was
+> always right; only the attribution was wrong. `PersistentWorker` does not make a
+> mistake here.
 
 ### One correction to both issues
 
@@ -88,7 +99,7 @@ fn should_record(alarm_latched: bool, alarm_spoke_now: bool) -> bool {
 | --- | --- | --- |
 | `channel.boot_failed` | `escalator.has_escalated()` | `record_failure(now).is_some()` |
 | `channel.died` | `deaths.in_storm()` | `deaths.record(now).is_some()` |
-| `channel.started` | `deaths.in_storm()` | `false` — a start is never an alarm |
+| `channel.started` | — **never gated**, see below | — |
 
 **Both inputs are sampled *after* the recording call, and that is load-bearing.**
 Sampling `in_storm()` *before* `record()` reads more naturally and is wrong in one
@@ -98,9 +109,6 @@ below threshold and re-arms — so the first death of the *next* storm has
 suppressed, and the first evidence of a fresh storm is exactly the row you want).
 The same argument applies to `has_escalated()` across a `record_success()`. A test
 pins it.
-
-For `channel.started` there is no recording call in that arm at all — it reads the
-alarm's current latched state, which reflects the previous cycle's death.
 
 `channel.boot_failed` with `fatal: true` is **never** gated: it is terminal, it is
 one row, and it is the row that says why the channel will not be retried.
@@ -119,24 +127,45 @@ Two properties this has that #518's own sketch
 The death that *trips* the alarm is itself recorded, not the first one suppressed:
 `record()` returns `Some(count)` on that call, so `alarm_spoke_now` carries it.
 
-Why `channel.started` is gated on the death alarm rather than on its own counter:
-`failures` resets to 0 on every stable death, so in the #522 band a start-count gate
-would never engage. And inside a storm the `started` row is genuinely redundant —
-the paired `channel.died` row carries `ran_ms`, which already proves the channel
-came up and for how long. Outside a storm (a recovery from a bring-up outage) it is
-the most valuable row there is, and stays unconditional.
+### Why `channel.started` is not gated
+
+An earlier version of this design gated it on the death alarm, reasoning that inside
+a storm the `started` row is redundant because the paired `channel.died` row carries
+`ran_ms`. **That was wrong, and it was caught during implementation.** The latch is
+cleared only by a *later death*, so the start that **ends** a storm is suppressed
+too — and a channel that recovers for good never writes another row at all. The last
+durable event stays a `channel.died`, which reads as "still broken" for a channel
+that is healthy again. There is no other durable row carrying "it recovered".
+
+Gating it on its own counter does not work either: `failures` resets to 0 on every
+stable death, so in the #522 band a start-count gate would never engage.
+
+So `channel.started` is written unconditionally. It is the row an operator actually
+queries, and its absence is now trustworthy.
 
 ### Resulting row counts
 
 | scenario | today | after |
 | --- | --- | --- |
-| 24 h sustained bring-up outage | ~1440 `boot_failed` | ~57 (≈10 before the backoff-plus-threshold escalates, then 47 repeats) |
-| 24 h flap at 61 s cycles | ~1416 `died` + ~1416 `started` | ~58 (5 `died` + 5 `started` at storm onset, then 48 `died` repeats; a pure flap writes no `boot_failed` at all, since every bring-up succeeds) |
+| 24 h sustained bring-up outage | ~1440 `boot_failed` | **~57** (≈10 before the backoff-plus-threshold escalates, then 47 repeats) |
+| 24 h flap at 61 s cycles, restarts succeeding first try | ~1416 `died` + ~1416 `started` | **~1470** (~1416 ungated `started` + ~53 `died`: 5 at storm onset, then 48 repeats) |
 | transient blip (the common case) | fully recorded | **unchanged** |
 
 The last row is the one that matters most: the gate only engages once an alarm has
 already spoken, so the ordinary transient failure that resolves in seconds is
 recorded exactly as it is today.
+
+**The flap figure carries an assumption, stated here because it is easy to miss.**
+It holds only when each restart succeeds on its first attempt. A stable death takes
+`Outage::Ends` → `record_success()`, which clears the escalator's latch — so if a
+restart's first attempt fails transiently before a later one succeeds, that failed
+attempt writes an **ungated** `boot_failed` row every cycle, because the latch was
+just cleared and `CHANNEL STILL DOWN` never fires in this band at all. Closing that
+is deliberately **not** done here: OR-ing `deaths.in_storm()` into the bring-up gate
+would be a bare latch read with no preceding `record()` — the stale-latch hazard
+`the_first_death_of_a_fresh_storm_is_recorded` exists to forbid — and it would
+suppress the `cause` string, the only forensic field in the whole row set. Filed as
+[#523](https://github.com/hherb/kastellan/issues/523).
 
 This also halves the exposure to [#515](https://github.com/hherb/kastellan/issues/515):
 `emit` is awaited (deliberately, for row ordering and test determinism) and the
@@ -213,13 +242,20 @@ it, and it would make genuine short outages back off harder than they should.
 | `core/src/channel/respawn_alarm.rs` | 163 | `+ with_repeat`, `+ in_storm`; module doc gains its second consumer |
 | `core/src/channel/boot_supervisor/downtime.rs` | 315 | `+ has_escalated()` |
 | `core/src/channel/boot_supervisor/reporting.rs` | **new** | all reporting policy in one place |
-| `core/src/channel/boot_supervisor.rs` | 451 | owns the death alarm; three arms gate their `emit` |
+| `core/src/channel/boot_supervisor.rs` | 451 | holds the policy; the two recurring arms gate their `emit` |
 | `core/src/install/plan.rs` | — | operator help correction, see below |
 
-`reporting.rs` takes `Outage`, `note_outage` and `escalate_if_due` from the parent
-(they are reporting policy, and `boot_supervisor.rs` hit the 500-line cap last
-session) and adds `should_record`, the flap constants and the flapping line. Net
-effect on the parent is roughly **451 → 420**, so it stays under the cap.
+`reporting.rs` takes `Outage` and `note_outage` from the parent (they are reporting
+policy, and `boot_supervisor.rs` hit the 500-line cap last session) and adds
+`should_record`, the flap constants and the flapping phrase.
+
+**As built, the split landed one notch differently from this table** and the shipped
+version is the better one: the *emission* stayed in the parent as
+`boot_supervisor::report`, because that is where the channel label lives. Only the
+deciding moved. `reporting.rs`'s own module doc states the boundary — it owns the
+deciding, the parent owns the logging. `Outage` and `note_outage` are `pub(super)`,
+not `pub`: `kastellan-core` is published to crates.io, and neither is anything an
+external caller should be able to drive.
 
 It also owns a small `ReportingPolicy` that holds *both* alarms and answers one
 question per event (`Verdict { record, still_down, flapping }`). That replaces the
@@ -245,12 +281,29 @@ for.
 > Every attempt is durable in audit_log as `channel.boot_failed`, and success as
 > `channel.started`
 
-That becomes false. The help must state that the rows are rate-limited once the
-channel has been failing (or flapping) for a while, and that the daemon log is the
-per-event record. The existing test iterates `channel::actions`, so no new action
-name is introduced and that test needs no change — this is a prose correction, and
-it is exactly the drift this spec's `should_record` design is meant to make harder
-elsewhere.
+That becomes false. The help must name the **two independent** gates separately —
+`channel.boot_failed` on the downtime clock (`CHANNEL STILL DOWN`),
+`channel.died` on the flap alarm (`CHANNEL FLAPPING`) — say that `channel.started`
+is never gated, and say that the daemon log is the per-event record. Naming them as
+one mechanism is wrong in exactly the #522 band, where `CHANNEL STILL DOWN` can
+never fire yet `channel.died` still goes quiet.
+
+**A prediction in an earlier draft of this spec turned out to be the source of a
+defect**, and it is worth recording rather than deleting. It read: *"The existing
+test iterates `channel::actions`, so no new action name is introduced and that test
+needs no change."* True as far as it goes — and it is why the new `CHANNEL FLAPPING`
+phrase shipped into the help as a **bare literal**, alongside four neighbours that
+are all interpolated from consts. The guard iterates *actions*; this branch
+introduced a new *log phrase*. Caught by the final whole-branch review and fixed:
+`@@CHANNEL_FLAPPING@@` is now substituted from `CHANNEL_FLAPPING_LOG_PHRASE`, and
+the help test asserts through the const. This is #516's finding recurring inside the
+very change that documents itself as immune to it — the lesson being that a guard
+protects the category it enumerates and nothing adjacent to it.
+
+A third instance of the same class survives and is filed as
+[#524](https://github.com/hherb/kastellan/issues/524): `CHANNEL STILL DOWN` is still
+a bare literal in both the help text and `report`'s `error!`, and is now the only
+operator-facing phrase in that block that is not const-driven.
 
 ## Test file split
 
@@ -285,8 +338,6 @@ the file this work grows.
 - `boot_failed` rows stop once the outage escalates and resume on the next escalation.
 - A `fatal` row is never gated.
 - `died` rows stop inside a storm and resume when the alarm repeats.
-- `started` is suppressed inside a storm, but never for a recovery from a bring-up
-  outage.
 - **The alarm accumulates across restarts** — the #522 regression test.
 
 **Mutation checks, run rather than assumed:**
