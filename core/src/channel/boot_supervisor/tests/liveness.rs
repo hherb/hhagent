@@ -21,7 +21,7 @@ async fn a_channel_that_dies_is_brought_back_up() {
     let sup = ChannelSupervisor::spawn(
         "test",
         fast_backoff(),
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         Some(sink.sink()),
         scripted(vec![dying(&stopped), healthy(&stopped)]),
     );
@@ -52,7 +52,7 @@ async fn a_death_is_audited_separately_from_a_failed_bring_up() {
     let sup = ChannelSupervisor::spawn(
         "test",
         fast_backoff(),
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         Some(sink.sink()),
         scripted(vec![dying(&stopped), healthy(&stopped)]),
     );
@@ -85,7 +85,7 @@ async fn a_flapping_channel_backs_off_instead_of_spinning() {
         "test",
         growing_backoff(),
         // Nothing counts as having stayed up, so every death is a flap.
-        DowntimeEscalator::default().with_stable_uptime(Duration::MAX),
+        ReportingPolicy::default().with_stable_uptime(Duration::MAX),
         Some(sink.sink()),
         scripted(vec![
             dying(&stopped),
@@ -120,7 +120,7 @@ async fn a_channel_that_ran_long_enough_restarts_at_the_base_delay() {
         "test",
         growing_backoff(),
         // Every death counts as "it had been up", without waiting a minute.
-        DowntimeEscalator::default().with_stable_uptime(Duration::ZERO),
+        ReportingPolicy::default().with_stable_uptime(Duration::ZERO),
         Some(sink.sink()),
         scripted(vec![
             dying(&stopped),
@@ -169,7 +169,7 @@ async fn a_death_racing_shutdown_is_not_recorded_as_a_death() {
     let sup = ChannelSupervisor::spawn(
         "test",
         fast_backoff(),
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         Some(sink.sink()),
         move || {
             attempt_count.fetch_add(1, Ordering::SeqCst);
@@ -226,7 +226,7 @@ async fn a_first_try_recovery_reports_one_attempt() {
     let sup = ChannelSupervisor::spawn(
         "test",
         fast_backoff(),
-        DowntimeEscalator::default().with_stable_uptime(Duration::ZERO),
+        ReportingPolicy::default().with_stable_uptime(Duration::ZERO),
         Some(sink.sink()),
         scripted(vec![dying(&stopped), healthy(&stopped)]),
     );
@@ -261,7 +261,7 @@ async fn a_recovery_after_a_flap_keeps_counting() {
     let sup = ChannelSupervisor::spawn(
         "test",
         fast_backoff(),
-        DowntimeEscalator::default().with_stable_uptime(Duration::MAX),
+        ReportingPolicy::default().with_stable_uptime(Duration::MAX),
         Some(sink.sink()),
         scripted(vec![dying(&stopped), dying(&stopped), healthy(&stopped)]),
     );

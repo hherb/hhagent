@@ -17,7 +17,7 @@ async fn retries_until_the_channel_comes_up() {
     let sup = ChannelSupervisor::spawn(
         "test",
         fast_backoff(),
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         Some(sink.sink()),
         scripted(vec![
             BootOutcome::Retry(anyhow::anyhow!("sidecar cgroup refused")),
@@ -48,7 +48,7 @@ async fn a_fatal_outcome_stops_the_loop() {
     let sup = ChannelSupervisor::spawn(
         "test",
         fast_backoff(),
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         Some(sink.sink()),
         scripted(vec![BootOutcome::Fatal(anyhow::anyhow!("homeserver is statically dead"))]),
     );
@@ -76,7 +76,7 @@ async fn an_unconfigured_channel_stops_silently() {
     let sup = ChannelSupervisor::spawn(
         "test",
         fast_backoff(),
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         Some(sink.sink()),
         scripted(vec![BootOutcome::NotConfigured]),
     );
@@ -99,7 +99,7 @@ async fn shutdown_while_backing_off_returns_promptly() {
     let sup = ChannelSupervisor::spawn(
         "test",
         slow,
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         Some(sink.sink()),
         scripted(vec![BootOutcome::Retry(anyhow::anyhow!("down"))]),
     );
@@ -120,7 +120,7 @@ async fn every_failed_attempt_is_audited_with_its_attempt_number() {
     let sup = ChannelSupervisor::spawn(
         "test",
         fast_backoff(),
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         Some(sink.sink()),
         scripted(vec![
             BootOutcome::Retry(anyhow::anyhow!("first")),
@@ -175,7 +175,7 @@ async fn a_supervisor_without_an_audit_sink_still_starts_and_stops_the_channel()
     let sup = ChannelSupervisor::spawn(
         "test",
         fast_backoff(),
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         None,
         move || {
             counter.fetch_add(1, Ordering::SeqCst);
@@ -224,7 +224,7 @@ async fn shutdown_before_the_first_poll_starts_no_attempt() {
     let sup = ChannelSupervisor::spawn(
         "test",
         fast_backoff(),
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         Some(sink.sink()),
         move || {
             counter.fetch_add(1, Ordering::SeqCst);

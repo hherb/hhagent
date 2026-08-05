@@ -72,7 +72,7 @@ use tracing::{error, info};
 
 use kastellan_core::channel::boot_supervisor::pg_sink::pg_boot_audit_sink;
 use kastellan_core::channel::boot_supervisor::{
-    BootOutcome, ChannelSupervisor, DowntimeEscalator, StartedChannel,
+    BootOutcome, ChannelSupervisor, ReportingPolicy, StartedChannel,
 };
 use kastellan_core::channel::polled_driver::AckOnlyAudit;
 use kastellan_core::channel::{ChannelBus, ChannelId};
@@ -284,7 +284,7 @@ pub(crate) fn supervise_email_channel(
     ChannelSupervisor::spawn(
         "email",
         RestartBackoff::default(),
-        DowntimeEscalator::default(),
+        ReportingPolicy::default(),
         Some(audit),
         move || attempt(pool.clone(), sandboxes.clone(), force_routing.clone()),
     )
