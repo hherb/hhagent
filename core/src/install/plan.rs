@@ -233,12 +233,24 @@ pub fn render_email_help() -> String {
 # channel off for the life of the process. Since #517 the same applies AFTER
 # the channel is up: if it stops working it is restarted the same way, and the
 # death is recorded as @@BOOT_DIED@@ carrying ran_ms (how long it had been
-# working — what tells a real outage apart from a flapping channel). Every
-# attempt is durable in audit_log as @@BOOT_FAILED@@, and success as
-# @@BOOT_STARTED@@:
+# working — what tells a real outage apart from a flapping channel). The
+# first attempts are durable in audit_log as @@BOOT_FAILED@@:
 #   SELECT ts, action, payload FROM audit_log
 #    WHERE action IN ('@@BOOT_STARTED@@','@@BOOT_FAILED@@','@@BOOT_DIED@@')
 #      AND payload->>'channel' = 'email' ORDER BY ts DESC LIMIT 20;
+# @@BOOT_FAILED@@ is RATE-LIMITED by the downtime clock: every attempt until
+# the outage is first reported as CHANNEL STILL DOWN (5 min of continuous
+# downtime), then only on each repeat of that line (every 30 min). A 24-hour
+# outage produces ~57 rows instead of ~1440. @@BOOT_DIED@@
+# is RATE-LIMITED by a separate flap alarm: every death until 5 deaths within
+# an hour first reports CHANNEL FLAPPING, then only on each repeat. These are
+# independent: a channel that keeps recovering and dying (e.g., cycles up 61s
+# then dies repeatedly) may never produce CHANNEL STILL DOWN at all, yet will
+# still stop writing @@BOOT_DIED@@ rows once the flap alarm fires. @@BOOT_STARTED@@
+# is NOT rate-limited: every successful start writes a row, always. So a gap
+# between rows means "still broken, still saying the same thing", NOT
+# "recovered" — look for a @@BOOT_STARTED@@ row for recovery. The daemon log
+# (~/.local/state/kastellan/*.out) is the per-event record.
 # CAVEAT: a channel most often dies because Postgres went away — and the row
 # above needs that same Postgres, so exactly that outage writes no rows until
 # it is over. The daemon log is the record for it.
