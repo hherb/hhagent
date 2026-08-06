@@ -1,5 +1,5 @@
 //! ---------------------------------------------------------------------------
-//! #518/#522: what gets said, and what gets stored, about a recurring channel
+//! #518/#522/#523: what gets said, and what gets stored, about a recurring channel
 //! event.
 //!
 //! Two halves. The first drives `note_outage` — the pure half of

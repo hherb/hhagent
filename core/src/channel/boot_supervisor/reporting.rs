@@ -289,7 +289,7 @@ impl ReportingPolicy {
     /// for the regime the downtime clock cannot see (#523: each stable death
     /// resets the clock, so a flap whose restarts also fail transiently never
     /// escalates): it bounds the rows to the first [`FLAP_ALARM_THRESHOLD`]
-    /// per episode plus one per [`FLAP_ALARM_REPEAT`], each carrying `cause`.
+    /// per attempt storm (a storm ends only when the sliding window empties, not when an outage does) plus one per [`FLAP_ALARM_REPEAT`], each carrying `cause`.
     /// Its voice counts only while the escalator has NOT escalated —
     /// otherwise a sustained outage would write two near-duplicate rows per
     /// repeat interval, one per alarm's independent clock.
