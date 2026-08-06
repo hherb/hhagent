@@ -66,6 +66,10 @@
 //!   it resets the escalator instead of extending it and `CHANNEL STILL DOWN`
 //!   never fires. `CHANNEL FLAPPING` is the alarm that does, once enough
 //!   deaths land inside its window.
+//!   The failed-attempt stream carries the same shape of gate since #523 — a
+//!   silent rate alarm inside the policy — because the flap band resets the
+//!   escalator on every stable death, leaving bring-up failures otherwise
+//!   ungated exactly there.
 //!
 //! The loop itself is database-free and network-free: audit rows go out
 //! through a boxed closure ([`BootAuditSink`] — the idiom

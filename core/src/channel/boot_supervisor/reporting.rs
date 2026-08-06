@@ -27,7 +27,7 @@
 //! row for `channel.boot_failed` and `channel.died`: record the event unless
 //! the alarm that owns its regime is already latched on this episode and did
 //! not speak for this particular event. That is what turns a 24-hour outage
-//! into ~57 `boot_failed` rows instead of ~1440, without inventing a "first N
+//! into ~53 `boot_failed` rows instead of ~1440, without inventing a "first N
 //! events" counter that would drift from the escalation policy the moment
 //! either changed.
 //!
@@ -42,26 +42,28 @@
 //! permanently-failing `Retry` (a missing worker binary, say) can run for
 //! weeks.
 //!
-//! That ~1470 figure carries an unstated assumption worth stating: it holds
-//! only when every restart in the flap **succeeds on its first try**. Every
-//! death in the #522 band is *stable* (up longer than
-//! [`super::downtime::STABLE_UPTIME`]), so [`note_death`](ReportingPolicy::note_death)
-//! takes [`Outage::Ends`], which clears both `first_failure` and
-//! `last_escalated` (`escalator.record_success()` — see [`super::downtime`]).
-//! [`note_failed_attempt`](ReportingPolicy::note_failed_attempt) gates on
-//! `has_escalated()`, and that latch was just cleared — so if a restart's
-//! *first* attempt fails transiently before a later one succeeds, that failed
-//! attempt is recorded **ungated**, every single cycle of the flap.
-//! `CHANNEL STILL DOWN` correctly never fires in this band (that is the #522
-//! fix working as intended: nothing ever latches long enough to escalate), but
-//! it also means nothing ever *gates* — so a flap whose restarts also fail
-//! transiently writes an unbounded stream of `boot_failed` rows, not the ~53
-//! this section's arithmetic assumes. Deliberately not fixed by OR-ing
-//! `deaths.in_storm()` into that gate: it would be a bare latch read with no
-//! preceding `record()` — the exact stale-latch hazard the
-//! `the_first_death_of_a_fresh_storm_is_recorded` test below exists to
-//! forbid — and it would suppress `cause`, the only forensic field this row
-//! set has. Tracked as a follow-up rather than changed here.
+//! That ~1470 figure once carried an unstated assumption — that every restart
+//! in the flap succeeds on its first try — and #523 was the regime where it
+//! broke: every death in the #522 band is *stable*, so
+//! [`note_death`](ReportingPolicy::note_death) takes [`Outage::Ends`], which
+//! clears both halves of the escalator (`record_success()`), and a restart
+//! whose first attempt failed transiently was then evaluated against a
+//! freshly-cleared latch — one ungated `boot_failed` row per cycle, for as
+//! long as the flap lasted. The attempt stream therefore has its own rate
+//! gate: a second [`RespawnRateAlarm`] fed by
+//! [`note_failed_attempt`](ReportingPolicy::note_failed_attempt) itself, so
+//! its latch is always read after a `record()` on the same alarm. It is
+//! deliberately SILENT — no log line — because its firing rate cannot
+//! distinguish an outage from a flap (~59 attempts/hour in both), and each
+//! regime already has its loud line. That weakens "the row and the loud line
+//! are the same decision" to: every loud line still has its row, and
+//! rate-gate rows are line-less cause samples. Its voice keeps a row only
+//! while the escalator has not escalated, so a sustained bring-up outage
+//! follows the escalator's row schedule (~53 rows in 24 h: the first five
+//! attempts, then each escalation) rather than two near-duplicate rows per
+//! repeat interval, and the flap-with-failing-restarts regime is bounded to
+//! the first five attempts plus one cause-bearing row per
+//! [`FLAP_ALARM_REPEAT`] (#523).
 
 use std::time::{Duration, Instant};
 
@@ -174,9 +176,9 @@ pub struct Verdict {
 
 /// The gate, and the whole of #518 in one line.
 ///
-/// A recurring event earns a durable row unless its alarm is already latched on
-/// this episode and did not speak for this particular event. Everything else —
-/// which alarm, which stream — is the caller's business.
+/// A recurring event earns a durable row unless an alarm owning its regime is
+/// already latched on this episode and none spoke for this particular event.
+/// Everything else — which alarm, which stream — is the caller's business.
 ///
 /// Note what this deliberately is NOT: a "first N events" counter. N would be a
 /// constant nobody could derive from anything, and it would drift from the
@@ -301,7 +303,11 @@ impl ReportingPolicy {
         let escalated = self.escalator.has_escalated();
         let latched = escalated || self.attempts.in_storm();
         let spoke = still_down.is_some() || (rate_fired.is_some() && !escalated);
-        Verdict { record: should_record(latched, spoke), still_down, flapping: None }
+        Verdict {
+            record: should_record(latched, spoke),
+            still_down,
+            flapping: None,
+        }
     }
 
     /// Fold the death of a running channel into the bookkeeping.
@@ -341,7 +347,7 @@ mod tests {
     }
 
     /// A failed attempt is recorded in full until the outage escalates, then
-    /// only on escalations — ~57 rows in a day instead of ~1440 (#518).
+    /// only on escalations — ~53 rows in a day instead of ~1440 (#518).
     #[test]
     fn failed_attempts_stop_being_recorded_once_the_outage_escalates() {
         let base = Instant::now();
