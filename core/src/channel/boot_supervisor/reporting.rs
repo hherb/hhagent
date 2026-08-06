@@ -209,6 +209,17 @@ pub struct ReportingPolicy {
     /// replace: `ReportingPolicy`, which the retry loop holds across every
     /// iteration.
     deaths: RespawnRateAlarm,
+    /// Rate gate for the failed-attempt stream (#523). The escalator's latch
+    /// cannot gate this stream in the flap band — each stable death clears it
+    /// (`Outage::Ends` → `record_success`) — so a restart whose first attempt
+    /// fails transiently would write one ungated row per cycle, forever. Fed
+    /// by [`note_failed_attempt`](Self::note_failed_attempt) itself, so its
+    /// latch is always read after a `record()` on the SAME alarm: the
+    /// read-after-record contract by construction, not by exception.
+    /// Deliberately SILENT — no log line — because its firing rate cannot
+    /// distinguish an outage from a flap (~59 attempts/hour in both), and
+    /// each regime already has its loud line.
+    attempts: RespawnRateAlarm,
 }
 
 impl Default for ReportingPolicy {
@@ -224,6 +235,8 @@ impl ReportingPolicy {
         Self {
             escalator,
             deaths: RespawnRateAlarm::new(FLAP_ALARM_WINDOW, FLAP_ALARM_THRESHOLD)
+                .with_repeat(FLAP_ALARM_REPEAT),
+            attempts: RespawnRateAlarm::new(FLAP_ALARM_WINDOW, FLAP_ALARM_THRESHOLD)
                 .with_repeat(FLAP_ALARM_REPEAT),
         }
     }
@@ -245,6 +258,14 @@ impl ReportingPolicy {
         self
     }
 
+    /// Override the failed-attempt rate gate. Exists so a test can trip it in
+    /// two attempts instead of five — the same reason as
+    /// [`with_flap_alarm`](Self::with_flap_alarm).
+    pub fn with_attempt_alarm(mut self, attempts: RespawnRateAlarm) -> Self {
+        self.attempts = attempts;
+        self
+    }
+
     /// Did a channel that has now died run long enough to count as having
     /// worked? The flap guard — see [`DowntimeEscalator::ran_long_enough`].
     pub fn ran_long_enough(&self, ran: Duration) -> bool {
@@ -260,18 +281,27 @@ impl ReportingPolicy {
     }
 
     /// Fold a failed bring-up attempt into the bookkeeping.
+    ///
+    /// Two alarms feed the verdict. The escalator owns the loud line and,
+    /// once it has escalated, the row schedule. The rate gate is the fallback
+    /// for the regime the downtime clock cannot see (#523: each stable death
+    /// resets the clock, so a flap whose restarts also fail transiently never
+    /// escalates): it bounds the rows to the first [`FLAP_ALARM_THRESHOLD`]
+    /// per episode plus one per [`FLAP_ALARM_REPEAT`], each carrying `cause`.
+    /// Its voice counts only while the escalator has NOT escalated —
+    /// otherwise a sustained outage would write two near-duplicate rows per
+    /// repeat interval, one per alarm's independent clock.
     pub fn note_failed_attempt(&mut self, now: Instant) -> Verdict {
         let still_down = note_outage(&mut self.escalator, Outage::Continues, now);
-        // Read after recording, matching `note_death` below — but here the
-        // order is NOT actually load-bearing: `record_failure` never clears
-        // `has_escalated`'s latch mid-call the way `RespawnRateAlarm::record`
-        // clears `in_storm`'s, so `!latched || spoke` is invariant either way.
-        // Kept read-after-record anyway, so the two methods read alike.
-        Verdict {
-            record: should_record(self.escalator.has_escalated(), still_down.is_some()),
-            still_down,
-            flapping: None,
-        }
+        // Record first, read after — the same contract `note_death` honors:
+        // `record` is what re-arms a cleared storm's latch, so a read taken
+        // beforehand could reflect a storm that is already over and suppress
+        // the first attempt of the fresh one.
+        let rate_fired = self.attempts.record(now);
+        let escalated = self.escalator.has_escalated();
+        let latched = escalated || self.attempts.in_storm();
+        let spoke = still_down.is_some() || (rate_fired.is_some() && !escalated);
+        Verdict { record: should_record(latched, spoke), still_down, flapping: None }
     }
 
     /// Fold the death of a running channel into the bookkeeping.
