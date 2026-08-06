@@ -239,13 +239,13 @@ pub fn render_email_help() -> String {
 #    WHERE action IN ('@@BOOT_STARTED@@','@@BOOT_FAILED@@','@@BOOT_DIED@@')
 #      AND payload->>'channel' = 'email' ORDER BY ts DESC LIMIT 20;
 # @@BOOT_FAILED@@ is RATE-LIMITED by the downtime clock: every attempt until
-# the outage is first reported as CHANNEL STILL DOWN (5 min of continuous
+# the outage is first reported as @@CHANNEL_STILL_DOWN@@ (5 min of continuous
 # downtime), then only on each repeat of that line (every 30 min). A 24-hour
 # outage produces ~57 rows instead of ~1440. @@BOOT_DIED@@
 # is RATE-LIMITED by a separate flap alarm: every death until 5 deaths within
 # an hour first reports @@CHANNEL_FLAPPING@@, then only on each repeat. These are
 # independent: a channel that keeps recovering and dying (e.g., cycles up 61s
-# then dies repeatedly) may never produce CHANNEL STILL DOWN at all, yet will
+# then dies repeatedly) may never produce @@CHANNEL_STILL_DOWN@@ at all, yet will
 # still stop writing @@BOOT_DIED@@ rows once the flap alarm fires — but in
 # that same cycling regime @@BOOT_FAILED@@ rows are NOT rate-limited at all:
 # each stable death resets the downtime clock above (a channel that ran long
@@ -324,6 +324,12 @@ pub fn render_email_help() -> String {
     .replace(
         "@@CHANNEL_FLAPPING@@",
         crate::channel::boot_supervisor::CHANNEL_FLAPPING_LOG_PHRASE,
+    )
+    // Third instance of the same class (#524): the escalator's phrase,
+    // substituted for the same reason as the two phrase replaces above.
+    .replace(
+        "@@CHANNEL_STILL_DOWN@@",
+        crate::channel::boot_supervisor::CHANNEL_STILL_DOWN_LOG_PHRASE,
     )
 }
 
@@ -926,6 +932,14 @@ mod tests {
         assert!(
             help.contains(crate::channel::boot_supervisor::CHANNEL_FLAPPING_LOG_PHRASE),
             "must name the exact flap-alarm log phrase to grep for: {help}"
+        );
+        // Third instance of the same class (#524): the downtime escalator's
+        // phrase, asserted through the const `report()` interpolates rather
+        // than a literal typed a second time here — a literal is exactly what
+        // stayed green while the help and the log line drifted apart, twice.
+        assert!(
+            help.contains(crate::channel::boot_supervisor::CHANNEL_STILL_DOWN_LOG_PHRASE),
+            "must name the exact still-down log phrase to grep for: {help}"
         );
         assert!(
             !help.contains("@@"),
