@@ -238,20 +238,22 @@ pub fn render_email_help() -> String {
 #   SELECT ts, action, payload FROM audit_log
 #    WHERE action IN ('@@BOOT_STARTED@@','@@BOOT_FAILED@@','@@BOOT_DIED@@')
 #      AND payload->>'channel' = 'email' ORDER BY ts DESC LIMIT 20;
-# @@BOOT_FAILED@@ is RATE-LIMITED by the downtime clock: every attempt until
-# the outage is first reported as CHANNEL STILL DOWN (5 min of continuous
-# downtime), then only on each repeat of that line (every 30 min). A 24-hour
-# outage produces ~57 rows instead of ~1440. @@BOOT_DIED@@
+# @@BOOT_FAILED@@ is RATE-LIMITED twice over: by the downtime clock (every
+# attempt until the outage is first reported as @@CHANNEL_STILL_DOWN@@ — 5 min
+# of continuous downtime — then only on each repeat of that line, every
+# 30 min) and by an attempt-rate gate (5 failed attempts inside an hour,
+# then one row per 30 min), whichever engages first. A 24-hour outage
+# produces ~53 rows instead of ~1440: the first five attempts, then each
+# escalation. @@BOOT_DIED@@
 # is RATE-LIMITED by a separate flap alarm: every death until 5 deaths within
 # an hour first reports @@CHANNEL_FLAPPING@@, then only on each repeat. These are
 # independent: a channel that keeps recovering and dying (e.g., cycles up 61s
-# then dies repeatedly) may never produce CHANNEL STILL DOWN at all, yet will
-# still stop writing @@BOOT_DIED@@ rows once the flap alarm fires — but in
-# that same cycling regime @@BOOT_FAILED@@ rows are NOT rate-limited at all:
-# each stable death resets the downtime clock above (a channel that ran long
-# enough to count as having worked always does, whatever killed it), so if a
-# restart's first attempt then fails transiently before a later one succeeds,
-# that attempt is recorded ungated, every cycle. @@BOOT_STARTED@@
+# then dies repeatedly) may never produce @@CHANNEL_STILL_DOWN@@ at all, yet will
+# still stop writing @@BOOT_DIED@@ rows once the flap alarm fires — and in that
+# same cycling regime a restart attempt that fails transiently is bounded by
+# the attempt-rate gate (the first few rows carry the failure cause, then one
+# row per 30 min keeps sampling it), where it used to write one ungated row
+# per cycle. @@BOOT_STARTED@@
 # is NOT rate-limited: every successful start writes a row, always. So a gap
 # between rows means "still broken, still saying the same thing", NOT
 # "recovered" — look for a @@BOOT_STARTED@@ row for recovery. The daemon log
@@ -324,6 +326,12 @@ pub fn render_email_help() -> String {
     .replace(
         "@@CHANNEL_FLAPPING@@",
         crate::channel::boot_supervisor::CHANNEL_FLAPPING_LOG_PHRASE,
+    )
+    // Third instance of the same class (#524): the escalator's phrase,
+    // substituted for the same reason as the two phrase replaces above.
+    .replace(
+        "@@CHANNEL_STILL_DOWN@@",
+        crate::channel::boot_supervisor::CHANNEL_STILL_DOWN_LOG_PHRASE,
     )
 }
 
@@ -926,6 +934,14 @@ mod tests {
         assert!(
             help.contains(crate::channel::boot_supervisor::CHANNEL_FLAPPING_LOG_PHRASE),
             "must name the exact flap-alarm log phrase to grep for: {help}"
+        );
+        // Third instance of the same class (#524): the downtime escalator's
+        // phrase, asserted through the const `report()` interpolates rather
+        // than a literal typed a second time here — a literal is exactly what
+        // stayed green while the help and the log line drifted apart, twice.
+        assert!(
+            help.contains(crate::channel::boot_supervisor::CHANNEL_STILL_DOWN_LOG_PHRASE),
+            "must name the exact still-down log phrase to grep for: {help}"
         );
         assert!(
             !help.contains("@@"),

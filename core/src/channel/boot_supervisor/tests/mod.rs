@@ -7,7 +7,7 @@
 //!
 //! Split by concern: [`bringup`] is #514 (a channel that will not start),
 //! [`liveness`] is #517 (one that started and then stopped), and
-//! [`reporting`] is #518/#522 (what gets said and stored about either). The
+//! [`reporting`] is #518/#522/#523 (what gets said and stored about either). The
 //! shared scaffolding lives here because all three drive the same loop.
 
 use std::collections::VecDeque;

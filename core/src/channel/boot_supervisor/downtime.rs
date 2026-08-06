@@ -93,11 +93,13 @@ impl DowntimeEscalator {
 
     /// Has this outage already been reported loudly?
     ///
-    /// The supervisor's audit gate reads this to decide whether a failed
-    /// attempt still earns a durable row: until the outage has been escalated,
-    /// every attempt does, and after it only the escalations do. That is what
-    /// keeps a 24-hour outage to ~57 rows instead of ~1440 (#518) without
-    /// inventing a "first N attempts" constant nobody could derive.
+    /// The supervisor's audit gate reads this as one arm of the decision on
+    /// whether a failed attempt still earns a durable row: until the outage
+    /// has been escalated, attempts are gated only by the attempt-stream rate
+    /// limiter (#523), and after it only the escalations are written. That is
+    /// what keeps a 24-hour outage to ~53 rows instead of ~1440 (#518): the
+    /// first five attempts, then each escalation — without inventing a
+    /// "first N attempts" constant nobody could derive.
     ///
     /// Cleared by [`record_success`](Self::record_success), so a fresh outage
     /// records its early attempts in full.

@@ -66,6 +66,10 @@
 //!   it resets the escalator instead of extending it and `CHANNEL STILL DOWN`
 //!   never fires. `CHANNEL FLAPPING` is the alarm that does, once enough
 //!   deaths land inside its window.
+//!   The failed-attempt stream carries the same shape of gate since #523 — a
+//!   silent rate alarm inside the policy — because the flap band resets the
+//!   escalator on every stable death, leaving bring-up failures otherwise
+//!   ungated exactly there.
 //!
 //! The loop itself is database-free and network-free: audit rows go out
 //! through a boxed closure ([`BootAuditSink`] — the idiom
@@ -123,6 +127,17 @@ pub const AUDIT_CAUSE_CAP_CHARS: usize = 256;
 /// grep matched nothing. Interpolating one const in both places makes that
 /// particular drift unrepresentable.
 pub const CHANNEL_DISABLED_LOG_PHRASE: &str = "CHANNEL DISABLED";
+
+/// The phrase the downtime escalator's `error!` line opens with, and
+/// therefore the string an operator greps for.
+///
+/// A `const` for the same reason as [`CHANNEL_DISABLED_LOG_PHRASE`] above and
+/// `CHANNEL_FLAPPING_LOG_PHRASE` in [`reporting`]: the operator help
+/// (`crate::install::plan::render_email_help`) names this phrase, and an
+/// operator-facing phrase written in two places drifts — #516 found the first
+/// instance of this class, the #518/#522 review found the second, and #524
+/// found this one still bare.
+pub const CHANNEL_STILL_DOWN_LOG_PHRASE: &str = "CHANNEL STILL DOWN";
 
 /// A supervised channel bring-up: the retry loop, plus the handle that stops
 /// both it and whatever it started.
@@ -420,7 +435,7 @@ fn report(label: &str, verdict: &Verdict, attempts: u32) {
             channel = %label,
             down_secs = down.as_secs(),
             attempts,
-            "CHANNEL STILL DOWN — nothing sent to this channel has been received for this long, \
+            "{CHANNEL_STILL_DOWN_LOG_PHRASE} — nothing sent to this channel has been received for this long, \
              and it is still not staying up. The daemon is otherwise healthy; the cause is on \
              the preceding attempts' `error` field."
         );

@@ -1,5 +1,5 @@
 //! ---------------------------------------------------------------------------
-//! #518/#522: what gets said, and what gets stored, about a recurring channel
+//! #518/#522/#523: what gets said, and what gets stored, about a recurring channel
 //! event.
 //!
 //! Two halves. The first drives `note_outage` — the pure half of
@@ -280,4 +280,152 @@ async fn failed_attempts_stop_being_recorded_once_the_outage_is_reported() {
          interval and say nothing new: {:?}",
         sink.events()
     );
+}
+
+/// #523: in the flap band each stable death clears the escalator
+/// (`Outage::Ends` → `record_success`), so without its own gate the attempt
+/// stream writes one ungated `boot_failed` row per cycle, forever. The rate
+/// gate bounds it: the first attempts of the episode are recorded in full
+/// (with `cause`), later ones are latched-and-silent, and the repeat interval
+/// brings one cause-bearing row back per period.
+#[test]
+fn flap_band_boot_failed_rows_are_gated_once_the_rate_alarm_latches() {
+    let base = std::time::Instant::now();
+    let mut policy = ReportingPolicy::default().with_attempt_alarm(
+        RespawnRateAlarm::new(Duration::from_secs(3600), 2)
+            .with_repeat(Duration::from_secs(1800)),
+    );
+
+    // Each cycle: a stable death (which clears the escalator — the #523
+    // premise), then one transiently-failing restart attempt.
+    let mut verdicts = Vec::new();
+    for i in 0..4u64 {
+        let t = base + Duration::from_secs(61 * i);
+        policy.note_death(true, t);
+        verdicts.push(policy.note_failed_attempt(t + Duration::from_secs(1)));
+    }
+
+    assert!(
+        verdicts.iter().all(|v| v.still_down.is_none()),
+        "each stable death resets the downtime clock, so the escalator never speaks: {verdicts:?}"
+    );
+    assert!(verdicts[0].record, "the first failed attempt of the episode is recorded");
+    assert!(verdicts[1].record, "the attempt that trips the rate gate is itself recorded");
+    assert!(!verdicts[2].record, "latched and silent: this row says nothing new");
+    assert!(!verdicts[3].record, "still latched: the unbounded-rows defect, gated");
+
+    // The repeat interval brings one cause-bearing row back per period.
+    let t = base + Duration::from_secs(2000);
+    policy.note_death(true, t);
+    let v = policy.note_failed_attempt(t + Duration::from_secs(1));
+    assert!(v.record, "the repeat keeps one row per interval reaching the table: {v:?}");
+}
+
+/// The sampling-order trap, pinned for the ATTEMPT stream — the mirror of
+/// `the_first_death_of_a_fresh_storm_is_recorded`. When an attempt storm
+/// clears, `record` prunes the window and re-arms, so a latch read taken
+/// BEFORE the recording call still shows the old storm and would silently
+/// suppress the first failed attempt of the new one.
+#[test]
+fn the_first_failed_attempt_after_the_attempt_storm_clears_is_recorded() {
+    let base = std::time::Instant::now();
+    let mut policy = ReportingPolicy::default()
+        .with_attempt_alarm(RespawnRateAlarm::new(Duration::from_secs(60), 2));
+
+    policy.note_failed_attempt(base);
+    policy.note_failed_attempt(base + Duration::from_secs(1));
+    // Latched: a third attempt inside the window is gated.
+    assert!(!policy.note_failed_attempt(base + Duration::from_secs(2)).record);
+
+    // The restart then succeeds and the channel works: the outage ends
+    // (`record_success`), so the escalator cannot speak for the attempt below
+    // and the rate gate's own recovery is the only thing under test.
+    policy.note_death(true, base + Duration::from_secs(400));
+
+    // Long enough that the attempt window is empty: a NEW episode, and its
+    // first failed attempt is the one an operator most needs in the table.
+    let v = policy.note_failed_attempt(base + Duration::from_secs(500));
+    assert!(v.record, "the first attempt of a fresh episode must be recorded: {v:?}");
+    assert!(
+        v.still_down.is_none(),
+        "recorded by the rate gate's recovery, not by escalation: {v:?}"
+    );
+}
+
+/// The deferral, pinned: once the escalator has escalated an outage, the rate
+/// gate's repeat must NOT keep rows on its own schedule — the escalator owns
+/// that regime, and two alarms repeating on independent clocks would write
+/// near-duplicate rows every interval.
+#[test]
+fn a_rate_alarm_repeat_defers_to_an_escalated_outage() {
+    let base = std::time::Instant::now();
+    // A zero-threshold escalator escalates on the very first attempt; its
+    // repeat (1800 s) then stays quiet for the rest of the test. The rate
+    // gate's much shorter repeat would keep firing if it were allowed to.
+    let mut policy = ReportingPolicy::new(DowntimeEscalator::new(
+        Duration::ZERO,
+        Duration::from_secs(1800),
+    ))
+    .with_attempt_alarm(
+        RespawnRateAlarm::new(Duration::from_secs(3600), 1).with_repeat(Duration::from_secs(10)),
+    );
+
+    // First attempt: the escalation itself — recorded, and it latches both
+    // alarms (threshold 1 trips the rate gate on the same event).
+    let v = policy.note_failed_attempt(base);
+    assert!(v.record && v.still_down.is_some());
+
+    // 11 s later: the rate repeat has elapsed, the escalator repeat has not.
+    // The rate voice alone must not keep the row.
+    let v = policy.note_failed_attempt(base + Duration::from_secs(11));
+    assert!(
+        !v.record,
+        "an escalated outage's rows follow the escalator's schedule, not the rate gate's: {v:?}"
+    );
+}
+
+/// #523 through the real loop: a flapping channel whose restarts also fail
+/// transiently. Without the rate gate every such attempt wrote an ungated
+/// `boot_failed` row — one per cycle, unbounded; with it the attempt stream
+/// is bounded exactly the way the death stream already is.
+#[tokio::test]
+async fn a_flapping_channel_with_failing_restarts_stops_writing_boot_failed_rows() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let sink = RecordingSink::default();
+
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        // Every death is stable — the #523 premise: the escalator resets on
+        // each one and can never latch, so only the rate gate stands between
+        // the attempt stream and one ungated row per cycle.
+        ReportingPolicy::default()
+            .with_stable_uptime(Duration::ZERO)
+            .with_attempt_alarm(RespawnRateAlarm::new(Duration::from_secs(3600), 2)),
+        Some(sink.sink()),
+        scripted(vec![
+            dying(&stopped),
+            BootOutcome::Retry(anyhow::anyhow!("first restart attempt")),
+            dying(&stopped),
+            BootOutcome::Retry(anyhow::anyhow!("second restart attempt")),
+            dying(&stopped),
+            BootOutcome::Retry(anyhow::anyhow!("third restart attempt")),
+            healthy(&stopped),
+        ]),
+    );
+
+    // Nine events: Started, Died, Failed, Started, Died, Failed, Started,
+    // Died, Started — the third Retry is latched-and-silent, so it emits no
+    // Failed row (a regression that records it makes the counts below fail).
+    sink.wait_for(9).await;
+    sup.shutdown().await;
+
+    let events = sink.events();
+    let failed = events.iter().filter(|e| matches!(e, BootAudit::Failed { .. })).count();
+    assert_eq!(
+        failed, 2,
+        "the first two restart attempts are durable and the third is gated: {events:?}"
+    );
+    let died = events.iter().filter(|e| matches!(e, BootAudit::Died { .. })).count();
+    assert_eq!(died, 3, "the death stream is untouched by the attempt gate: {events:?}");
 }
