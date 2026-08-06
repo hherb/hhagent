@@ -383,3 +383,49 @@ fn a_rate_alarm_repeat_defers_to_an_escalated_outage() {
         "an escalated outage's rows follow the escalator's schedule, not the rate gate's: {v:?}"
     );
 }
+
+/// #523 through the real loop: a flapping channel whose restarts also fail
+/// transiently. Without the rate gate every such attempt wrote an ungated
+/// `boot_failed` row — one per cycle, unbounded; with it the attempt stream
+/// is bounded exactly the way the death stream already is.
+#[tokio::test]
+async fn a_flapping_channel_with_failing_restarts_stops_writing_boot_failed_rows() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let sink = RecordingSink::default();
+
+    let sup = ChannelSupervisor::spawn(
+        "test",
+        fast_backoff(),
+        // Every death is stable — the #523 premise: the escalator resets on
+        // each one and can never latch, so only the rate gate stands between
+        // the attempt stream and one ungated row per cycle.
+        ReportingPolicy::default()
+            .with_stable_uptime(Duration::ZERO)
+            .with_attempt_alarm(RespawnRateAlarm::new(Duration::from_secs(3600), 2)),
+        Some(sink.sink()),
+        scripted(vec![
+            dying(&stopped),
+            BootOutcome::Retry(anyhow::anyhow!("first restart attempt")),
+            dying(&stopped),
+            BootOutcome::Retry(anyhow::anyhow!("second restart attempt")),
+            dying(&stopped),
+            BootOutcome::Retry(anyhow::anyhow!("third restart attempt")),
+            healthy(&stopped),
+        ]),
+    );
+
+    // Nine events: Started, Died, Failed, Started, Died, Failed, Started,
+    // Died, Started — the third Retry is latched-and-silent, so it emits no
+    // Failed row (a regression that records it makes the counts below fail).
+    sink.wait_for(9).await;
+    sup.shutdown().await;
+
+    let events = sink.events();
+    let failed = events.iter().filter(|e| matches!(e, BootAudit::Failed { .. })).count();
+    assert_eq!(
+        failed, 2,
+        "the first two restart attempts are durable and the third is gated: {events:?}"
+    );
+    let died = events.iter().filter(|e| matches!(e, BootAudit::Died { .. })).count();
+    assert_eq!(died, 3, "the death stream is untouched by the attempt gate: {events:?}");
+}
