@@ -78,6 +78,11 @@ if [ -f "$CORE_LOG" ]; then
   CORE_LOG_OFFSET="$(wc -c < "$CORE_LOG" | tr -d ' ')"
 fi
 
+# NOTE: `install` REGENERATES $ENV_FILE from CLI flags. Operator settings belong
+# in ${ENV_FILE}.local, which the installer never writes and whose values win
+# (systemd applies EnvironmentFile= directives in order, later winning). If the
+# install reports dropped or changed keys, they were still in the generated file
+# — move them into the .local and re-run. See issue #458.
 echo "==> install"
 if [ -n "$HS" ] && [ -n "$MX_USER" ]; then
   ./target/release/kastellan-cli install --matrix-homeserver-url "$HS" --matrix-user "$MX_USER"
