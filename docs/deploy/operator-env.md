@@ -42,8 +42,14 @@ warning: install is regenerating /home/you/.config/kastellan/kastellan.env
   dropped: KASTELLAN_MAIL_ENDPOINT
   changed: KASTELLAN_LLM_LOCAL_MODEL
   previous file saved to /home/you/.config/kastellan/kastellan.env.bak
+  to keep these across future installs, move them into /home/you/.config/kastellan/kastellan.env.local —
+  the installer never writes that file, and its values override this one.
 ```
 
 Those keys were still in the generated file. Copy them out of the `.bak` into
-`kastellan.env.local` and restart. The backup is only written when something is
-actually being lost, so it is not overwritten by a later clean install.
+`kastellan.env.local`, then apply it the same way the table above describes:
+
+- **On Linux (systemd):** `systemctl --user restart kastellan-core`
+- **On macOS (launchd):** Re-run `kastellan-cli install`, since launchd reads the values only when the plist is written.
+
+The backup is only written when something is actually being lost, so it is not overwritten by a later clean install.
