@@ -9,6 +9,7 @@
 //! alongside their code in the sibling `builders.rs`.
 
 use super::*;
+use crate::EnvFileRef;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Minimal spec used as a starting point in driver tests.
@@ -25,7 +26,7 @@ fn minimal_spec(name: &str) -> ServiceSpec {
         after: vec![],
         part_of: None,
         restart_backoff: None,
-        environment_file: None,
+        environment_files: Vec::new(),
     }
 }
 
@@ -193,37 +194,61 @@ fn status_returns_not_installed_when_plist_absent() {
     assert_eq!(s, ServiceStatus::NotInstalled);
 }
 
-// ---------- environment_file folding (launchd's EnvironmentFile= counterpart) ----------
+// ---------- environment_files folding (launchd's EnvironmentFile= counterpart) ----------
 
 #[test]
-fn install_folds_environment_file_into_plist_env_vars() {
+fn install_folds_environment_files_in_order_with_later_winning() {
     let dir = TestRoot::new("env-file");
-    let env_file = dir.path().join("kastellan.env");
-    fs::write(&env_file, "# tuned by operator\nKASTELLAN_DATA_DIR=/srv/data\nKASTELLAN_LLM_LOCAL_MODEL=test-model\n")
-        .unwrap();
+    let base = dir.path().join("kastellan.env");
+    let local = dir.path().join("kastellan.env.local");
+    fs::write(&base, "# tuned by operator\nKASTELLAN_DATA_DIR=/srv/data\nKASTELLAN_LLM_LOCAL_MODEL=stock-tag\n").unwrap();
+    // The overlay overrides the regenerated value and adds a key of its own —
+    // the two shapes #458 exists to fix.
+    fs::write(&local, "KASTELLAN_LLM_LOCAL_MODEL=tuned-tag\nKASTELLAN_MAIL_ENDPOINT=https://10.0.0.3:8443\n").unwrap();
 
     let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
     let mut spec = minimal_spec("kastellan-core");
-    spec.environment_file = Some(env_file);
+    spec.environment_files = vec![
+        EnvFileRef { path: base, optional: false },
+        EnvFileRef { path: local, optional: true },
+    ];
     sup.install(&spec).expect("install");
 
     let body = fs::read_to_string(sup.plist_path("kastellan-core")).unwrap();
-    // The env-file keys must land in the plist's EnvironmentVariables, since
-    // launchd has no EnvironmentFile= directive to read them at start.
-    assert!(body.contains("<key>EnvironmentVariables</key>"), "{body}");
     assert!(body.contains("<key>KASTELLAN_DATA_DIR</key>"), "{body}");
     assert!(body.contains("<string>/srv/data</string>"), "{body}");
-    assert!(body.contains("<key>KASTELLAN_LLM_LOCAL_MODEL</key>"), "{body}");
-    assert!(body.contains("<string>test-model</string>"), "{body}");
+    assert!(body.contains("<string>tuned-tag</string>"), "{body}");
+    assert!(!body.contains("<string>stock-tag</string>"), "later file must win: {body}");
+    assert!(body.contains("<key>KASTELLAN_MAIL_ENDPOINT</key>"), "{body}");
 }
 
 #[test]
-fn install_errors_when_environment_file_missing() {
+fn install_skips_a_missing_optional_environment_file() {
+    let dir = TestRoot::new("env-file-optional-missing");
+    let base = dir.path().join("kastellan.env");
+    fs::write(&base, "KASTELLAN_DATA_DIR=/srv/data\n").unwrap();
+    let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
+    let mut spec = minimal_spec("svc");
+    // The normal case: the operator has not created a `.local` yet.
+    spec.environment_files = vec![
+        EnvFileRef { path: base, optional: false },
+        EnvFileRef { path: dir.path().join("kastellan.env.local"), optional: true },
+    ];
+    sup.install(&spec).expect("a missing OPTIONAL env file must not fail the install");
+    let body = fs::read_to_string(sup.plist_path("svc")).unwrap();
+    assert!(body.contains("<key>KASTELLAN_DATA_DIR</key>"), "{body}");
+}
+
+#[test]
+fn install_errors_when_a_required_environment_file_is_missing() {
     let dir = TestRoot::new("env-file-missing");
     let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
     let mut spec = minimal_spec("svc");
-    spec.environment_file = Some(dir.path().join("does-not-exist.env"));
-    let err = sup.install(&spec).expect_err("missing env file");
+    spec.environment_files = vec![EnvFileRef {
+        path: dir.path().join("does-not-exist.env"),
+        optional: false,
+    }];
+    let err = sup.install(&spec).expect_err("missing REQUIRED env file");
     assert!(matches!(err, SupervisorError::Io(_)), "{err}");
 }
 
