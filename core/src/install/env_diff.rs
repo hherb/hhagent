@@ -45,23 +45,44 @@ impl EnvDiff {
 /// something, not destroying it. Output follows `old`'s line order so the
 /// operator-facing message is deterministic, and each key is reported at most
 /// once even if the source file repeats it.
+///
+/// A key's operative value is its **last** occurrence in the file, matching
+/// systemd's precedence and the behaviour of `merge_env` elsewhere in this crate.
 pub fn diff_env_files(old: &str, new: &str) -> EnvDiff {
+    use std::collections::HashMap;
+
     let new_pairs = parse_env_file(new);
     // Both sides are bound to locals first: `parse_env_file` returns an owned
     // Vec, and iterating it inline would drop the temporary while the borrowed
     // &str keys are still in use.
     let old_pairs = parse_env_file(old);
 
+    // Build maps of key -> last_value for efficient lookup and correct comparison.
+    // Multiple occurrences of the same key use the last one (systemd behaviour).
+    let mut new_values: HashMap<&str, &str> = HashMap::new();
+    for (key, value) in new_pairs.iter() {
+        new_values.insert(key.as_str(), value.as_str());
+    }
+
+    let mut old_values: HashMap<&str, &str> = HashMap::new();
+    for (key, value) in old_pairs.iter() {
+        old_values.insert(key.as_str(), value.as_str());
+    }
+
     let mut diff = EnvDiff::default();
     let mut seen: Vec<&str> = Vec::new();
-    for (key, old_value) in old_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())) {
+
+    // Iterate through old_pairs in order to preserve first-appearance ordering
+    for (key, _) in old_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())) {
         if seen.contains(&key) {
             continue;
         }
         seen.push(key);
-        match new_pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()) {
+
+        let old_value = old_values[key];
+        match new_values.get(key) {
             None => diff.lost.push(key.to_string()),
-            Some(new_value) if new_value != old_value => diff.changed.push(key.to_string()),
+            Some(&new_value) if new_value != old_value => diff.changed.push(key.to_string()),
             Some(_) => {}
         }
     }

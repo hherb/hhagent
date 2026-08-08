@@ -58,3 +58,21 @@ fn reported_keys_follow_the_old_files_order_and_do_not_repeat() {
     // the source file is reported once.
     assert_eq!(d.lost, vec!["Z", "A"]);
 }
+
+#[test]
+fn a_repeated_key_is_compared_on_its_last_value_not_its_first() {
+    // systemd takes the last occurrence, and env_file::merge_env already
+    // behaves that way. Comparing the first would report a change that did
+    // not happen.
+    let d = diff_env_files("A=old\nA=real\n", "A=real\n");
+    assert!(d.is_empty(), "nothing changed; operative old value is `real`: {d:?}");
+}
+
+#[test]
+fn a_revert_of_a_repeated_keys_last_value_is_reported() {
+    // The dangerous direction: comparing first values makes this look
+    // unchanged, and a real revert is silently unreported.
+    let d = diff_env_files("A=1\nA=2\n", "A=1\n");
+    assert_eq!(d.changed, vec!["A"]);
+    assert!(d.lost.is_empty());
+}
