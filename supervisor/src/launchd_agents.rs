@@ -271,7 +271,7 @@ impl Supervisor for LaunchAgents {
                     SupervisorError::Io(format!("read environment_file {}: {e}", env_file.display()))
                 })?;
                 let mut merged = spec.clone();
-                builders::merge_env(&mut merged.env, builders::parse_env_file(&contents));
+                crate::env_file::merge_env(&mut merged.env, crate::env_file::parse_env_file(&contents));
                 merged.environment_file = None; // already folded into env
                 build_plist(&merged)
             }

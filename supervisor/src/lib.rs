@@ -15,6 +15,8 @@
 //!   - `systemctl --user` and `launchctl bootstrap gui/<uid>` are the
 //!     standard cross-platform pair for per-user always-on services.
 
+pub mod env_file;
+
 #[cfg(target_os = "linux")]
 pub mod systemd_user;
 
