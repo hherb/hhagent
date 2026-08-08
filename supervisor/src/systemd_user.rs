@@ -373,6 +373,14 @@ impl SystemdUser {
                 spec.program.display()
             )));
         }
+        // Env-file paths too. This one is fail-OPEN without the check: systemd
+        // drops a relative `EnvironmentFile=` with a journal warning and loads
+        // the unit anyway, so the daemon starts with NO environment at all —
+        // #458's failure in its total form, and invisible unless the operator
+        // reads the journal.
+        for ef in &spec.environment_files {
+            crate::env_file::validate_env_file_path(&ef.path)?;
+        }
 
         // Defense-in-depth (audit finding #10): path fields are written into
         // unit-file directives verbatim via `Display`, so a value containing a
@@ -381,20 +389,16 @@ impl SystemdUser {
         // escapes newlines), but these path fields did not. Specs are
         // code-constructed today, but `ServiceSpec` is `Deserialize`, so reject
         // any control character before the write.
-        let path_fields: [(&str, Option<&PathBuf>); 5] = [
-            ("program", Some(&spec.program)),
-            ("environment_file", spec.environment_file.as_ref()),
-            ("working_dir", spec.working_dir.as_ref()),
-            ("stdout_log", spec.stdout_log.as_ref()),
-            ("stderr_log", spec.stderr_log.as_ref()),
-        ];
-        for (field, maybe_path) in path_fields {
-            if let Some(p) = maybe_path {
-                if p.to_string_lossy().contains(|c: char| c.is_control()) {
-                    return Err(SupervisorError::Io(format!(
-                        "{field} must not contain control characters, got {p:?}"
-                    )));
-                }
+        let path_fields = std::iter::once(("program", &spec.program))
+            .chain(spec.environment_files.iter().map(|ef| ("environment_file", &ef.path)))
+            .chain(spec.working_dir.as_ref().map(|p| ("working_dir", p)))
+            .chain(spec.stdout_log.as_ref().map(|p| ("stdout_log", p)))
+            .chain(spec.stderr_log.as_ref().map(|p| ("stderr_log", p)));
+        for (field, p) in path_fields {
+            if p.to_string_lossy().contains(|c: char| c.is_control()) {
+                return Err(SupervisorError::Io(format!(
+                    "{field} must not contain control characters, got {p:?}"
+                )));
             }
         }
 

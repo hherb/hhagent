@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 // Daemon bring-up + shutdown helpers and the Matrix channel bring-up live in
 // sibling files under `main/` to keep this binary entrypoint under the 500-LOC
@@ -198,6 +198,31 @@ async fn main() -> Result<()> {
         let swept = fr.sweep_stale_scratch_dirs();
         if swept > 0 {
             info!(dirs = swept, "egress: reclaimed stale per-worker scratch dirs from a prior daemon");
+        }
+    } else {
+        use kastellan_core::egress::force_routing_notice as frn;
+        // `observed` names what the daemon actually read: every spelling other
+        // than 1/true/yes/on is off, so an operator who set `=enabled` and then
+        // read DISABLED would otherwise conclude the line was stale rather than
+        // that their value was rejected.
+        warn!(
+            env_var = frn::ENV_VAR,
+            observed = ?std::env::var(frn::ENV_VAR).ok(),
+            "{}",
+            frn::force_routing_disabled_message()
+        );
+        // Best-effort: the posture belongs in the oversight record, not only in
+        // a plaintext log with no role gating. A failed insert must not stop a
+        // daemon that is otherwise healthy.
+        if let Err(e) = kastellan_db::audit::insert(
+            &pool,
+            frn::DAEMON_ACTOR,
+            frn::ACTION_FORCE_ROUTING_DISABLED,
+            frn::force_routing_disabled_payload(),
+        )
+        .await
+        {
+            warn!(error = %e, "could not audit the disabled force-routing posture");
         }
     }
 

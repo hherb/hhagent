@@ -330,8 +330,9 @@ cargo build --release --workspace
 ```
 
 This copies all binaries into `~/.local/lib/kastellan/`, assets into
-`~/.local/share/kastellan/`, initializes the cluster (idempotent), writes a
-tunable `~/.config/kastellan/kastellan.env` (mode 0600), installs the
+`~/.local/share/kastellan/`, initializes the cluster (idempotent), writes
+`~/.config/kastellan/kastellan.env` (mode 0600, regenerated from the flags on
+every run — see below), installs the
 `kastellan.target` units, enables linger (Linux), and verifies both services
 reach `active` before returning. Re-running it is a clean upgrade (stop→start so
 new binaries/env take effect).
@@ -343,9 +344,16 @@ kastellan-cli uninstall [--purge]               # --purge also deletes the clust
 ```
 
 Tune the LLM/prompt/data settings any time by editing
-`~/.config/kastellan/kastellan.env` and restarting:
-`systemctl --user restart kastellan.target` (Linux). Check health with
-`systemctl --user status kastellan.target` and `kastellan-cli secret list`.
+`~/.config/kastellan/kastellan.env.local`, then apply it: on Linux
+`systemctl --user restart kastellan.target`; on macOS re-run `kastellan-cli
+install` **with the same flags you used originally**, because launchd has no
+`EnvironmentFile=` and the values are baked into the plist at install time.
+`install` regenerates `kastellan.env` itself on every run, so hand edits there
+don't survive the next deploy — the `.local` overlay is never touched by the
+installer and its values win. See
+[`docs/deploy/operator-env.md`](docs/deploy/operator-env.md).
+Check health with `systemctl --user status kastellan.target` and
+`kastellan-cli secret list`.
 
 ## License
 
