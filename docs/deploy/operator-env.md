@@ -53,3 +53,13 @@ Those keys were still in the generated file. Copy them out of the `.bak` into
 - **On macOS (launchd):** Re-run `kastellan-cli install`, since launchd reads the values only when the plist is written.
 
 The backup is only written when something is actually being lost, so it is not overwritten by a later clean install.
+
+## Before you `uninstall --purge`
+
+`--purge` deletes `~/.config/kastellan/` outright — that is the directory
+`kastellan.env.local` and `kastellan.env.bak` live in, so both go with it.
+The daemon itself points operators at `uninstall --purge` then reinstall as
+the fix for a stale-cluster role mismatch; the purge summary now names both
+files, but by then it is too late. Copy anything you need out of
+`kastellan.env.local` (and `kastellan.env.bak`, if you have not already moved
+its contents over) before running `--purge`.

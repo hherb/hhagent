@@ -280,7 +280,11 @@ pub fn run_uninstall(purge: bool) -> Result<(), String> {
                 Err(e) => return Err(format!("purge {}: {e}", d.display())),
             }
         }
-        eprintln!("purged prefix + data + logs (cluster + secrets deleted)");
+        eprintln!(
+            "purged prefix + data + logs (cluster + secrets deleted), including \
+             kastellan.env.local and kastellan.env.bak if present — copy anything you \
+             need out of them first next time"
+        );
     } else {
         eprintln!("kept data dir + secrets at {} (use --purge to delete)", layout.assets_dir.display());
     }

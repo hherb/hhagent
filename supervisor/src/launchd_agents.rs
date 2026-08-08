@@ -257,20 +257,17 @@ impl Supervisor for LaunchAgents {
         fs::create_dir_all(&self.agents_dir)
             .map_err(|e| SupervisorError::Io(format!("create {}: {e}", self.agents_dir.display())))?;
 
-        // launchd has no `EnvironmentFile=` equivalent, so honour
+        // launchd has no `EnvironmentFile=` directive, so honour
         // `spec.environment_files` by reading each one at install time and
-        // baking its KEY=value pairs into the plist's `EnvironmentVariables`
-        // — in declared order, later winning on key collision, matching
-        // systemd's file-order-wins semantics at start time. This gives
-        // macOS the same guarantee the Linux backend gets from
-        // `EnvironmentFile=` rather than silently dropping the operator's
-        // tuned config.
+        // folding its KEY=value pairs into the plist's `EnvironmentVariables`
+        // — in declared order, later winning on key collision (over both
+        // each other and `spec.env`), matching systemd's file-order-wins
+        // semantics at start time. This gives macOS the same guarantee the
+        // Linux backend gets from `EnvironmentFile=` rather than silently
+        // dropping the operator's tuned config. An absent OPTIONAL file is
+        // skipped (the normal state of `kastellan.env.local`); an absent
+        // REQUIRED one is still an error.
         let path = self.plist_path(&spec.name);
-        // launchd has no `EnvironmentFile=` directive, so fold each file's
-        // pairs into the plist's `EnvironmentVariables` at install time — in
-        // declared order, later winning, matching what systemd does at start
-        // time. An absent OPTIONAL file is skipped (that is the normal state
-        // of `kastellan.env.local`); an absent REQUIRED one is still an error.
         let mut merged = spec.clone();
         for ef in &spec.environment_files {
             let contents = match fs::read_to_string(&ef.path) {
