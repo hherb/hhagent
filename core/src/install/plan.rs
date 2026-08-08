@@ -18,6 +18,11 @@ pub struct Layout {
     pub data_dir: PathBuf,
     pub config_dir: PathBuf,
     pub env_file: PathBuf,
+    /// The operator overlay. **Never written by the installer** — it exists so
+    /// hand-tuned settings survive the `kastellan.env` regeneration that
+    /// otherwise drops them on every deploy (#458). Listed after `env_file` on
+    /// the service spec, so its values win.
+    pub env_local_file: PathBuf,
     pub log_dir: PathBuf,
     /// Symlink placed on the operator's PATH (`~/.local/bin/kastellan-cli`)
     /// pointing at `bin_dir/kastellan-cli`. The flat prefix (`bin_dir`) lives
@@ -40,6 +45,7 @@ pub fn resolve_layout(home: &Path, user: &str) -> Layout {
         l0_rules_file: assets_dir.join("seeds/memory/l0_meta_rules.toml"),
         data_dir: assets_dir.join("pg/data"),
         env_file: config_dir.join("kastellan.env"),
+        env_local_file: config_dir.join("kastellan.env.local"),
         log_dir: home.join(".local/state/kastellan"),
         cli_link: home.join(".local/bin/kastellan-cli"),
         assets_dir,
@@ -458,7 +464,10 @@ pub struct InstallSpecs {
 pub fn build_specs(layout: &Layout, postgres_binary: &Path) -> InstallSpecs {
     let postgres = postgres_service_spec(postgres_binary, &layout.data_dir, &layout.log_dir);
     let mut core = core_service_spec(&layout.bin_dir.join("kastellan"), &layout.log_dir);
-    core.environment_file = Some(layout.env_file.clone());
+    core.environment_files = vec![
+        kastellan_supervisor::EnvFileRef { path: layout.env_file.clone(), optional: false },
+        kastellan_supervisor::EnvFileRef { path: layout.env_local_file.clone(), optional: true },
+    ];
     InstallSpecs { members: vec![postgres, core], target: kastellan_target_spec() }
 }
 
@@ -629,6 +638,7 @@ mod tests {
         assert_eq!(l.data_dir, PathBuf::from("/home/u/.local/share/kastellan/pg/data"));
         assert_eq!(l.config_dir, PathBuf::from("/home/u/.config/kastellan"));
         assert_eq!(l.env_file, PathBuf::from("/home/u/.config/kastellan/kastellan.env"));
+        assert_eq!(l.env_local_file, PathBuf::from("/home/u/.config/kastellan/kastellan.env.local"));
         assert_eq!(l.log_dir, PathBuf::from("/home/u/.local/state/kastellan"));
         // The operator CLI is symlinked onto PATH (~/.local/bin), not left in the lib prefix.
         assert_eq!(l.cli_link, PathBuf::from("/home/u/.local/bin/kastellan-cli"));
@@ -741,11 +751,28 @@ mod tests {
         assert_eq!(specs.members.len(), 2);
         let core = specs.members.iter().find(|s| s.name == "kastellan-core").unwrap();
         assert_eq!(core.program, PathBuf::from("/home/u/.local/lib/kastellan/kastellan"));
-        assert_eq!(core.environment_file.as_deref(), Some(l.env_file.as_path()));
         let pg = specs.members.iter().find(|s| s.name == "kastellan-postgres").unwrap();
         assert_eq!(pg.program, PathBuf::from("/usr/lib/postgresql/18/bin/postgres"));
         assert!(specs.target.members.contains(&"kastellan-postgres".to_string()));
         assert!(specs.target.members.contains(&"kastellan-core".to_string()));
+    }
+
+    #[test]
+    fn specs_point_core_at_the_generated_env_then_the_operator_overlay() {
+        let l = layout();
+        let specs = build_specs(&l, Path::new("/usr/lib/postgresql/16/bin/postgres"));
+        let core = specs.members.iter().find(|s| s.name == "kastellan-core").unwrap();
+        // Order is the mechanism: systemd applies these in order and the LATER
+        // file wins, so the operator's `.local` overrides anything `install`
+        // regenerates. Reversing them would silently restore #458.
+        assert_eq!(core.environment_files.len(), 2);
+        assert_eq!(core.environment_files[0].path, l.env_file);
+        assert!(!core.environment_files[0].optional);
+        assert_eq!(core.environment_files[1].path, l.env_local_file);
+        assert!(
+            core.environment_files[1].optional,
+            "the overlay must be optional — the installer never creates it"
+        );
     }
 
     #[test]
