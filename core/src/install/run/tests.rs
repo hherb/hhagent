@@ -97,13 +97,18 @@ fn failed_symlink_replace_removes_its_staging_link() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The overlay path the production caller passes (`layout.env_local_file`).
+fn overlay(dir: &Path) -> PathBuf {
+    dir.join("kastellan.env.local")
+}
+
 #[test]
 fn a_destructive_rewrite_backs_the_old_file_up() {
     let dir = tempfile::tempdir().unwrap();
     let env = dir.path().join("kastellan.env");
     fs::write(&env, "KASTELLAN_MAIL_ENDPOINT=https://h:8443\n").unwrap();
 
-    preserve_and_report_env(&env, "KASTELLAN_DATA_DIR=/d\n").unwrap();
+    preserve_and_report_env(&env, &overlay(dir.path()), "KASTELLAN_DATA_DIR=/d\n").unwrap();
 
     let bak = dir.path().join("kastellan.env.bak");
     assert_eq!(
@@ -111,6 +116,23 @@ fn a_destructive_rewrite_backs_the_old_file_up() {
         "KASTELLAN_MAIL_ENDPOINT=https://h:8443\n",
         "the backup is where the operator reads the values the warning omits"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_backup_is_private_like_the_file_it_copies() {
+    // The backup is BY DESIGN the value-bearing artefact — the whole reason the
+    // transcript prints key names only is "read the values from the .bak". A
+    // umask-default 0644 copy would undo the 0600 on the source.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join("kastellan.env");
+    fs::write(&env, "KASTELLAN_MAIL_TOKEN=s3cr3t\n").unwrap();
+
+    preserve_and_report_env(&env, &overlay(dir.path()), "").unwrap();
+
+    let mode = fs::metadata(dir.path().join("kastellan.env.bak")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "backup must not be world-readable, got {mode:o}");
 }
 
 #[test]
@@ -121,7 +143,7 @@ fn a_non_destructive_rewrite_writes_no_backup() {
     let env = dir.path().join("kastellan.env");
     fs::write(&env, "A=1\n").unwrap();
 
-    preserve_and_report_env(&env, "A=1\nB=2\n").unwrap();
+    preserve_and_report_env(&env, &overlay(dir.path()), "A=1\nB=2\n").unwrap();
 
     assert!(!dir.path().join("kastellan.env.bak").exists());
 }
@@ -130,8 +152,58 @@ fn a_non_destructive_rewrite_writes_no_backup() {
 fn a_first_install_has_nothing_to_preserve() {
     let dir = tempfile::tempdir().unwrap();
     let env = dir.path().join("kastellan.env");
-    preserve_and_report_env(&env, "A=1\n").expect("a missing env file is not an error");
+    preserve_and_report_env(&env, &overlay(dir.path()), "A=1\n")
+        .expect("a missing env file is not an error");
     assert!(!dir.path().join("kastellan.env.bak").exists());
+}
+
+#[test]
+fn an_unreadable_env_file_fails_the_install_instead_of_being_overwritten() {
+    // The dangerous half of "a missing file is fine": a file that EXISTS but
+    // cannot be decoded took the same early return, and the caller's next act
+    // is a truncating write. One stray non-UTF-8 byte therefore destroyed the
+    // file with no backup, no diff and no warning — #458 via its own fix.
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join("kastellan.env");
+    fs::write(&env, [b'A', b'=', 0xff, 0xfe, b'\n']).unwrap();
+
+    let err = preserve_and_report_env(&env, &overlay(dir.path()), "A=1\n")
+        .expect_err("an unreadable env file must not be silently overwritten");
+
+    assert!(err.contains("refusing to continue"), "{err}");
+    assert!(!dir.path().join("kastellan.env.bak").exists(), "no backup was possible");
+    assert_eq!(
+        fs::read(&env).unwrap(),
+        vec![b'A', b'=', 0xff, 0xfe, b'\n'],
+        "the original must still be on disk for the operator to rescue"
+    );
+}
+
+#[test]
+fn a_second_destructive_install_does_not_clobber_the_first_backup() {
+    // The realistic loss: install #1 drops the mail keys into `.bak`; the
+    // operator misses the warning in a long upgrade transcript; weeks later an
+    // install with a changed flag diffs non-empty against the ALREADY-STRIPPED
+    // file and would overwrite the only copy of those values.
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join("kastellan.env");
+
+    fs::write(&env, "KASTELLAN_MAIL_ENDPOINT=https://h:8443\n").unwrap();
+    preserve_and_report_env(&env, &overlay(dir.path()), "KASTELLAN_LLM_LOCAL_MODEL=stock\n").unwrap();
+    fs::write(&env, "KASTELLAN_LLM_LOCAL_MODEL=stock\n").unwrap();
+
+    preserve_and_report_env(&env, &overlay(dir.path()), "KASTELLAN_LLM_LOCAL_MODEL=other\n").unwrap();
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join("kastellan.env.bak")).unwrap(),
+        "KASTELLAN_MAIL_ENDPOINT=https://h:8443\n",
+        "the first backup holds the only copy of the dropped values and must survive"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("kastellan.env.bak.1")).unwrap(),
+        "KASTELLAN_LLM_LOCAL_MODEL=stock\n",
+        "the later backup lands beside it rather than on top of it"
+    );
 }
 
 #[test]
@@ -166,6 +238,42 @@ fn the_warning_points_at_the_backup_and_the_overlay() {
     );
     assert!(msg.contains("kastellan.env.bak"), "{msg}");
     assert!(msg.contains("kastellan.env.local"), "{msg}");
+}
+
+#[test]
+fn the_warning_never_prints_a_value() {
+    // The one security-shaped contract in this module, and the only one nothing
+    // asserted: `EnvDiff` carries names, so a value can only appear if someone
+    // widens the type or interpolates the old file. Both should fail here.
+    let old = "KASTELLAN_MAIL_TOKEN=s3cr3t-do-not-print\nKASTELLAN_LLM_LOCAL_MODEL=tuned-tag\n";
+    let diff = crate::install::env_diff::diff_env_files(old, "KASTELLAN_LLM_LOCAL_MODEL=stock\n");
+    let msg = render_drop_warning(
+        Path::new("/h/kastellan.env"),
+        Path::new("/h/kastellan.env.bak"),
+        Path::new("/h/kastellan.env.local"),
+        &diff,
+    );
+
+    assert!(msg.contains("KASTELLAN_MAIL_TOKEN"), "the key must be named: {msg}");
+    assert!(!msg.contains("s3cr3t"), "a dropped key's value must never reach the transcript: {msg}");
+    assert!(!msg.contains("tuned-tag"), "a changed key's OLD value must not leak either: {msg}");
+    assert!(!msg.contains("stock"), "nor its new one: {msg}");
+}
+
+#[test]
+fn the_warning_says_how_to_make_the_overlay_take_effect() {
+    // Platform-specific, and the macOS half is the one that bites: launchd bakes
+    // the values in at install time, so "move them into the overlay" alone tells
+    // a Mac operator to do something that has no effect until the next install.
+    // Asserted through the same const the message renders, so they cannot drift.
+    let diff = EnvDiff { lost: vec!["A".into()], changed: vec![] };
+    let msg = render_drop_warning(
+        Path::new("/h/kastellan.env"),
+        Path::new("/h/kastellan.env.bak"),
+        Path::new("/h/kastellan.env.local"),
+        &diff,
+    );
+    assert!(msg.contains(OVERLAY_APPLY_HINT), "{msg}");
 }
 
 #[test]

@@ -60,10 +60,20 @@ fn reported_keys_follow_the_old_files_order_and_do_not_repeat() {
 }
 
 #[test]
+fn a_quoted_value_is_not_a_spurious_change() {
+    // The overlay is hand-written and humans quote; the generated file never
+    // does. Both sides go through the shared grammar, so `"x"` and `x` are the
+    // same value and the operator is not told something changed that did not.
+    let d = diff_env_files("KASTELLAN_MAIL_ENDPOINT=\"https://h:8443\"\n",
+                           "KASTELLAN_MAIL_ENDPOINT=https://h:8443\n");
+    assert!(d.is_empty(), "{d:?}");
+}
+
+#[test]
 fn a_repeated_key_is_compared_on_its_last_value_not_its_first() {
-    // systemd takes the last occurrence, and env_file::merge_env already
-    // behaves that way. Comparing the first would report a change that did
-    // not happen.
+    // systemd takes the last occurrence, and kastellan_supervisor::env_file's
+    // merge_env already behaves that way. Comparing the first would report a
+    // change that did not happen.
     let d = diff_env_files("A=old\nA=real\n", "A=real\n");
     assert!(d.is_empty(), "nothing changed; operative old value is `real`: {d:?}");
 }

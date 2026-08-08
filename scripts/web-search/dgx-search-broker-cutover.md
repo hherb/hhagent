@@ -35,16 +35,20 @@ SearxNG. No public SearxNG, no SSRF exemption.
    ```
    `install` regenerates the systemd unit **and** `kastellan.env` from flags.
 
-3. **Re-add force-routing to the regenerated unit** (`plan.rs` does NOT emit it —
-   a naive install silently DISABLES a core containment control):
+3. **Check force-routing survived.** `core_service_spec` bakes
+   `Environment=KASTELLAN_EGRESS_FORCE_ROUTING=1` into the generated unit, so a
+   normal install keeps it — this step used to say `plan.rs` does not emit it,
+   which is stale. What *can* still disable it is an env file, since
+   `EnvironmentFile=` is applied after `Environment=`; the daemon now says so
+   loudly at startup (grep `EGRESS FORCE-ROUTING DISABLED`). Verify with:
    ```sh
-   # append to ~/.config/systemd/user/kastellan-core.service under [Service]:
-   #   Environment=KASTELLAN_EGRESS_FORCE_ROUTING=1
-   systemctl --user daemon-reload
+   grep -c 'FORCE_ROUTING' ~/.config/systemd/user/kastellan-core.service
    ```
 
-4. **Append the broker-mode env** to `~/.config/kastellan/kastellan.env`
-   (install regenerated it from flags, so add these after):
+4. **Put the broker-mode env in the overlay**, `~/.config/kastellan/kastellan.env.local`
+   — *not* in `kastellan.env`, which the install in step 2 just regenerated and
+   which the next one will regenerate again (see
+   [`docs/deploy/operator-env.md`](../../docs/deploy/operator-env.md)):
    ```sh
    KASTELLAN_WEB_SEARCH_ENDPOINT=http://127.0.0.1:8888/search
    KASTELLAN_WEB_SEARCH_USE_BROKER=1
@@ -94,7 +98,7 @@ ssh dgx 'cd ~/src/kastellan && setsid bash -lc "source ~/.cargo/env && \
 ```
 
 ## Rollback
-Set `KASTELLAN_WEB_SEARCH_USE_BROKER=0` (or remove it) in `kastellan.env` and
+Set `KASTELLAN_WEB_SEARCH_USE_BROKER=0` (or remove it) in `kastellan.env.local` and
 restart. web-search falls back to the direct entry — which, under force-routing,
 cannot reach the loopback SearxNG (that's the whole reason for the broker), so
 rollback means web-search is non-functional until a routable endpoint or the

@@ -240,6 +240,11 @@ impl Supervisor for LaunchAgents {
                 spec.program.display()
             )));
         }
+        // Env-file paths too: this backend resolves them against the INSTALLER's
+        // cwd, and the systemd side would silently drop a relative directive.
+        for ef in &spec.environment_files {
+            crate::env_file::validate_env_file_path(&ef.path)?;
+        }
 
         // launchd has no operator-controllable exponential restart backoff
         // (its only knob, ThrottleInterval, is a constant floor, not a ramp).
@@ -269,19 +274,7 @@ impl Supervisor for LaunchAgents {
         // REQUIRED one is still an error.
         let path = self.plist_path(&spec.name);
         let mut merged = spec.clone();
-        for ef in &spec.environment_files {
-            let contents = match fs::read_to_string(&ef.path) {
-                Ok(c) => c,
-                Err(e) if ef.optional && e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(SupervisorError::Io(format!(
-                        "read environment_file {}: {e}",
-                        ef.path.display()
-                    )))
-                }
-            };
-            crate::env_file::merge_env(&mut merged.env, crate::env_file::parse_env_file(&contents));
-        }
+        crate::env_file::fold_env_files(&mut merged.env, &spec.environment_files)?;
         merged.environment_files = Vec::new(); // already folded into env
         let body = build_plist(&merged);
         write_atomic(&path, body.as_bytes())?;

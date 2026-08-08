@@ -53,10 +53,15 @@ CORE_LOG="$HOME/.local/state/kastellan/kastellan-core.out"
 # (later file wins) — an operator who moved the Matrix block into
 # ${ENV_FILE}.local per this script's own advice below must still be found here.
 HS=""; MX_USER=""
+# `tail -1`, not `head -1`: within ONE file a repeated key resolves to its LAST
+# occurrence (systemd's precedence, and what `merge_env`/`diff_env_files` do) —
+# appending a corrected line rather than editing in place is the natural way an
+# overlay accumulates, and taking the first value would re-pass the superseded
+# one while the daemon runs on the later.
 for f in "$ENV_FILE.local" "$ENV_FILE"; do
   [ -f "$f" ] || continue
-  [ -n "$HS" ]      || HS="$(sed -n 's/^KASTELLAN_MATRIX_HOMESERVER_URL=//p' "$f" | head -1)"
-  [ -n "$MX_USER" ] || MX_USER="$(sed -n 's/^KASTELLAN_MATRIX_USER=//p' "$f" | head -1)"
+  [ -n "$HS" ]      || HS="$(sed -n 's/^KASTELLAN_MATRIX_HOMESERVER_URL=//p' "$f" | tail -1)"
+  [ -n "$MX_USER" ] || MX_USER="$(sed -n 's/^KASTELLAN_MATRIX_USER=//p' "$f" | tail -1)"
 done
 
 # shellcheck disable=SC1090,SC1091

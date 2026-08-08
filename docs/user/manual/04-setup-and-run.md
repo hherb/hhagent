@@ -136,8 +136,10 @@ kastellan-cli install --llm-url "http://127.0.0.1:8000" --llm-model "<your-model
 
 On a Linux GPU host running vLLM or SGLang, the model server usually listens
 on port `8000`; on macOS with Ollama it is `11434`. You can change these at
-any time by editing `~/.config/kastellan/kastellan.env` and restarting the
-service.
+any time by putting them in `~/.config/kastellan/kastellan.env.local` and
+restarting the service — **not** in `kastellan.env`, which the installer
+regenerates from these flags on every run. See
+[Operator environment settings](../../deploy/operator-env.md).
 
 Frontier (cloud) models are deliberately *not* reachable yet — that path is
 gated behind a future policy layer and is off by default. Kastellan starts
@@ -160,8 +162,10 @@ In one go this:
   into `~/.local/share/kastellan/`;
 - initialises Kastellan's own private PostgreSQL database (idempotent — safe
   to re-run);
-- writes a tunable configuration file at `~/.config/kastellan/kastellan.env`
-  (readable only by you);
+- writes a configuration file at `~/.config/kastellan/kastellan.env` (readable
+  only by you) — **regenerated from the CLI flags every time you install**, so
+  your own settings belong in `kastellan.env.local` beside it, which the
+  installer never touches;
 - installs the service-supervisor units (`systemd --user` on Linux, `launchd`
   on macOS) so the agent starts on login and **restarts itself with sensible
   backoff if it crashes**;
@@ -217,7 +221,7 @@ project includes a full guide and helper scripts:
 Once your homeserver is running, point Kastellan at it and tell it which chat
 account is the *agent's* (the account the bot logs in as). The simplest way is
 to pass the details to the installer — or add the equivalent lines to
-`~/.config/kastellan/kastellan.env` and restart:
+`~/.config/kastellan/kastellan.env.local` and restart:
 
 ```sh
 kastellan-cli install \
@@ -226,10 +230,13 @@ kastellan-cli install \
 ```
 
 Then tell the agent which account is *you*, so it only ever accepts you as a
-partner (in `kastellan.env`, comma-separated if more than one):
+partner. This one has **no installer flag**, so it must go in
+`~/.config/kastellan/kastellan.env.local` (comma-separated if more than one) —
+put it in `kastellan.env` and the next install silently drops it, taking your
+pairing allowlist with it:
 
 ```sh
-KASTELLAN_MATRIX_PEERS="@you:your-homeserver"
+KASTELLAN_MATRIX_PEERS=@you:your-homeserver
 ```
 
 Finally, a new chat partner must **pair** before the agent will listen to
@@ -290,8 +297,9 @@ this is the place to look.**
 Several workers are **opt-in** and stay off until you explicitly enable
 them, because they widen what the agent can do. You turn each one on with its
 switch. In a supervised install these settings go in
-`~/.config/kastellan/kastellan.env` (then restart with
-`systemctl --user restart kastellan.target`); if you run the daemon by hand
+`~/.config/kastellan/kastellan.env.local` — the overlay the installer never
+writes — and then you restart with
+`systemctl --user restart kastellan.target`; if you run the daemon by hand
 they are ordinary environment variables you `export` first. The names are the
 same either way:
 
@@ -309,6 +317,12 @@ The **inbound email channel** (receiving gated instructions by email)
 comes on when you set the `KASTELLAN_EMAIL_*` group of settings; the
 installer writes a commented-out guide to those into `kastellan.env`.
 Leave them unset and both features simply stay off.
+
+None of these have installer flags, so **set them in `kastellan.env.local`**.
+Copying them into `kastellan.env` — even from the commented guide the installer
+writes there — means the next install drops them again: that is exactly how the
+deployed agent lost its mail capability for two days, with no error anywhere and
+a wrong answer as the only symptom.
 
 Network-using tools are confined to an **allowlist** of sites you control —
 for instance, the web-fetch worker will only ever connect to the hosts you

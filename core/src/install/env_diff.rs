@@ -47,42 +47,37 @@ impl EnvDiff {
 /// once even if the source file repeats it.
 ///
 /// A key's operative value is its **last** occurrence in the file, matching
-/// systemd's precedence and the behaviour of `merge_env` elsewhere in this crate.
+/// systemd's precedence and the behaviour of
+/// [`kastellan_supervisor::env_file::merge_env`].
+///
+/// Values are compared *after* that grammar has normalised them, so an operator
+/// who quoted a value the installer renders bare is not reported as a spurious
+/// `changed:`.
 pub fn diff_env_files(old: &str, new: &str) -> EnvDiff {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
-    let new_pairs = parse_env_file(new);
-    // Both sides are bound to locals first: `parse_env_file` returns an owned
-    // Vec, and iterating it inline would drop the temporary while the borrowed
-    // &str keys are still in use.
+    // `collect` keeps the LAST insert for a repeated key, on both sides —
+    // systemd's precedence. Comparing the first value instead would report
+    // `old = "A=1\nA=2"` against `new = "A=1"` as no change at all, which is a
+    // genuine revert going unreported: the exact silence this module exists to
+    // break.
+    let new_values: HashMap<String, String> = parse_env_file(new).into_iter().collect();
+    // `old` stays a Vec as well: the report follows its line order.
     let old_pairs = parse_env_file(old);
-
-    // Build maps of key -> last_value for efficient lookup and correct comparison.
-    // Multiple occurrences of the same key use the last one (systemd behaviour).
-    let mut new_values: HashMap<&str, &str> = HashMap::new();
-    for (key, value) in new_pairs.iter() {
-        new_values.insert(key.as_str(), value.as_str());
-    }
-
-    let mut old_values: HashMap<&str, &str> = HashMap::new();
-    for (key, value) in old_pairs.iter() {
-        old_values.insert(key.as_str(), value.as_str());
-    }
+    let old_values: HashMap<&str, &str> =
+        old_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
     let mut diff = EnvDiff::default();
-    let mut seen: Vec<&str> = Vec::new();
-
-    // Iterate through old_pairs in order to preserve first-appearance ordering
-    for (key, _) in old_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())) {
-        if seen.contains(&key) {
-            continue;
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (key, _) in &old_pairs {
+        if !seen.insert(key.as_str()) {
+            continue; // already reported at its first appearance
         }
-        seen.push(key);
-
-        let old_value = old_values[key];
-        match new_values.get(key) {
-            None => diff.lost.push(key.to_string()),
-            Some(&new_value) if new_value != old_value => diff.changed.push(key.to_string()),
+        match new_values.get(key.as_str()) {
+            None => diff.lost.push(key.clone()),
+            Some(new_value) if new_value.as_str() != old_values[key.as_str()] => {
+                diff.changed.push(key.clone())
+            }
             Some(_) => {}
         }
     }

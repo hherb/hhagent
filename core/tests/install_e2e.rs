@@ -65,6 +65,30 @@ fn prepare_filesystem_populates_prefix_and_env_file() {
     assert!(env.contains("KASTELLAN_LLM_LOCAL_MODEL=test-model\n"));
     assert!(env.contains(&format!("KASTELLAN_DATA_DIR={}\n", layout.data_dir.display())));
 
+    // The overlay is the last line of defence against #458, and "the installer
+    // never writes it" is the whole guarantee — stated in six doc comments and,
+    // until now, asserted nowhere. A future change that stubs the file out (or
+    // seeds defaults into it) would reinstate #458 one file to the left,
+    // permanently, with every other test still green.
+    assert!(
+        !layout.env_local_file.exists(),
+        "install must never create {} — operators own that file",
+        layout.env_local_file.display()
+    );
+
+    // Re-running install is the documented upgrade path, so the guarantee has to
+    // survive a second pass: this is the only place the installer runs twice,
+    // which is the shape the whole issue takes.
+    prepare_filesystem(&layout, &from, &assets_src, &args).expect("second prepare_filesystem");
+    assert!(
+        !layout.env_local_file.exists(),
+        "a re-install must not create the overlay either"
+    );
+    assert!(
+        !layout.env_file.with_extension("env.bak").exists(),
+        "an identical re-install destroys nothing, so it must write no backup"
+    );
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

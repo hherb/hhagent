@@ -8,29 +8,82 @@
 //! compiled and tested on **both** hosts, while per-backend code is invisible
 //! to CI (there is no macOS job at all) — the same reasoning that folded the
 //! two backends' staging helpers into one `atomic_write` in #511.
+//!
+//! **Why this module owns file I/O too.** [`fold_env_files`] resolves an
+//! ordered [`EnvFileRef`] list into a flat env map. It used to live inside the
+//! macOS-only launchd backend, which meant the *ordering* and *optionality*
+//! semantics of #458 — half of a cross-platform guarantee — compiled and ran
+//! only when somebody happened to run `cargo test` on a Mac. Same argument as
+//! the parser above; the I/O is incidental to it.
+
+use std::path::Path;
+
+use crate::{EnvFileRef, SupervisorError};
 
 /// Parse an `EnvironmentFile`-style buffer into ordered `(KEY, value)` pairs.
 ///
-/// Pure (no I/O). Matches the subset of systemd's `EnvironmentFile=` grammar
-/// the installer emits: one `KEY=value` per line, blank lines and `#` comments
-/// skipped, surrounding whitespace on the key trimmed. Values are taken
-/// verbatim after the first `=` (no shell expansion, no quote stripping) since
-/// the installer writes plain values. Lines without `=` are ignored.
+/// Pure (no I/O). Implements the subset of systemd's `EnvironmentFile=` grammar
+/// that operators actually write, **measured against a live systemd user manager
+/// on 2026-08-09** rather than recalled:
+///
+/// | line | systemd | here |
+/// | --- | --- | --- |
+/// | `A="a b"` | `a b` | `a b` |
+/// | `A='a b'` | `a b` | `a b` |
+/// | `A=  c  ` | `c` | `c` |
+/// | `A=f"g` | `f"g` | `f"g` |
+/// | `export A=h` | dropped | dropped |
+/// | `;A=i` | dropped | dropped |
+/// | `#A=i` | dropped | dropped |
+///
+/// Quote-stripping and value-trimming are **not** cosmetic. Before #528 this
+/// took values verbatim, justified by "the installer writes plain values" — a
+/// premise #458 retired, because `kastellan.env.local` is the first env file a
+/// *human* writes by hand, and humans quote. On Linux systemd did the stripping
+/// and here nothing did, so one overlay file produced two different runtime
+/// environments on the two first-class platforms.
+///
+/// Not implemented, because the installer never emits them and systemd's own
+/// handling is more elaborate than an operator overlay warrants: backslash line
+/// continuations, and C-style escapes inside double quotes. A value needing
+/// either is out of contract on both platforms.
 pub fn parse_env_file(contents: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in contents.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        // `;` is a comment introducer to systemd just as `#` is; treating it as
+        // a key named `;FOO` invented a variable the Linux side never sees.
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        if let Some((k, v)) = line.split_once('=') {
-            let k = k.trim();
-            if !k.is_empty() {
-                out.push((k.to_string(), v.to_string()));
-            }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let k = k.trim();
+        // systemd ignores an assignment whose name is not a bare identifier —
+        // notably `export FOO=bar`, which shell users write by reflex. Silently
+        // accepting it here created an env var literally named "export FOO".
+        if k.is_empty() || k.contains(char::is_whitespace) {
+            continue;
         }
+        out.push((k.to_string(), unquote(v.trim())));
     }
     out
+}
+
+/// Strip one matching pair of surrounding quotes, if present.
+///
+/// Only a *matched* pair is stripped, so `f"g` and `"a` stay verbatim — which
+/// is what systemd does with them.
+fn unquote(v: &str) -> String {
+    let bytes = v.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        if (first == b'"' || first == b'\'') && bytes[bytes.len() - 1] == first {
+            return v[1..v.len() - 1].to_string();
+        }
+    }
+    v.to_string()
 }
 
 /// Merge `from` into `into`, with `from` winning on key collision (matching
@@ -38,6 +91,10 @@ pub fn parse_env_file(contents: &str) -> Vec<(String, String)> {
 /// later-file-wins order between two `EnvironmentFile=` directives — both
 /// measured on a live systemd user manager, not assumed). Existing keys keep
 /// their position with the value replaced; new keys are appended.
+///
+/// A key repeated *within* one batch resolves to its **last** occurrence, for
+/// the same reason: the first push creates the slot, each later one overwrites
+/// it in place.
 pub fn merge_env(into: &mut Vec<(String, String)>, from: Vec<(String, String)>) {
     for (k, v) in from {
         if let Some(slot) = into.iter_mut().find(|(ek, _)| *ek == k) {
@@ -46,6 +103,59 @@ pub fn merge_env(into: &mut Vec<(String, String)>, from: Vec<(String, String)>) 
             into.push((k, v));
         }
     }
+}
+
+/// Resolve an ordered [`EnvFileRef`] list over `into`, later files winning.
+///
+/// The backend-neutral half of #458: read each file in declared order and merge
+/// its pairs, so an operator's `kastellan.env.local` overrides the
+/// `kastellan.env` the installer regenerates. An absent **optional** file is
+/// skipped — that is the normal state of the overlay — while an absent
+/// **required** one is an error, and a file that exists but cannot be read is
+/// an error either way. `NotFound` is the only forgiven kind: silently treating
+/// an unreadable overlay as an empty one would be #458 wearing a new hat, since
+/// the operator wrote the file and believes it applies.
+///
+/// Used by the launchd backend, which has no `EnvironmentFile=` directive and
+/// must bake the values into the plist at install time. systemd does this
+/// resolution itself at service start, from the directives
+/// `systemd_user::builder` renders — so this function is macOS's route to the
+/// same guarantee, and lives here so its semantics are tested on both hosts.
+pub fn fold_env_files(
+    into: &mut Vec<(String, String)>,
+    files: &[EnvFileRef],
+) -> Result<(), SupervisorError> {
+    for ef in files {
+        let contents = match std::fs::read_to_string(&ef.path) {
+            Ok(c) => c,
+            Err(e) if ef.optional && e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(SupervisorError::Io(format!(
+                    "read environment_file {}: {e}",
+                    ef.path.display()
+                )))
+            }
+        };
+        merge_env(into, parse_env_file(&contents));
+    }
+    Ok(())
+}
+
+/// Reject an `EnvironmentFile=` path systemd would refuse or misread.
+///
+/// systemd requires an absolute path and drops the directive (with a journal
+/// warning) otherwise, leaving the service running with **no** environment at
+/// all — fail-open, and invisible unless someone reads the journal. The sibling
+/// path fields already get this check at both backends' `install`; the env-file
+/// list was added to the control-character guard only.
+pub fn validate_env_file_path(path: &Path) -> Result<(), SupervisorError> {
+    if !path.is_absolute() {
+        return Err(SupervisorError::Io(format!(
+            "environment_file must be absolute, got {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

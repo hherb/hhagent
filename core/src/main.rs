@@ -201,19 +201,22 @@ async fn main() -> Result<()> {
         }
     } else {
         use kastellan_core::egress::force_routing_notice as frn;
+        // `observed` names what the daemon actually read: every spelling other
+        // than 1/true/yes/on is off, so an operator who set `=enabled` and then
+        // read DISABLED would otherwise conclude the line was stale rather than
+        // that their value was rejected.
         warn!(
-            env_var = "KASTELLAN_EGRESS_FORCE_ROUTING",
-            "{} — Net::Allowlist workers get a direct network route; no egress \
-             proxy enforces host:port or SSRF. Set it to 1 in kastellan.env.local \
-             unless this is a deliberate bring-up without the proxy.",
-            frn::FORCE_ROUTING_DISABLED_LOG_PHRASE
+            env_var = frn::ENV_VAR,
+            observed = ?std::env::var(frn::ENV_VAR).ok(),
+            "{}",
+            frn::force_routing_disabled_message()
         );
         // Best-effort: the posture belongs in the oversight record, not only in
         // a plaintext log with no role gating. A failed insert must not stop a
         // daemon that is otherwise healthy.
         if let Err(e) = kastellan_db::audit::insert(
             &pool,
-            frn::ACTOR,
+            frn::DAEMON_ACTOR,
             frn::ACTION_FORCE_ROUTING_DISABLED,
             frn::force_routing_disabled_payload(),
         )

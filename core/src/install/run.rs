@@ -18,6 +18,26 @@ use super::plan::{
 };
 use crate::install::env_diff::EnvDiff;
 
+/// How an operator makes an overlay edit take effect, per platform.
+///
+/// systemd re-reads `EnvironmentFile=` at every service start, so a restart is
+/// enough. launchd has no such directive — the backend folds the pairs into the
+/// plist at *install* time — so an edit needs another install, and it must carry
+/// the same flags as the original, because a bare re-run regenerates
+/// `kastellan.env` from flag defaults and reverts them.
+///
+/// A `const` per platform rather than a `cfg!()` inside the message: the test
+/// then asserts through the same const it renders, so the two cannot drift, and
+/// it passes on whichever host runs it.
+#[cfg(target_os = "macos")]
+pub(crate) const OVERLAY_APPLY_HINT: &str =
+    "then re-run `kastellan-cli install` WITH THE SAME FLAGS you used originally — launchd has no \
+     EnvironmentFile=, so the values are baked into the plist at install time and a restart alone \
+     will not pick them up";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const OVERLAY_APPLY_HINT: &str =
+    "then `systemctl --user restart kastellan-core` to pick them up";
+
 /// Build the operator-facing warning for a destructive env-file rewrite.
 ///
 /// Pure, so the text an operator actually reads is unit-testable — the point
@@ -38,11 +58,43 @@ fn render_drop_warning(env_file: &Path, backup: &Path, local: &Path, diff: &EnvD
     msg.push_str(&format!(
         "  previous file saved to {}\n  \
          to keep these across future installs, move them into {} —\n  \
-         the installer never writes that file, and its values override this one.",
+         the installer never writes that file, and its values override this one;\n  \
+         {OVERLAY_APPLY_HINT}.",
         backup.display(),
         local.display()
     ));
     msg
+}
+
+/// Pick a backup path that does not destroy an earlier one.
+///
+/// The first destructive install writes `kastellan.env.bak`. A *later*
+/// destructive install must not overwrite it: by then the live file is the
+/// already-stripped one, so overwriting would replace the only surviving copy
+/// of the keys the first install dropped with a copy that no longer contains
+/// them — and the transcript only ever printed key names, by design. Later
+/// backups therefore get `.bak.1`, `.bak.2`, … and the warning names whichever
+/// path was actually used.
+///
+/// Bounded rather than unbounded: a host with 100 unpruned backups is not a
+/// state to paper over, and failing here is safe because the caller has not yet
+/// overwritten anything.
+fn next_backup_path(env_file: &Path) -> Result<PathBuf, String> {
+    let first = env_file.with_extension("env.bak");
+    if !first.exists() {
+        return Ok(first);
+    }
+    for n in 1..100 {
+        let candidate = env_file.with_extension(format!("env.bak.{n}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "refusing to overwrite an existing backup: {} and .bak.1 … .bak.99 all exist. \
+         Prune the ones you no longer need and re-run install.",
+        first.display()
+    ))
 }
 
 /// Back up and report on the `kastellan.env` an install is about to overwrite.
@@ -54,26 +106,46 @@ fn render_drop_warning(env_file: &Path, backup: &Path, local: &Path, diff: &EnvD
 ///
 /// * nothing to lose (fresh install, or a purely additive rewrite) ⇒ no backup,
 ///   no output — the common case stays quiet;
-/// * otherwise ⇒ copy the current file to `kastellan.env.bak` and name every key
+/// * otherwise ⇒ copy the current file to [`next_backup_path`] and name every key
 ///   being dropped or changed, pointing at `kastellan.env.local` as the fix.
 ///
 /// **Key names only, never values.** The operator reads values from the backup;
 /// keeping them out of the install transcript means an env file that one day
 /// holds a secret does not echo it to a terminal.
-pub(crate) fn preserve_and_report_env(env_file: &Path, new_contents: &str) -> Result<(), String> {
-    let Ok(old) = fs::read_to_string(env_file) else {
-        return Ok(()); // first install: nothing to preserve
+///
+/// **Fails closed on an env file it cannot read.** Only `NotFound` means "first
+/// install"; `InvalidData` (one non-UTF-8 byte) and `PermissionDenied` used to
+/// take the same early return, and the caller's very next act is a truncating
+/// `write_private` — so an unreadable file was destroyed with no backup, no
+/// diff and no warning. That is #458 reproduced by its own fix, in the one case
+/// where the operator has no other copy.
+pub(crate) fn preserve_and_report_env(
+    env_file: &Path,
+    env_local_file: &Path,
+    new_contents: &str,
+) -> Result<(), String> {
+    let old = match fs::read_to_string(env_file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "read {}: {e}\n  \
+                 refusing to continue — install is about to overwrite this file, and a file it \
+                 cannot read is one it can neither diff nor back up. Move it aside (or repair its \
+                 permissions/encoding) and re-run install.",
+                env_file.display()
+            ))
+        }
     };
     let diff = crate::install::env_diff::diff_env_files(&old, new_contents);
     if diff.is_empty() {
         return Ok(());
     }
 
-    let bak = env_file.with_extension("env.bak");
+    let bak = next_backup_path(env_file)?;
     write_private(&bak, old.as_bytes())?;
 
-    let local = env_file.with_extension("env.local");
-    eprintln!("{}", render_drop_warning(env_file, &bak, &local, &diff));
+    eprintln!("{}", render_drop_warning(env_file, &bak, env_local_file, &diff));
     Ok(())
 }
 
@@ -117,7 +189,10 @@ pub fn prepare_filesystem(
     copy_tree(&assets_src.join("seeds"), &layout.assets_dir.join("seeds"))?;
 
     let env = render_env_file(args, layout);
-    preserve_and_report_env(&layout.env_file, &env)?;
+    // `layout` owns both paths: re-deriving the overlay here would let a rename
+    // in `resolve_layout` point the warning at a file the service spec does not
+    // read, with no test failing.
+    preserve_and_report_env(&layout.env_file, &layout.env_local_file, &env)?;
     write_private(&layout.env_file, env.as_bytes())?;
 
     // Put the operator CLI on PATH. The flat prefix (`bin_dir`) lives under
@@ -282,8 +357,8 @@ pub fn run_uninstall(purge: bool) -> Result<(), String> {
         }
         eprintln!(
             "purged prefix + data + logs (cluster + secrets deleted), including \
-             kastellan.env.local and kastellan.env.bak if present — copy anything you \
-             need out of them first next time"
+             kastellan.env.local and any kastellan.env.bak* if present — copy anything \
+             you need out of them first next time"
         );
     } else {
         eprintln!("kept data dir + secrets at {} (use --purge to delete)", layout.assets_dir.display());
