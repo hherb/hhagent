@@ -31,7 +31,11 @@ use crate::{EnvFileRef, SupervisorError};
 /// | `A="a b"` | `a b` | `a b` |
 /// | `A='a b'` | `a b` | `a b` |
 /// | `A=  c  ` | `c` | `c` |
+/// | `A='  x  '` | `  x  ` | `  x  ` |
 /// | `A=f"g` | `f"g` | `f"g` |
+/// | `A="a` | `a` | `a` |
+/// | `A="a'` | `a'` | `a'` |
+/// | `A=""` | *empty* | *empty* |
 /// | `export A=h` | dropped | dropped |
 /// | `;A=i` | dropped | dropped |
 /// | `#A=i` | dropped | dropped |
@@ -71,19 +75,26 @@ pub fn parse_env_file(contents: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Strip one matching pair of surrounding quotes, if present.
+/// Strip systemd's quoting from a value.
 ///
-/// Only a *matched* pair is stripped, so `f"g` and `"a` stay verbatim — which
-/// is what systemd does with them.
+/// A quote only matters as the value's **first** character: systemd enters a
+/// quoted state there and leaves it at the matching close, or at end-of-line if
+/// there is none. So the leading quote is always removed, a matching trailing
+/// one is removed with it, and a quote anywhere else is literal.
+///
+/// Measured, not inferred — the "matched pair only" rule this replaced was the
+/// obvious reading and was wrong for exactly the operator-typo cases: systemd
+/// turns `A="a` into `a` and `A="a'` into `a'`, where a pair-only rule keeps
+/// both quotes.
 fn unquote(v: &str) -> String {
-    let bytes = v.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        if (first == b'"' || first == b'\'') && bytes[bytes.len() - 1] == first {
-            return v[1..v.len() - 1].to_string();
-        }
+    let Some(q) = v.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+        return v.to_string();
+    };
+    let rest = &v[q.len_utf8()..];
+    match rest.strip_suffix(q) {
+        Some(inner) => inner.to_string(),
+        None => rest.to_string(),
     }
-    v.to_string()
 }
 
 /// Merge `from` into `into`, with `from` winning on key collision (matching

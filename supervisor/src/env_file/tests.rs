@@ -95,14 +95,22 @@ fn parse_env_file_leaves_a_json_value_untouched() {
     assert_eq!(parsed, pairs(&[("KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA", "{\"10.0.0.3\":\"/c.pem\"}")]));
 }
 
+/// Second DGX measurement (same day, same method), covering the cases the first
+/// fixture did not reach. It overturned the obvious "strip a matched pair" rule:
+/// a quote only matters as the value's FIRST character, where systemd enters a
+/// quoted state and leaves it at the matching close *or at end-of-line*.
 #[test]
-fn parse_env_file_strips_only_a_matched_pair() {
-    // An unterminated quote is not a pair, and a quote of the other kind at the
-    // far end is not a pair either.
-    assert_eq!(parse_env_file("A=\"a\n"), pairs(&[("A", "\"a")]));
-    assert_eq!(parse_env_file("A=\"a'\n"), pairs(&[("A", "\"a'")]));
-    // A bare pair of quotes IS a pair, and yields the empty value.
+fn parse_env_file_strips_a_leading_quote_even_when_unterminated() {
+    // Measured: systemd yields `a`, not `"a`.
+    assert_eq!(parse_env_file("A=\"a\n"), pairs(&[("A", "a")]));
+    // Measured: the trailing `'` does not close a `"`, so it stays in the value.
+    assert_eq!(parse_env_file("A=\"a'\n"), pairs(&[("A", "a'")]));
+    // Measured: a bare pair collapses to empty.
     assert_eq!(parse_env_file("A=\"\"\n"), pairs(&[("A", "")]));
+    assert_eq!(parse_env_file("A=\n"), pairs(&[("A", "")]));
+    // Measured: quotes are stripped but the whitespace INSIDE them survives —
+    // so the value trim must happen outside the quotes, not inside.
+    assert_eq!(parse_env_file("A='  x  '\n"), pairs(&[("A", "  x  ")]));
 }
 
 #[test]

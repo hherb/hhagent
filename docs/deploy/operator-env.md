@@ -35,9 +35,11 @@ the same subset, so one overlay behaves identically on both platforms:
 | you write | the daemon gets |
 | --- | --- |
 | `A=plain` | `plain` |
-| `A="a b"` or `A='a b'` | `a b` — one matching pair of surrounding quotes is stripped |
-| `A=  c  ` | `c` — surrounding whitespace is trimmed |
-| `A=f"g` | `f"g` — an unmatched quote is literal |
+| `A="a b"` or `A='a b'` | `a b` — surrounding quotes are stripped |
+| `A='  x  '` | `  x  ` — whitespace *inside* quotes is kept |
+| `A=  c  ` | `c` — whitespace outside them is trimmed |
+| `A=f"g` | `f"g` — a quote that is not the first character is literal |
+| `A="a` | `a` — a leading quote is stripped even with no closing one |
 | `# A=x`, `; A=x` | ignored, both are comments |
 | `export A=x` | **ignored** — write `A=x`, not shell syntax |
 
