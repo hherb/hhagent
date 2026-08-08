@@ -635,6 +635,25 @@ fn a_key_the_operator_uncommented_is_reported_as_lost() {
 }
 
 #[test]
+fn a_repeated_key_is_compared_on_its_last_value_not_its_first() {
+    // systemd takes the last occurrence, and env_file::merge_env already
+    // behaves that way. Comparing the first would report a change that did
+    // not happen.
+    let d = diff_env_files("A=old\nA=real\n", "A=real\n");
+    assert!(d.is_empty(), "nothing changed; operative old value is `real`: {d:?}");
+}
+
+#[test]
+fn a_revert_of_a_repeated_keys_last_value_is_reported() {
+    // The dangerous direction: comparing first values makes this look
+    // unchanged, so a real revert goes silently unreported -- the exact #458
+    // failure this feature exists to prevent.
+    let d = diff_env_files("A=1\nA=2\n", "A=1\n");
+    assert_eq!(d.changed, vec!["A"]);
+    assert!(d.lost.is_empty());
+}
+
+#[test]
 fn reported_keys_follow_the_old_files_order_and_do_not_repeat() {
     let d = diff_env_files("Z=1\nA=2\nZ=3\n", "");
     // Deterministic for a stable operator-facing message; a duplicated key in
@@ -701,20 +720,32 @@ impl EnvDiff {
 /// operator-facing message is deterministic, and each key is reported at most
 /// once even if the source file repeats it.
 pub fn diff_env_files(old: &str, new: &str) -> EnvDiff {
-    let new_pairs = parse_env_file(new);
     // Both sides are bound to locals first: `parse_env_file` returns an owned
     // Vec, and iterating it inline would drop the temporary while the borrowed
     // &str keys are still in use.
     let old_pairs = parse_env_file(old);
+    let new_pairs = parse_env_file(new);
+
+    // A repeated key's OPERATIVE value is its LAST occurrence -- systemd's own
+    // behaviour, and already what `env_file::merge_env` does when it folds pairs
+    // in order. Comparing the first occurrence instead would both invent changes
+    // that did not happen and, worse, silently miss real ones.
+    let last = |pairs: &[(String, String)], key: &str| -> Option<String> {
+        pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    };
 
     let mut diff = EnvDiff::default();
     let mut seen: Vec<&str> = Vec::new();
-    for (key, old_value) in old_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())) {
+    // Report order follows the old file by FIRST appearance, so the
+    // operator-facing message is stable, even though the compared value comes
+    // from the last.
+    for key in old_pairs.iter().map(|(k, _)| k.as_str()) {
         if seen.contains(&key) {
             continue;
         }
         seen.push(key);
-        match new_pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()) {
+        let old_value = last(&old_pairs, key).expect("key came from old_pairs");
+        match last(&new_pairs, key) {
             None => diff.lost.push(key.to_string()),
             Some(new_value) if new_value != old_value => diff.changed.push(key.to_string()),
             Some(_) => {}
@@ -736,7 +767,7 @@ pub mod env_diff;
 - [ ] **Step 4: Run tests**
 
 Run: `source "$HOME/.cargo/env" && cargo test -p kastellan-core --lib install::env_diff`
-Expected: PASS, 7 tests.
+Expected: PASS, 9 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1225,7 +1256,7 @@ ssh dgx 'cd ~/src/kastellan && source ~/.cargo/env && \
    echo CLIPPY_EXIT=$? >> ~/gate-458.log; echo DONE-SENTINEL >> ~/gate-458.log)'
 ```
 
-Expected: `TEST_EXIT=0`, `CLIPPY_EXIT=0`, and the passed count equal to **3047 + the tests this plan adds on Linux**. Task 2's +1 is entirely in the macOS-only launchd tests, so it contributes **+0 on the DGX**: Task 2 +0, Task 3 +1, Task 4 +7, Task 5 +3, Task 6 +3, Task 7 +1 = **+15 ⇒ 3062** on the DGX (the Mac sees +16) and confirm the run lands on that number. A count that misses the prediction means a test was silently skipped or a file is not compiled on that host — investigate before shipping. Confirm exactly 4 `[SKIP]` lines, all the `KASTELLAN_GLINER_RELEX_ENABLE` tier.
+Expected: `TEST_EXIT=0`, `CLIPPY_EXIT=0`, and the passed count equal to **3047 + the tests this plan adds on Linux**. Task 2's +1 is entirely in the macOS-only launchd tests, so it contributes **+0 on the DGX**: Task 2 +0, Task 3 +1, Task 4 +9, Task 5 +3, Task 6 +3, Task 7 +1 = **+17 ⇒ 3064** on the DGX; the Mac sees +18) and confirm the run lands on that number. A count that misses the prediction means a test was silently skipped or a file is not compiled on that host — investigate before shipping. Confirm exactly 4 `[SKIP]` lines, all the `KASTELLAN_GLINER_RELEX_ENABLE` tier.
 
 - [ ] **Live acceptance on the DGX — today's failure, re-run as a test.** This is the point of the change; do not skip it.
 
