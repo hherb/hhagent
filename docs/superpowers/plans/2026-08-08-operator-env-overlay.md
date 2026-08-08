@@ -62,7 +62,7 @@ Pure movement, no behaviour change — its own commit so the diff is reviewable 
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `kastellan_supervisor::env_file::parse_env_file(&str) -> Vec<(String, String)>` and `kastellan_supervisor::env_file::merge_env(&mut Vec<(String,String)>, Vec<(String,String)>)`. Task 3 and Task 5 both depend on these exact signatures.
+- Produces: `kastellan_supervisor::env_file::parse_env_file(&str) -> Vec<(String, String)>` and `kastellan_supervisor::env_file::merge_env(&mut Vec<(String,String)>, Vec<(String,String)>)`. Task 2 (the launchd fold) and Task 4 (the installer's diff) both depend on these exact signatures.
 
 - [ ] **Step 1: Create the new module with the two functions moved verbatim**
 
@@ -194,19 +194,25 @@ home, compiled and tested on both hosts."
 
 ---
 
-### Task 2: `EnvFileRef` + `ServiceSpec.environment_files`, and systemd renders the list
+### Task 2: `EnvFileRef` + `ServiceSpec.environment_files`, rendered by both backends
+
+> **Merged from the plan's original Tasks 2 and 3.** A `ServiceSpec` field rename
+> spans both backends, so splitting it leaves an intermediate where
+> `kastellan-supervisor` does not compile — `launchd_agents.rs:268` reads the old
+> field. There is no half a reviewer could meaningfully approve.
 
 **Files:**
 - Modify: `supervisor/src/lib.rs:126-136` (field), plus `EnvFileRef` definition
 - Modify: `supervisor/src/systemd_user/builder.rs:130-135`
 - Modify: `supervisor/src/systemd_user.rs:384-399`
+- Modify: `supervisor/src/launchd_agents.rs:261-279`
 - Modify: `supervisor/src/specs.rs:103`, `:169`
 - Modify (literal sites, `environment_file: None` → `environment_files: Vec::new()`): `supervisor/src/lib.rs:408`, `:511`; `supervisor/src/systemd_user/tests.rs:32`; `supervisor/src/systemd_user/builder/tests.rs:23`; `supervisor/src/launchd_agents/tests.rs:28`; `supervisor/src/launchd_agents/builders/tests.rs:23`, `:183`; `supervisor/tests/target_smoke.rs:62`; `supervisor/tests/systemd_user_smoke.rs:154`, `:248`; `supervisor/tests/launchd_agents_smoke.rs:143`, `:203`, `:247`
-- Test: `supervisor/src/systemd_user/builder/tests.rs`
+- Test: `supervisor/src/systemd_user/builder/tests.rs`, `supervisor/src/launchd_agents/tests.rs`
 
 **Interfaces:**
-- Consumes: nothing from Task 1.
-- Produces: `kastellan_supervisor::EnvFileRef { path: PathBuf, optional: bool }` and `ServiceSpec.environment_files: Vec<EnvFileRef>`. Tasks 3 and 4 consume both.
+- Consumes: `env_file::{parse_env_file, merge_env}` (Task 1).
+- Produces: `kastellan_supervisor::EnvFileRef { path: PathBuf, optional: bool }` and `ServiceSpec.environment_files: Vec<EnvFileRef>`. Task 3 consumes both.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -245,9 +251,75 @@ fn environment_files_absent_when_empty() {
 
 Add `use kastellan_supervisor::EnvFileRef;` (or `use crate::EnvFileRef;` — match the file's existing import style) at the top of that test file.
 
+
+Then, in `supervisor/src/launchd_agents/tests.rs`, replace `install_folds_environment_file_into_plist_env_vars` and `install_errors_when_environment_file_missing` (lines 198-228) with:
+
+
+Replace `install_folds_environment_file_into_plist_env_vars` and `install_errors_when_environment_file_missing` in `supervisor/src/launchd_agents/tests.rs:198-228` with:
+
+```rust
+#[test]
+fn install_folds_environment_files_in_order_with_later_winning() {
+    let dir = TestRoot::new("env-file");
+    let base = dir.path().join("kastellan.env");
+    let local = dir.path().join("kastellan.env.local");
+    fs::write(&base, "# tuned by operator\nKASTELLAN_DATA_DIR=/srv/data\nKASTELLAN_LLM_LOCAL_MODEL=stock-tag\n").unwrap();
+    // The overlay overrides the regenerated value and adds a key of its own —
+    // the two shapes #458 exists to fix.
+    fs::write(&local, "KASTELLAN_LLM_LOCAL_MODEL=tuned-tag\nKASTELLAN_MAIL_ENDPOINT=https://10.0.0.3:8443\n").unwrap();
+
+    let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
+    let mut spec = minimal_spec("kastellan-core");
+    spec.environment_files = vec![
+        EnvFileRef { path: base, optional: false },
+        EnvFileRef { path: local, optional: true },
+    ];
+    sup.install(&spec).expect("install");
+
+    let body = fs::read_to_string(sup.plist_path("kastellan-core")).unwrap();
+    assert!(body.contains("<key>KASTELLAN_DATA_DIR</key>"), "{body}");
+    assert!(body.contains("<string>/srv/data</string>"), "{body}");
+    assert!(body.contains("<string>tuned-tag</string>"), "{body}");
+    assert!(!body.contains("<string>stock-tag</string>"), "later file must win: {body}");
+    assert!(body.contains("<key>KASTELLAN_MAIL_ENDPOINT</key>"), "{body}");
+}
+
+#[test]
+fn install_skips_a_missing_optional_environment_file() {
+    let dir = TestRoot::new("env-file-optional-missing");
+    let base = dir.path().join("kastellan.env");
+    fs::write(&base, "KASTELLAN_DATA_DIR=/srv/data\n").unwrap();
+    let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
+    let mut spec = minimal_spec("svc");
+    // The normal case: the operator has not created a `.local` yet.
+    spec.environment_files = vec![
+        EnvFileRef { path: base, optional: false },
+        EnvFileRef { path: dir.path().join("kastellan.env.local"), optional: true },
+    ];
+    sup.install(&spec).expect("a missing OPTIONAL env file must not fail the install");
+    let body = fs::read_to_string(sup.plist_path("svc")).unwrap();
+    assert!(body.contains("<key>KASTELLAN_DATA_DIR</key>"), "{body}");
+}
+
+#[test]
+fn install_errors_when_a_required_environment_file_is_missing() {
+    let dir = TestRoot::new("env-file-missing");
+    let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
+    let mut spec = minimal_spec("svc");
+    spec.environment_files = vec![EnvFileRef {
+        path: dir.path().join("does-not-exist.env"),
+        optional: false,
+    }];
+    let err = sup.install(&spec).expect_err("missing REQUIRED env file");
+    assert!(matches!(err, SupervisorError::Io(_)), "{err}");
+}
+```
+
+Add `use kastellan_supervisor::EnvFileRef;` (matching the file's import style) if not already in scope.
+
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `source "$HOME/.cargo/env" && cargo test -p kastellan-supervisor --lib environment_files`
+Run: `source "$HOME/.cargo/env" && cargo test -p kastellan-supervisor`
 Expected: FAIL to compile — `no field 'environment_files' on type 'ServiceSpec'`.
 
 - [ ] **Step 3: Add the type and change the field**
@@ -343,114 +415,7 @@ Replace `supervisor/src/systemd_user/builder.rs:130-135` with:
     }
 ```
 
-- [ ] **Step 6: Run tests**
-
-Run: `source "$HOME/.cargo/env" && cargo test -p kastellan-supervisor`
-Expected: PASS. Note the count: the two replaced builder tests are net zero, so the total should be unchanged from Task 1.
-
-- [ ] **Step 7: Clippy**
-
-Run: `source "$HOME/.cargo/env" && cargo clippy -p kastellan-supervisor --all-targets -- -D warnings`
-Expected: exit 0.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add supervisor/src/lib.rs supervisor/src/systemd_user.rs supervisor/src/systemd_user/builder.rs \
-        supervisor/src/systemd_user/builder/tests.rs supervisor/src/systemd_user/tests.rs \
-        supervisor/src/specs.rs supervisor/src/launchd_agents/tests.rs \
-        supervisor/src/launchd_agents/builders/tests.rs supervisor/tests/target_smoke.rs \
-        supervisor/tests/systemd_user_smoke.rs supervisor/tests/launchd_agents_smoke.rs
-git commit -m "feat(supervisor): ordered EnvironmentFile list with per-entry optionality
-
-ServiceSpec.environment_file (Option<PathBuf>) becomes environment_files
-(Vec<EnvFileRef>), applied in order with later winning — systemd's own
-semantics. The systemd backend renders one directive per entry, '-'-prefixed
-when optional. Groundwork for #458's kastellan.env.local overlay."
-```
-
----
-
-### Task 3: launchd folds the list in order, skipping absent optional files
-
-**Files:**
-- Modify: `supervisor/src/launchd_agents.rs:261-279`
-- Test: `supervisor/src/launchd_agents/tests.rs:196-228`
-
-**Interfaces:**
-- Consumes: `env_file::{parse_env_file, merge_env}` (Task 1), `EnvFileRef` + `ServiceSpec.environment_files` (Task 2).
-- Produces: nothing new.
-
-- [ ] **Step 1: Write the failing tests**
-
-Replace `install_folds_environment_file_into_plist_env_vars` and `install_errors_when_environment_file_missing` in `supervisor/src/launchd_agents/tests.rs:198-228` with:
-
-```rust
-#[test]
-fn install_folds_environment_files_in_order_with_later_winning() {
-    let dir = TestRoot::new("env-file");
-    let base = dir.path().join("kastellan.env");
-    let local = dir.path().join("kastellan.env.local");
-    fs::write(&base, "# tuned by operator\nKASTELLAN_DATA_DIR=/srv/data\nKASTELLAN_LLM_LOCAL_MODEL=stock-tag\n").unwrap();
-    // The overlay overrides the regenerated value and adds a key of its own —
-    // the two shapes #458 exists to fix.
-    fs::write(&local, "KASTELLAN_LLM_LOCAL_MODEL=tuned-tag\nKASTELLAN_MAIL_ENDPOINT=https://10.0.0.3:8443\n").unwrap();
-
-    let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
-    let mut spec = minimal_spec("kastellan-core");
-    spec.environment_files = vec![
-        EnvFileRef { path: base, optional: false },
-        EnvFileRef { path: local, optional: true },
-    ];
-    sup.install(&spec).expect("install");
-
-    let body = fs::read_to_string(sup.plist_path("kastellan-core")).unwrap();
-    assert!(body.contains("<key>KASTELLAN_DATA_DIR</key>"), "{body}");
-    assert!(body.contains("<string>/srv/data</string>"), "{body}");
-    assert!(body.contains("<string>tuned-tag</string>"), "{body}");
-    assert!(!body.contains("<string>stock-tag</string>"), "later file must win: {body}");
-    assert!(body.contains("<key>KASTELLAN_MAIL_ENDPOINT</key>"), "{body}");
-}
-
-#[test]
-fn install_skips_a_missing_optional_environment_file() {
-    let dir = TestRoot::new("env-file-optional-missing");
-    let base = dir.path().join("kastellan.env");
-    fs::write(&base, "KASTELLAN_DATA_DIR=/srv/data\n").unwrap();
-    let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
-    let mut spec = minimal_spec("svc");
-    // The normal case: the operator has not created a `.local` yet.
-    spec.environment_files = vec![
-        EnvFileRef { path: base, optional: false },
-        EnvFileRef { path: dir.path().join("kastellan.env.local"), optional: true },
-    ];
-    sup.install(&spec).expect("a missing OPTIONAL env file must not fail the install");
-    let body = fs::read_to_string(sup.plist_path("svc")).unwrap();
-    assert!(body.contains("<key>KASTELLAN_DATA_DIR</key>"), "{body}");
-}
-
-#[test]
-fn install_errors_when_a_required_environment_file_is_missing() {
-    let dir = TestRoot::new("env-file-missing");
-    let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
-    let mut spec = minimal_spec("svc");
-    spec.environment_files = vec![EnvFileRef {
-        path: dir.path().join("does-not-exist.env"),
-        optional: false,
-    }];
-    let err = sup.install(&spec).expect_err("missing REQUIRED env file");
-    assert!(matches!(err, SupervisorError::Io(_)), "{err}");
-}
-```
-
-Add `use kastellan_supervisor::EnvFileRef;` (matching the file's import style) if not already in scope.
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `source "$HOME/.cargo/env" && cargo test -p kastellan-supervisor --lib launchd_agents::tests::install_`
-Expected: FAIL to compile — `environment_files` not handled by the install body.
-
-- [ ] **Step 3: Implement the fold**
+- [ ] **Step 6: Implement the fold**
 
 Replace `supervisor/src/launchd_agents.rs:267-279` with:
 
@@ -482,31 +447,38 @@ Replace `supervisor/src/launchd_agents.rs:267-279` with:
 
 Update the doc comment above it (lines 261-266) to describe the list rather than the single file.
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 7: Run tests**
 
 Run: `source "$HOME/.cargo/env" && cargo test -p kastellan-supervisor`
-Expected: PASS, **+1 test** over Task 2 (two tests replaced by three).
+Expected: PASS, **+1 test** over Task 1 (the two systemd builder tests are replaced 2-for-2; the two launchd tests become three).
 
-- [ ] **Step 5: Clippy, and cross-lint the Linux arm from the Mac**
+- [ ] **Step 8: Clippy, and cross-lint the Linux arm from the Mac**
 
 Run: `source "$HOME/.cargo/env" && cargo clippy -p kastellan-supervisor --all-targets -- -D warnings`
 Run (Mac only): `source "$HOME/.cargo/env" && cargo clippy -p kastellan-supervisor --target aarch64-unknown-linux-gnu -- -D warnings`
 Expected: exit 0 both. The crate is pure-Rust so the cross-lint type-checks the systemd arm without a linker.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add supervisor/src/launchd_agents.rs supervisor/src/launchd_agents/tests.rs
-git commit -m "feat(supervisor): launchd folds every environment file in order
+git add supervisor/src/lib.rs supervisor/src/systemd_user.rs supervisor/src/systemd_user/builder.rs \
+        supervisor/src/systemd_user/builder/tests.rs supervisor/src/systemd_user/tests.rs \
+        supervisor/src/specs.rs supervisor/src/launchd_agents.rs supervisor/src/launchd_agents/tests.rs \
+        supervisor/src/launchd_agents/builders/tests.rs supervisor/tests/target_smoke.rs \
+        supervisor/tests/systemd_user_smoke.rs supervisor/tests/launchd_agents_smoke.rs
+git commit -m "feat(supervisor): ordered EnvironmentFile list with per-entry optionality
 
-Later file wins, matching systemd. A missing OPTIONAL file is skipped rather
-than failing the install — the normal state of kastellan.env.local; a missing
-REQUIRED file still errors, as before."
+ServiceSpec.environment_file (Option<PathBuf>) becomes environment_files
+(Vec<EnvFileRef>), applied in order with later winning -- systemd's own
+semantics, measured on a live user manager. systemd renders one directive per
+entry, '-'-prefixed when optional; launchd folds them in the same order and
+skips a missing OPTIONAL file (the normal state of kastellan.env.local) while
+still erroring on a missing REQUIRED one. Groundwork for #458's overlay."
 ```
 
 ---
 
-### Task 4: The installer points the core service at both files
+### Task 3: The installer points the core service at both files
 
 **Files:**
 - Modify: `core/src/install/plan.rs:20-42` (`Layout`), `:458-463` (`build_specs`)
@@ -514,7 +486,7 @@ REQUIRED file still errors, as before."
 
 **Interfaces:**
 - Consumes: `EnvFileRef`, `ServiceSpec.environment_files` (Task 2).
-- Produces: `Layout.env_local_file: PathBuf`. Task 6 does **not** need it (the diff is on `env_file`), but the docs task does.
+- Produces: `Layout.env_local_file: PathBuf`. Task 5 does **not** need it (the diff is on `env_file`), but Task 7 (docs) does.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -592,7 +564,7 @@ which is what stops a deploy silently dropping tuned config (#458)."
 
 ---
 
-### Task 5: `diff_env_files` — the pure diff
+### Task 4: `diff_env_files` — the pure diff
 
 **Files:**
 - Create: `core/src/install/env_diff.rs`
@@ -601,7 +573,7 @@ which is what stops a deploy silently dropping tuned config (#458)."
 
 **Interfaces:**
 - Consumes: `kastellan_supervisor::env_file::parse_env_file` (Task 1).
-- Produces: `EnvDiff { lost: Vec<String>, changed: Vec<String>, is_empty() -> bool }` and `diff_env_files(old: &str, new: &str) -> EnvDiff`. Task 6 consumes both.
+- Produces: `EnvDiff { lost: Vec<String>, changed: Vec<String>, is_empty() -> bool }` and `diff_env_files(old: &str, new: &str) -> EnvDiff`. Task 5 consumes both.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -778,14 +750,14 @@ install-time warning (#458)."
 
 ---
 
-### Task 6: `install` backs the file up and names what it is dropping
+### Task 5: `install` backs the file up and names what it is dropping
 
 **Files:**
 - Modify: `core/src/install/run.rs:59-60`
 - Test: `core/src/install/run/tests.rs` (already exists; `run.rs:512` declares `#[cfg(test)] mod tests;` — append to it, do not create a new module)
 
 **Interfaces:**
-- Consumes: `env_diff::{diff_env_files, EnvDiff}` (Task 5), `Layout.env_file` (existing).
+- Consumes: `env_diff::{diff_env_files, EnvDiff}` (Task 4), `Layout.env_file` (existing).
 - Produces: `pub(crate) fn preserve_and_report_env(env_file: &Path, new_contents: &str) -> Result<(), String>` — writes the backup and prints the warning; called immediately before the env write.
 
 - [ ] **Step 1: Write the failing test**
@@ -923,7 +895,7 @@ stay out of the install transcript."
 
 ---
 
-### Task 7: A disabled force-routing becomes loud
+### Task 6: A disabled force-routing becomes loud
 
 **Files:**
 - Create: `core/src/egress/force_routing_notice.rs`
@@ -1095,7 +1067,7 @@ with the operator phrase as a const (#458)."
 
 ---
 
-### Task 8: Operator documentation
+### Task 7: Operator documentation
 
 **Files:**
 - Modify: `core/src/install/plan.rs` — `render_env_file` gains a header comment naming the overlay
@@ -1103,7 +1075,7 @@ with the operator phrase as a const (#458)."
 - Create: `docs/deploy/operator-env.md` (the directory already exists and holds `matrix-homeserver.md`)
 
 **Interfaces:**
-- Consumes: `Layout.env_local_file` (Task 4).
+- Consumes: `Layout.env_local_file` (Task 3).
 - Produces: nothing.
 
 - [ ] **Step 1: Write the failing test**
@@ -1252,7 +1224,7 @@ ssh dgx 'cd ~/src/kastellan && source ~/.cargo/env && \
    echo CLIPPY_EXIT=$? >> ~/gate-458.log; echo DONE-SENTINEL >> ~/gate-458.log)'
 ```
 
-Expected: `TEST_EXIT=0`, `CLIPPY_EXIT=0`, and the passed count equal to **3047 + the tests this plan adds**. Count them from the plan (Task 3 +1, Task 4 +1, Task 5 +7, Task 6 +3, Task 7 +3, Task 8 +1 = **+16 ⇒ 3063**) and confirm the run lands on that number. A count that misses the prediction means a test was silently skipped or a file is not compiled on that host — investigate before shipping. Confirm exactly 4 `[SKIP]` lines, all the `KASTELLAN_GLINER_RELEX_ENABLE` tier.
+Expected: `TEST_EXIT=0`, `CLIPPY_EXIT=0`, and the passed count equal to **3047 + the tests this plan adds**. Count them from the plan (Task 2 +1, Task 3 +1, Task 4 +7, Task 5 +3, Task 6 +3, Task 7 +1 = **+16 ⇒ 3063**) and confirm the run lands on that number. A count that misses the prediction means a test was silently skipped or a file is not compiled on that host — investigate before shipping. Confirm exactly 4 `[SKIP]` lines, all the `KASTELLAN_GLINER_RELEX_ENABLE` tier.
 
 - [ ] **Live acceptance on the DGX — today's failure, re-run as a test.** This is the point of the change; do not skip it.
 
