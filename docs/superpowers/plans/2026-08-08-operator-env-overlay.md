@@ -13,7 +13,8 @@
 ## Global Constraints
 
 - **AGPL-compatible dependencies only.** This plan adds none.
-- **Cross-platform, Linux + macOS first-class.** No platform-gated code in this change: `supervisor/src/env_file.rs` is `cfg`-free deliberately, so its tests run on both hosts (#511 `atomic_write` precedent).
+- **Cross-platform, Linux + macOS first-class.** `supervisor/src/env_file.rs` is `cfg`-free deliberately, so its tests run on both hosts (#511 `atomic_write` precedent) — the functions it holds previously lived in the macOS-only `launchd_agents` module and never compiled on Linux at all.
+- **The two backends compile on one host each** — `systemd_user` is `#[cfg(target_os = "linux")]`, `launchd_agents` is `#[cfg(target_os = "macos")]`. So a `launchd_agents.rs` change is invisible to the DGX and a `systemd_user.rs` change is invisible to the Mac. Gate any task touching a backend on **both** hosts, and expect the two hosts to report **different test counts**.
 - **Clippy is enforced:** `cargo clippy --workspace --all-targets -- -D warnings` must stay at exit 0.
 - **Run cargo in the FOREGROUND. Never background a `cargo test` or `cargo clippy` and wait on it.**
 - **Source the toolchain first:** every shell step assumes `source "$HOME/.cargo/env"`.
@@ -450,7 +451,7 @@ Update the doc comment above it (lines 261-266) to describe the list rather than
 - [ ] **Step 7: Run tests**
 
 Run: `source "$HOME/.cargo/env" && cargo test -p kastellan-supervisor`
-Expected: PASS, **+1 test** over Task 1 (the two systemd builder tests are replaced 2-for-2; the two launchd tests become three).
+Expected on the **Mac**: PASS, **+1 test** over Task 1 (the systemd builder tests are replaced 2-for-2; the two launchd tests become three). Expected on the **DGX**: **+0** — `launchd_agents` is `#[cfg(target_os = "macos")]`, so the launchd tests do not exist there and the systemd replacement is net zero. A differing count between hosts is correct here, not a skipped test.
 
 - [ ] **Step 8: Clippy, and cross-lint the Linux arm from the Mac**
 
@@ -1224,7 +1225,7 @@ ssh dgx 'cd ~/src/kastellan && source ~/.cargo/env && \
    echo CLIPPY_EXIT=$? >> ~/gate-458.log; echo DONE-SENTINEL >> ~/gate-458.log)'
 ```
 
-Expected: `TEST_EXIT=0`, `CLIPPY_EXIT=0`, and the passed count equal to **3047 + the tests this plan adds**. Count them from the plan (Task 2 +1, Task 3 +1, Task 4 +7, Task 5 +3, Task 6 +3, Task 7 +1 = **+16 ⇒ 3063**) and confirm the run lands on that number. A count that misses the prediction means a test was silently skipped or a file is not compiled on that host — investigate before shipping. Confirm exactly 4 `[SKIP]` lines, all the `KASTELLAN_GLINER_RELEX_ENABLE` tier.
+Expected: `TEST_EXIT=0`, `CLIPPY_EXIT=0`, and the passed count equal to **3047 + the tests this plan adds on Linux**. Task 2's +1 is entirely in the macOS-only launchd tests, so it contributes **+0 on the DGX**: Task 2 +0, Task 3 +1, Task 4 +7, Task 5 +3, Task 6 +3, Task 7 +1 = **+15 ⇒ 3062** on the DGX (the Mac sees +16) and confirm the run lands on that number. A count that misses the prediction means a test was silently skipped or a file is not compiled on that host — investigate before shipping. Confirm exactly 4 `[SKIP]` lines, all the `KASTELLAN_GLINER_RELEX_ENABLE` tier.
 
 - [ ] **Live acceptance on the DGX — today's failure, re-run as a test.** This is the point of the change; do not skip it.
 

@@ -115,9 +115,22 @@ installer's diff (Part 2) needs the same grammar and `core` already depends on
 
 This follows #511's `atomic_write` precedent for its stated reason: shared code
 is compiled and tested on **both** hosts, per-backend code is invisible to CI
-(there is no macOS job at all). Both backend modules are already declared
-uncgated, so nothing platform-specific moves. A second parser for one file format
-is the drift shape #479 and #520 each cost a round.
+(there is no macOS job at all). A second parser for one file format is the drift
+shape #479 and #520 each cost a round.
+
+**The lift buys more than symmetry.** `systemd_user` is
+`#[cfg(target_os = "linux")]` and `launchd_agents` is
+`#[cfg(target_os = "macos")]`, so `parse_env_file` and `merge_env` — sitting
+inside the launchd module — were **never compiled on Linux and their tests never
+ran there**, including on the DGX and in CI. Moving them to a `cfg`-free module
+is what makes the one env-file grammar actually covered on both hosts.
+
+**Consequence for gating, stated so a count mismatch is not misread.** Because
+each backend compiles on only one host, changes to `launchd_agents.rs` are
+invisible to the DGX and changes to `systemd_user.rs` are invisible to the Mac —
+the [[cfg-linux-e2e-deadcode-dgx-clippy]] blindness, in both directions. Every
+task touching a backend must be gated on **both** hosts, and the two hosts will
+legitimately report **different test counts**.
 
 **Documented platform asymmetry.** On systemd the overlay is re-read at every
 service start, so an edit takes effect on `restart`. On launchd the pairs are
