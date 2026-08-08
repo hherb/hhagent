@@ -16,6 +16,34 @@ use super::plan::{
     build_specs, cli_path_precedence_note, estimate_model_bytes, is_local_ollama, memory_suffices,
     optional_binaries, render_env_file, required_binaries, InstallArgs, Layout,
 };
+use crate::install::env_diff::EnvDiff;
+
+/// Build the operator-facing warning for a destructive env-file rewrite.
+///
+/// Pure, so the text an operator actually reads is unit-testable — the point
+/// of this warning is that it is SEEN, and a message with no test is one
+/// refactor away from silently losing a line.
+///
+/// Key names only: values are never interpolated here. The operator reads
+/// values from the backup, which keeps anything secret-shaped out of the
+/// install transcript.
+fn render_drop_warning(env_file: &Path, backup: &Path, local: &Path, diff: &EnvDiff) -> String {
+    let mut msg = format!("warning: install is regenerating {}\n", env_file.display());
+    for k in &diff.lost {
+        msg.push_str(&format!("  dropped: {k}\n"));
+    }
+    for k in &diff.changed {
+        msg.push_str(&format!("  changed: {k}\n"));
+    }
+    msg.push_str(&format!(
+        "  previous file saved to {}\n  \
+         to keep these across future installs, move them into {} —\n  \
+         the installer never writes that file, and its values override this one.",
+        backup.display(),
+        local.display()
+    ));
+    msg
+}
 
 /// Back up and report on the `kastellan.env` an install is about to overwrite.
 ///
@@ -44,20 +72,8 @@ pub(crate) fn preserve_and_report_env(env_file: &Path, new_contents: &str) -> Re
     let bak = env_file.with_extension("env.bak");
     write_private(&bak, old.as_bytes())?;
 
-    eprintln!("warning: install is regenerating {}", env_file.display());
-    for k in &diff.lost {
-        eprintln!("  dropped: {k}");
-    }
-    for k in &diff.changed {
-        eprintln!("  changed: {k}");
-    }
-    eprintln!(
-        "  previous file saved to {}\n  \
-         to keep these across future installs, move them into {} —\n  \
-         the installer never writes that file, and its values override this one.",
-        bak.display(),
-        env_file.with_extension("env.local").display()
-    );
+    let local = env_file.with_extension("env.local");
+    eprintln!("{}", render_drop_warning(env_file, &bak, &local, &diff));
     Ok(())
 }
 

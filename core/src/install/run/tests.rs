@@ -133,3 +133,51 @@ fn a_first_install_has_nothing_to_preserve() {
     preserve_and_report_env(&env, "A=1\n").expect("a missing env file is not an error");
     assert!(!dir.path().join("kastellan.env.bak").exists());
 }
+
+#[test]
+fn the_warning_names_every_dropped_and_changed_key() {
+    let diff = EnvDiff {
+        lost: vec!["KASTELLAN_MAIL_ENDPOINT".into(), "KASTELLAN_MAIL_TOKEN_FILE".into()],
+        changed: vec!["KASTELLAN_LLM_LOCAL_MODEL".into()],
+    };
+    let msg = render_drop_warning(
+        Path::new("/h/.config/kastellan/kastellan.env"),
+        Path::new("/h/.config/kastellan/kastellan.env.bak"),
+        Path::new("/h/.config/kastellan/kastellan.env.local"),
+        &diff,
+    );
+    // Every key must be named -- these are exactly the keys whose silent loss
+    // cost the deployed agent its mail capability for two days.
+    assert!(msg.contains("KASTELLAN_MAIL_ENDPOINT"), "{msg}");
+    assert!(msg.contains("KASTELLAN_MAIL_TOKEN_FILE"), "{msg}");
+    assert!(msg.contains("KASTELLAN_LLM_LOCAL_MODEL"), "{msg}");
+}
+
+#[test]
+fn the_warning_points_at_the_backup_and_the_overlay() {
+    // Without both pointers the operator is told something was lost and not
+    // where to recover it from or how to stop it recurring.
+    let diff = EnvDiff { lost: vec!["A".into()], changed: vec![] };
+    let msg = render_drop_warning(
+        Path::new("/h/kastellan.env"),
+        Path::new("/h/kastellan.env.bak"),
+        Path::new("/h/kastellan.env.local"),
+        &diff,
+    );
+    assert!(msg.contains("kastellan.env.bak"), "{msg}");
+    assert!(msg.contains("kastellan.env.local"), "{msg}");
+}
+
+#[test]
+fn a_changed_only_diff_still_produces_a_warning() {
+    // Pins the `changed` loop specifically: dropping it leaves `lost`-only
+    // diffs working, so a lost-key test alone would not catch its removal.
+    let diff = EnvDiff { lost: vec![], changed: vec!["KASTELLAN_LLM_LOCAL_MODEL".into()] };
+    let msg = render_drop_warning(
+        Path::new("/h/kastellan.env"),
+        Path::new("/h/kastellan.env.bak"),
+        Path::new("/h/kastellan.env.local"),
+        &diff,
+    );
+    assert!(msg.contains("KASTELLAN_LLM_LOCAL_MODEL"), "{msg}");
+}
