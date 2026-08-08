@@ -96,3 +96,40 @@ fn failed_symlink_replace_removes_its_staging_link() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_destructive_rewrite_backs_the_old_file_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join("kastellan.env");
+    fs::write(&env, "KASTELLAN_MAIL_ENDPOINT=https://h:8443\n").unwrap();
+
+    preserve_and_report_env(&env, "KASTELLAN_DATA_DIR=/d\n").unwrap();
+
+    let bak = dir.path().join("kastellan.env.bak");
+    assert_eq!(
+        fs::read_to_string(&bak).unwrap(),
+        "KASTELLAN_MAIL_ENDPOINT=https://h:8443\n",
+        "the backup is where the operator reads the values the warning omits"
+    );
+}
+
+#[test]
+fn a_non_destructive_rewrite_writes_no_backup() {
+    // Gating on a non-empty diff is what stops a later clean install from
+    // clobbering the one backup that mattered.
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join("kastellan.env");
+    fs::write(&env, "A=1\n").unwrap();
+
+    preserve_and_report_env(&env, "A=1\nB=2\n").unwrap();
+
+    assert!(!dir.path().join("kastellan.env.bak").exists());
+}
+
+#[test]
+fn a_first_install_has_nothing_to_preserve() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join("kastellan.env");
+    preserve_and_report_env(&env, "A=1\n").expect("a missing env file is not an error");
+    assert!(!dir.path().join("kastellan.env.bak").exists());
+}

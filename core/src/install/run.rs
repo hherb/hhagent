@@ -17,6 +17,50 @@ use super::plan::{
     optional_binaries, render_env_file, required_binaries, InstallArgs, Layout,
 };
 
+/// Back up and report on the `kastellan.env` an install is about to overwrite.
+///
+/// `install` regenerates the env file from CLI flags, so every hand-added key is
+/// dropped and every hand-tuned value reverts (#458). Silence there cost the
+/// deployed agent its mail capability for two days. This makes the loss loud and
+/// recoverable:
+///
+/// * nothing to lose (fresh install, or a purely additive rewrite) ⇒ no backup,
+///   no output — the common case stays quiet;
+/// * otherwise ⇒ copy the current file to `kastellan.env.bak` and name every key
+///   being dropped or changed, pointing at `kastellan.env.local` as the fix.
+///
+/// **Key names only, never values.** The operator reads values from the backup;
+/// keeping them out of the install transcript means an env file that one day
+/// holds a secret does not echo it to a terminal.
+pub(crate) fn preserve_and_report_env(env_file: &Path, new_contents: &str) -> Result<(), String> {
+    let Ok(old) = fs::read_to_string(env_file) else {
+        return Ok(()); // first install: nothing to preserve
+    };
+    let diff = crate::install::env_diff::diff_env_files(&old, new_contents);
+    if diff.is_empty() {
+        return Ok(());
+    }
+
+    let bak = env_file.with_extension("env.bak");
+    write_private(&bak, old.as_bytes())?;
+
+    eprintln!("warning: install is regenerating {}", env_file.display());
+    for k in &diff.lost {
+        eprintln!("  dropped: {k}");
+    }
+    for k in &diff.changed {
+        eprintln!("  changed: {k}");
+    }
+    eprintln!(
+        "  previous file saved to {}\n  \
+         to keep these across future installs, move them into {} —\n  \
+         the installer never writes that file, and its values override this one.",
+        bak.display(),
+        env_file.with_extension("env.local").display()
+    );
+    Ok(())
+}
+
 /// Create dirs, copy binaries + assets, write the EnvironmentFile.
 /// Returns the names of binaries actually copied. Fails closed if a
 /// required binary is absent in `from_dir`.
@@ -57,6 +101,7 @@ pub fn prepare_filesystem(
     copy_tree(&assets_src.join("seeds"), &layout.assets_dir.join("seeds"))?;
 
     let env = render_env_file(args, layout);
+    preserve_and_report_env(&layout.env_file, &env)?;
     write_private(&layout.env_file, env.as_bytes())?;
 
     // Put the operator CLI on PATH. The flat prefix (`bin_dir`) lives under
