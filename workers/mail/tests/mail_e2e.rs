@@ -7,14 +7,36 @@
 //! No PG, no sandbox backend, no live localmail: the worker runs standalone
 //! (the prelude's Linux lockdown is a no-op without `KASTELLAN_LANDLOCK_*`, and
 //! macOS lockdown is a no-op), reaching the mock on loopback with a direct
-//! transport. Runs on both hosts.
+//! transport. Runs on both hosts, and — since #536 — in CI on every PR.
+//!
+//! The wire shapes below mirror `kastellan_tests_common::mock_localmail`, which
+//! the live drift gate in `core/tests/mail_daemon_e2e.rs` pins against the real
+//! service. They are a SECOND copy of that contract, kept here because
+//! `workers/mail` is a bin-only crate with no dev-dependency on `tests-common`
+//! (taking one would put `kastellan-core` in a leaf worker's dev graph). When
+//! the gate says the live shapes moved, both copies need the edit.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+/// The message id the canned search hit references, as localmail puts it on the
+/// wire: a STRING.
+const CANNED_MESSAGE_ID: &str = "7";
+
+/// Does this request-target's query carry the exact pair `headers=full`?
+///
+/// Mirrors localmail's own `full_headers=(headers == "full")` rather than a
+/// loose substring check, so a client sending some *other* spelling gets the
+/// same header-less 200 the real service would give it. That asymmetry is #500,
+/// and a mock that ignored the query could not reproduce it.
+fn wants_full_headers(query: &str) -> bool {
+    query.split('&').any(|pair| pair == "headers=full")
+}
 
 /// Minimal HTTP/1.1 mock: one request per connection (`Connection: close`),
-/// routed by path. Runs until the listener is dropped.
+/// routed by exact path. Runs until the listener is dropped.
 fn spawn_mock() -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -29,25 +51,68 @@ fn spawn_mock() -> (String, std::thread::JoinHandle<()>) {
                 continue;
             }
             let req = String::from_utf8_lossy(&buf[..n]);
-            let first = req.lines().next().unwrap_or("");
+            let first = req.lines().next().unwrap_or("").to_string();
             // Every request must carry the bearer we provisioned.
             assert!(
                 req.to_lowercase().contains("authorization: bearer e2e-token"),
                 "request missing bearer: {first}"
             );
-            let (status, ctype, body): (&str, &str, Vec<u8>) = if first.contains("GET /v1/accounts")
-            {
-                ("200 OK", "application/json", br#"[{"id":1,"name":"work"}]"#.to_vec())
-            } else if first.contains("POST /v1/search") {
-                // Real localmail keys results under "results" (not "hits").
-                ("200 OK", "application/json", br#"{"results":[{"message_id":7}],"next_cursor":null}"#.to_vec())
-            } else if first.contains("/v1/attachments/") && first.contains("/text") {
-                // Real localmail returns application/json {"text": "..."}.
-                ("200 OK", "application/json", br#"{"text":"extracted booking text"}"#.to_vec())
-            } else if first.contains("/v1/attachments/") {
-                ("200 OK", "application/pdf", b"%PDF-1.7 fake booking".to_vec())
-            } else {
-                ("404 Not Found", "text/plain", b"nope".to_vec())
+            // Route on the parsed method + path, never on `contains`: a
+            // substring match makes `/v1/messages/77` indistinguishable from
+            // `/v1/messages/7`, so a bug that corrupted the id would be served
+            // the canned body anyway and the test would read back its own
+            // constant. The detail route echoes the id it was actually asked
+            // for, which is what makes the assertion mean something.
+            let mut parts = first.split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+
+            let (status, ctype, body): (&str, &str, Vec<u8>) = match (method, path) {
+                // Live localmail serves ids as STRINGS on every route.
+                ("GET", "/v1/accounts") => (
+                    "200 OK",
+                    "application/json",
+                    br#"[{"id":"1","name":"work"}]"#.to_vec(),
+                ),
+                // Real localmail keys results under "results" (not "hits") and
+                // serves `message_id` as a STRING. Serving a number here is what
+                // let #527 hide: the worker's i64 agreed with this fixture and
+                // not with the service.
+                ("POST", "/v1/search") => (
+                    "200 OK",
+                    "application/json",
+                    format!(r#"{{"results":[{{"message_id":"{CANNED_MESSAGE_ID}"}}],"next_cursor":null}}"#)
+                        .into_bytes(),
+                ),
+                ("GET", p) if p.starts_with("/v1/attachments/") && p.ends_with("/text") => {
+                    // Real localmail returns application/json {"text": "..."}.
+                    (
+                        "200 OK",
+                        "application/json",
+                        br#"{"text":"extracted booking text"}"#.to_vec(),
+                    )
+                }
+                ("GET", p) if p.starts_with("/v1/attachments/") => {
+                    ("200 OK", "application/pdf", b"%PDF-1.7 fake booking".to_vec())
+                }
+                ("GET", p) if p.starts_with("/v1/messages/") => {
+                    let id = p.trim_start_matches("/v1/messages/");
+                    // `headers` appears ONLY for the exact `?headers=full`
+                    // spelling — the #500 asymmetry, modelled rather than hidden.
+                    let headers = if wants_full_headers(query) {
+                        r#","headers":{"Message-ID":"<canned@example.test>"}"#
+                    } else {
+                        ""
+                    };
+                    (
+                        "200 OK",
+                        "application/json",
+                        format!(r#"{{"id":"{id}","subject":"invoice","attachments":[]{headers}}}"#)
+                            .into_bytes(),
+                    )
+                }
+                _ => ("404 Not Found", "text/plain", b"nope".to_vec()),
             };
             let head = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -61,10 +126,46 @@ fn spawn_mock() -> (String, std::thread::JoinHandle<()>) {
     (base, handle)
 }
 
+/// Spawn the worker against `base`, with a 0600 token file under `tmp`.
+///
+/// `out_dir` is `Some` only for the attachment leg; the id-contract test
+/// deliberately runs without `KASTELLAN_WORKER_OUT` to keep its surface small.
+fn spawn_worker(
+    base: &str,
+    tmp: &Path,
+    out_dir: Option<&Path>,
+) -> (Child, ChildStdin, BufReader<ChildStdout>) {
+    std::fs::create_dir_all(tmp).unwrap();
+    let token_file = tmp.join("token");
+    std::fs::write(&token_file, "e2e-token\n").unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kastellan-worker-mail"));
+    cmd.env("KASTELLAN_MAIL_ENDPOINT", base)
+        .env("KASTELLAN_MAIL_TOKEN_FILE", &token_file)
+        // Opt out of the prelude's Linux self-lockdown: this e2e exercises the
+        // worker's application logic standalone, so it does not receive the
+        // daemon-derived landlock RW set (which, in production, includes out/).
+        // Without this, the unset KASTELLAN_LANDLOCK_RW yields an empty writable
+        // set and the out/ write is denied on Linux (macOS has no landlock).
+        .env("KASTELLAN_LANDLOCK_PROFILE", "none")
+        .env("KASTELLAN_SECCOMP_PROFILE", "none")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(out) = out_dir {
+        std::fs::create_dir_all(out).unwrap();
+        cmd.env("KASTELLAN_WORKER_OUT", out);
+    }
+    let mut child = cmd.spawn().expect("spawn mail worker");
+    let stdin = child.stdin.take().unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    (child, stdin, stdout)
+}
+
 /// Send one JSON-RPC request line and read one response line.
 fn rpc(
-    stdin: &mut std::process::ChildStdin,
-    stdout: &mut BufReader<std::process::ChildStdout>,
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
     id: u64,
     method: &str,
     params: serde_json::Value,
@@ -77,45 +178,38 @@ fn rpc(
     serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad response line {line:?}: {e}"))
 }
 
+/// A rejected call must come back as an INVALID_PARAMS error carrying `needle`.
+///
+/// Asserting the error is *present* first matters: the regression that counts is
+/// the bad value being ACCEPTED, and a bare `["error"]["message"].as_str()
+/// .unwrap_or_default()` then fails with "cursor must be named" — the opposite
+/// diagnosis to the truth.
+#[track_caller]
+fn assert_rejected_with(resp: &serde_json::Value, needle: &str) {
+    assert!(
+        resp.get("error").is_some(),
+        "the value must be REJECTED, not accepted; got {resp}"
+    );
+    assert_eq!(resp["error"]["code"], -32602, "must be INVALID_PARAMS: {resp}");
+    let msg = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains(needle), "expected {needle:?} in the advice; got {resp}");
+}
+
 #[test]
 fn mail_worker_stdio_roundtrip_against_mock() {
     let (base, _mock) = spawn_mock();
-
-    // 0600 token file + a workspace out/ dir.
     let tmp = std::env::temp_dir().join(format!("mail-e2e-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
-    let token_file = tmp.join("token");
-    std::fs::write(&token_file, "e2e-token\n").unwrap();
     let out_dir = tmp.join("out");
-    std::fs::create_dir_all(&out_dir).unwrap();
+    let (mut child, mut stdin, mut stdout) = spawn_worker(&base, &tmp, Some(&out_dir));
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kastellan-worker-mail"))
-        .env("KASTELLAN_MAIL_ENDPOINT", &base)
-        .env("KASTELLAN_MAIL_TOKEN_FILE", &token_file)
-        .env("KASTELLAN_WORKER_OUT", &out_dir)
-        // Opt out of the prelude's Linux self-lockdown: this e2e exercises the
-        // worker's application logic standalone, so it does not receive the
-        // daemon-derived landlock RW set (which, in production, includes out/).
-        // Without this, the unset KASTELLAN_LANDLOCK_RW yields an empty writable
-        // set and the out/ write is denied on Linux (macOS has no landlock).
-        .env("KASTELLAN_LANDLOCK_PROFILE", "none")
-        .env("KASTELLAN_SECCOMP_PROFILE", "none")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mail worker");
-
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-    // 1. list_accounts → the mock's one account.
+    // 1. list_accounts → the mock's one account, id served as a string.
     let r = rpc(&mut stdin, &mut stdout, 1, "mail.list_accounts", serde_json::json!({}));
-    assert_eq!(r["result"][0]["id"], 1, "resp: {r}");
+    assert_eq!(r["result"][0]["id"], "1", "resp: {r}");
 
-    // 2. search → a hit under localmail's real "results" key.
+    // 2. search → a hit under localmail's real "results" key, with the
+    //    STRING message_id the real service emits.
     let r = rpc(&mut stdin, &mut stdout, 2, "mail.search", serde_json::json!({"query": "qantas"}));
-    assert_eq!(r["result"]["results"][0]["message_id"], 7, "resp: {r}");
+    assert_eq!(r["result"]["results"][0]["message_id"], "7", "resp: {r}");
 
     // 3. get_attachment_text → localmail returns application/json {"text": …};
     // the worker must surface the inner text, not the JSON envelope as a string.
@@ -143,6 +237,83 @@ fn mail_worker_stdio_roundtrip_against_mock() {
     assert_eq!(r["error"]["code"], -32601, "resp: {r}");
 
     drop(stdin); // EOF → worker exits its stdio loop.
+    let _ = child.wait();
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// The #527 regression, reproduced end to end: take the `message_id` **exactly
+/// as `mail.search` returned it** and hand it straight to `mail.get_message`.
+///
+/// That is what the planner does, and until this fix it failed with
+/// `invalid type: string "7", expected i64` — 7 of the 14 live failures. Feeding
+/// the value through rather than retyping it as a literal is the whole point of
+/// the test: a hand-written `7` passes with or without the fix.
+#[test]
+fn a_message_id_taken_verbatim_from_a_search_hit_is_accepted() {
+    let (base, _mock) = spawn_mock();
+    let tmp = std::env::temp_dir().join(format!("mail-chain-{}", std::process::id()));
+    let (mut child, mut stdin, mut stdout) = spawn_worker(&base, &tmp, None);
+
+    let hit = rpc(&mut stdin, &mut stdout, 1, "mail.search", serde_json::json!({"query": "invoice"}));
+    let id = hit["result"]["results"][0]["message_id"].clone();
+    assert!(id.is_string(), "fixture must serve the live string shape, got {id}");
+
+    // Verbatim — no parsing, no re-typing.
+    let got = rpc(&mut stdin, &mut stdout, 2, "mail.get_message", serde_json::json!({"message_id": id}));
+    assert!(
+        got.get("error").is_none(),
+        "get_message must accept the id search just returned; got {got}"
+    );
+    // The mock echoes back the id it was actually asked for, so this asserts the
+    // id SURVIVED the round trip rather than reading back a canned constant.
+    assert_eq!(got["result"]["id"], CANNED_MESSAGE_ID, "resp: {got}");
+
+    // The other 7 live failures: a cursor and a placeholder must now come back
+    // with text the planner can act on, since inner_loop feeds it the error.
+    let bad = rpc(&mut stdin, &mut stdout, 3, "mail.get_message",
+        serde_json::json!({"message_id": "ZHwyMDI2LTA4LTA4VDIyOjAxOjU4KzAwOjAwfDM3NDc0"}));
+    assert_rejected_with(&bad, "next_cursor");
+
+    let bad = rpc(&mut stdin, &mut stdout, 4, "mail.get_message",
+        serde_json::json!({"message_id": "{{message_id}}"}));
+    assert_rejected_with(&bad, "NO template substitution");
+
+    drop(stdin);
+    let _ = child.wait();
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// #500, asserted BEHAVIOURALLY rather than by string-equality on a URL.
+///
+/// The other #500 tests check that the worker *sends* `?headers=full`, against a
+/// fake that was handed that same string — they cannot catch "our reading of
+/// localmail is wrong". This one asserts the thing the tool actually promises:
+/// ask for full headers, get headers back. The mock reproduces the real
+/// service's asymmetry (`headers` appears only for the exact `headers=full`
+/// pair), so reverting `detail_path` to the old `?full_headers=true` spelling
+/// fails here with a missing `headers` block — the production symptom, not a
+/// string mismatch.
+#[test]
+fn asking_for_full_headers_actually_returns_headers() {
+    let (base, _mock) = spawn_mock();
+    let tmp = std::env::temp_dir().join(format!("mail-headers-{}", std::process::id()));
+    let (mut child, mut stdin, mut stdout) = spawn_worker(&base, &tmp, None);
+
+    let compact = rpc(&mut stdin, &mut stdout, 1, "mail.get_message",
+        serde_json::json!({"message_id": "7"}));
+    assert!(
+        compact["result"].get("headers").is_none(),
+        "compact is localmail's default; the flag must not be sent: {compact}"
+    );
+
+    let full = rpc(&mut stdin, &mut stdout, 2, "mail.get_message",
+        serde_json::json!({"message_id": "7", "full_headers": true}));
+    assert!(
+        full["result"].get("headers").is_some_and(|h| h.as_object().is_some_and(|o| !o.is_empty())),
+        "full_headers: true must produce a non-empty `headers` block: {full}"
+    );
+
+    drop(stdin);
     let _ = child.wait();
     std::fs::remove_dir_all(&tmp).ok();
 }

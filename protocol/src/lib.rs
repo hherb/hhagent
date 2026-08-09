@@ -29,6 +29,29 @@ use serde::{Deserialize, Serialize};
 /// not a valid message and is rejected rather than buffered.
 pub const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
+/// How many chars of a failed step's error text survive into the planner's
+/// next prompt.
+///
+/// This is a contract between the two sides of the wire, which is why it lives
+/// here rather than in either of them. A worker's [`RpcError::message`] is
+/// carried verbatim into the core's step `detail`
+/// (`core::scheduler::tool_dispatch::result_mapping`), and the core then clamps
+/// that `detail` to this many chars when it renders the plan-so-far summary
+/// that the planner reads (`core::scheduler::inner_loop::summary`). Text past
+/// the clamp is replaced by a trailing `…` and is never seen.
+///
+/// So a worker writing an error meant to *repair* a planner mistake — rather
+/// than merely to be logged — has to fit its advice inside this budget, minus
+/// whatever prefix the worker's own error path adds. `workers/mail`'s
+/// `ids::explain` is the worked example: it puts the class-specific diagnosis
+/// first precisely because the generic tail is what the clamp eats.
+///
+/// It was duplicated as a hand-synced `#[cfg(test)]` const in `workers/mail`
+/// until #536 — where the review observed that lowering it here would leave
+/// that copy stale and silently start truncating the repair advice, with every
+/// test on both sides still green.
+pub const STEP_ERR_DETAIL_MAX: usize = 200;
+
 /// Outcome of reading one `\n`-terminated record with a byte ceiling, via
 /// [`read_capped_record`].
 #[derive(Debug)]

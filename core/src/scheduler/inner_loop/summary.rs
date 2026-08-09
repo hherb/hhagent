@@ -14,7 +14,14 @@ use crate::cassandra::types::Plan;
 /// the `code` (always short) is never truncated. A truncated detail gets a
 /// trailing `…`, so the rendered detail is at most `STEP_ERR_DETAIL_MAX + 1`
 /// chars.
-pub(crate) const STEP_ERR_DETAIL_MAX: usize = 200;
+///
+/// Defined in `kastellan-protocol` rather than here because it binds *both*
+/// sides of the wire: a worker that writes an error meant to repair a planner
+/// mistake has to fit its advice in this budget, and until #536 `workers/mail`
+/// carried a hand-synced `#[cfg(test)]` copy of the number. Lowering it here
+/// would have left that copy stale and silently truncated the repair advice
+/// with every test on both sides still green.
+pub(crate) use kastellan_protocol::STEP_ERR_DETAIL_MAX;
 
 /// Max bytes of a *successful* step's output head surfaced back to the planner
 /// in `plans_so_far_summary`. The head is screened at the sink (see

@@ -80,6 +80,18 @@ jobs:
       - name: cargo test (tests-common — hermetic structural guards)
         run: cargo test -p kastellan-tests-common --locked
 
+      # The mail worker's suite is hermetic for the same reason tests-common's
+      # is: loopback-only mock HTTP, no Postgres, no bwrap, no KVM, and the
+      # prelude's self-lockdown opted out per-test. It runs here because #536
+      # measured the alternative — reverting `message_id: LocalmailId` to `i64`
+      # (the #527 defect, 54% of live `mail.get_message` dispatches) left 31 of
+      # 33 mail tests green, and the one failure was in `tests/mail_e2e.rs`,
+      # which nothing in CI executed. The fixture self-consistency tests ran on
+      # every PR while the behavioural pin ran nowhere. Same argument that put
+      # `tests-common::installable` here after #504.
+      - name: cargo test (mail worker — hermetic id/query contract)
+        run: cargo test -p kastellan-worker-mail --locked
+
   # The Matrix worker's live SDK path (`workers/matrix/src/sdk_live.rs`) is
   # behind the optional `live-matrix` feature (`dep:matrix-sdk`). The `check`
   # job above builds the default `--workspace`, which deliberately excludes that

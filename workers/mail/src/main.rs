@@ -5,6 +5,7 @@
 
 mod client;
 mod handler;
+mod ids;
 
 use kastellan_worker_prelude::serve_stdio;
 
