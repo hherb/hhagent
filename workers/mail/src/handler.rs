@@ -372,6 +372,25 @@ mod tests {
         h.call("mail.list_messages", serde_json::json!({"limit": 10})).unwrap();
     }
 
+    /// `account_ids`/`folder_ids` were widened from `Vec<i64>` to
+    /// `Vec<LocalmailId>` on the reasoning that fixing `message_id` alone
+    /// would repeat the mock's own #527 mistake (agreeing with a fixture, not
+    /// the live service) — but nothing pinned that widening, so a revert to
+    /// `Vec<i64>` would pass every other test in this file. Mixed on purpose:
+    /// a search hit's string id alongside a hand-typed number, both landing
+    /// in the same call, is exactly what the planner does in practice.
+    #[test]
+    fn list_messages_accepts_mixed_string_and_number_ids() {
+        let mut h = MailHandler::with_client(client_with(Box::new(PathFake(
+            "/v1/messages?account_ids=1,2&limit=10",
+        ))));
+        h.call(
+            "mail.list_messages",
+            serde_json::json!({"account_ids": ["1", 2], "limit": 10}),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn list_accounts_builds_path() {
         let mut h = MailHandler::with_client(client_with(Box::new(PathFake("/v1/accounts"))));

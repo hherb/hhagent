@@ -351,9 +351,17 @@ fn mock_localmail_shapes_match_real_localmail() {
 
     // 2. accounts → JSON array.
     let (_h, accounts) = curl("GET", "/v1/accounts", None);
+    let accounts = accounts.expect("accounts JSON");
+    assert!(accounts.is_array(), "real localmail /v1/accounts must be a JSON array");
+    // #527/#500's central discovery, pinned against the live service directly:
+    // until now this was asserted only in the mock's own unit tests, which is
+    // a claim ABOUT the live service verified against the live service
+    // nowhere — precisely this gate's job.
     assert!(
-        accounts.expect("accounts JSON").is_array(),
-        "real localmail /v1/accounts must be a JSON array"
+        accounts.get(0).and_then(|a| a.get("id")).map(|id| id.is_string()).unwrap_or(false),
+        "real localmail /v1/accounts[0].id must be a STRING (measured live: \"1\"), not a bare \
+         JSON number; got {:?}",
+        accounts.get(0)
     );
 
     // 3. attachment text → application/json {"text": …} (NOT text/plain). Find a
@@ -367,6 +375,22 @@ fn mock_localmail_shapes_match_real_localmail() {
     assert!(
         list.as_ref().and_then(|v| v.get("messages")).map(|r| r.is_array()).unwrap_or(false),
         "real localmail /v1/messages must key rows under `messages`: {list:?}"
+    );
+    // #527/#500's central discovery, pinned against the live service directly
+    // (see the /v1/accounts assert above for why this gate, not the mock's own
+    // unit tests, is where the claim belongs). Keep the lenient
+    // `as_i64().or_else(as_str)` extraction in the loop below for robustness —
+    // this assert is the guard.
+    let first_message_id = list
+        .as_ref()
+        .and_then(|v| v.get("messages"))
+        .and_then(|r| r.as_array())
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("message_id"));
+    assert!(
+        first_message_id.map(|id| id.is_string()).unwrap_or(false),
+        "real localmail /v1/messages[0].message_id must be a STRING (measured live: \"37477\"), \
+         not a bare JSON number; got {first_message_id:?}"
     );
     let mut sha: Option<String> = None;
     // Checked once, on the first detail actually fetched (see below).

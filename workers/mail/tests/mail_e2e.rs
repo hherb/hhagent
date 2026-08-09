@@ -211,4 +211,5 @@ fn a_message_id_taken_verbatim_from_a_search_hit_is_accepted() {
 
     let _ = child.kill();
     let _ = child.wait();
+    std::fs::remove_dir_all(&tmp).ok();
 }

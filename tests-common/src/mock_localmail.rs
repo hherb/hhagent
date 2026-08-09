@@ -255,8 +255,9 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
     } else if path.starts_with("/v1/changes") {
         // Shape confirmed against the real localmail route (task-1-report.md's
         // "Final response shapes" — `message_id`, `next_cursor`, and the
-        // embedded `account.id` are all STRINGS on the wire, unlike
-        // `/v1/accounts`' own numeric `id` below; `email-in`'s handler reads
+        // embedded `account.id` are all STRINGS on the wire, and so is every
+        // other id on every localmail route, including `/v1/accounts`' own
+        // `id` below (measured live 2026-08-09); `email-in`'s handler reads
         // `message_id` via `.as_str()` and silently skips anything else, so a
         // number here would swallow every message with no error at all.
         json(serde_json::json!({
@@ -271,11 +272,19 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
         }).to_string())
     } else if path.starts_with("/v1/search") {
         // Shapes measured against the live localmail 2026-08-09: `message_id` is
-        // a STRING on this route, exactly as on /v1/changes below. The mock
+        // a STRING on this route, exactly as on /v1/changes above. The mock
         // previously served a NUMBER here, which is why a hermetic
         // search -> get_message chain passed while production failed 54% of the
         // time (#527): the worker's `i64` agreed with the mock and not with the
         // service. `results` (not `hits`) is correct and stays.
+        //
+        // `next_cursor` deliberately still serves the base64 `CANNED_NEXT_CURSOR`
+        // shape, not the hex format /v1/search actually uses live (e.g.
+        // `"6f6dd7a731…"` — one of the three live cursor-paste failures was
+        // exactly a hex cursor). Not modelled: nothing downstream of this route
+        // parses cursor bytes, only round-trips the opaque string, so the two
+        // formats are behaviourally interchangeable for every consumer this mock
+        // stands in for. Flagged here rather than silently collapsed.
         json(serde_json::json!({
             "results": [{
                 "message_id": CANNED_MESSAGE_ID.to_string(),

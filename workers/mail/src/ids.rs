@@ -109,7 +109,7 @@ pub fn explain(v: &serde_json::Value) -> String {
         ),
         serde_json::Value::String(s) => format!(
             "{:?} is not a number; if it came from next_cursor, that is an opaque paging \
-             token, not an id — re-read the message_id field of the hit instead. {WANT}",
+             token, not an id — re-read the hit's message_id instead, e.g. 37477. {WANT}",
             head(s)
         ),
         _ => format!("Got {}, not a valid message_id. {WANT}", head(&v.to_string())),
@@ -215,10 +215,23 @@ mod tests {
 
     #[test]
     fn every_explanation_names_the_field_and_gives_an_example() {
+        // Scoped to what the planner actually sees, not the unclamped string:
+        // `core::scheduler::inner_loop::summary` clamps a step error's `detail`
+        // to `STEP_ERR_DETAIL_MAX` (200) chars before it ever reaches the
+        // planner prompt, and `detail` is `"bad params: " + explain(...)` (see
+        // `PLANNER_DETAIL_CLAMP`'s doc comment above), so only the first
+        // `budget` chars of `explain`'s output are ever delivered. Before the
+        // cursor arm named its example inline, the unclamped cursor message put
+        // "37477" at char 233 of a 239-char message — past this budget, so
+        // production never delivered the example for exactly the failure class
+        // (a pasted `next_cursor`) it was written for. This test would not have
+        // caught that: it asserted on the unclamped string.
+        let budget = PLANNER_DETAIL_CLAMP - "bad params: ".len();
         for v in [json!("{{x}}"), json!("ZHwy"), json!(null), json!(-1)] {
             let m = explain(&v);
-            assert!(m.contains("message_id"), "must name the field; got: {m}");
-            assert!(m.contains("37477"), "must give a concrete example; got: {m}");
+            let seen: String = m.chars().take(budget).collect();
+            assert!(seen.contains("message_id"), "must name the field within the planner's budget; got: {seen:?} (full: {m})");
+            assert!(seen.contains("37477"), "must give a concrete example within the planner's budget; got: {seen:?} (full: {m})");
         }
     }
 
@@ -231,13 +244,16 @@ mod tests {
     /// that point is dropped just as surely as if it were never written.
     ///
     /// The budget-window checks alone are NOT an ordering guard: with the
-    /// current (short) `WANT`, both the cursor and placeholder messages fit
-    /// inside the budget regardless of which half comes first, so a future
-    /// edit that reverts the ordering (while leaving `WANT` short) would pass
-    /// those assertions and regress silently. The `.find(...) < .find(...)`
-    /// checks below are what actually pin the ordering, independent of how
-    /// long `WANT` is; the budget checks pin the fit. Neither alone is
-    /// sufficient — see the review round 2 note in the task report.
+    /// current (short) `WANT`, both the two *pinned phrases* (`"paging
+    /// token"` / `"NO template substitution"`) fit inside the budget
+    /// regardless of which half comes first, so a future edit that reverts
+    /// the ordering (while leaving `WANT` short) would pass those assertions
+    /// and regress silently — the full messages themselves do NOT both fit
+    /// regardless of order (the cursor message alone is 239 chars against
+    /// this 188-char budget). The `.find(...) < .find(...)` checks below are
+    /// what actually pin the ordering, independent of how long `WANT` is; the
+    /// budget checks pin the fit of the pinned phrase. Neither alone is
+    /// sufficient.
     #[test]
     fn the_repair_phrase_survives_the_core_side_planner_clamp() {
         let budget = PLANNER_DETAIL_CLAMP - "bad params: ".len();
