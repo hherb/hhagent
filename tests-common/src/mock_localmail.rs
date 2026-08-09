@@ -39,6 +39,11 @@ pub const CANNED_ATTACHMENT_TEXT: &str = "NORTH COAST AREA HEALTH SERVICE invoic
 pub const CANNED_ATTACHMENT_BYTES: &[u8] = b"%PDF-1.4 canned attachment bytes";
 /// The message id the canned search/list hits reference.
 pub const CANNED_MESSAGE_ID: i64 = 7;
+/// A realistic opaque paging token. Base64 of `d|2026-08-08T22:01:58+00:00|37474`,
+/// copied from a live `/v1/messages` response. It is here because the live audit
+/// log shows the planner pasting this value into `message_id` (3 of 14 failures) —
+/// a `null` cursor cannot reproduce that, so the mock would hide it.
+pub const CANNED_NEXT_CURSOR: &str = "ZHwyMDI2LTA4LTA4VDIyOjAxOjU4KzAwOjAwfDM3NDc0";
 /// The canned message's From address. On the wire localmail wraps it in an
 /// address OBJECT (`{"address", "name"}`), never a bare string — see [`route`].
 /// Already lowercase, matching the peer `email-in` derives from it.
@@ -265,12 +270,23 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
             "next_cursor": CANNED_MESSAGE_ID.to_string()
         }).to_string())
     } else if path.starts_with("/v1/search") {
+        // Shapes measured against the live localmail 2026-08-09: `message_id` is
+        // a STRING on this route, exactly as on /v1/changes below. The mock
+        // previously served a NUMBER here, which is why a hermetic
+        // search -> get_message chain passed while production failed 54% of the
+        // time (#527): the worker's `i64` agreed with the mock and not with the
+        // service. `results` (not `hits`) is correct and stays.
         json(serde_json::json!({
-            "results": [{"message_id": CANNED_MESSAGE_ID, "subject": "invoice", "snippet": "…"}],
-            "next_cursor": serde_json::Value::Null
+            "results": [{
+                "message_id": CANNED_MESSAGE_ID.to_string(),
+                "subject": "invoice",
+                "snippet": "…"
+            }],
+            "next_cursor": CANNED_NEXT_CURSOR
         }).to_string())
     } else if path.starts_with("/v1/accounts") {
-        json(serde_json::json!([{"id": 1, "name": "horst-gmail"}]).to_string())
+        // Measured live: `id` is a STRING here too.
+        json(serde_json::json!([{"id": "1", "name": "horst-gmail"}]).to_string())
     } else if path.contains("/text") && path.starts_with("/v1/attachments/") {
         json(serde_json::json!({"text": CANNED_ATTACHMENT_TEXT}).to_string())
     } else if path.starts_with("/v1/attachments/") {
@@ -324,9 +340,16 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
         }
         json(msg.to_string())
     } else if path.starts_with("/v1/messages") {
+        // Measured live 2026-08-09: the list route keys rows under `messages`
+        // (NOT `results` — that is the search route) and serves `message_id` as
+        // a STRING. Both differed from this mock.
         json(serde_json::json!({
-            "results": [{"message_id": CANNED_MESSAGE_ID, "subject": "invoice"}],
-            "next_cursor": serde_json::Value::Null
+            "messages": [{
+                "message_id": CANNED_MESSAGE_ID.to_string(),
+                "subject": "invoice",
+                "account": {"id": "1", "name": "horst-gmail"}
+            }],
+            "next_cursor": CANNED_NEXT_CURSOR
         }).to_string())
     } else {
         ("404 Not Found", "text/plain", b"no such endpoint".to_vec())
@@ -573,5 +596,58 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(body).unwrap();
             assert!(v["results"].is_array(), "expected results array, got {v}");
         });
+    }
+
+    /// Drive the pure router with a minimal well-formed request head.
+    /// `route` refuses a request with no non-empty bearer, so one is supplied.
+    fn routed(request_line: &str) -> serde_json::Value {
+        let head = format!("{request_line}\r\nHost: x\r\nAuthorization: Bearer t\r\n");
+        let (status, ctype, body) = route(&head);
+        assert!(status.starts_with("200"), "unexpected status {status} for {request_line}");
+        assert_eq!(ctype, "application/json", "for {request_line}");
+        serde_json::from_slice(&body).expect("json body")
+    }
+
+    /// `/v1/search` must serve `message_id` as a JSON string. The mock served a
+    /// NUMBER until 2026-08-09, which is precisely why no hermetic test caught
+    /// #527: `mail.get_message` takes an `i64`, so the mock agreed with the
+    /// worker while the real service disagreed with both.
+    #[test]
+    fn search_returns_message_id_as_a_string() {
+        let v = routed("POST /v1/search HTTP/1.1");
+        assert!(
+            v["results"][0]["message_id"].is_string(),
+            "search message_id must be a JSON string (live localmail serves \"20973\"); got {}",
+            v["results"][0]["message_id"]
+        );
+    }
+
+    /// The list route keys rows under `messages` and serves string ids. It used
+    /// `results` + a number, disagreeing with the live service on both counts.
+    #[test]
+    fn list_messages_keys_rows_under_messages_with_string_ids() {
+        let v = routed("GET /v1/messages?limit=50 HTTP/1.1");
+        assert!(
+            v["messages"].is_array(),
+            "list route must key rows under `messages` (that is the live shape; \
+             `results` is the SEARCH route); got keys {:?}",
+            v.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        );
+        assert!(
+            v["messages"][0]["message_id"].is_string(),
+            "list message_id must be a JSON string; got {}",
+            v["messages"][0]["message_id"]
+        );
+    }
+
+    /// `/v1/accounts` serves `id` as a string, like every other id localmail emits.
+    #[test]
+    fn accounts_return_id_as_a_string() {
+        let v = routed("GET /v1/accounts HTTP/1.1");
+        assert!(
+            v[0]["id"].is_string(),
+            "account id must be a JSON string; got {}",
+            v[0]["id"]
+        );
     }
 }
