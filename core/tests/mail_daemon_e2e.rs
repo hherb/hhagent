@@ -360,19 +360,26 @@ fn mock_localmail_shapes_match_real_localmail() {
     //    real attachment sha via list → message; skip this leg (printed note) if
     //    the archive carries no attachment.
     let (_h, list) = curl("GET", "/v1/messages?limit=50", None);
-    // list_messages must ALSO key rows under `results` (same drift surface as
-    // search). get_message's shape is exercised implicitly by the sha discovery
-    // below; get_attachment (raw bytes) is structurally simple and not JSON.
+    // The LIST route keys rows under `messages` and the SEARCH route under
+    // `results` — they differ, and this gate asserted `results` for both until
+    // 2026-08-09. Measured live: `/v1/messages` returns exactly
+    // ["messages", "next_cursor"]. get_message's shape is pinned below.
     assert!(
-        list.as_ref().and_then(|v| v.get("results")).map(|r| r.is_array()).unwrap_or(false),
-        "real localmail /v1/messages must key rows under `results`: {list:?}"
+        list.as_ref().and_then(|v| v.get("messages")).map(|r| r.is_array()).unwrap_or(false),
+        "real localmail /v1/messages must key rows under `messages`: {list:?}"
     );
     let mut sha: Option<String> = None;
     // Checked once, on the first detail actually fetched (see below).
     let mut detail_shape_checked = false;
-    if let Some(rows) = list.as_ref().and_then(|v| v.get("results")).and_then(|r| r.as_array()) {
+    if let Some(rows) = list.as_ref().and_then(|v| v.get("messages")).and_then(|r| r.as_array()) {
         for row in rows {
-            let Some(id) = row.get("message_id").or_else(|| row.get("id")).and_then(|v| v.as_i64())
+            // localmail serves ids as STRINGS. `as_i64()` alone returns None for
+            // every row, so this loop used to skip the whole archive and exercise
+            // nothing — the silent pass the assert below the loop exists to catch.
+            let Some(id) = row
+                .get("message_id")
+                .or_else(|| row.get("id"))
+                .and_then(|v| v.as_i64().map(|i| i.to_string()).or_else(|| v.as_str().map(str::to_owned)))
             else {
                 continue;
             };
