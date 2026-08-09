@@ -68,27 +68,51 @@ pub fn parse_id(v: &serde_json::Value) -> Result<i64, String> {
     }
 }
 
+/// Mirrors `core::scheduler::inner_loop::summary::STEP_ERR_DETAIL_MAX` (200).
+/// Not imported: that const is `pub(crate)` inside the `kastellan-core` crate,
+/// and this worker is a separate process linked against neither `core` nor its
+/// internal modules — the only channel between the two is the JSON-RPC wire.
+/// `core`'s `plans_so_far_summary` clamps a failed step's `detail` — which is
+/// exactly `"bad params: " + explain(...)` (see `handler::parse_params`) — to
+/// `STEP_ERR_DETAIL_MAX` chars before it ever reaches the planner prompt, so
+/// [`explain`]'s wording was hand-fitted to put its repair advice inside that
+/// budget. `#[cfg(test)]`-only: nothing at runtime consults this number —
+/// `the_repair_phrase_survives_the_core_side_planner_clamp` (below) is what
+/// actually pins the guarantee, so the const would be dead weight in the real
+/// binary.
+/// Keep this in sync by hand if the upstream const ever moves.
+#[cfg(test)]
+const PLANNER_DETAIL_CLAMP: usize = 200;
+
 /// What to tell the **planner** when a value is not a usable id.
 ///
 /// Each arm names a mistake the live `audit_log` actually recorded, because
 /// this string is fed back into the next planning iteration and a generic
 /// "expected i64" has demonstrably not been enough: the same three mistakes
 /// recurred across two months.
+///
+/// The class-specific diagnosis comes FIRST in every arm and the generic
+/// "expected a numeric id" boilerplate is demoted to the tail: `core` clamps
+/// this text (see `PLANNER_DETAIL_CLAMP`'s doc comment below) before it
+/// reaches the planner, so whatever is placed after the clamp point is
+/// silently dropped and never seen. Putting the repair advice first is what
+/// makes it survive that clamp — see `the_repair_phrase_survives_the_core_side_planner_clamp`.
 pub fn explain(v: &serde_json::Value) -> String {
-    const WANT: &str = "expected the numeric message_id of a mail.search / \
-                        mail.list_messages hit, e.g. 37477 (a number, or a string of digits)";
+    // Kept short deliberately: this is the part most at risk of being clamped
+    // away, so it does not get to spend the budget the repair advice needs.
+    const WANT: &str = "Expected the numeric message_id of a hit, e.g. 37477.";
     match v {
         serde_json::Value::String(s) if s.starts_with("{{") && s.ends_with("}}") => format!(
-            "{WANT}. Got the placeholder {:?}: there is NO template substitution in this \
-             system — write the literal id from the previous step's output.",
+            "NO template substitution — write the literal id from the previous step's output, \
+             not the placeholder {:?}. {WANT}",
             head(s)
         ),
         serde_json::Value::String(s) => format!(
-            "{WANT}. Got {:?}, which is not a number. If this came from next_cursor, that is \
-             an opaque paging token and not an id — re-read the message_id field of the hit.",
+            "{:?} is not a number; if it came from next_cursor, that is an opaque paging \
+             token, not an id — re-read the message_id field of the hit instead. {WANT}",
             head(s)
         ),
-        _ => format!("{WANT}. Got {v}."),
+        _ => format!("Got {}, not a valid message_id. {WANT}", head(&v.to_string())),
     }
 }
 
@@ -198,15 +222,59 @@ mod tests {
         }
     }
 
+    /// Pins the actual guarantee, not just that the phrase appears *somewhere*
+    /// in the full string: `core::scheduler::inner_loop::summary` clamps a step
+    /// error's `detail` (`"bad params: " + explain(...)`) to
+    /// `STEP_ERR_DETAIL_MAX = 200` chars before it ever reaches the planner
+    /// prompt, so only the first `PLANNER_DETAIL_CLAMP - "bad params: ".len()`
+    /// chars of `explain`'s output are ever seen. A phrase that shows up after
+    /// that point is dropped just as surely as if it were never written.
     #[test]
-    fn a_long_rejected_value_is_truncated() {
+    fn the_repair_phrase_survives_the_core_side_planner_clamp() {
+        let budget = PLANNER_DETAIL_CLAMP - "bad params: ".len();
+
+        let cursor = explain(&json!("ZHwyMDI2LTA4LTA4VDIyOjAxOjU4KzAwOjAwfDM3NDc0"));
+        let cursor_head: String = cursor.chars().take(budget).collect();
+        assert!(cursor_head.contains("next_cursor"), "clamped to: {cursor_head:?}");
+        assert!(cursor_head.contains("paging token"), "clamped to: {cursor_head:?}");
+
+        let placeholder = explain(&json!("{{message_id}}"));
+        let placeholder_head: String = placeholder.chars().take(budget).collect();
+        assert!(placeholder_head.contains("NO template substitution"), "clamped to: {placeholder_head:?}");
+        assert!(placeholder_head.contains("literal id"), "clamped to: {placeholder_head:?}");
+        // The placeholder arm is short enough that even the concrete example
+        // survives the clamp too, not just the repair phrase.
+        assert!(placeholder_head.contains("37477"), "clamped to: {placeholder_head:?}");
+    }
+
+    #[test]
+    fn a_long_rejected_string_is_truncated() {
         // This text rides into the planner's next prompt, so it must not grow
-        // with the offending value. The bound is generous on purpose: the fixed
-        // prose is already ~280 chars, and pinning it tighter would make an
-        // ordinary wording edit fail this test for no reason. What is being
-        // asserted is that 500 chars of input do NOT reach the output.
+        // with the offending value. Bound on chars, not bytes: `head` truncates
+        // by `chars().count()` and `{:?}` Debug-escapes the value, so a
+        // byte-based bound could be tripped by escaping/non-ASCII width
+        // unrelated to the truncation this test is pinning.
         let m = explain(&json!("x".repeat(500)));
-        assert!(m.len() < 400, "explanation must not grow with the value; got {} chars", m.len());
+        assert!(
+            m.chars().count() < 300,
+            "explanation must not grow with the value; got {} chars: {m}",
+            m.chars().count()
+        );
+        assert!(m.contains('…'), "the value should be visibly truncated; got: {m}");
+    }
+
+    #[test]
+    fn a_long_rejected_non_scalar_is_also_truncated() {
+        // The catch-all arm renders `v` itself (via `Display`/`to_string`), not
+        // just the two string arms — an array or object must be bounded too,
+        // not just formatted unbounded onto the wire and into the audit log.
+        let big = serde_json::Value::Array(vec![json!("x".repeat(500))]);
+        let m = explain(&big);
+        assert!(
+            m.chars().count() < 300,
+            "explanation must not grow with the value; got {} chars: {m}",
+            m.chars().count()
+        );
         assert!(m.contains('…'), "the value should be visibly truncated; got: {m}");
     }
 }
