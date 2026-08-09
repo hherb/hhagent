@@ -133,7 +133,14 @@ impl WorkerManifest for MailManifest {
                 summary: "Fetch one message: headers, plaintext body, and attachment list \
                           [{filename, sha256, content_type, size}].",
                 params: &[
-                    ToolParam { name: "message_id", description: "message id from a search/list hit", required: true },
+                    ToolParam {
+                        name: "message_id",
+                        description: "numeric message_id of a mail.search / mail.list_messages hit, \
+                                      e.g. 37477 (a number or a digit-string). NOT next_cursor — that \
+                                      is a paging token. Use the literal value from the previous step's \
+                                      output, not a placeholder.",
+                        required: true,
+                    },
                     ToolParam { name: "full_headers", description: "include full headers (default false)", required: false },
                 ],
             },
@@ -302,6 +309,35 @@ mod tests {
                 "mail.get_attachment_text",
                 "mail.get_attachment",
             ]
+        );
+    }
+
+    /// The `message_id` description is load-bearing, not prose: the live audit
+    /// log recorded 4 dispatches sending the literal `{{message_id}}` and 3
+    /// sending `next_cursor`, and this tool is the ONLY one in the log that has
+    /// ever been given a `{{…}}` placeholder. So the description must name the
+    /// field, rule out the adjacent one, and forbid the placeholder.
+    ///
+    /// Asserted by substring rather than by pinning the whole string: the exact
+    /// wording should stay editable, the three commitments should not.
+    #[test]
+    fn message_id_description_names_the_field_and_rules_out_the_two_live_mistakes() {
+        let docs = MailManifest.tool_docs();
+        let get = docs
+            .iter()
+            .find(|d| d.method == "mail.get_message")
+            .expect("mail.get_message must be advertised");
+        let p = get
+            .params
+            .iter()
+            .find(|p| p.name == "message_id")
+            .expect("message_id must be advertised");
+        let d = p.description;
+        assert!(d.contains("message_id"), "must name the field to read: {d:?}");
+        assert!(d.contains("next_cursor"), "must rule out the adjacent cursor: {d:?}");
+        assert!(
+            d.contains("not a placeholder") || d.contains("literal"),
+            "must forbid a template placeholder: {d:?}"
         );
     }
 }
