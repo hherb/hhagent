@@ -64,8 +64,9 @@ impl MailHandler {
             full_headers: bool,
         }
         let p: P = parse_params(params)?;
-        let path = format!("/v1/messages/{}?full_headers={}", p.message_id.get(), p.full_headers);
-        self.client.get_json(&path).map_err(mail_err_to_rpc)
+        self.client
+            .get_json(&detail_path(p.message_id.get(), p.full_headers))
+            .map_err(mail_err_to_rpc)
     }
 
     fn list_messages(&self, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
@@ -249,6 +250,26 @@ fn safe_attachment_name(requested: Option<&str>, sha256: &str) -> String {
     format!("{prefix}_{stem}")
 }
 
+/// localmail's message-detail URL.
+///
+/// The tool's public parameter is the boolean `full_headers` and stays that way
+/// — it is the advertised schema. The service, however, reads a differently
+/// *named* query parameter and derives the flag from its *value*
+/// (`serve/routes/messages.py::detail`: `full_headers=(headers == "full")`), so
+/// FastAPI silently dropped the `?full_headers=<bool>` this worker used to send
+/// and every response came back without `headers`. Translating here keeps the
+/// mismatch at the one boundary where it belongs.
+///
+/// Compact is the service's default, so the parameter is omitted rather than
+/// sent as `headers=compact`.
+fn detail_path(message_id: i64, full_headers: bool) -> String {
+    if full_headers {
+        format!("/v1/messages/{message_id}?headers=full")
+    } else {
+        format!("/v1/messages/{message_id}")
+    }
+}
+
 /// `/v1/accounts` serves ids as strings too, so these arrive in either shape;
 /// `LocalmailId` has already validated them to digits by the time they get here.
 fn join_ids(v: &[LocalmailId]) -> String {
@@ -328,8 +349,21 @@ mod tests {
 
     #[test]
     fn get_message_builds_path() {
-        let mut h = MailHandler::with_client(client_with(Box::new(PathFake("/v1/messages/5?full_headers=false"))));
+        // Compact is localmail's default, so the flag is simply omitted.
+        let mut h = MailHandler::with_client(client_with(Box::new(PathFake("/v1/messages/5"))));
         h.call("mail.get_message", serde_json::json!({"message_id": 5})).unwrap();
+    }
+
+    /// #500: the service reads a differently NAMED query parameter and derives
+    /// the flag from its VALUE (`full_headers=(headers == "full")`), so the
+    /// `?full_headers=true` this worker used to send was dropped by FastAPI and
+    /// the response never carried `headers` — measured against the live service
+    /// on 2026-08-09, where `?headers=full` returns 19 headers and
+    /// `?full_headers=true` returns none.
+    #[test]
+    fn get_message_asks_for_full_headers_the_way_localmail_reads_it() {
+        let mut h = MailHandler::with_client(client_with(Box::new(PathFake("/v1/messages/5?headers=full"))));
+        h.call("mail.get_message", serde_json::json!({"message_id": 5, "full_headers": true})).unwrap();
     }
 
     #[test]
