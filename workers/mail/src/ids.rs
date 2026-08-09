@@ -93,7 +93,7 @@ const PLANNER_DETAIL_CLAMP: usize = 200;
 ///
 /// The class-specific diagnosis comes FIRST in every arm and the generic
 /// "expected a numeric id" boilerplate is demoted to the tail: `core` clamps
-/// this text (see `PLANNER_DETAIL_CLAMP`'s doc comment below) before it
+/// this text (see `PLANNER_DETAIL_CLAMP`'s doc comment above) before it
 /// reaches the planner, so whatever is placed after the clamp point is
 /// silently dropped and never seen. Putting the repair advice first is what
 /// makes it survive that clamp — see `the_repair_phrase_survives_the_core_side_planner_clamp`.
@@ -229,14 +229,33 @@ mod tests {
     /// prompt, so only the first `PLANNER_DETAIL_CLAMP - "bad params: ".len()`
     /// chars of `explain`'s output are ever seen. A phrase that shows up after
     /// that point is dropped just as surely as if it were never written.
+    ///
+    /// The budget-window checks alone are NOT an ordering guard: with the
+    /// current (short) `WANT`, both the cursor and placeholder messages fit
+    /// inside the budget regardless of which half comes first, so a future
+    /// edit that reverts the ordering (while leaving `WANT` short) would pass
+    /// those assertions and regress silently. The `.find(...) < .find(...)`
+    /// checks below are what actually pin the ordering, independent of how
+    /// long `WANT` is; the budget checks pin the fit. Neither alone is
+    /// sufficient — see the review round 2 note in the task report.
     #[test]
     fn the_repair_phrase_survives_the_core_side_planner_clamp() {
         let budget = PLANNER_DETAIL_CLAMP - "bad params: ".len();
+        // Unique to the generic tail — "Expected" never appears in either
+        // class-specific arm, only inside `WANT`.
+        const GENERIC_MARKER: &str = "Expected the numeric message_id";
 
         let cursor = explain(&json!("ZHwyMDI2LTA4LTA4VDIyOjAxOjU4KzAwOjAwfDM3NDc0"));
         let cursor_head: String = cursor.chars().take(budget).collect();
         assert!(cursor_head.contains("next_cursor"), "clamped to: {cursor_head:?}");
         assert!(cursor_head.contains("paging token"), "clamped to: {cursor_head:?}");
+        let repair = cursor.find("paging token").expect("repair phrase present");
+        let generic = cursor.find(GENERIC_MARKER).expect("generic text present");
+        assert!(
+            repair < generic,
+            "the class-specific diagnosis must come FIRST, before the generic text, \
+             or it is what core's clamp eats: {cursor}"
+        );
 
         let placeholder = explain(&json!("{{message_id}}"));
         let placeholder_head: String = placeholder.chars().take(budget).collect();
@@ -245,6 +264,13 @@ mod tests {
         // The placeholder arm is short enough that even the concrete example
         // survives the clamp too, not just the repair phrase.
         assert!(placeholder_head.contains("37477"), "clamped to: {placeholder_head:?}");
+        let repair = placeholder.find("NO template substitution").expect("repair phrase present");
+        let generic = placeholder.find(GENERIC_MARKER).expect("generic text present");
+        assert!(
+            repair < generic,
+            "the class-specific diagnosis must come FIRST, before the generic text, \
+             or it is what core's clamp eats: {placeholder}"
+        );
     }
 
     #[test]
