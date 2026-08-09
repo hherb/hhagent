@@ -37,8 +37,19 @@ pub const CANNED_SHA256: &str =
 pub const CANNED_ATTACHMENT_TEXT: &str = "NORTH COAST AREA HEALTH SERVICE invoice total 42.00";
 /// Original-format bytes delivered by `mail.get_attachment`.
 pub const CANNED_ATTACHMENT_BYTES: &[u8] = b"%PDF-1.4 canned attachment bytes";
-/// The message id the canned search/list hits reference.
+/// The numeric message id the canned search/list hits reference.
+///
+/// **Every route serves it as a JSON string** (`.to_string()`) — localmail never
+/// puts a bare number on the wire. Compare against `CANNED_MESSAGE_ID.to_string()`,
+/// never against this const directly: `hit["message_id"] == CANNED_MESSAGE_ID` is
+/// `false`, and believing otherwise is #527 in miniature.
 pub const CANNED_MESSAGE_ID: i64 = 7;
+/// The canned account id, as it appears on the wire: a STRING, like every other
+/// id localmail emits. Single-sourced because this fixture's string-vs-number
+/// disagreement with the live service is exactly what #527 was.
+pub const CANNED_ACCOUNT_ID: &str = "1";
+/// The canned account's name, paired with [`CANNED_ACCOUNT_ID`].
+pub const CANNED_ACCOUNT_NAME: &str = "horst-gmail";
 /// A realistic opaque paging token. Base64 of `d|2026-08-08T22:01:58+00:00|37474`,
 /// copied from a live `/v1/messages` response. It is here because the live audit
 /// log shows the planner pasting this value into `message_id` (3 of 14 failures) —
@@ -266,17 +277,26 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
                 "subject": "invoice",
                 "from": {"address": "billing@example.test", "name": "Billing"},
                 "date": "2026-07-28T00:00:00+00:00",
-                "account": {"id": "1", "name": "horst-gmail"}
+                "account": {"id": CANNED_ACCOUNT_ID, "name": CANNED_ACCOUNT_NAME}
             }],
+            // Deliberately a plain id rather than [`CANNED_NEXT_CURSOR`]:
+            // `email-in` round-trips this value straight back into the next
+            // `/v1/changes` request, and the ack path keys on it, so a short
+            // recognisable token keeps those tests readable. The opaque-blob
+            // shape matters only where the planner can SEE the cursor and paste
+            // it into an id — the search and list routes, which use it.
             "next_cursor": CANNED_MESSAGE_ID.to_string()
         }).to_string())
     } else if path.starts_with("/v1/search") {
         // Shapes measured against the live localmail 2026-08-09: `message_id` is
         // a STRING on this route, exactly as on /v1/changes above. The mock
         // previously served a NUMBER here, which is why a hermetic
-        // search -> get_message chain passed while production failed 54% of the
-        // time (#527): the worker's `i64` agreed with the mock and not with the
-        // service. `results` (not `hits`) is correct and stays.
+        // search -> get_message chain passed while 7 of the 26 live
+        // `mail.get_message` dispatches failed on exactly this (of 14 failures
+        // in all, across three causes — #527): the worker's `i64` agreed with
+        // the mock and not with the service. `results` (not `hits`) is correct
+        // and stays, and the snippet field is `snippet_html`
+        // (`api/search.py::_to_api_result`), not `snippet`.
         //
         // `next_cursor` deliberately still serves the base64 `CANNED_NEXT_CURSOR`
         // shape, not the hex format /v1/search actually uses live (e.g.
@@ -288,14 +308,17 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
         json(serde_json::json!({
             "results": [{
                 "message_id": CANNED_MESSAGE_ID.to_string(),
+                "account": {"id": CANNED_ACCOUNT_ID, "name": serde_json::Value::Null},
                 "subject": "invoice",
-                "snippet": "…"
+                "snippet_html": "…"
             }],
             "next_cursor": CANNED_NEXT_CURSOR
         }).to_string())
     } else if path.starts_with("/v1/accounts") {
-        // Measured live: `id` is a STRING here too.
-        json(serde_json::json!([{"id": "1", "name": "horst-gmail"}]).to_string())
+        // Measured live 2026-08-09: `id` is a STRING here too.
+        json(serde_json::json!([
+            {"id": CANNED_ACCOUNT_ID, "name": CANNED_ACCOUNT_NAME}
+        ]).to_string())
     } else if path.contains("/text") && path.starts_with("/v1/attachments/") {
         json(serde_json::json!({"text": CANNED_ATTACHMENT_TEXT}).to_string())
     } else if path.starts_with("/v1/attachments/") {
@@ -316,9 +339,11 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
         //     `email-in`'s own message-detail fixtures use (`handler/tests.rs`:
         //     `"id": "7"`; `client.rs`'s `message_detail_requests_full_headers`:
         //     `"id":"42"`).
-        //     Nothing in the tree reads this field today (verified by grep — the
-        //     only mail-adjacent `id` reads are other fixtures and the real
-        //     localmail LIST route), so this is fidelity, not a behaviour fix.
+        //     No PRODUCTION code reads this field (the only mail-adjacent `id`
+        //     reads are fixtures and the real localmail LIST route), so it is
+        //     fidelity rather than a behaviour fix — but it is no longer
+        //     unread: since #536, `workers/mail/tests/mail_e2e.rs` asserts on it
+        //     to check the id survived a search → get_message round trip.
         //   * `headers` exists ONLY when the request carried `?headers=full`
         //     (`serve/routes/messages.py::detail` maps that query pair to
         //     `full_headers=(headers == "full")`), and every value is an ARRAY
@@ -356,7 +381,7 @@ fn route(head: &str) -> (&'static str, &'static str, Vec<u8>) {
             "messages": [{
                 "message_id": CANNED_MESSAGE_ID.to_string(),
                 "subject": "invoice",
-                "account": {"id": "1", "name": "horst-gmail"}
+                "account": {"id": CANNED_ACCOUNT_ID, "name": CANNED_ACCOUNT_NAME}
             }],
             "next_cursor": CANNED_NEXT_CURSOR
         }).to_string())

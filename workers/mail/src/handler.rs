@@ -8,7 +8,7 @@ use std::path::Path;
 use kastellan_protocol::{codes, server::Handler, RpcError};
 
 use crate::client::{MailClient, MailError};
-use crate::ids::LocalmailId;
+use crate::ids::{self, LocalmailId};
 
 pub struct MailHandler {
     client: MailClient,
@@ -26,6 +26,7 @@ impl MailHandler {
 
     fn search(&self, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct P {
             query: String,
             #[serde(default)]
@@ -58,23 +59,26 @@ impl MailHandler {
 
     fn get_message(&self, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct P {
+            #[serde(deserialize_with = "ids::message_id")]
             message_id: LocalmailId,
             #[serde(default)]
             full_headers: bool,
         }
         let p: P = parse_params(params)?;
         self.client
-            .get_json(&detail_path(p.message_id.get(), p.full_headers))
+            .get_json(&detail_path(p.message_id, p.full_headers))
             .map_err(mail_err_to_rpc)
     }
 
     fn list_messages(&self, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct P {
-            #[serde(default)]
+            #[serde(default, deserialize_with = "ids::account_ids")]
             account_ids: Option<Vec<LocalmailId>>,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "ids::folder_ids")]
             folder_ids: Option<Vec<LocalmailId>>,
             #[serde(default)]
             limit: Option<u32>,
@@ -109,6 +113,7 @@ impl MailHandler {
 
     fn get_attachment_text(&self, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct P {
             sha256: String,
         }
@@ -134,6 +139,7 @@ impl MailHandler {
 
     fn get_attachment(&self, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct P {
             sha256: String,
             #[serde(default)]
@@ -262,7 +268,13 @@ fn safe_attachment_name(requested: Option<&str>, sha256: &str) -> String {
 ///
 /// Compact is the service's default, so the parameter is omitted rather than
 /// sent as `headers=compact`.
-fn detail_path(message_id: i64, full_headers: bool) -> String {
+///
+/// Takes a [`LocalmailId`], not an `i64`: this is the URL-path interpolation the
+/// whole traversal argument is about, so the validated type reaches it rather
+/// than stopping one call short. `LocalmailId` cannot be turned back into an
+/// `i64` anywhere in this crate — only `Display`ed — which is what makes the
+/// guard structural instead of positional.
+fn detail_path(message_id: LocalmailId, full_headers: bool) -> String {
     if full_headers {
         format!("/v1/messages/{message_id}?headers=full")
     } else {
@@ -270,8 +282,10 @@ fn detail_path(message_id: i64, full_headers: bool) -> String {
     }
 }
 
-/// `/v1/accounts` serves ids as strings too, so these arrive in either shape;
-/// `LocalmailId` has already validated them to digits by the time they get here.
+/// `/v1/accounts` and get_message's `folders` both serve ids as strings, so
+/// these arrive in either shape; `LocalmailId` has already validated them to
+/// digits by the time they get here, and an empty list was refused at
+/// deserialization (it would render as a bare `account_ids=`).
 fn join_ids(v: &[LocalmailId]) -> String {
     v.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
 }
@@ -349,7 +363,6 @@ mod tests {
 
     #[test]
     fn get_message_builds_path() {
-        // Compact is localmail's default, so the flag is simply omitted.
         let mut h = MailHandler::with_client(client_with(Box::new(PathFake("/v1/messages/5"))));
         h.call("mail.get_message", serde_json::json!({"message_id": 5})).unwrap();
     }
@@ -358,8 +371,14 @@ mod tests {
     /// the flag from its VALUE (`full_headers=(headers == "full")`), so the
     /// `?full_headers=true` this worker used to send was dropped by FastAPI and
     /// the response never carried `headers` — measured against the live service
-    /// on 2026-08-09, where `?headers=full` returns 19 headers and
-    /// `?full_headers=true` returns none.
+    /// on 2026-08-09, where `?headers=full` returns a populated `headers` block
+    /// and `?full_headers=true` returns none.
+    ///
+    /// This asserts the URL this worker *sends*, against a fake handed that same
+    /// string — so it cannot catch "our reading of localmail is wrong". The two
+    /// tests that can are `mail_e2e::asking_for_full_headers_actually_returns_headers`
+    /// (behavioural, hermetic) and the live gate's `?headers=full` legs in
+    /// `core/tests/mail_daemon_e2e.rs` (behavioural, against the real service).
     #[test]
     fn get_message_asks_for_full_headers_the_way_localmail_reads_it() {
         let mut h = MailHandler::with_client(client_with(Box::new(PathFake("/v1/messages/5?headers=full"))));
@@ -389,6 +408,96 @@ mod tests {
             serde_json::json!({"account_ids": ["1", 2], "limit": 10}),
         )
         .unwrap();
+    }
+
+    /// `folder_ids` had no test at all: renaming it to `folder_id=`, swapping it
+    /// with `account_ids` or dropping it outright passed the whole suite. This
+    /// also pins the `&`-join ORDER, which nothing exercised while only one
+    /// filter was ever present in a test.
+    #[test]
+    fn list_messages_joins_both_id_filters_in_order() {
+        let mut h = MailHandler::with_client(client_with(Box::new(PathFake(
+            "/v1/messages?account_ids=1,2&folder_ids=3&limit=10",
+        ))));
+        h.call(
+            "mail.list_messages",
+            serde_json::json!({"account_ids": [1, "2"], "folder_ids": ["3"], "limit": 10}),
+        )
+        .unwrap();
+    }
+
+    /// An explicitly empty list would render as a bare `account_ids=`, which
+    /// asks localmail to filter by nothing and most plausibly returns the whole
+    /// unfiltered archive — the caller asks for one thing and silently gets
+    /// another, which is the family of failure this branch exists to close.
+    #[test]
+    fn an_empty_id_list_is_refused_rather_than_sent_as_a_bare_parameter() {
+        for field in ["account_ids", "folder_ids"] {
+            let mut h = MailHandler::with_client(client_with(Box::new(PathFake("unreachable"))));
+            let err = h
+                .call("mail.list_messages", serde_json::json!({ field: [] }))
+                .expect_err("an empty id list must be refused");
+            assert_eq!(err.code, codes::INVALID_PARAMS, "for {field}");
+            assert!(err.message.contains(field), "must name the field: {}", err.message);
+            assert!(
+                err.message.contains("omit it entirely"),
+                "must say how to repair it: {}",
+                err.message
+            );
+        }
+    }
+
+    /// The #536 regression: `LocalmailId` serves three parameters, and `explain`
+    /// used to hardcode `message_id` in every arm — so a fumbled `account_ids`
+    /// was answered with advice to repair `message_id`, three times over, plus a
+    /// `next_cursor` diagnosis no account id has ever been confused with.
+    /// Asserted through the RPC surface, not the pure function, because that is
+    /// where `inner_loop` reads it from.
+    #[test]
+    fn a_bad_account_id_is_not_blamed_on_message_id() {
+        let mut h = MailHandler::with_client(client_with(Box::new(PathFake("unreachable"))));
+        let err = h
+            .call("mail.list_messages", serde_json::json!({"account_ids": ["abc"]}))
+            .expect_err("a non-numeric account id must be refused");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+        assert!(err.message.contains("account_ids"), "got: {}", err.message);
+        assert!(
+            !err.message.contains("message_id"),
+            "must not send the planner to repair message_id: {}",
+            err.message
+        );
+    }
+
+    /// The #500 failure shape on the worker's OWN side of the wire. localmail
+    /// silently ignored a query parameter it did not recognise and returned a
+    /// header-less 200; without this, the worker does the same to its caller —
+    /// `{"headers": "full"}` (the spelling this branch's code and comments are
+    /// now full of, and the one a model reaching for the service's own
+    /// vocabulary would emit) was accepted and silently produced a COMPACT
+    /// fetch. A rejected key rides back to the planner through the same channel
+    /// `ids::explain` uses, so it is repairable; a dropped one is not.
+    #[test]
+    fn a_misspelled_parameter_is_refused_rather_than_silently_dropped() {
+        for bad in [
+            serde_json::json!({"message_id": 5, "full_header": true}),
+            serde_json::json!({"message_id": 5, "headers": "full"}),
+        ] {
+            let mut h = MailHandler::with_client(client_with(Box::new(PathFake("unreachable"))));
+            let err = h
+                .call("mail.get_message", bad.clone())
+                .expect_err("an unknown parameter must be refused");
+            assert_eq!(err.code, codes::INVALID_PARAMS, "for {bad}");
+            assert!(
+                err.message.contains("unknown field"),
+                "must name the offending key: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("full_headers"),
+                "must name the parameter that was meant: {}",
+                err.message
+            );
+        }
     }
 
     #[test]
