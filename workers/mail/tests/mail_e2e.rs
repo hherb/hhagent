@@ -37,10 +37,16 @@ fn spawn_mock() -> (String, std::thread::JoinHandle<()>) {
             );
             let (status, ctype, body): (&str, &str, Vec<u8>) = if first.contains("GET /v1/accounts")
             {
-                ("200 OK", "application/json", br#"[{"id":1,"name":"work"}]"#.to_vec())
+                // Live localmail serves ids as STRINGS on every route.
+                ("200 OK", "application/json", br#"[{"id":"1","name":"work"}]"#.to_vec())
             } else if first.contains("POST /v1/search") {
-                // Real localmail keys results under "results" (not "hits").
-                ("200 OK", "application/json", br#"{"results":[{"message_id":7}],"next_cursor":null}"#.to_vec())
+                // Real localmail keys results under "results" (not "hits") and
+                // serves `message_id` as a STRING. Serving a number here is what
+                // let #527 hide: the worker's i64 agreed with this fixture and
+                // not with the service.
+                ("200 OK", "application/json", br#"{"results":[{"message_id":"7"}],"next_cursor":null}"#.to_vec())
+            } else if first.contains("GET /v1/messages/7") {
+                ("200 OK", "application/json", br#"{"id":"7","subject":"invoice","attachments":[]}"#.to_vec())
             } else if first.contains("/v1/attachments/") && first.contains("/text") {
                 // Real localmail returns application/json {"text": "..."}.
                 ("200 OK", "application/json", br#"{"text":"extracted booking text"}"#.to_vec())
@@ -109,13 +115,15 @@ fn mail_worker_stdio_roundtrip_against_mock() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    // 1. list_accounts → the mock's one account.
+    // 1. list_accounts → the mock's one account. Live localmail serves the id
+    //    as a string; the worker passes the body through untouched.
     let r = rpc(&mut stdin, &mut stdout, 1, "mail.list_accounts", serde_json::json!({}));
-    assert_eq!(r["result"][0]["id"], 1, "resp: {r}");
+    assert_eq!(r["result"][0]["id"], "1", "resp: {r}");
 
-    // 2. search → a hit under localmail's real "results" key.
+    // 2. search → a hit under localmail's real "results" key, with the
+    //    STRING message_id the real service emits.
     let r = rpc(&mut stdin, &mut stdout, 2, "mail.search", serde_json::json!({"query": "qantas"}));
-    assert_eq!(r["result"]["results"][0]["message_id"], 7, "resp: {r}");
+    assert_eq!(r["result"]["results"][0]["message_id"], "7", "resp: {r}");
 
     // 3. get_attachment_text → localmail returns application/json {"text": …};
     // the worker must surface the inner text, not the JSON envelope as a string.
@@ -145,4 +153,62 @@ fn mail_worker_stdio_roundtrip_against_mock() {
     drop(stdin); // EOF → worker exits its stdio loop.
     let _ = child.wait();
     std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// The #527 regression, reproduced end to end: take the `message_id` **exactly
+/// as `mail.search` returned it** and hand it straight to `mail.get_message`.
+///
+/// That is what the planner does, and until this fix it failed with
+/// `invalid type: string "7", expected i64` — 7 of the 14 live failures. Feeding
+/// the value through rather than retyping it as a literal is the whole point of
+/// the test: a hand-written `7` passes with or without the fix.
+#[test]
+fn a_message_id_taken_verbatim_from_a_search_hit_is_accepted() {
+    let (base, _mock) = spawn_mock();
+
+    let tmp = std::env::temp_dir().join(format!("mail-chain-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let token_file = tmp.join("token");
+    std::fs::write(&token_file, "e2e-token\n").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kastellan-worker-mail"))
+        .env("KASTELLAN_MAIL_ENDPOINT", &base)
+        .env("KASTELLAN_MAIL_TOKEN_FILE", &token_file)
+        .env("KASTELLAN_LANDLOCK_PROFILE", "none")
+        .env("KASTELLAN_SECCOMP_PROFILE", "none")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mail worker");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let hit = rpc(&mut stdin, &mut stdout, 1, "mail.search", serde_json::json!({"query": "invoice"}));
+    let id = hit["result"]["results"][0]["message_id"].clone();
+    assert!(id.is_string(), "fixture must serve the live string shape, got {id}");
+
+    // Verbatim — no parsing, no re-typing.
+    let got = rpc(&mut stdin, &mut stdout, 2, "mail.get_message", serde_json::json!({"message_id": id}));
+    assert!(
+        got.get("error").is_none(),
+        "get_message must accept the id search just returned; got {got}"
+    );
+    assert_eq!(got["result"]["id"], "7", "resp: {got}");
+
+    // The other 7 live failures: a cursor and a placeholder must now come back
+    // with text the planner can act on, since inner_loop feeds it the error.
+    let bad = rpc(&mut stdin, &mut stdout, 3, "mail.get_message",
+        serde_json::json!({"message_id": "ZHwyMDI2LTA4LTA4VDIyOjAxOjU4KzAwOjAwfDM3NDc0"}));
+    let msg = bad["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("next_cursor"), "cursor must be named; got {bad}");
+
+    let bad = rpc(&mut stdin, &mut stdout, 4, "mail.get_message",
+        serde_json::json!({"message_id": "{{message_id}}"}));
+    let msg = bad["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("NO template substitution"), "placeholder must be named; got {bad}");
+
+    let _ = child.kill();
+    let _ = child.wait();
 }

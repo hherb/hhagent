@@ -8,6 +8,7 @@ use std::path::Path;
 use kastellan_protocol::{codes, server::Handler, RpcError};
 
 use crate::client::{MailClient, MailError};
+use crate::ids::LocalmailId;
 
 pub struct MailHandler {
     client: MailClient,
@@ -58,12 +59,12 @@ impl MailHandler {
     fn get_message(&self, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         #[derive(serde::Deserialize)]
         struct P {
-            message_id: i64,
+            message_id: LocalmailId,
             #[serde(default)]
             full_headers: bool,
         }
         let p: P = parse_params(params)?;
-        let path = format!("/v1/messages/{}?full_headers={}", p.message_id, p.full_headers);
+        let path = format!("/v1/messages/{}?full_headers={}", p.message_id.get(), p.full_headers);
         self.client.get_json(&path).map_err(mail_err_to_rpc)
     }
 
@@ -71,9 +72,9 @@ impl MailHandler {
         #[derive(serde::Deserialize)]
         struct P {
             #[serde(default)]
-            account_ids: Option<Vec<i64>>,
+            account_ids: Option<Vec<LocalmailId>>,
             #[serde(default)]
-            folder_ids: Option<Vec<i64>>,
+            folder_ids: Option<Vec<LocalmailId>>,
             #[serde(default)]
             limit: Option<u32>,
             #[serde(default)]
@@ -248,7 +249,9 @@ fn safe_attachment_name(requested: Option<&str>, sha256: &str) -> String {
     format!("{prefix}_{stem}")
 }
 
-fn join_ids(v: &[i64]) -> String {
+/// `/v1/accounts` serves ids as strings too, so these arrive in either shape;
+/// `LocalmailId` has already validated them to digits by the time they get here.
+fn join_ids(v: &[LocalmailId]) -> String {
     v.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
 }
 
