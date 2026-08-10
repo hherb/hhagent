@@ -10,9 +10,10 @@
 //! NOT (writing a spurious row would corrupt the snapshot the approval gate
 //! reads).
 
+use crate::prompt_assembly::allowed_values::{render_allowed_values, AdvertisedTool};
 use crate::scheduler::tool_dispatch::HANDOFF_TOOL;
 use crate::scheduler::ToolRegistry;
-use crate::worker_manifest::{ResolveCtx, Resolution, ToolDoc, WorkerManifest};
+use crate::worker_manifest::{ResolveCtx, Resolution, WorkerManifest};
 
 /// Every worker the daemon may register. Adding a worker = add its
 /// `WorkerManifest` impl + one line here. Order is irrelevant (the registry
@@ -109,7 +110,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 pub async fn build_tool_registry(
     pool: &sqlx::PgPool,
     exe_dir: Option<std::path::PathBuf>,
-) -> Result<(ToolRegistry, Vec<LoadedToolRecord>, Vec<ToolDoc>), kastellan_db::DbError> {
+) -> Result<(ToolRegistry, Vec<LoadedToolRecord>, Vec<AdvertisedTool>), kastellan_db::DbError> {
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -169,13 +170,13 @@ pub fn build_registry_loaded_payload(tools: &[LoadedToolRecord]) -> serde_json::
 pub fn assemble_registry(
     manifests: &[&dyn WorkerManifest],
     ctx: &ResolveCtx<'_>,
-) -> (ToolRegistry, Vec<LoadedToolRecord>, Vec<ToolDoc>) {
+) -> (ToolRegistry, Vec<LoadedToolRecord>, Vec<AdvertisedTool>) {
     let mut reg = ToolRegistry::new();
     let mut loaded: Vec<LoadedToolRecord> = Vec::new();
     // Planner-facing tool descriptions, collected ONLY for tools that register
     // (the `Register` arm below) — a disabled/misconfigured worker is never
     // advertised, so the planner is never told of a tool it can't dispatch.
-    let mut docs: Vec<ToolDoc> = Vec::new();
+    let mut docs: Vec<AdvertisedTool> = Vec::new();
     for m in manifests {
         if m.name() == HANDOFF_TOOL {
             tracing::warn!(
@@ -256,8 +257,19 @@ pub fn assemble_registry(
                     allowlist_sha256: sha256_argv0_list(&allowlist),
                 });
                 reg.insert(name, entry);
+                // Advertise the operator allowlist when the worker declares
+                // one. Both halves are required: the kind picks the wording.
+                // Looked up via the DECLARED tool name rather than `name`,
+                // so a worker whose allowlist_tool() differs from name() is
+                // still correct.
+                let allowed = match (m.allowlist_tool(), m.allowlist_kind()) {
+                    (Some(tool), Some(kind)) => {
+                        Some(render_allowed_values(kind, &(ctx.allowlist)(tool)))
+                    }
+                    _ => None,
+                };
                 for doc in m.tool_docs() {
-                    docs.push(doc);
+                    docs.push(AdvertisedTool { doc, allowed: allowed.clone() });
                 }
             }
             Resolution::Disabled { detail } => {
@@ -703,9 +715,9 @@ mod tests {
             allowlist: &allowlist,
         };
         let (_reg, _loaded, docs) = assemble_registry(WORKER_MANIFESTS, &ctx);
-        assert!(docs.iter().any(|d| d.name == "shell-exec"), "shell-exec doc collected");
+        assert!(docs.iter().any(|d| d.doc.name == "shell-exec"), "shell-exec doc collected");
         assert!(
-            !docs.iter().any(|d| d.name == "web-search"),
+            !docs.iter().any(|d| d.doc.name == "web-search"),
             "disabled web-search must not be advertised"
         );
     }
@@ -738,6 +750,110 @@ mod tests {
                      add the override to its WorkerManifest impl"
                 );
             }
+        }
+    }
+
+    /// Build a ctx in which only the shell-exec exe-sibling exists, with `al`
+    /// answering the allowlist lookup. Mirrors the existing
+    /// `shell_exec_registers_with_no_override_env_via_exe_sibling` fixture.
+    fn shell_exec_only_ctx_parts(exe_dir: &Path) -> PathBuf {
+        exe_dir.join("kastellan-worker-shell-exec")
+    }
+
+    /// A declared allowlist reaches the advertised surface: sorted, and worded by
+    /// the declared `EntryKind`. This is the whole point of #533 — the planner was
+    /// never shown this set and guessed it one value per plan iteration.
+    #[test]
+    fn a_declared_allowlist_is_advertised_sorted_and_worded_by_kind() {
+        let exe_dir = PathBuf::from("/install/bin");
+        let sibling = shell_exec_only_ctx_parts(&exe_dir);
+        let get_env = |_k: &str| None;
+        let exists = {
+            let s = sibling.clone();
+            move |p: &Path| p == s.as_path()
+        };
+        // Deliberately NOT in sorted order — the renderer must sort.
+        let allowlist = |t: &str| {
+            if t == "shell-exec" {
+                vec!["/usr/bin/ls".to_string(), "/usr/bin/cat".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        let ctx = ResolveCtx {
+            get_env: &get_env,
+            exists: &exists,
+            is_dir: &|_p: &Path| false,
+            exe_dir: Some(exe_dir.as_path()),
+            canonicalize: &|_p| None,
+            allowlist: &allowlist,
+        };
+
+        let (_reg, _loaded, docs) = assemble_registry(WORKER_MANIFESTS, &ctx);
+        let shell = docs.iter().find(|d| d.doc.name == "shell-exec").expect("shell-exec advertised");
+        let allowed = shell.allowed.as_deref().expect("shell-exec declares an allowlist");
+        assert!(allowed.contains("/usr/bin/cat, /usr/bin/ls"), "sorted permitted set: {allowed}");
+        assert!(allowed.contains("argv[0]"), "argv0 wording: {allowed}");
+    }
+
+    /// Whether a permitted set is advertised follows the manifest's DECLARATION,
+    /// never the contents of the list. Run with an all-empty allowlist so
+    /// shell-exec is "declared but empty": it must still advertise (with the
+    /// refusal warning), because that is precisely the state in which every call
+    /// fails — the live 2026-06-20/21 regime that produced 15 of 15 failures.
+    #[test]
+    fn advertising_a_permitted_set_follows_the_declaration_not_the_contents() {
+        let exe_dir = PathBuf::from("/install/bin");
+        let sibling = shell_exec_only_ctx_parts(&exe_dir);
+        let get_env = |_k: &str| None;
+        let exists = {
+            let s = sibling.clone();
+            move |p: &Path| p == s.as_path()
+        };
+        let allowlist = |_t: &str| Vec::new();
+        let ctx = ResolveCtx {
+            get_env: &get_env,
+            exists: &exists,
+            is_dir: &|_p: &Path| false,
+            exe_dir: Some(exe_dir.as_path()),
+            canonicalize: &|_p| None,
+            allowlist: &allowlist,
+        };
+
+        let (_reg, _loaded, docs) = assemble_registry(WORKER_MANIFESTS, &ctx);
+        assert!(!docs.is_empty(), "at least shell-exec must register");
+        for d in &docs {
+            let m = WORKER_MANIFESTS
+                .iter()
+                .find(|m| m.name() == d.doc.name)
+                .expect("every advertised doc has a manifest");
+            assert_eq!(
+                d.allowed.is_some(),
+                m.allowlist_tool().is_some(),
+                "{}: advertising must follow the declaration, not the list contents",
+                d.doc.name
+            );
+        }
+        let shell = docs.iter().find(|d| d.doc.name == "shell-exec").expect("shell-exec advertised");
+        let allowed = shell.allowed.as_deref().expect("declared, so advertised even when empty");
+        assert!(allowed.contains("refused"), "empty ⇒ warn that calls fail: {allowed}");
+    }
+
+    /// `allowlist_tool()` and `allowlist_kind()` must be declared together: the
+    /// renderer needs the kind to pick its wording, so a worker declaring only the
+    /// tool would advertise nothing at all — silently.
+    ///
+    /// This guards the trait-declaration pairing and NOTHING adjacent to it (the
+    /// standing #516/#524/#525 lesson): it does not check the rendered wording.
+    #[test]
+    fn every_allowlist_worker_declares_both_tool_and_kind() {
+        for m in WORKER_MANIFESTS {
+            assert_eq!(
+                m.allowlist_tool().is_some(),
+                m.allowlist_kind().is_some(),
+                "{}: allowlist_tool() and allowlist_kind() must be declared together",
+                m.name()
+            );
         }
     }
 }
