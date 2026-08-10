@@ -155,7 +155,7 @@ fn render_handoff_block() -> String {
 /// Single pass: `&` maps to `&amp;` unconditionally, so an already-`&amp;`-
 /// looking body round-trips exactly as the old chained-`replace` form did.
 /// L0/skills are left verbatim — they are operator-gated, not laundered.
-fn escape_untrusted_body(body: &str) -> String {
+pub(super) fn escape_untrusted_body(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     for c in body.chars() {
         match c {

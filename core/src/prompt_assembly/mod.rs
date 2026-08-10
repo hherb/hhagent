@@ -35,10 +35,12 @@ use kastellan_db::DbError;
 use thiserror::Error;
 
 pub mod assemble;
+pub mod allowed_values;
 mod now;
 pub mod pg_builder;
 
 pub use assemble::assemble_system_prompt;
+pub use allowed_values::{render_allowed_values, AdvertisedTool, ADVERTISED_ALLOWLIST_MAX};
 pub use now::{resolve_timezone, TzSource};
 pub use pg_builder::{PgSystemPromptBuilder, StaticSystemPromptBuilder};
 
