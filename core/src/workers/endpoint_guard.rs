@@ -284,7 +284,7 @@ pub(crate) fn partition_dead_rows(
 ) -> (Vec<String>, Vec<String>) {
     let dead_hosts: Vec<&str> = dead_net_entries.iter().map(|e| host_of_entry(e)).collect();
     let (withheld, live): (Vec<String>, Vec<String>) =
-        rows.iter().cloned().partition(|r| dead_hosts.iter().any(|h| *h == r.as_str()));
+        rows.iter().cloned().partition(|r| dead_hosts.contains(&r.as_str()));
     if live.is_empty() && !rows.is_empty() {
         return (rows.to_vec(), Vec::new());
     }
