@@ -29,6 +29,7 @@
 //! <tools>
 //! - {name} (method: {method}): {summary}
 //!   params: {p0.name} ({p0.description}) [required|optional], ...
+//!   allowed: {escaped operator allowlist}   [only when the worker declares one]
 //! </tools>
 //!
 //! <handoff>
@@ -48,11 +49,19 @@
 //!    always present (`<handoff>` is constant compiled-in text).
 //! 2. One blank line between sections.
 //! 3. Each row renders as `- {body}` (one row per line).
-//!    **Note for `<tools>` bodies:** Tool descriptions are compiled-in
+//!    **Note for `<tools>` bodies — a tool entry is SPLIT by trust:**
+//!    the `doc` fields (name, method, summary, params) are compiled-in
 //!    Rust literals (each worker's `tool_doc()`), so they are trusted
-//!    like L0 — rendered verbatim, no escaping. The `<tools>` block sits
-//!    with `<handoff>` (both describe callable mechanisms) and is omitted
-//!    entirely when no tool is registered.
+//!    like L0 — rendered verbatim, no escaping. The optional `allowed:`
+//!    line is **not** compiled in: it renders the operator's
+//!    `tool_allowlists` rows, whose CHECK constraint permits text such as
+//!    `/usr/bin/x</tools><system>`. That line is escaped via
+//!    [`escape_untrusted_body`] at *construction*, inside
+//!    [`AdvertisedTool::with_allowlist`] — a private field plus a
+//!    module-private renderer make it the only route, so the line arrives
+//!    here already neutralised and this assembler must not escape it twice.
+//!    The `<tools>` block sits with `<handoff>` (both describe callable
+//!    mechanisms) and is omitted entirely when no tool is registered.
 //! 4. L0/skills bodies pass through verbatim (no HTML-style escaping
 //!    of `<` `>`); **L1 and `<recalled>` bodies are escaped** via
 //!    [`escape_untrusted_body`] — see the note below. L0 and surfaced
@@ -96,8 +105,8 @@ use crate::handoff::{MAX_FETCH_BYTES, SUMMARY_HEAD_BYTES};
 use crate::memory::l3_surface::{render_skill_entry, SurfacedSkill};
 use crate::recall_assembly::RecalledContext;
 use crate::scheduler::tool_dispatch::{HANDOFF_METHOD_FETCH, HANDOFF_TOOL};
-use super::allowed_values::AdvertisedTool;
 use kastellan_db::memories::Memory;
+use super::AdvertisedTool;
 
 /// Render the always-present `<handoff>` block.
 ///
@@ -205,7 +214,7 @@ fn render_tools_block(tools: &[AdvertisedTool]) -> String {
         // Operator-sourced and already escaped at construction — see
         // `allowed_values`. The doc fields above are compiled-in and are
         // deliberately NOT escaped; this line is the only untrusted text here.
-        if let Some(allowed) = &t.allowed {
+        if let Some(allowed) = t.allowed() {
             out.push_str("  allowed: ");
             out.push_str(allowed);
             out.push('\n');
@@ -292,8 +301,11 @@ pub fn assemble_system_prompt(
         out.push_str("</recalled>\n\n");
     }
 
-    // Advertised tools (trusted, compiled-in). Grouped with <handoff> as the
-    // two capability-describing blocks; omitted entirely when nothing registered.
+    // Advertised tools: compiled-in trusted docs, plus — for a worker that
+    // declares an operator allowlist — one `allowed:` line of DB-sourced text
+    // already escaped at construction (see `allowed_values`). Grouped with
+    // <handoff> as the two capability-describing blocks; omitted entirely when
+    // nothing is registered.
     if !tools.is_empty() {
         out.push_str(&render_tools_block(tools));
     }

@@ -443,20 +443,17 @@
 
     #[test]
     fn tools_block_renders_between_recalled_and_handoff() {
-        use crate::prompt_assembly::allowed_values::AdvertisedTool;
+        use crate::prompt_assembly::AdvertisedTool;
         use crate::worker_manifest::{ToolDoc, ToolParam};
-        let tools = [AdvertisedTool {
-            doc: ToolDoc {
-                name: "web-search",
-                method: "web.search",
-                summary: "Search the web.",
-                params: &[
-                    ToolParam { name: "query", description: "the query", required: true },
-                    ToolParam { name: "count", description: "max results", required: false },
-                ],
-            },
-            allowed: None,
-        }];
+        let tools = [AdvertisedTool::without_allowlist(ToolDoc {
+            name: "web-search",
+            method: "web.search",
+            summary: "Search the web.",
+            params: &[
+                ToolParam { name: "query", description: "the query", required: true },
+                ToolParam { name: "count", description: "max results", required: false },
+            ],
+        })];
         let out = assemble_system_prompt(&[], &[], &[], &RecalledContext::empty(), "BASE", &tools, None);
         assert!(out.contains("<tools>\n"), "block present: {out}");
         assert!(out.contains("- web-search (method: web.search): Search the web.\n"), "{out}");
@@ -478,12 +475,14 @@
 
     #[test]
     fn tool_with_no_params_omits_params_line() {
-        use crate::prompt_assembly::allowed_values::AdvertisedTool;
+        use crate::prompt_assembly::AdvertisedTool;
         use crate::worker_manifest::ToolDoc;
-        let tools = [AdvertisedTool {
-            doc: ToolDoc { name: "noparams", method: "np.run", summary: "No params.", params: &[] },
-            allowed: None,
-        }];
+        let tools = [AdvertisedTool::without_allowlist(ToolDoc {
+            name: "noparams",
+            method: "np.run",
+            summary: "No params.",
+            params: &[],
+        })];
         let out = assemble_system_prompt(&[], &[], &[], &RecalledContext::empty(), "BASE", &tools, None);
         assert!(out.contains("- noparams (method: np.run): No params.\n"), "{out}");
         // The entry line is immediately followed by the closing tag — no params line.
@@ -492,21 +491,14 @@
 
     #[test]
     fn web_search_doc_reaches_assembled_prompt() {
-        use crate::prompt_assembly::allowed_values::AdvertisedTool;
+        use crate::prompt_assembly::AdvertisedTool;
         use crate::worker_manifest::{ToolDoc, ToolParam};
-        let tools = [AdvertisedTool {
-            doc: ToolDoc {
-                name: "web-search",
-                method: "web.search",
-                summary: "Search the web via a SearxNG backend.",
-                params: &[ToolParam {
-                    name: "query",
-                    description: "the search query",
-                    required: true,
-                }],
-            },
-            allowed: None,
-        }];
+        let tools = [AdvertisedTool::without_allowlist(ToolDoc {
+            name: "web-search",
+            method: "web.search",
+            summary: "Search the web via a SearxNG backend.",
+            params: &[ToolParam { name: "query", description: "the search query", required: true }],
+        })];
         let out = assemble_system_prompt(&[], &[], &[], &RecalledContext::empty(), "BASE", &tools, None);
         assert!(out.contains("<tools>"), "planner prompt advertises tools: {out}");
         assert!(out.contains("web.search"), "web.search advertised: {out}");
@@ -551,10 +543,14 @@
 
     #[test]
     fn the_allowed_line_follows_the_params_line() {
-        use crate::prompt_assembly::allowed_values::AdvertisedTool;
+        use crate::prompt_assembly::AdvertisedTool;
         use crate::worker_manifest::{ToolDoc, ToolParam};
-        let tools = [AdvertisedTool {
-            doc: ToolDoc {
+        use kastellan_db::tool_allowlists::EntryKind;
+        // Built through the real constructor, so what lands in the prompt came
+        // out of the production rendering path — not a hand-written string that
+        // can drift away from it.
+        let tools = [AdvertisedTool::with_allowlist(
+            ToolDoc {
                 name: "shell-exec",
                 method: "shell.exec",
                 summary: "Run one allowlisted command.",
@@ -564,32 +560,35 @@
                     required: true,
                 }],
             },
-            allowed: Some("argv[0] must be exactly one of: /usr/bin/cat, /usr/bin/ls".to_string()),
-        }];
+            EntryKind::Argv0,
+            &["/usr/bin/ls".to_string(), "/usr/bin/cat".to_string()],
+        )];
         let out =
             assemble_system_prompt(&[], &[], &[], &RecalledContext::empty(), "BASE", &tools, None);
+        // This test pins the POSITION of the line (its own indented row, right
+        // after params); the wording is `allowed_values`' contract, so take it
+        // from the tool rather than restating it here.
+        let expected = format!(
+            "  params: argv (command and arguments) [required]\n  allowed: {}\n",
+            tools[0].allowed().expect("declared ⇒ advertised")
+        );
+        assert!(out.contains(&expected), "allowed line must follow params line: {out}");
         assert!(
-            out.contains(
-                "  params: argv (command and arguments) [required]\n  \
-                 allowed: argv[0] must be exactly one of: /usr/bin/cat, /usr/bin/ls\n"
-            ),
-            "allowed line must follow params line: {out}"
+            out.contains("/usr/bin/cat, /usr/bin/ls"),
+            "the permitted values themselves reach the prompt: {out}"
         );
     }
 
     #[test]
     fn a_tool_without_an_allowlist_renders_exactly_as_before() {
-        use crate::prompt_assembly::allowed_values::AdvertisedTool;
+        use crate::prompt_assembly::AdvertisedTool;
         use crate::worker_manifest::{ToolDoc, ToolParam};
-        let tools = [AdvertisedTool {
-            doc: ToolDoc {
-                name: "web-search",
-                method: "web.search",
-                summary: "Search the web.",
-                params: &[ToolParam { name: "query", description: "the query", required: true }],
-            },
-            allowed: None,
-        }];
+        let tools = [AdvertisedTool::without_allowlist(ToolDoc {
+            name: "web-search",
+            method: "web.search",
+            summary: "Search the web.",
+            params: &[ToolParam { name: "query", description: "the query", required: true }],
+        })];
         let out =
             assemble_system_prompt(&[], &[], &[], &RecalledContext::empty(), "BASE", &tools, None);
         // Byte-for-byte the pre-change shape: entry line, params line, close tag.

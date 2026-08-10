@@ -34,13 +34,17 @@ use async_trait::async_trait;
 use kastellan_db::DbError;
 use thiserror::Error;
 
-pub mod assemble;
 pub mod allowed_values;
+pub mod assemble;
 mod now;
 pub mod pg_builder;
 
+// One spelling for every consumer: `prompt_assembly::AdvertisedTool`. Nothing
+// outside `allowed_values` names the module path directly. The renderer and its
+// cap are deliberately NOT re-exported — the renderer is module-private (the
+// escaping seam, see `allowed_values`) and the cap has no caller outside it.
+pub use allowed_values::AdvertisedTool;
 pub use assemble::assemble_system_prompt;
-pub use allowed_values::{render_allowed_values, AdvertisedTool, ADVERTISED_ALLOWLIST_MAX};
 pub use now::{resolve_timezone, TzSource};
 pub use pg_builder::{PgSystemPromptBuilder, StaticSystemPromptBuilder};
 

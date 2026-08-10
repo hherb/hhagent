@@ -263,9 +263,8 @@ async fn main() -> Result<()> {
     // registered — `dispatch_step` then returns `UNKNOWN_TOOL`.
     let (registry, loaded_tool_records, tool_docs) =
         kastellan_core::registry_build::build_tool_registry(&pool, exe_dir).await?;
-    let tool_docs: std::sync::Arc<
-        [kastellan_core::prompt_assembly::allowed_values::AdvertisedTool],
-    > = std::sync::Arc::from(tool_docs);
+    let tool_docs: std::sync::Arc<[kastellan_core::prompt_assembly::AdvertisedTool]> =
+        std::sync::Arc::from(tool_docs);
     let tool_registry = Arc::new(registry);
     // Best-effort audit row (was previously written inside build_tool_registry;
     // moved here now that the builder is side-effect-free).

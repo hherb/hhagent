@@ -14,10 +14,10 @@ use sqlx::PgPool;
 
 use crate::memory::l0_seed::load_l0_active_default;
 use crate::memory::layers::load_l1_default;
-use super::allowed_values::AdvertisedTool;
 
 use super::{
-    assemble::assemble_system_prompt, AssembledPrompt, PromptAssemblyError, SystemPromptBuilder,
+    assemble::assemble_system_prompt, AdvertisedTool, AssembledPrompt, PromptAssemblyError,
+    SystemPromptBuilder,
 };
 
 /// Production builder: loads L0 + L1 from Postgres on every call.
@@ -169,15 +169,14 @@ mod tests {
         // A lazily-connected pool that is never queried in this unit test.
         // `connect_lazy` needs a Tokio context, hence `#[tokio::test]`.
         let pool = PgPool::connect_lazy("postgres://unused").expect("lazy pool");
-        let docs: Arc<[AdvertisedTool]> = Arc::from(vec![AdvertisedTool {
-            doc: ToolDoc {
+        let docs: Arc<[AdvertisedTool]> = Arc::from(vec![AdvertisedTool::without_allowlist(
+            ToolDoc {
                 name: "web-search",
                 method: "web.search",
                 summary: "Search the web.",
                 params: &[],
             },
-            allowed: None,
-        }]);
+        )]);
         let b = PgSystemPromptBuilder::new(pool).with_tool_docs(docs);
         assert_eq!(b.tool_docs_for_test().len(), 1);
         assert_eq!(b.tool_docs_for_test()[0].doc.name, "web-search");

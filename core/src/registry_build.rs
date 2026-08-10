@@ -10,7 +10,7 @@
 //! NOT (writing a spurious row would corrupt the snapshot the approval gate
 //! reads).
 
-use crate::prompt_assembly::allowed_values::{render_allowed_values, AdvertisedTool};
+use crate::prompt_assembly::AdvertisedTool;
 use crate::scheduler::tool_dispatch::HANDOFF_TOOL;
 use crate::scheduler::ToolRegistry;
 use crate::worker_manifest::{ResolveCtx, Resolution, WorkerManifest};
@@ -261,15 +261,20 @@ pub fn assemble_registry(
                 // one. Both halves are required: the kind picks the wording.
                 // Looked up via the DECLARED tool name rather than `name`,
                 // so a worker whose allowlist_tool() differs from name() is
-                // still correct.
-                let allowed = match (m.allowlist_tool(), m.allowlist_kind()) {
-                    (Some(tool), Some(kind)) => {
-                        Some(render_allowed_values(kind, &(ctx.allowlist)(tool)))
-                    }
+                // still correct. Fetched once per manifest, then rendered per
+                // doc by `with_allowlist` (which is where the escaping lives —
+                // this site never touches the raw DB text).
+                let declared = match (m.allowlist_tool(), m.allowlist_kind()) {
+                    (Some(tool), Some(kind)) => Some((kind, (ctx.allowlist)(tool))),
                     _ => None,
                 };
                 for doc in m.tool_docs() {
-                    docs.push(AdvertisedTool { doc, allowed: allowed.clone() });
+                    docs.push(match &declared {
+                        Some((kind, entries)) => {
+                            AdvertisedTool::with_allowlist(doc, *kind, entries)
+                        }
+                        None => AdvertisedTool::without_allowlist(doc),
+                    });
                 }
             }
             Resolution::Disabled { detail } => {
@@ -734,29 +739,11 @@ mod tests {
         assert_eq!(allowlist_kind_for_tool("nonexistent-tool"), None);
     }
 
-    /// Every manifest that declares an allowlist must also declare its KIND.
-    /// Without this, a future network worker that overrides `allowlist_tool`
-    /// but forgets `allowlist_kind` silently inherits the `Argv0` default, and
-    /// the operator's first `tools allowlist add <tool> example.org` fails with
-    /// "argv0 must be an absolute path" — a fail-closed but thoroughly
-    /// misleading error. Cheap to pin, so pin it.
-    #[test]
-    fn every_allowlist_declaring_manifest_also_declares_a_kind() {
-        for m in WORKER_MANIFESTS {
-            if let Some(tool) = m.allowlist_tool() {
-                assert!(
-                    m.allowlist_kind().is_some(),
-                    "{tool} declares allowlist_tool() but not allowlist_kind(); \
-                     add the override to its WorkerManifest impl"
-                );
-            }
-        }
-    }
-
-    /// Build a ctx in which only the shell-exec exe-sibling exists, with `al`
-    /// answering the allowlist lookup. Mirrors the existing
+    /// The exe-relative sibling path shell-exec resolves to when no override
+    /// env is set — the one path a ctx must report as existing for shell-exec
+    /// (and only shell-exec) to register. Mirrors the existing
     /// `shell_exec_registers_with_no_override_env_via_exe_sibling` fixture.
-    fn shell_exec_only_ctx_parts(exe_dir: &Path) -> PathBuf {
+    fn shell_exec_sibling(exe_dir: &Path) -> PathBuf {
         exe_dir.join("kastellan-worker-shell-exec")
     }
 
@@ -766,7 +753,7 @@ mod tests {
     #[test]
     fn a_declared_allowlist_is_advertised_sorted_and_worded_by_kind() {
         let exe_dir = PathBuf::from("/install/bin");
-        let sibling = shell_exec_only_ctx_parts(&exe_dir);
+        let sibling = shell_exec_sibling(&exe_dir);
         let get_env = |_k: &str| None;
         let exists = {
             let s = sibling.clone();
@@ -791,7 +778,7 @@ mod tests {
 
         let (_reg, _loaded, docs) = assemble_registry(WORKER_MANIFESTS, &ctx);
         let shell = docs.iter().find(|d| d.doc.name == "shell-exec").expect("shell-exec advertised");
-        let allowed = shell.allowed.as_deref().expect("shell-exec declares an allowlist");
+        let allowed = shell.allowed().expect("shell-exec declares an allowlist");
         assert!(allowed.contains("/usr/bin/cat, /usr/bin/ls"), "sorted permitted set: {allowed}");
         assert!(allowed.contains("argv[0]"), "argv0 wording: {allowed}");
     }
@@ -804,7 +791,7 @@ mod tests {
     #[test]
     fn advertising_a_permitted_set_follows_the_declaration_not_the_contents() {
         let exe_dir = PathBuf::from("/install/bin");
-        let sibling = shell_exec_only_ctx_parts(&exe_dir);
+        let sibling = shell_exec_sibling(&exe_dir);
         let get_env = |_k: &str| None;
         let exists = {
             let s = sibling.clone();
@@ -828,20 +815,27 @@ mod tests {
                 .find(|m| m.name() == d.doc.name)
                 .expect("every advertised doc has a manifest");
             assert_eq!(
-                d.allowed.is_some(),
+                d.allowed().is_some(),
                 m.allowlist_tool().is_some(),
                 "{}: advertising must follow the declaration, not the list contents",
                 d.doc.name
             );
         }
         let shell = docs.iter().find(|d| d.doc.name == "shell-exec").expect("shell-exec advertised");
-        let allowed = shell.allowed.as_deref().expect("declared, so advertised even when empty");
+        let allowed = shell.allowed().expect("declared, so advertised even when empty");
         assert!(allowed.contains("refused"), "empty ⇒ warn that calls fail: {allowed}");
     }
 
     /// `allowlist_tool()` and `allowlist_kind()` must be declared together: the
     /// renderer needs the kind to pick its wording, so a worker declaring only the
     /// tool would advertise nothing at all — silently.
+    ///
+    /// The other direction has bitten operators since before #533: a network
+    /// worker that overrides `allowlist_tool` but forgets `allowlist_kind`
+    /// silently inherits the `Argv0` default, and the operator's first
+    /// `tools allowlist add <tool> example.org` fails with "argv0 must be an
+    /// absolute path" — fail-closed, but thoroughly misleading. The `assert_eq!`
+    /// below is bidirectional and covers both.
     ///
     /// This guards the trait-declaration pairing and NOTHING adjacent to it (the
     /// standing #516/#524/#525 lesson): it does not check the rendered wording.

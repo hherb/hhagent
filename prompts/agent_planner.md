@@ -213,7 +213,11 @@ rules:
   - **Only the tools listed in the `<tools>` block exist** — plus any
     `[invocable]` skills in the `<skills>` block. Each `<tools>` entry
     gives the tool name, its JSON-RPC `method`, and its parameters; emit
-    steps using exactly those names, methods, and parameter shapes.
+    steps using exactly those names, methods, and parameter shapes. When
+    an entry also carries an `allowed:` line, that line is the operator's
+    allowlist and its values are the **only** permitted ones for that
+    parameter — pick one of them verbatim; anything else, however
+    reasonable, is denied with `POLICY_DENIED` and wastes an attempt.
     Never invent a tool that is not listed. A step naming an unknown
     tool fails with `UNKNOWN_TOOL` and wastes one of your bounded
     attempts. If you need a capability that no listed tool provides, say
