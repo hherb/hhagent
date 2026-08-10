@@ -13,11 +13,18 @@
 //!
 //! [`crate::worker_manifest::ToolDoc`] is all-`'static` and documented as
 //! "compiled-in ⇒ trusted (no escaping at the render site)". An allowlist is
-//! NOT compiled in: it comes from the `tool_allowlists` table, whose CHECK
-//! constraint enforces only a leading `/` (for `argv0`) and no `..` segments.
-//! `/usr/bin/x</tools><system>` satisfies the database. [`AdvertisedTool`] is
-//! therefore the single route by which non-compiled-in text reaches the
-//! `<tools>` block, and every entry goes through `escape_untrusted_body`.
+//! NOT compiled in: it comes from the `tool_allowlists` table, and for
+//! **`argv0` rows** migration `0021`'s `tool_allowlists_entry_shape` CHECK
+//! requires only a leading `/` and no `..` segment (`validate_argv0` adds only
+//! a NUL rejection), so `/usr/bin/x</tools><system>` satisfies both. Domain
+//! rows are NOT an injection vector — the same CHECK constrains them to
+//! `^\.?[A-Za-z0-9.-]+$` or a bracketed IPv6 literal, which excludes `<`, `>`,
+//! `&` and whitespace outright. The escaping is therefore load-bearing for
+//! `argv0` rows and belt-and-braces for domain rows; it is applied to both
+//! because the seam, not the row kind, is what must be unskippable.
+//! [`AdvertisedTool`] is the single route by which non-compiled-in text
+//! reaches the `<tools>` block, and every entry goes through
+//! `escape_untrusted_body`.
 //!
 //! That routing is enforced by the type, not by convention: `allowed` is a
 //! private field and [`render_allowed_values`] is module-private, so the only
@@ -33,21 +40,37 @@ use crate::worker_manifest::ToolDoc;
 /// Cap on how many allowlist entries are advertised.
 ///
 /// Governs prompt shape, so it is a compile-time const rather than an env
-/// knob: an env key is silently lost across reinstalls (#458), and a knob
-/// that disappears on install and changes the planner's prompt is a bad
-/// trade for a value under no live pressure. Changing it cuts a release.
+/// knob: `install` regenerates `kastellan.env`, so a hand-added key survives
+/// only if the operator knows to put it in `kastellan.env.local` (#458 made
+/// that loss loud and recoverable, not impossible). A knob that silently
+/// reverts to its default on reinstall — and changes the planner's prompt when
+/// it does — is a bad trade for a value under no live pressure. Changing this
+/// cuts a release.
+///
+/// Caps the entry COUNT, not the rendered byte length: `validate_argv0` puts
+/// no length bound on an `argv0` row, so 30 long rows can still be large. See
+/// the byte-budget follow-up issue; `<tools>` shares the prompt's global
+/// untracked budget (#78) today.
 pub const ADVERTISED_ALLOWLIST_MAX: usize = 30;
 
 /// One advertised tool: its compiled-in doc plus, when the worker declares an
 /// operator allowlist, the escaped rendering of the permitted value set.
 ///
-/// The permitted set is `None` **only** when the worker declares no allowlist
-/// at all. A worker that declares one which happens to be empty gets
-/// `Some(warning)` — the two are different facts and conflating them hides the
-/// case where every call will be refused. Pick the constructor that states
-/// which of those two worlds the *manifest declares*
-/// ([`Self::with_allowlist`] / [`Self::without_allowlist`]); never infer it
-/// from whether the entry list happens to be empty.
+/// The permitted set is `None` when the worker declares no allowlist. A worker
+/// that declares one which happens to be **empty** gets `Some(warning)` — the
+/// two are different facts and conflating them hides the case where every call
+/// will be refused. Pick the constructor that states which of those two worlds
+/// the *manifest declares* ([`Self::with_allowlist`] /
+/// [`Self::without_allowlist`]); never infer it from whether the entry list
+/// happens to be empty.
+///
+/// One further way to reach `None` exists and is a **misconfiguration**, not a
+/// declaration: a manifest that overrides `allowlist_tool()` but not
+/// `allowlist_kind()` has no kind for the renderer to word the line with, so
+/// `registry_build` cannot advertise it. That worker's allowlist is still
+/// ENFORCED, so the symptom is the planner guessing again (i.e. #533 reopening
+/// for that one tool) rather than an error — which is why the call site logs a
+/// `warn!` naming the missing override rather than passing silently.
 pub struct AdvertisedTool {
     /// Compiled-in, trusted, never escaped. Invariant unchanged.
     pub doc: ToolDoc,
@@ -98,21 +121,51 @@ fn render_allowed_values(kind: EntryKind, entries: &[String]) -> String {
     if entries.is_empty() {
         // Deliberately not "the allowlist is empty" — that reads as
         // UNRESTRICTED to a model, inverting the meaning.
-        let what = match kind {
-            EntryKind::Argv0 => "argv[0] value",
-            EntryKind::Domain => "host",
+        //
+        // The consequence is stated per kind because it genuinely differs, and
+        // this line is live on the DGX today for the three domain workers
+        // (which sit at zero rows):
+        //   * argv0 — `shell-exec` string-matches argv[0] against the list, so
+        //     an empty list refuses every dispatch. The strong claim is true.
+        //   * domain — the list gates the worker's own egress, not a parameter.
+        //     `web-fetch`/`browser-driver` fail per call, but `web.research`
+        //     has no host parameter: it still searches and returns every hit as
+        //     an UNFETCHED source. "every call will be refused" would be false
+        //     there, and a planner that believed it would abandon the half of
+        //     the tool that still works.
+        // The remedy names the restart because the allowlist is read exactly
+        // once, at daemon bring-up (`registry_build::build_tool_registry`);
+        // `tools allowlist add` alone changes nothing until then.
+        return match kind {
+            EntryKind::Argv0 => "no argv[0] value is currently permitted — every call to this \
+                                 tool will be refused until an operator adds one and the daemon \
+                                 restarts"
+                .to_string(),
+            EntryKind::Domain => "no host is currently permitted — this tool can currently reach \
+                                  nothing, so calls will fail or return no usable content until \
+                                  an operator adds a host and the daemon restarts"
+                .to_string(),
         };
-        return format!(
-            "no {what} is currently permitted — every call to this tool will be \
-             refused until an operator adds one"
-        );
     }
 
+    // Sorted so the rendering is a pure function of the SET, not of row order.
+    // `list_for_tool` does `ORDER BY argv0 ASC` today, but that is Postgres
+    // COLLATION order while this is byte order, and a pure renderer must not
+    // inherit its determinism from one caller's query — a locale change or a
+    // second caller would otherwise reshuffle the prompt between restarts.
     let mut sorted: Vec<&str> = entries.iter().map(String::as_str).collect();
     sorted.sort_unstable();
 
     let shown = sorted.len().min(ADVERTISED_ALLOWLIST_MAX);
-    let listed: Vec<String> = sorted[..shown].iter().map(|e| escape_untrusted_body(e)).collect();
+    // Each entry is individually quoted, NOT just comma-joined. `validate_argv0`
+    // accepts any absolute path, commas and spaces included, so the single row
+    // `/usr/bin/ls, /usr/bin/cat` would otherwise render as two permitted values
+    // — NEITHER of which is permitted, since the one permitted argv0 is the
+    // whole comma string. The planner would then fail every dispatch while the
+    // line looked perfectly correct. Quoting makes the row boundaries explicit;
+    // `registry_build` separately warns the operator about such a row.
+    let listed: Vec<String> =
+        sorted[..shown].iter().map(|e| format!("`{}`", escape_untrusted_body(e))).collect();
 
     let lead = match kind {
         EntryKind::Argv0 => "argv[0] must be exactly one of",
@@ -156,23 +209,65 @@ mod tests {
         // "the allowlist is empty" reads as UNRESTRICTED to a model — the
         // opposite of the truth. The line must say calls will be refused.
         assert!(line.contains("refused"), "must state calls are refused: {line}");
-        assert!(!line.contains(':'), "no value list to introduce: {line}");
+        // Names the argv0 kind, not the domain kind: swapping the two match
+        // arms is a textbook copy-paste mutation and `contains("refused")`
+        // alone would not notice it.
+        assert!(line.contains("argv[0]"), "argv0 wording: {line}");
+        // No value list is introduced. Asserted against the LEAD text rather
+        // than the absence of a colon — a better-worded warning may legitimately
+        // contain a colon (e.g. naming the CLI command that fixes it).
+        assert!(
+            !line.contains("must be exactly one of"),
+            "no value list to introduce: {line}"
+        );
+        // The remedy must name the restart: the allowlist is read once, at
+        // bring-up, so `tools allowlist add` alone changes nothing.
+        assert!(line.contains("restart"), "remedy names the restart: {line}");
     }
 
     #[test]
-    fn an_empty_domain_allowlist_says_every_call_will_be_refused() {
+    fn an_empty_domain_allowlist_states_the_consequence_without_claiming_refusal() {
         let line = render_allowed_values(EntryKind::Domain, &[]);
-        assert!(line.contains("refused"), "must state calls are refused: {line}");
+        // A domain allowlist gates the WORKER'S OWN EGRESS, not a parameter.
+        // `web.research` has no host parameter: with zero rows it still searches
+        // and returns every hit as an unfetched source, so "every call will be
+        // refused" is false and would make a planner abandon the working half.
+        assert!(
+            !line.contains("refused"),
+            "must not claim refusal — web.research still serves: {line}"
+        );
+        assert!(line.contains("reach nothing"), "states the real consequence: {line}");
+        assert!(line.contains("host"), "domain wording: {line}");
+        assert!(line.contains("restart"), "remedy names the restart: {line}");
     }
 
     #[test]
     fn the_rendering_does_not_depend_on_input_order() {
-        // The DB query guarantees no ordering and this text sits in the
-        // system prompt's KV-cache prefix, so the output must be stable.
+        // `list_for_tool` is `ORDER BY argv0 ASC`, but that is Postgres
+        // COLLATION order and this is byte order — a pure renderer must not
+        // inherit determinism from one caller's query, or a locale change
+        // reshuffles the prompt between restarts.
         let a = render_allowed_values(EntryKind::Argv0, &v(&["/usr/bin/ls", "/usr/bin/cat"]));
         let b = render_allowed_values(EntryKind::Argv0, &v(&["/usr/bin/cat", "/usr/bin/ls"]));
         assert_eq!(a, b, "shuffled input must render identically");
-        assert!(a.contains("/usr/bin/cat, /usr/bin/ls"), "sorted ascending: {a}");
+        assert!(a.contains("`/usr/bin/cat`, `/usr/bin/ls`"), "sorted ascending: {a}");
+    }
+
+    #[test]
+    fn one_row_containing_a_comma_cannot_fabricate_two_permitted_values() {
+        // `validate_argv0` accepts any absolute path, commas included, so this
+        // is a single permitted value — and NEITHER `/usr/bin/ls` nor
+        // `/usr/bin/cat` is permitted on its own. Comma-joining unquoted would
+        // advertise two values that both fail every dispatch.
+        let line = render_allowed_values(EntryKind::Argv0, &v(&["/usr/bin/ls, /usr/bin/cat"]));
+        assert!(
+            line.contains("`/usr/bin/ls, /usr/bin/cat`"),
+            "the row must render as ONE quoted value: {line}"
+        );
+        assert!(
+            !line.contains("`/usr/bin/ls`"),
+            "must not appear as a standalone permitted value: {line}"
+        );
     }
 
     #[test]
@@ -183,8 +278,9 @@ mod tests {
         let line = render_allowed_values(EntryKind::Argv0, &many);
         // A truncated list that reads as exhaustive would make the planner
         // skip a value that IS permitted — a failure mode invented by the fix.
-        assert!(line.contains("30"), "shown count present: {line}");
-        assert!(line.contains("31"), "total count present: {line}");
+        // Asserts the numbers' ROLES, not merely their presence: "showing 31 of
+        // 30" would otherwise pass and overstate what the planner can see.
+        assert!(line.contains("showing 30 of 31"), "shown-of-total, in order: {line}");
         assert_eq!(line.matches("/usr/bin/tool").count(), ADVERTISED_ALLOWLIST_MAX);
     }
 
@@ -229,9 +325,14 @@ mod tests {
 
     #[test]
     fn the_two_kinds_render_different_wording() {
-        let argv0 = render_allowed_values(EntryKind::Argv0, &v(&["/usr/bin/ls"]));
-        let domain = render_allowed_values(EntryKind::Domain, &v(&["example.org"]));
-        assert_ne!(argv0, domain);
+        // The SAME entry under both kinds, so `assert_ne!` is load-bearing:
+        // with different entries the two strings differ regardless of whether
+        // the kinds share wording, and the mutation "collapse both arms" would
+        // survive.
+        let same = v(&["example.org"]);
+        let argv0 = render_allowed_values(EntryKind::Argv0, &same);
+        let domain = render_allowed_values(EntryKind::Domain, &same);
+        assert_ne!(argv0, domain, "the kinds must not share wording");
         assert!(argv0.contains("argv[0]"), "argv0 wording: {argv0}");
         assert!(domain.contains("host"), "domain wording: {domain}");
     }

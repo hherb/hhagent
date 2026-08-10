@@ -96,6 +96,58 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// Operator-facing warnings about the permitted set that is about to be
+/// advertised to the planner.
+///
+/// Lives here rather than in the renderer because `prompt_assembly` deliberately
+/// holds no `tracing` (the renderer is a pure function), while both conditions
+/// below are silent from the operator's side and have a prompt consequence:
+/// the rendered `allowed:` line is never persisted — `inner_loop_audit` stores
+/// only `system_prompt_sha256` — so an operator cannot read back what the
+/// planner was told.
+fn advertisement_warnings(tool: &str, entries: &[String]) {
+    use crate::prompt_assembly::allowed_values::ADVERTISED_ALLOWLIST_MAX;
+
+    // The cap is announced to the MODEL ("showing 30 of 31") but was silent to
+    // the operator, who would otherwise have no way to learn that adding a 31st
+    // entry left it permanently invisible to the planner.
+    if entries.len() > ADVERTISED_ALLOWLIST_MAX {
+        // Same sort the renderer applies, so `withheld` names the entries it
+        // actually drops rather than an arbitrary suffix.
+        let mut sorted: Vec<&str> = entries.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        tracing::warn!(
+            tool,
+            total = entries.len(),
+            advertised = ADVERTISED_ALLOWLIST_MAX,
+            withheld = ?&sorted[ADVERTISED_ALLOWLIST_MAX..],
+            "allowlist exceeds the advertised cap: these entries are ENFORCED but \
+             invisible to the planner, which will never propose them"
+        );
+    }
+
+    // A row carrying a comma, whitespace or a backtick cannot be a plausible
+    // argv0 and does not render unambiguously in a quoted, comma-joined list.
+    // Advertised anyway — withholding it would make the advertisement disagree
+    // with what the worker enforces — but the operator is told, because the
+    // near-certain cause is one `tools allowlist add` that meant to add several.
+    let ambiguous: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.contains(',') || e.contains('`') || e.chars().any(char::is_whitespace))
+        .map(String::as_str)
+        .collect();
+    if !ambiguous.is_empty() {
+        tracing::warn!(
+            tool,
+            entries = ?ambiguous,
+            "tool_allowlists rows carry a comma, whitespace or a backtick, so each is ONE \
+             permitted value that no plausible command matches — did a single \
+             `tools allowlist add` mean to add several entries? They are advertised \
+             quoted, so the planner at least sees the real value boundaries"
+        );
+    }
+}
+
 /// Build the registry of tools the scheduler may dispatch by resolving every
 /// [`WORKER_MANIFESTS`] entry against the host environment. Pre-fetches each
 /// manifest's argv allowlist from the `tool_allowlists` DB table (the only
@@ -220,6 +272,10 @@ pub fn assemble_registry(
                     entry_is_vm(&entry),
                     ctx.get_env,
                 );
+                // Net entries this screen proved statically undialable. Captured
+                // rather than only logged because the advertisement below must
+                // not tell the planner such a host is reachable.
+                let mut dead_net_entries: Vec<String> = Vec::new();
                 if let kastellan_sandbox::Net::Allowlist(net_entries) = &entry.policy.net {
                     use crate::workers::endpoint_guard::{screen_net_allowlist, NetScreen};
                     match screen_net_allowlist(name, net_entries, force_routed) {
@@ -239,11 +295,21 @@ pub fn assemble_registry(
                                  matching tool_allowlists rows / endpoint env vars to \
                                  agree)"
                             );
+                            dead_net_entries = dead;
                         }
                         NetScreen::Ok => {}
                     }
                 }
-                let allowlist = (ctx.allowlist)(name);
+                // ONE key for the fetch, the boot log, the audit record and the
+                // advertisement. `allowlist_tool()` is the key `build_tool_registry`
+                // prefetches under, so for a worker where it differs from `name()`
+                // keying the audit record on `name()` would report `allowlist_len: 0`
+                // and the SHA-256 of the empty list while the prompt advertised the
+                // real set — two disagreeing accounts of one allowlist, with no
+                // diagnostic. Every current manifest returns the same constant from
+                // both, so this is drift-proofing, not a live fix.
+                let al_key = m.allowlist_tool().unwrap_or(name);
+                let allowlist = (ctx.allowlist)(al_key);
                 tracing::info!(
                     tool = name,
                     binary = %entry.binary.display(),
@@ -257,16 +323,63 @@ pub fn assemble_registry(
                     allowlist_sha256: sha256_argv0_list(&allowlist),
                 });
                 reg.insert(name, entry);
-                // Advertise the operator allowlist when the worker declares
-                // one. Both halves are required: the kind picks the wording.
-                // Looked up via the DECLARED tool name rather than `name`,
-                // so a worker whose allowlist_tool() differs from name() is
-                // still correct. Fetched once per manifest, then rendered per
-                // doc by `with_allowlist` (which is where the escaping lives —
-                // this site never touches the raw DB text).
+                // Advertise the operator allowlist when the worker declares one.
+                // Both halves are required: the kind picks the wording, so a
+                // manifest with only `allowlist_tool()` cannot be advertised at
+                // all — warned about below rather than passed over silently,
+                // because its allowlist is still ENFORCED and the symptom is the
+                // planner going back to guessing (#533 reopening for that tool).
+                //
+                // `declared` carries the LIVE rows only: entries the screen above
+                // proved dead are withheld, so the planner is never told a host is
+                // reachable that the daemon has already computed is not. Fetched
+                // once per manifest, then rendered per doc by `with_allowlist`
+                // (which is where the escaping lives — this site never touches the
+                // raw DB text).
                 let declared = match (m.allowlist_tool(), m.allowlist_kind()) {
-                    (Some(tool), Some(kind)) => Some((kind, (ctx.allowlist)(tool))),
-                    _ => None,
+                    (Some(_), Some(kind)) => {
+                        let (live, withheld) =
+                            crate::workers::endpoint_guard::partition_dead_rows(
+                                &allowlist,
+                                &dead_net_entries,
+                            );
+                        if !withheld.is_empty() {
+                            tracing::warn!(
+                                tool = name,
+                                withheld = ?withheld,
+                                "tool_allowlists rows are statically dead and will NOT be \
+                                 advertised to the planner (they are still enforced, so a \
+                                 request naming one is refused rather than silently allowed) \
+                                 — fix or remove the rows"
+                            );
+                        }
+                        advertisement_warnings(name, &live);
+                        Some((kind, live))
+                    }
+                    (Some(tool), None) => {
+                        tracing::warn!(
+                            tool = name,
+                            allowlist_tool = tool,
+                            "worker declares allowlist_tool() but not allowlist_kind(); its \
+                             operator allowlist is ENFORCED but will NOT be advertised to \
+                             the planner, which then guesses permitted values one plan \
+                             iteration at a time (#533) — and `tools allowlist add` will \
+                             validate its entries as argv0 paths. Add the allowlist_kind() \
+                             override to its WorkerManifest impl"
+                        );
+                        None
+                    }
+                    (None, Some(kind)) => {
+                        tracing::warn!(
+                            tool = name,
+                            ?kind,
+                            "worker declares allowlist_kind() but not allowlist_tool(); the \
+                             kind is dead code — no allowlist is fetched, enforced or \
+                             advertised"
+                        );
+                        None
+                    }
+                    (None, None) => None,
                 };
                 for doc in m.tool_docs() {
                     docs.push(match &declared {
@@ -296,11 +409,23 @@ mod tests {
 
     /// A fake worker for assembly tests. `outcome` selects which arm
     /// `resolve` returns; `allowlist_name` (if Some) is reported from
-    /// `allowlist_tool()` so the prefetch-keying path is exercised.
+    /// `allowlist_tool()` so the allowlist-lookup path is exercised (the
+    /// *prefetch* itself lives in `build_tool_registry`, which only ever
+    /// iterates the real `WORKER_MANIFESTS` and never sees a fake).
     struct FakeManifest {
         name: &'static str,
         outcome: FakeOutcome,
         allowlist_name: Option<&'static str>,
+        /// When true, `tool_doc()` returns a synthetic doc, so this fake reaches
+        /// the ADVERTISED surface (the returned `Vec<AdvertisedTool>`) and not
+        /// only the registry. Without it a fake contributes no docs at all and
+        /// any assertion over `docs` silently has nothing to look at.
+        advertise_doc: bool,
+        /// Reported from `allowlist_kind()`. Deliberately independent of
+        /// `allowlist_name`: the two halves must be declarable *separately* so
+        /// the declared-together guard and the tool-without-kind warn arm are
+        /// both reachable from a test.
+        allowlist_kind: Option<kastellan_db::tool_allowlists::EntryKind>,
     }
     enum FakeOutcome {
         Register,
@@ -325,6 +450,17 @@ mod tests {
         }
         fn allowlist_tool(&self) -> Option<&'static str> {
             self.allowlist_name
+        }
+        fn allowlist_kind(&self) -> Option<kastellan_db::tool_allowlists::EntryKind> {
+            self.allowlist_kind
+        }
+        fn tool_doc(&self) -> Option<crate::worker_manifest::ToolDoc> {
+            self.advertise_doc.then_some(crate::worker_manifest::ToolDoc {
+                name: self.name,
+                method: "fake.run",
+                summary: "A fake tool.",
+                params: &[],
+            })
         }
         fn resolve(&self, ctx: &ResolveCtx<'_>) -> Resolution {
             match &self.outcome {
@@ -407,6 +543,8 @@ mod tests {
                 "svc.localhost:8080".to_string(),
             ]),
             allowlist_name: None,
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
         assert!(reg.lookup("deadtool").is_none(), "statically dead tool must not register");
@@ -424,6 +562,8 @@ mod tests {
                 "localhost:443".to_string(),
             ]),
             allowlist_name: None,
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
         assert!(reg.lookup("mixedtool").is_some(), "subset-dead tool still registers");
@@ -438,6 +578,8 @@ mod tests {
             name: "hosttool",
             outcome: FakeOutcome::RegisterWithNet(vec!["localhost:443".to_string()]),
             allowlist_name: None,
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
         assert!(reg.lookup("hosttool").is_some(), "no force-routing ⇒ untouched");
@@ -456,6 +598,8 @@ mod tests {
             name: "vmdead",
             outcome: FakeOutcome::RegisterVmWithNet(vec!["localhost:443".to_string()]),
             allowlist_name: None,
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
         assert!(reg.lookup("vmdead").is_none(), "VM ⇒ always forced ⇒ all-dead refused");
@@ -472,6 +616,8 @@ mod tests {
             name: "denytool",
             outcome: FakeOutcome::Register,
             allowlist_name: None,
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let (reg, _loaded, _docs) = assemble_registry(&[&m], &ctx);
         assert!(reg.lookup("denytool").is_some());
@@ -495,6 +641,8 @@ mod tests {
             name: "brokertool",
             outcome: FakeOutcome::RegisterBrokerSearch,
             allowlist_name: None,
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
         assert!(reg.lookup("brokertool").is_some(), "broker present ⇒ registers");
@@ -510,6 +658,8 @@ mod tests {
             name: "brokerdead",
             outcome: FakeOutcome::RegisterBrokerSearch,
             allowlist_name: None,
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
         assert!(reg.lookup("brokerdead").is_none(), "absent broker binary ⇒ refused");
@@ -526,6 +676,8 @@ mod tests {
             name: "brokerdead2",
             outcome: FakeOutcome::RegisterBrokerSearch,
             allowlist_name: None,
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let (reg, _loaded, _docs) = assemble_registry(&[&m], &ctx);
         assert!(reg.lookup("brokerdead2").is_none(), "unconditional broker refuse");
@@ -545,6 +697,8 @@ mod tests {
             name: "alpha",
             outcome: FakeOutcome::Register,
             allowlist_name: Some("alpha"),
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let manifests: &[&dyn WorkerManifest] = &[&m_alpha];
 
@@ -566,11 +720,15 @@ mod tests {
             name: "off",
             outcome: FakeOutcome::Disabled,
             allowlist_name: None,
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let m_bad = FakeManifest {
             name: "bad",
             outcome: FakeOutcome::Misconfigured,
             allowlist_name: None,
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let manifests: &[&dyn WorkerManifest] = &[&m_off, &m_bad];
 
@@ -614,6 +772,8 @@ mod tests {
             name: "handoff",
             outcome: FakeOutcome::Register,
             allowlist_name: None,
+            advertise_doc: false,
+            allowlist_kind: None,
         };
         let (reg, loaded, _docs) = assemble_registry(&[&reserved], &ctx);
         assert!(reg.lookup("handoff").is_none(), "reserved name must not register");
@@ -779,56 +939,121 @@ mod tests {
         let (_reg, _loaded, docs) = assemble_registry(WORKER_MANIFESTS, &ctx);
         let shell = docs.iter().find(|d| d.doc.name == "shell-exec").expect("shell-exec advertised");
         let allowed = shell.allowed().expect("shell-exec declares an allowlist");
-        assert!(allowed.contains("/usr/bin/cat, /usr/bin/ls"), "sorted permitted set: {allowed}");
+        assert!(
+            allowed.contains("`/usr/bin/cat`, `/usr/bin/ls`"),
+            "sorted, individually quoted permitted set: {allowed}"
+        );
         assert!(allowed.contains("argv[0]"), "argv0 wording: {allowed}");
     }
 
     /// Whether a permitted set is advertised follows the manifest's DECLARATION,
-    /// never the contents of the list. Run with an all-empty allowlist so
-    /// shell-exec is "declared but empty": it must still advertise (with the
-    /// refusal warning), because that is precisely the state in which every call
-    /// fails — the live 2026-06-20/21 regime that produced 15 of 15 failures.
+    /// never the contents of the list — in **both** directions.
+    ///
+    /// Built from fakes rather than `WORKER_MANIFESTS` deliberately. The earlier
+    /// version of this test used a ctx in which only `shell-exec` resolved, so its
+    /// loop ran exactly once, over a tool that *does* declare: the `false == false`
+    /// direction the test is named for never executed, and a mutation that
+    /// advertised an `allowed:` line for EVERY registered tool (telling the planner
+    /// `web.search` and `mail.*` refuse everything) survived the whole suite.
+    ///
+    /// Three registering, advertised workers cover the matrix:
+    ///   * `argvy`  — declares both halves, list EMPTY ⇒ `Some(refusal warning)`
+    ///   * `domainy` — declares both halves, `Domain` kind, non-empty ⇒ `Some(hosts)`
+    ///   * `silent` — advertised but declares no allowlist ⇒ `None`
     #[test]
     fn advertising_a_permitted_set_follows_the_declaration_not_the_contents() {
-        let exe_dir = PathBuf::from("/install/bin");
-        let sibling = shell_exec_sibling(&exe_dir);
-        let get_env = |_k: &str| None;
-        let exists = {
-            let s = sibling.clone();
-            move |p: &Path| p == s.as_path()
+        use kastellan_db::tool_allowlists::EntryKind;
+        let allowlist = |t: &str| match t {
+            // `argvy` declares an allowlist that is EMPTY — the state in which
+            // every dispatch fails, and precisely the live 2026-06-20/21 regime
+            // that produced 15 of 15 failures with the planner told nothing.
+            "domainy" => vec!["example.org".to_string()],
+            _ => Vec::new(),
         };
-        let allowlist = |_t: &str| Vec::new();
-        let ctx = ResolveCtx {
-            get_env: &get_env,
-            exists: &exists,
-            is_dir: &|_p: &Path| false,
-            exe_dir: Some(exe_dir.as_path()),
-            canonicalize: &|_p| None,
-            allowlist: &allowlist,
+        let ctx = test_ctx(&allowlist);
+        let argvy = FakeManifest {
+            name: "argvy",
+            outcome: FakeOutcome::Register,
+            allowlist_name: Some("argvy"),
+            advertise_doc: true,
+            allowlist_kind: Some(EntryKind::Argv0),
         };
+        let domainy = FakeManifest {
+            name: "domainy",
+            outcome: FakeOutcome::Register,
+            allowlist_name: Some("domainy"),
+            advertise_doc: true,
+            allowlist_kind: Some(EntryKind::Domain),
+        };
+        let silent = FakeManifest {
+            name: "silent",
+            outcome: FakeOutcome::Register,
+            allowlist_name: None,
+            advertise_doc: true,
+            allowlist_kind: None,
+        };
+        let manifests: &[&dyn WorkerManifest] = &[&argvy, &domainy, &silent];
 
-        let (_reg, _loaded, docs) = assemble_registry(WORKER_MANIFESTS, &ctx);
-        assert!(!docs.is_empty(), "at least shell-exec must register");
-        for d in &docs {
-            let m = WORKER_MANIFESTS
-                .iter()
-                .find(|m| m.name() == d.doc.name)
-                .expect("every advertised doc has a manifest");
-            assert_eq!(
-                d.allowed().is_some(),
-                m.allowlist_tool().is_some(),
-                "{}: advertising must follow the declaration, not the list contents",
-                d.doc.name
-            );
-        }
-        let shell = docs.iter().find(|d| d.doc.name == "shell-exec").expect("shell-exec advertised");
-        let allowed = shell.allowed().expect("declared, so advertised even when empty");
-        assert!(allowed.contains("refused"), "empty ⇒ warn that calls fail: {allowed}");
+        let (_reg, _loaded, docs) = assemble_registry(manifests, &ctx);
+        assert_eq!(docs.len(), 3, "all three fakes must be advertised: {}", docs.len());
+
+        let find = |n: &str| docs.iter().find(|d| d.doc.name == n).expect("advertised");
+        // Declared but empty ⇒ still advertised, with the refusal warning.
+        let argv0_line = find("argvy").allowed().expect("declared ⇒ advertised even when empty");
+        assert!(argv0_line.contains("refused"), "empty argv0 ⇒ refusal warning: {argv0_line}");
+        // A Domain-kind worker reaches the advertised surface — the three real
+        // domain workers (web-fetch/web-research/browser-driver) take this path.
+        let domain_line = find("domainy").allowed().expect("declared ⇒ advertised");
+        assert!(domain_line.contains("`example.org`"), "host advertised: {domain_line}");
+        assert!(domain_line.contains("reachable"), "domain wording: {domain_line}");
+        // The direction the old test never reached: no declaration ⇒ no line.
+        assert!(
+            find("silent").allowed().is_none(),
+            "a worker declaring no allowlist must advertise no permitted set"
+        );
+    }
+
+    /// A `tool_allowlists` row the #459 screen has already computed to be
+    /// statically dead must NOT be advertised as reachable: telling the planner a
+    /// host works when the daemon knows it does not is the INVERTED form of #533,
+    /// and costs a plan iteration per attempt. The live rows stay advertised.
+    #[test]
+    fn statically_dead_rows_are_withheld_from_the_advertisement() {
+        use kastellan_db::tool_allowlists::EntryKind;
+        // Force-routed (the supervised default), so a `localhost` NAME is dead —
+        // the proxy range-denies what it resolves to.
+        let allowlist = |_t: &str| vec!["example.org".to_string(), "localhost".to_string()];
+        let ctx = forced_ctx(&allowlist);
+        let m = FakeManifest {
+            name: "domainy",
+            outcome: FakeOutcome::RegisterWithNet(vec![
+                "example.org:443".to_string(),
+                "localhost:443".to_string(),
+            ]),
+            allowlist_name: Some("domainy"),
+            advertise_doc: true,
+            allowlist_kind: Some(EntryKind::Domain),
+        };
+        let (_reg, loaded, docs) = assemble_registry(&[&m], &ctx);
+
+        let line = docs[0].allowed().expect("declared ⇒ advertised");
+        assert!(line.contains("`example.org`"), "live row still advertised: {line}");
+        assert!(
+            !line.contains("localhost"),
+            "statically-dead row must not be advertised as reachable: {line}"
+        );
+        // Enforcement is untouched — the audit record still counts BOTH rows, so
+        // a request naming `localhost` is refused rather than silently allowed.
+        assert_eq!(loaded[0].allowlist_len, 2, "withholding is advertisement-only");
     }
 
     /// `allowlist_tool()` and `allowlist_kind()` must be declared together: the
     /// renderer needs the kind to pick its wording, so a worker declaring only the
-    /// tool would advertise nothing at all — silently.
+    /// tool would advertise nothing at all while still ENFORCING its allowlist —
+    /// i.e. #533 reopening for that one tool. `assemble_registry` now `warn!`s on
+    /// that arm rather than passing over it silently, but a `warn!` an operator
+    /// must notice in a boot log is a weaker guarantee than this list being right,
+    /// so both stay.
     ///
     /// The other direction has bitten operators since before #533: a network
     /// worker that overrides `allowlist_tool` but forgets `allowlist_kind`

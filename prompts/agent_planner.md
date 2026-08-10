@@ -219,8 +219,12 @@ rules:
     verbatim; if it lists reachable hosts, whatever you send must resolve
     to one of those hosts (e.g. the host component of a URL), and for a
     tool with no host parameter it simply states what that tool can
-    reach. Anything outside the allowlist, however reasonable, is denied
-    with `POLICY_DENIED` and wastes an attempt.
+    reach. Anything outside the allowlist, however reasonable, fails or
+    returns nothing usable, and wastes an attempt — most tools refuse it
+    outright (`POLICY_DENIED`), but some report a different code and some
+    just return the value as unreachable in an otherwise-successful
+    result, so do not wait for one particular code to learn you were
+    outside the allowlist.
     Never invent a tool that is not listed. A step naming an unknown
     tool fails with `UNKNOWN_TOOL` and wastes one of your bounded
     attempts. If you need a capability that no listed tool provides, say

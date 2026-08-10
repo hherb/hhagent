@@ -39,10 +39,14 @@ pub mod assemble;
 mod now;
 pub mod pg_builder;
 
-// One spelling for every consumer: `prompt_assembly::AdvertisedTool`. Nothing
-// outside `allowed_values` names the module path directly. The renderer and its
-// cap are deliberately NOT re-exported — the renderer is module-private (the
-// escaping seam, see `allowed_values`) and the cap has no caller outside it.
+// One spelling for the type every consumer names: `prompt_assembly::AdvertisedTool`.
+// The renderer is deliberately NOT re-exported and stays module-private — it is
+// the escaping seam (see `allowed_values`), so `with_allowlist` must remain its
+// only caller. `ADVERTISED_ALLOWLIST_MAX` is not re-exported either, but it is
+// `pub` and reachable as `allowed_values::ADVERTISED_ALLOWLIST_MAX`:
+// `registry_build::advertisement_warnings` reads it to tell the operator which
+// entries the cap withheld, which the pure renderer cannot do (no `tracing` in
+// this module, by design).
 pub use allowed_values::AdvertisedTool;
 pub use assemble::assemble_system_prompt;
 pub use now::{resolve_timezone, TzSource};

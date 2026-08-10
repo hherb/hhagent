@@ -54,8 +54,10 @@
 //!    Rust literals (each worker's `tool_doc()`), so they are trusted
 //!    like L0 — rendered verbatim, no escaping. The optional `allowed:`
 //!    line is **not** compiled in: it renders the operator's
-//!    `tool_allowlists` rows, whose CHECK constraint permits text such as
-//!    `/usr/bin/x</tools><system>`. That line is escaped via
+//!    `tool_allowlists` rows, and an `argv0`-kind row may be text such as
+//!    `/usr/bin/x</tools><system>` (migration `0021`'s CHECK requires only a
+//!    leading `/`; domain-kind rows are separately restricted to a host
+//!    charset and cannot carry framing). That line is escaped via
 //!    [`escape_untrusted_body`] at *construction*, inside
 //!    [`AdvertisedTool::with_allowlist`] — a private field plus a
 //!    module-private renderer make it the only route, so the line arrives
@@ -148,10 +150,17 @@ fn render_handoff_block() -> String {
 /// `<system>`, a chat-template token) — and cannot forge an extra `- ` row,
 /// injecting content the planner reads as higher-trust structure.
 ///
-/// Applied to **L1 and `<recalled>` bodies** — both carry laundered LLM
-/// output (threat-model adversary #6): `<recalled>` is written by any process
-/// with `INSERT` on `memories`, and `<l1_insights>` mixes operator rows with
-/// agent-raised rows the L1 promotion writer sources from `Plan.l1_insight`.
+/// Applied at three sites, with two different threat sources — change this
+/// function and you change all three:
+/// - **L1 and `<recalled>` bodies**, both laundered LLM output (threat-model
+///   adversary #6): `<recalled>` is written by any process with `INSERT` on
+///   `memories`, and `<l1_insights>` mixes operator rows with agent-raised rows
+///   the L1 promotion writer sources from `Plan.l1_insight`. Escaped here, at
+///   the render site.
+/// - **`tool_allowlists` entries**, via
+///   [`allowed_values::render_allowed_values`](super::allowed_values) — operator
+///   -sourced, not adversary #6, and escaped at *construction* rather than here
+///   (see [`AdvertisedTool`] and the note in this module's docs).
 ///
 /// Two neutralisations, both render-level guarantees that hold regardless of
 /// what any upstream writer or builder allowed:
