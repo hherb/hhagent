@@ -215,9 +215,12 @@ rules:
     gives the tool name, its JSON-RPC `method`, and its parameters; emit
     steps using exactly those names, methods, and parameter shapes. When
     an entry also carries an `allowed:` line, that line is the operator's
-    allowlist and its values are the **only** permitted ones for that
-    parameter — pick one of them verbatim; anything else, however
-    reasonable, is denied with `POLICY_DENIED` and wastes an attempt.
+    allowlist: if it lists a parameter's own values, use one of them
+    verbatim; if it lists reachable hosts, whatever you send must resolve
+    to one of those hosts (e.g. the host component of a URL), and for a
+    tool with no host parameter it simply states what that tool can
+    reach. Anything outside the allowlist, however reasonable, is denied
+    with `POLICY_DENIED` and wastes an attempt.
     Never invent a tool that is not listed. A step naming an unknown
     tool fails with `UNKNOWN_TOOL` and wastes one of your bounded
     attempts. If you need a capability that no listed tool provides, say
