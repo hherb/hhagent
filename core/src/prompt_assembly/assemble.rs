@@ -96,7 +96,7 @@ use crate::handoff::{MAX_FETCH_BYTES, SUMMARY_HEAD_BYTES};
 use crate::memory::l3_surface::{render_skill_entry, SurfacedSkill};
 use crate::recall_assembly::RecalledContext;
 use crate::scheduler::tool_dispatch::{HANDOFF_METHOD_FETCH, HANDOFF_TOOL};
-use crate::worker_manifest::ToolDoc;
+use super::allowed_values::AdvertisedTool;
 use kastellan_db::memories::Memory;
 
 /// Render the always-present `<handoff>` block.
@@ -169,22 +169,25 @@ pub(super) fn escape_untrusted_body(body: &str) -> String {
     out
 }
 
-/// Render the `<tools>` block: one entry per advertised tool. Trusted
-/// compiled-in text (authored in each worker's `tool_doc()`), so — unlike the
-/// L1/recalled blocks — bodies are NOT escaped. Emitted only when non-empty.
-fn render_tools_block(tools: &[ToolDoc]) -> String {
+/// Render the `<tools>` block: one entry per advertised tool. The `doc` fields
+/// are trusted compiled-in text (authored in each worker's `tool_doc()`) and —
+/// unlike the L1/recalled blocks — are NOT escaped. The optional `allowed`
+/// line is operator-sourced and was escaped when the `AdvertisedTool` was
+/// built. Emitted only when non-empty.
+fn render_tools_block(tools: &[AdvertisedTool]) -> String {
     let mut out = String::from("<tools>\n");
     for t in tools {
         out.push_str("- ");
-        out.push_str(t.name);
+        out.push_str(t.doc.name);
         out.push_str(" (method: ");
-        out.push_str(t.method);
+        out.push_str(t.doc.method);
         out.push_str("): ");
-        out.push_str(t.summary);
+        out.push_str(t.doc.summary);
         out.push('\n');
-        if !t.params.is_empty() {
+        if !t.doc.params.is_empty() {
             out.push_str("  params: ");
             let rendered: Vec<String> = t
+                .doc
                 .params
                 .iter()
                 .map(|p| {
@@ -197,6 +200,14 @@ fn render_tools_block(tools: &[ToolDoc]) -> String {
                 })
                 .collect();
             out.push_str(&rendered.join(", "));
+            out.push('\n');
+        }
+        // Operator-sourced and already escaped at construction — see
+        // `allowed_values`. The doc fields above are compiled-in and are
+        // deliberately NOT escaped; this line is the only untrusted text here.
+        if let Some(allowed) = &t.allowed {
+            out.push_str("  allowed: ");
+            out.push_str(allowed);
             out.push('\n');
         }
     }
@@ -225,7 +236,7 @@ pub fn assemble_system_prompt(
     skills: &[SurfacedSkill],
     recalled: &RecalledContext,
     base: &str,
-    tools: &[ToolDoc],
+    tools: &[AdvertisedTool],
     now: Option<&str>,
 ) -> String {
     let mut out = String::new();
