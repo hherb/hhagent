@@ -14,7 +14,7 @@ use sqlx::PgPool;
 
 use crate::memory::l0_seed::load_l0_active_default;
 use crate::memory::layers::load_l1_default;
-use crate::worker_manifest::ToolDoc;
+use super::allowed_values::AdvertisedTool;
 
 use super::{
     assemble::assemble_system_prompt, AssembledPrompt, PromptAssemblyError, SystemPromptBuilder,
@@ -37,7 +37,7 @@ pub struct PgSystemPromptBuilder {
     /// Advertised tool set rendered into the `<tools>` block. Empty until set
     /// via [`with_tool_docs`](Self::with_tool_docs); the daemon builds it once
     /// from the live registry at startup.
-    tool_docs: Arc<[ToolDoc]>,
+    tool_docs: Arc<[AdvertisedTool]>,
     /// Configured planner timezone. `None` (the `new()` default) → no `<now>`
     /// block, keeping output byte-identical to the pre-`<now>` builder. Set by
     /// the daemon via [`with_timezone`](Self::with_timezone).
@@ -53,7 +53,7 @@ impl PgSystemPromptBuilder {
 
     /// Attach the advertised tool set (rendered into the `<tools>` block).
     /// Threaded from `build_tool_registry` so only registered tools appear.
-    pub fn with_tool_docs(mut self, tool_docs: Arc<[ToolDoc]>) -> Self {
+    pub fn with_tool_docs(mut self, tool_docs: Arc<[AdvertisedTool]>) -> Self {
         self.tool_docs = tool_docs;
         self
     }
@@ -67,7 +67,7 @@ impl PgSystemPromptBuilder {
     }
 
     #[cfg(test)]
-    fn tool_docs_for_test(&self) -> &[ToolDoc] {
+    fn tool_docs_for_test(&self) -> &[AdvertisedTool] {
         &self.tool_docs
     }
 
@@ -162,21 +162,25 @@ impl SystemPromptBuilder for StaticSystemPromptBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker_manifest::ToolDoc;
 
     #[tokio::test]
     async fn pg_builder_retains_tool_docs() {
         // A lazily-connected pool that is never queried in this unit test.
         // `connect_lazy` needs a Tokio context, hence `#[tokio::test]`.
         let pool = PgPool::connect_lazy("postgres://unused").expect("lazy pool");
-        let docs: Arc<[ToolDoc]> = Arc::from(vec![ToolDoc {
-            name: "web-search",
-            method: "web.search",
-            summary: "s",
-            params: &[],
+        let docs: Arc<[AdvertisedTool]> = Arc::from(vec![AdvertisedTool {
+            doc: ToolDoc {
+                name: "web-search",
+                method: "web.search",
+                summary: "Search the web.",
+                params: &[],
+            },
+            allowed: None,
         }]);
         let b = PgSystemPromptBuilder::new(pool).with_tool_docs(docs);
         assert_eq!(b.tool_docs_for_test().len(), 1);
-        assert_eq!(b.tool_docs_for_test()[0].name, "web-search");
+        assert_eq!(b.tool_docs_for_test()[0].doc.name, "web-search");
     }
 
     #[tokio::test]
