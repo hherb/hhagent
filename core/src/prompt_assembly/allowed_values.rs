@@ -48,9 +48,9 @@ use crate::worker_manifest::ToolDoc;
 /// cuts a release.
 ///
 /// Caps the entry COUNT, not the rendered byte length: `validate_argv0` puts
-/// no length bound on an `argv0` row, so 30 long rows can still be large. See
-/// the byte-budget follow-up issue; `<tools>` shares the prompt's global
-/// untracked budget (#78) today.
+/// no length bound on an `argv0` row, so 30 long rows can still be large —
+/// tracked as #542. `<tools>` shares the prompt's global untracked budget
+/// (#78) today.
 pub const ADVERTISED_ALLOWLIST_MAX: usize = 30;
 
 /// One advertised tool: its compiled-in doc plus, when the worker declares an
@@ -70,7 +70,9 @@ pub const ADVERTISED_ALLOWLIST_MAX: usize = 30;
 /// `registry_build` cannot advertise it. That worker's allowlist is still
 /// ENFORCED, so the symptom is the planner guessing again (i.e. #533 reopening
 /// for that one tool) rather than an error — which is why the call site logs a
-/// `warn!` naming the missing override rather than passing silently.
+/// `warn!` naming the missing override rather than passing silently. #545 would
+/// remove this arm entirely by making the two halves one trait method, so the
+/// half-declared state stops being writable.
 pub struct AdvertisedTool {
     /// Compiled-in, trusted, never escaped. Invariant unchanged.
     pub doc: ToolDoc,

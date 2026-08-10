@@ -306,10 +306,12 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_withheld_when_the_rows_and_net_entries_do_not_correspond() {
-        // Withholding every row would flip the advertisement to "nothing is
-        // permitted" — a stronger claim than the screen supports, and false
-        // whenever the net entries came from somewhere other than these rows.
+    fn withholding_every_row_degrades_to_withholding_nothing() {
+        // A `Warn` is by definition a PROPER subset, so an all-dead match means
+        // the net entries and the rows do not correspond (e.g. entries built
+        // from endpoint env vars). Withholding all of them would flip the
+        // advertisement to "nothing is permitted" — a stronger claim than the
+        // screen supports, and probably false.
         let rows = vec!["example.org".to_string()];
         let (live, withheld) = partition_dead_rows(&rows, &["example.org:443".to_string()]);
         assert_eq!(live, rows, "all-withheld degrades to withholding nothing");
