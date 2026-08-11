@@ -30,6 +30,8 @@ use std::path::PathBuf;
 use kastellan_core::secrets::Vault;
 use kastellan_core::tool_host::{dispatch_with_sink, spawn_worker, ToolHostError, WorkerSpec};
 use kastellan_core::workers::python_exec::firecracker_mode_entry;
+use kastellan_protocol::client::ClientError;
+use kastellan_protocol::codes;
 use kastellan_tests_common::microvm::{firecracker_backend, image_dir, skip_if_no_microvm};
 use kastellan_tests_common::NoopAuditSink;
 
@@ -88,6 +90,34 @@ async fn run_in_microvm(code: &str) -> serde_json::Value {
     dispatch_in_microvm(serde_json::json!({ "code": code })).await
 }
 
+/// Assert `err` is exactly the dispatch-level signal-death error introduced
+/// by #539: an RPC error carrying `OPERATION_FAILED` whose message names the
+/// killing signal (the fixed `killed by <SIG> (...)` shape built by
+/// `kastellan_worker_prelude::child_exit::signal_death_message`). Local to
+/// this file rather than shared — `python_exec_e2e.rs`,
+/// `python_exec_container_e2e.rs` and `python_exec_firecracker_e2e.rs` are
+/// three separate test binaries, and pulling a three-call-site helper into a
+/// shared crate would be a new dependency edge just to save a few lines.
+fn assert_is_signal_death(err: &ToolHostError) {
+    match err {
+        ToolHostError::Protocol(ClientError::Rpc(rpc)) => {
+            assert_eq!(
+                rpc.code,
+                codes::OPERATION_FAILED,
+                "expected the #539 signal-death error, got: {rpc:?}"
+            );
+            assert!(
+                rpc.message.contains("killed by"),
+                "signal-death message must name the killing signal: {}",
+                rpc.message
+            );
+        }
+        other => panic!(
+            "expected Protocol(Rpc(_)) carrying the #539 signal-death error, got: {other:?}"
+        ),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "needs DGX: /dev/kvm + vhost_vsock + built rootfs + kastellan-microvm-run"]
 async fn microvm_round_trip_six_times_seven() {
@@ -111,22 +141,34 @@ async fn microvm_enforces_mem_cap() {
     }
     // Allocate ~900 MiB in a 512 MiB VM. KVM enforces the cap at the hypervisor
     // (unlike bwrap's cgroup on a shared kernel, this is a separate guest kernel
-    // with hard RAM); the allocation fails. Observed: exit_code 1 with a Python
-    // MemoryError traceback; a guest OOM-kill of the child would give a null
-    // exit_code. Accept either; reject a clean 0 (would mean the cap leaked).
+    // with hard RAM); the allocation fails.
+    //
+    // Two legitimate containment shapes now that a signal death is a dispatch
+    // ERROR rather than a null `exit_code` (#539):
+    //   (a) Ok(result) with a non-zero exit_code — observed: exit_code 1 with a
+    //       Python MemoryError traceback.
+    //   (b) Err(_) carrying the #539 signal-death error — a guest OOM-kill of
+    //       the child (SIGKILL) before it can raise.
+    // Reject a clean Ok(exit_code: 0) — would mean the cap leaked.
     let code = "x = bytearray(900 * 1024 * 1024); print(len(x))";
-    let out = run_in_microvm(code).await;
-    let exit_indicates_oom =
-        out["exit_code"].is_null() || out["exit_code"].as_i64().is_some_and(|c| c != 0);
-    assert!(
-        exit_indicates_oom,
-        "expected an OOM failure (non-zero or null exit), got: {out}"
-    );
-    let stdout = out["stdout"].as_str().unwrap_or_default();
-    assert!(
-        !stdout.contains(&(900 * 1024 * 1024).to_string()),
-        "the allocation print must not appear — it should fail first: {out}"
-    );
+    let result = try_dispatch_in_microvm(serde_json::json!({ "code": code }), None).await;
+    match result {
+        Ok(out) => {
+            assert_ne!(out["exit_code"], 0, "expected an OOM failure exit: {out}");
+            let stdout = out["stdout"].as_str().unwrap_or_default();
+            assert!(
+                !stdout.contains(&(900 * 1024 * 1024).to_string()),
+                "the allocation print must not appear — it should fail first: {out}"
+            );
+        }
+        Err(err) => {
+            assert_is_signal_death(&err);
+            assert!(
+                err.to_string().contains("SIGKILL"),
+                "a guest OOM-kill sends SIGKILL: {err}"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -140,6 +182,13 @@ async fn microvm_net_is_denied() {
     // stdout; its ABSENCE is the containment invariant. Non-vacuity rests on the
     // round-trip test proving this same harness faithfully relays guest stdout,
     // so a real connection could not hide. (Keep that test paired and live.)
+    //
+    // Two legitimate "no egress" shapes now that a signal death is a dispatch
+    // ERROR rather than a null `exit_code` (#539):
+    //   (a) Ok(result) — the caught-exception path: the script runs past the
+    //       try/except and exits 0 with "blocked" on stderr.
+    //   (b) Err(_) carrying the #539 signal-death error — the child is torn
+    //       down mid-attempt instead of reaching its `except` clause.
     let code = "\
 import socket, sys
 try:
@@ -148,16 +197,17 @@ try:
 except Exception:
     print('blocked', file=sys.stderr)
 ";
-    let out = run_in_microvm(code).await;
-    assert!(
-        out.get("exit_code").is_some(),
-        "worker returned no result object — dispatch broken, not contained: {out}"
-    );
-    let stdout = out["stdout"].as_str().unwrap_or_default();
-    assert!(
-        !stdout.contains("CONNECTED"),
-        "network must be denied (no CONNECTED): {out}"
-    );
+    let result = try_dispatch_in_microvm(serde_json::json!({ "code": code }), None).await;
+    match result {
+        Ok(out) => {
+            let stdout = out["stdout"].as_str().unwrap_or_default();
+            assert!(
+                !stdout.contains("CONNECTED"),
+                "network must be denied (no CONNECTED): {out}"
+            );
+        }
+        Err(err) => assert_is_signal_death(&err),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

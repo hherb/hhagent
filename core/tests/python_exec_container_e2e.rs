@@ -18,8 +18,9 @@
 use std::sync::Arc;
 
 use kastellan_core::secrets::Vault;
-use kastellan_core::tool_host::{dispatch_with_sink, spawn_worker, WorkerSpec};
+use kastellan_core::tool_host::{dispatch_with_sink, spawn_worker, ToolHostError, WorkerSpec};
 use kastellan_core::workers::python_exec::{container_mode_entry, DEFAULT_IMAGE};
+use kastellan_protocol::{client::ClientError, codes};
 use kastellan_sandbox::{macos_container::MacosContainer, SandboxBackendKind, SandboxBackends};
 use kastellan_tests_common::NoopAuditSink;
 
@@ -64,12 +65,19 @@ fn container_backend() -> Arc<dyn kastellan_sandbox::SandboxBackend> {
 }
 
 /// Spawn the worker in the VM, dispatch one `python.exec` with the given
-/// JSON-RPC params object, return the result.
+/// JSON-RPC params object, return the raw result.
 ///
 /// Uses `dispatch_with_sink` + `NoopAuditSink` so no PG cluster is needed.
 /// `container_mode_entry` sets `ephemeral_scratch: false` (scratch is the
 /// in-VM `/tmp` tmpfs), so no `with_scratch` call.
-async fn dispatch_in_container(payload: serde_json::Value) -> serde_json::Value {
+///
+/// Fallible: `dispatch_in_container` below is the happy-path convenience
+/// that unwraps this. The containment tests that must accept EITHER a
+/// non-zero `exit_code` (`Ok`) OR the #539 signal-death error (`Err`) call
+/// this directly instead.
+async fn try_dispatch_in_container(
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, ToolHostError> {
     let entry = container_mode_entry(
         std::path::PathBuf::from(
             kastellan_core::workers::python_exec::CONTAINER_WORKER_BIN,
@@ -97,12 +105,47 @@ async fn dispatch_in_container(payload: serde_json::Value) -> serde_json::Value 
     )
     .await;
     let _ = worker.close();
-    result.expect("dispatch python.exec")
+    result
+}
+
+/// Convenience: the happy-path dispatch, unwrapped.
+async fn dispatch_in_container(payload: serde_json::Value) -> serde_json::Value {
+    try_dispatch_in_container(payload)
+        .await
+        .expect("dispatch python.exec")
 }
 
 /// Convenience: dispatch code-only (no `params`).
 async fn run_in_container(code: &str) -> serde_json::Value {
     dispatch_in_container(serde_json::json!({ "code": code })).await
+}
+
+/// Assert `err` is exactly the dispatch-level signal-death error introduced
+/// by #539: an RPC error carrying `OPERATION_FAILED` whose message names the
+/// killing signal (the fixed `killed by <SIG> (...)` shape built by
+/// `kastellan_worker_prelude::child_exit::signal_death_message`). Local to
+/// this file rather than shared — `python_exec_e2e.rs`,
+/// `python_exec_container_e2e.rs` and `python_exec_firecracker_e2e.rs` are
+/// three separate test binaries, and pulling a three-call-site helper into a
+/// shared crate would be a new dependency edge just to save a few lines.
+fn assert_is_signal_death(err: &ToolHostError) {
+    match err {
+        ToolHostError::Protocol(ClientError::Rpc(rpc)) => {
+            assert_eq!(
+                rpc.code,
+                codes::OPERATION_FAILED,
+                "expected the #539 signal-death error, got: {rpc:?}"
+            );
+            assert!(
+                rpc.message.contains("killed by"),
+                "signal-death message must name the killing signal: {}",
+                rpc.message
+            );
+        }
+        other => panic!(
+            "expected Protocol(Rpc(_)) carrying the #539 signal-death error, got: {other:?}"
+        ),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -128,22 +171,32 @@ async fn container_enforces_mem_cap() {
     // allocation fails; under macOS Seatbelt host mode it would SUCCEED (Seatbelt
     // has no memory primitive — the parity gap this micro-VM mode closes).
     let code = "x = bytearray(900 * 1024 * 1024); print(len(x))";
-    let out = run_in_container(code).await;
-    // The cap failure surfaces as a non-zero exit (observed: exit_code 1 with a
-    // Python MemoryError traceback) or, if the cgroup OOM killer SIGKILLs the
-    // child first, a null exit_code (status.code() is None). Accept either; reject
-    // a clean 0 — a 0 would mean the 512 MiB cap was NOT enforced (the Seatbelt gap).
-    let exit_indicates_oom = out["exit_code"].is_null()
-        || out["exit_code"].as_i64().is_some_and(|c| c != 0);
-    assert!(
-        exit_indicates_oom,
-        "expected an OOM failure exit (non-zero or null), got: {out}"
-    );
-    let stdout = out["stdout"].as_str().unwrap_or_default();
-    assert!(
-        !stdout.contains(&(900 * 1024 * 1024).to_string()),
-        "the allocation print must not appear — it should be killed first: {out}"
-    );
+    let result = try_dispatch_in_container(serde_json::json!({ "code": code })).await;
+    // Two legitimate containment shapes now that a signal death is a dispatch
+    // ERROR rather than a null `exit_code` (#539):
+    //   (a) Ok(result) with a non-zero exit_code — observed: exit_code 1 with
+    //       a Python MemoryError traceback.
+    //   (b) Err(_) carrying the #539 signal-death error — the cgroup OOM
+    //       killer SIGKILLs the child before it can raise.
+    // Reject a clean Ok(exit_code: 0) — that would mean the 512 MiB cap was
+    // NOT enforced (the Seatbelt host-mode gap this micro-VM mode closes).
+    match result {
+        Ok(out) => {
+            assert_ne!(out["exit_code"], 0, "expected an OOM failure exit: {out}");
+            let stdout = out["stdout"].as_str().unwrap_or_default();
+            assert!(
+                !stdout.contains(&(900 * 1024 * 1024).to_string()),
+                "the allocation print must not appear — it should be killed first: {out}"
+            );
+        }
+        Err(err) => {
+            assert_is_signal_death(&err);
+            assert!(
+                err.to_string().contains("SIGKILL"),
+                "the cgroup OOM killer sends SIGKILL: {err}"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -160,26 +213,31 @@ try:
 except Exception as e:
     print('blocked', file=sys.stderr)
 ";
-    let out = run_in_container(code).await;
+    let result = try_dispatch_in_container(serde_json::json!({ "code": code })).await;
     // Containment guard: a SUCCESSFUL connection prints "CONNECTED" to stdout, so
-    // its ABSENCE is the invariant proving egress was denied. We deliberately do
-    // NOT assert on exit_code: a denied connect surfaces inconsistently across
-    // harness timing — sometimes a caught ENETUNREACH (child exits 0 with a
-    // "blocked" stderr), sometimes the child is torn down mid-attempt (exit_code
-    // null, empty streams). Both are legitimate "no egress" outcomes; only a real
-    // connection would ever print "CONNECTED". Non-vacuity rests on
+    // its ABSENCE is the invariant proving egress was denied. A denied connect
+    // surfaces inconsistently across harness timing, but now that a signal death
+    // is a dispatch ERROR rather than a null `exit_code` (#539) there are exactly
+    // two legitimate "no egress" shapes:
+    //   (a) Ok(result) — the caught-ENETUNREACH path: the script runs past the
+    //       try/except and exits 0 with "blocked" on stderr.
+    //   (b) Err(_) carrying the #539 signal-death error — the child is torn down
+    //       mid-attempt instead of reaching its `except` clause.
+    // Both are legitimate "no egress" outcomes; only a real connection would ever
+    // print "CONNECTED". Non-vacuity rests on
     // `python_exec_round_trips_through_container`: it proves this same harness
     // faithfully returns the child's stdout, so a connection that truly succeeded
-    // could not hide. The result-object check rules out a broken dispatch path.
+    // could not hide.
     // NOTE: this test's non-vacuity DEPENDS on the round-trip test above staying
     // live (not `#[ignore]`d / removed) — if it ever is, a worker that never ran
     // would also print no "CONNECTED" and this guard would weaken. Keep them paired.
-    assert!(
-        out.get("exit_code").is_some(),
-        "worker returned no result object — dispatch broken, not contained: {out}"
-    );
-    let stdout = out["stdout"].as_str().unwrap_or_default();
-    assert!(!stdout.contains("CONNECTED"), "network must be denied (no CONNECTED): {out}");
+    match result {
+        Ok(out) => {
+            let stdout = out["stdout"].as_str().unwrap_or_default();
+            assert!(!stdout.contains("CONNECTED"), "network must be denied (no CONNECTED): {out}");
+        }
+        Err(err) => assert_is_signal_death(&err),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

@@ -18,11 +18,12 @@
 use std::path::PathBuf;
 
 use kastellan_core::secrets::Vault;
-use kastellan_core::tool_host::{dispatch, spawn_worker, WorkerSpec};
+use kastellan_core::tool_host::{dispatch, spawn_worker, ToolHostError, WorkerSpec};
 use kastellan_core::workers::python_exec::{
     interpreter_extra_lib_dirs, python_exec_entry, PYTHON_CANDIDATES,
 };
 use kastellan_db::secrets::{MapKeyProvider, KEY_LEN};
+use kastellan_protocol::{client::ClientError, codes};
 use kastellan_tests_common::{
     backend, bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_no_supervisor,
     skip_if_sandbox_unavailable, unique_suffix, workspace_target_binary, PgCluster,
@@ -184,6 +185,34 @@ async fn exec_in_jail(
     dispatch_in_jail(pool, env, &Vault::new(), serde_json::json!({ "code": code })).await
 }
 
+/// Assert `err` is exactly the dispatch-level signal-death error introduced
+/// by #539: an RPC error carrying `OPERATION_FAILED` whose message names the
+/// killing signal (the fixed `killed by <SIG> (...)` shape built by
+/// `kastellan_worker_prelude::child_exit::signal_death_message`). Local to
+/// this file rather than shared — `python_exec_e2e.rs`,
+/// `python_exec_container_e2e.rs` and `python_exec_firecracker_e2e.rs` are
+/// three separate test binaries, and pulling a three-call-site helper into a
+/// shared crate would be a new dependency edge just to save a few lines.
+fn assert_is_signal_death(err: &ToolHostError) {
+    match err {
+        ToolHostError::Protocol(ClientError::Rpc(rpc)) => {
+            assert_eq!(
+                rpc.code,
+                codes::OPERATION_FAILED,
+                "expected the #539 signal-death error, got: {rpc:?}"
+            );
+            assert!(
+                rpc.message.contains("killed by"),
+                "signal-death message must name the killing signal: {}",
+                rpc.message
+            );
+        }
+        other => panic!(
+            "expected Protocol(Rpc(_)) carrying the #539 signal-death error, got: {other:?}"
+        ),
+    }
+}
+
 #[test]
 fn print_round_trip_through_sandboxed_worker() {
     let env = match ready_or_skip() {
@@ -209,22 +238,38 @@ fn socket_attempt_is_contained_by_the_jail() {
     };
     dispatch_runtime().block_on(async {
         let pool = probe_and_pool(&env.cluster.conn_spec).await;
-        // Under seccomp `strict` the socket(2) syscall is not in the
-        // allow-list → CPython dies with SIGSYS (exit_code null); under
-        // Seatbelt the connect is denied → OSError (exit_code 1). Either
-        // way: anything but success.
-        let r = exec_in_jail(
+        // Containment has two legitimate shapes now that a signal death is a
+        // dispatch ERROR rather than a null `exit_code` (#539):
+        //   (a) Ok(result) with a non-zero exit_code — under Seatbelt the
+        //       connect is denied → OSError → CPython exits 1.
+        //   (b) Err(_) carrying the #539 signal-death error — under seccomp
+        //       `strict` the socket(2) syscall is not in the allow-list →
+        //       CPython is SIGSYS-killed before it can raise.
+        // Anything else — a clean Ok(exit_code: 0), or "escaped" in stdout —
+        // means the socket attempt was NOT contained.
+        let result = exec_in_jail(
             &pool,
             &env,
             "import socket\ns = socket.socket()\ns.connect(('127.0.0.1', 9))\nprint('escaped')",
         )
-        .await
-        .expect("dispatch itself must succeed");
-        assert_ne!(r["exit_code"], 0, "socket attempt must not succeed: {r}");
-        assert!(
-            !r["stdout"].as_str().unwrap_or("").contains("escaped"),
-            "network reached from inside the jail: {r}"
-        );
+        .await;
+        match result {
+            Ok(r) => {
+                assert_ne!(r["exit_code"], 0, "socket attempt must not succeed: {r}");
+                assert!(
+                    !r["stdout"].as_str().unwrap_or("").contains("escaped"),
+                    "network reached from inside the jail: {r}"
+                );
+            }
+            Err(err) => {
+                assert_is_signal_death(&err);
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("SIGSYS"),
+                    "the seccomp socket(2) denial must SIGSYS-kill the interpreter: {msg}"
+                );
+            }
+        }
         pool.close().await;
     });
 }

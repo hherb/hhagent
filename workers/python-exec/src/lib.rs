@@ -11,6 +11,10 @@
 //! `{exit_code, stdout, stderr}`. A Python exception is *not* an RPC
 //! error: it comes back as a nonzero `exit_code` + traceback on
 //! `stderr`, which is what the planner needs to iterate on its own code.
+//! A **signal-killed** interpreter (cgroup OOM SIGKILL, seccomp SIGSYS,
+//! an rlimit SIGXCPU, …) is different: it has no exit code at all, so it
+//! comes back as an RPC error instead of a result with `exit_code: null`
+//! (#539).
 //!
 //! Design: `docs/superpowers/specs/2026-06-12-python-exec-worker-design.md`.
 //!
