@@ -23,6 +23,21 @@
 //! crash log at runtime. A clean exit (or any non-SIGSYS error code)
 //! proves the binary's syscall set is covered.
 //!
+//! ## When a SIGSYS is NOT a gap
+//!
+//! glibc's NSS opens a `socket(2)` for every user- or group-name
+//! resolution, and `WorkerStrict` denies `socket(2)`. Measured on the
+//! deployed host (issue #539): `ls -l`, `id`, and `whoami` are all
+//! SIGSYS-killed by that alone, while `ls` (no `-l`) and `cat` are
+//! not. The full measurement table is in
+//! `docs/superpowers/specs/2026-08-11-signal-killed-child-is-loud-design.md`
+//! §1.2. Widening `BASE_ALLOW` to admit `socket` is **not** the fix
+//! for one of these — that would void `Net::Deny` for every
+//! strict-profile worker; the SIGSYS is the network denial working
+//! as designed, not a coverage gap. The correct fix is to spell the
+//! command so it never resolves a name: `ls` instead of `ls -l`,
+//! `python3 -S` instead of relying on `-I` alone.
+//!
 //! ## Skip pattern
 //!
 //! Skips on hosts where:
@@ -206,6 +221,8 @@ fn ls_survives_strict() {
     let dir = prepare_scratch("ls");
     std::fs::write(dir.join("a"), "").expect("write fixture a");
     std::fs::write(dir.join("b"), "").expect("write fixture b");
+    // Deliberately no `-l`: it resolves owner/group names via NSS,
+    // which opens a socket(2) and gets SIGSYS-killed under strict.
     let out = run_under_lockdown(bin, &[dir.to_str().unwrap()], &dir);
     assert_no_sigsys(bin, &out);
 }
@@ -508,6 +525,10 @@ fn python3_survives_strict() {
     // crash log. Flags mirror the worker's invocation (`-I -S -B`,
     // exec.rs::python_args); `-c` instead of stdin-`-` because the
     // probe has no stdin plumbing — the syscall surface is the same.
+    // `-S` is what keeps this test green: it skips `site`, which is
+    // what would otherwise expand `~` via `getpwuid` and open a
+    // socket(2). Drop `-S` (or swap it for `-I` alone) and this dies
+    // by SIGSYS here exactly as the worker would in production.
     let bin = "/usr/bin/python3";
     if !binary_present(bin) {
         return;

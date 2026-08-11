@@ -187,7 +187,16 @@ pub fn serialize_params(params: &Option<Value>) -> Result<String, ParamsError> {
 ///   site dir), and drops the script dir/cwd from `sys.path`.
 /// * `-S` — skip the `site` module: system site-/dist-packages never
 ///   join `sys.path`. This is the roadmap's "curated stdlib bind" — a
-///   determinism measure; the *security* boundary is the jail.
+///   determinism measure; the *security* boundary is the jail. `-S`
+///   is ALSO load-bearing for the worker running at all under
+///   `WorkerStrict`: with `site` enabled, `site` expands `~` via
+///   `getpwuid`, glibc's NSS opens a `socket(2)` to resolve it, the
+///   seccomp profile denies that syscall, and the interpreter is
+///   SIGSYS-killed before it runs a line. `-I` alone is NOT a
+///   substitute — it ignores env vars but never disables `site`, so
+///   the kill still happens. Until #539 this failed *silently*: the
+///   worker reported a null exit code inside an otherwise-successful
+///   result, indistinguishable from a script that printed nothing.
 /// * `-B` — never write `.pyc`.
 /// * `-` — read the program from stdin until EOF (no scratch write, no
 ///   argv-size limit, nothing in `/proc/*/cmdline`).
