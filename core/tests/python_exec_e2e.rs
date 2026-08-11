@@ -280,7 +280,11 @@ fn socket_attempt_is_contained_by_the_jail() {
                 // non-zero captured byte count here would mean "escaped" got
                 // printed before the kill landed — not contained.
                 assert!(
-                    msg.contains("0 B out"),
+                    // Anchored on the ". " that `signal_death_message` always
+                    // emits after the parenthesised cause: a bare
+                    // `contains("0 B out")` also matches "10 B out", so an
+                    // escape whose output happens to be 10 bytes would pass.
+                    msg.contains(". 0 B out,"),
                     "the child printed before dying — not contained: {msg}"
                 );
             }

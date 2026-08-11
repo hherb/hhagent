@@ -181,7 +181,13 @@ async fn microvm_enforces_mem_cap() {
             // so demand it is zero — a non-zero count here would mean the child got
             // to print before dying, i.e. NOT contained.
             assert!(
-                err.to_string().contains("0 B out"),
+                // Anchored on the ". " that `signal_death_message` always emits
+                // after the parenthesised cause: a bare `contains("0 B out")`
+                // also matches "10 B out", and both leak payloads this test
+                // guards against — "CONNECTED\n" and the allocation length —
+                // are exactly 10 bytes, so the unanchored form was defeated by
+                // the very race it exists to catch.
+                err.to_string().contains(". 0 B out,"),
                 "the child printed before dying — not contained: {err}"
             );
         }
@@ -231,7 +237,13 @@ except Exception:
             // then a kill racing the print. Zero out bytes is what makes this
             // Err arm as strong a containment proof as the Ok arm's `!contains`.
             assert!(
-                err.to_string().contains("0 B out"),
+                // Anchored on the ". " that `signal_death_message` always emits
+                // after the parenthesised cause: a bare `contains("0 B out")`
+                // also matches "10 B out", and both leak payloads this test
+                // guards against — "CONNECTED\n" and the allocation length —
+                // are exactly 10 bytes, so the unanchored form was defeated by
+                // the very race it exists to catch.
+                err.to_string().contains(". 0 B out,"),
                 "the child printed before dying — not contained: {err}"
             );
         }
