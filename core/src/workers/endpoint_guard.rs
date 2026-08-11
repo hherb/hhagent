@@ -257,9 +257,74 @@ fn dead_entry_detail(
     )
 }
 
+/// Split an operator allowlist (`tool_allowlists` rows) against the dead
+/// `Net::Allowlist` entries a [`NetScreen::Warn`] named, returning
+/// `(live, withheld)`.
+///
+/// **Why this exists.** `assemble_registry` advertises the permitted set to the
+/// planner (#533). Advertising a row this module has just computed to be
+/// statically undialable tells the planner a host is reachable when it is not,
+/// and the planner then burns a plan iteration proving otherwise — the
+/// *inverted* form of the bug #533 fixes. Enforcement is unaffected either way;
+/// only what the planner is told changes.
+///
+/// Matching is by host: a dead net entry is a row plus (usually) `:port` from
+/// `allowlist_to_net_entries`, so [`host_of_entry`] maps it back to the row.
+///
+/// If every row would be withheld, nothing is: `NetScreen::Warn` is by
+/// definition a PROPER subset (all-dead is `Refuse`, which skips registration),
+/// so an empty `live` means the net entries and the rows do not correspond —
+/// e.g. entries built from endpoint env vars rather than from the rows. In that
+/// case withholding all of them would flip the advertisement to "nothing is
+/// permitted", a stronger and probably false claim, so the rows pass through
+/// unfiltered.
+pub(crate) fn partition_dead_rows(
+    rows: &[String],
+    dead_net_entries: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let dead_hosts: Vec<&str> = dead_net_entries.iter().map(|e| host_of_entry(e)).collect();
+    let (withheld, live): (Vec<String>, Vec<String>) =
+        rows.iter().cloned().partition(|r| dead_hosts.contains(&r.as_str()));
+    if live.is_empty() && !rows.is_empty() {
+        return (rows.to_vec(), Vec::new());
+    }
+    (live, withheld)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dead_row_is_withheld_from_the_advertisement_but_live_rows_survive() {
+        // The planner must not be told `localhost` is reachable when the screen
+        // has just computed that it is not — that invents the failure #533 fixes.
+        let rows = vec!["example.org".to_string(), "localhost".to_string()];
+        let (live, withheld) = partition_dead_rows(&rows, &["localhost:443".to_string()]);
+        assert_eq!(live, vec!["example.org".to_string()], "live row survives");
+        assert_eq!(withheld, vec!["localhost".to_string()], "dead row withheld");
+    }
+
+    #[test]
+    fn withholding_every_row_degrades_to_withholding_nothing() {
+        // A `Warn` is by definition a PROPER subset, so an all-dead match means
+        // the net entries and the rows do not correspond (e.g. entries built
+        // from endpoint env vars). Withholding all of them would flip the
+        // advertisement to "nothing is permitted" — a stronger claim than the
+        // screen supports, and probably false.
+        let rows = vec!["example.org".to_string()];
+        let (live, withheld) = partition_dead_rows(&rows, &["example.org:443".to_string()]);
+        assert_eq!(live, rows, "all-withheld degrades to withholding nothing");
+        assert!(withheld.is_empty(), "and reports nothing withheld: {withheld:?}");
+    }
+
+    #[test]
+    fn an_empty_screen_withholds_nothing() {
+        let rows = vec!["example.org".to_string()];
+        let (live, withheld) = partition_dead_rows(&rows, &[]);
+        assert_eq!(live, rows);
+        assert!(withheld.is_empty());
+    }
 
     #[test]
     fn ip_literals_are_not_flagged_even_when_loopback_or_private() {

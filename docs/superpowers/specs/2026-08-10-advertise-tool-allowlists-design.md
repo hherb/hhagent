@@ -111,14 +111,27 @@ pub struct AdvertisedTool {
     pub doc: ToolDoc,
     /// Operator-sourced. Escaped at construction. `None` ⇒ this worker
     /// declares no allowlist (distinct from "declares one that is empty").
-    pub allowed: Option<String>,
+    /// PRIVATE: reachable only through the constructors below.
+    allowed: Option<String>,
+}
+
+impl AdvertisedTool {
+    /// Declares an allowlist: escapes and renders `entries` (an EMPTY slice
+    /// still yields a line — see §3.3).
+    pub fn with_allowlist(doc: ToolDoc, kind: EntryKind, entries: &[String]) -> Self;
+    /// Declares no allowlist at all: no `allowed:` line is rendered.
+    pub fn without_allowlist(doc: ToolDoc) -> Self;
+    /// Read access for the renderer.
+    pub fn allowed(&self) -> Option<&str>;
 }
 ```
 
 `ToolDoc` keeps its stated invariant verbatim, and `AdvertisedTool` becomes the
 only route by which non-compiled-in text can reach the `<tools>` block — the
 escaping obligation is a property of the type instead of a comment a future
-author has to notice.
+author has to notice. The field is private and the renderer module-private
+precisely so that "property of the type" is enforced by the compiler: there is
+no way to construct an `AdvertisedTool` around raw `tool_allowlists` text.
 
 ### 3.2 The pure renderer
 
@@ -136,7 +149,10 @@ pub const ADVERTISED_ALLOWLIST_MAX: usize = 30;
 /// line: an empty `entries` is a meaningful state (§3.3), not an absence.
 /// Whether a tool has an allowlist *at all* is decided by the caller from the
 /// manifest's declaration — see §3.4 — never inferred from emptiness here.
-pub fn render_allowed_values(kind: EntryKind, entries: &[String]) -> String;
+///
+/// Module-private: `AdvertisedTool::with_allowlist` is its only caller, which
+/// is what makes the escaping below unskippable.
+fn render_allowed_values(kind: EntryKind, entries: &[String]) -> String;
 ```
 
 Behaviour:
@@ -156,7 +172,11 @@ Behaviour:
 4. **Wording by `kind`.** `Argv0` → *argv[0] must be exactly one of*;
    `Domain` → *only these hosts are reachable*. `allowlist_kind()` already
    exists on the trait and already draws exactly this distinction, so no new
-   per-worker declaration is introduced.
+   per-worker declaration is introduced. The `Domain` lead additionally glosses
+   the suffix-match notation: a `.example.org` row matches the apex and every
+   subdomain (`workers/web-common/src/allowlist.rs`), and advertised bare it
+   would invite `https://.example.org/…` — an invalid host, and one more
+   failure mode invented by the fix.
 
 ### 3.3 Empty is a distinct, load-bearing case
 
@@ -182,10 +202,19 @@ no allowlist", which is a different fact about a different worker.
 two lines above where it collects `m.tool_docs()`. Nothing new is fetched, and
 **the trait is untouched** — `tool_docs()` stays `'static` and pure.
 
-The loop pairs each doc with `render_allowed_values(kind, &allowlist)` when the
-manifest declares **both** `allowlist_tool()` and `allowlist_kind()`.
-`build_registry` returns `Vec<AdvertisedTool>`; `assemble_system_prompt` and
-`render_tools_block` take `&[AdvertisedTool]`.
+The loop builds each doc with `AdvertisedTool::with_allowlist(doc, kind,
+&allowlist)` when the manifest declares **both** `allowlist_tool()` and
+`allowlist_kind()`, and `AdvertisedTool::without_allowlist(doc)` otherwise —
+so the declaration, not the list's contents, decides. `build_registry` returns
+`Vec<AdvertisedTool>`; `assemble_system_prompt` and `render_tools_block` take
+`&[AdvertisedTool]`.
+
+The rendered line only has authority if the planner is told to obey it, so
+`prompts/agent_planner.md`'s "Only the tools listed in the `<tools>` block
+exist" rule — which bound the planner to names, methods and parameter *shapes*
+— gains a clause binding it to the `allowed:` values too. Without it the model
+is free to read the line as advisory and re-emit `/usr/bin/printenv`, which is
+the measured failure this change exists to remove.
 
 Rendered shape:
 

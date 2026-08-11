@@ -29,6 +29,7 @@
 //! <tools>
 //! - {name} (method: {method}): {summary}
 //!   params: {p0.name} ({p0.description}) [required|optional], ...
+//!   allowed: {escaped operator allowlist}   [only when the worker declares one]
 //! </tools>
 //!
 //! <handoff>
@@ -48,11 +49,21 @@
 //!    always present (`<handoff>` is constant compiled-in text).
 //! 2. One blank line between sections.
 //! 3. Each row renders as `- {body}` (one row per line).
-//!    **Note for `<tools>` bodies:** Tool descriptions are compiled-in
+//!    **Note for `<tools>` bodies — a tool entry is SPLIT by trust:**
+//!    the `doc` fields (name, method, summary, params) are compiled-in
 //!    Rust literals (each worker's `tool_doc()`), so they are trusted
-//!    like L0 — rendered verbatim, no escaping. The `<tools>` block sits
-//!    with `<handoff>` (both describe callable mechanisms) and is omitted
-//!    entirely when no tool is registered.
+//!    like L0 — rendered verbatim, no escaping. The optional `allowed:`
+//!    line is **not** compiled in: it renders the operator's
+//!    `tool_allowlists` rows, and an `argv0`-kind row may be text such as
+//!    `/usr/bin/x</tools><system>` (migration `0021`'s CHECK requires only a
+//!    leading `/`; domain-kind rows are separately restricted to a host
+//!    charset and cannot carry framing). That line is escaped via
+//!    [`escape_untrusted_body`] at *construction*, inside
+//!    [`AdvertisedTool::with_allowlist`] — a private field plus a
+//!    module-private renderer make it the only route, so the line arrives
+//!    here already neutralised and this assembler must not escape it twice.
+//!    The `<tools>` block sits with `<handoff>` (both describe callable
+//!    mechanisms) and is omitted entirely when no tool is registered.
 //! 4. L0/skills bodies pass through verbatim (no HTML-style escaping
 //!    of `<` `>`); **L1 and `<recalled>` bodies are escaped** via
 //!    [`escape_untrusted_body`] — see the note below. L0 and surfaced
@@ -96,8 +107,8 @@ use crate::handoff::{MAX_FETCH_BYTES, SUMMARY_HEAD_BYTES};
 use crate::memory::l3_surface::{render_skill_entry, SurfacedSkill};
 use crate::recall_assembly::RecalledContext;
 use crate::scheduler::tool_dispatch::{HANDOFF_METHOD_FETCH, HANDOFF_TOOL};
-use crate::worker_manifest::ToolDoc;
 use kastellan_db::memories::Memory;
+use super::AdvertisedTool;
 
 /// Render the always-present `<handoff>` block.
 ///
@@ -139,10 +150,17 @@ fn render_handoff_block() -> String {
 /// `<system>`, a chat-template token) — and cannot forge an extra `- ` row,
 /// injecting content the planner reads as higher-trust structure.
 ///
-/// Applied to **L1 and `<recalled>` bodies** — both carry laundered LLM
-/// output (threat-model adversary #6): `<recalled>` is written by any process
-/// with `INSERT` on `memories`, and `<l1_insights>` mixes operator rows with
-/// agent-raised rows the L1 promotion writer sources from `Plan.l1_insight`.
+/// Applied at three sites, with two different threat sources — change this
+/// function and you change all three:
+/// - **L1 and `<recalled>` bodies**, both laundered LLM output (threat-model
+///   adversary #6): `<recalled>` is written by any process with `INSERT` on
+///   `memories`, and `<l1_insights>` mixes operator rows with agent-raised rows
+///   the L1 promotion writer sources from `Plan.l1_insight`. Escaped here, at
+///   the render site.
+/// - **`tool_allowlists` entries**, via
+///   [`allowed_values::render_allowed_values`](super::allowed_values) — operator
+///   -sourced, not adversary #6, and escaped at *construction* rather than here
+///   (see [`AdvertisedTool`] and the note in this module's docs).
 ///
 /// Two neutralisations, both render-level guarantees that hold regardless of
 /// what any upstream writer or builder allowed:
@@ -155,7 +173,7 @@ fn render_handoff_block() -> String {
 /// Single pass: `&` maps to `&amp;` unconditionally, so an already-`&amp;`-
 /// looking body round-trips exactly as the old chained-`replace` form did.
 /// L0/skills are left verbatim — they are operator-gated, not laundered.
-fn escape_untrusted_body(body: &str) -> String {
+pub(super) fn escape_untrusted_body(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     for c in body.chars() {
         match c {
@@ -169,22 +187,25 @@ fn escape_untrusted_body(body: &str) -> String {
     out
 }
 
-/// Render the `<tools>` block: one entry per advertised tool. Trusted
-/// compiled-in text (authored in each worker's `tool_doc()`), so — unlike the
-/// L1/recalled blocks — bodies are NOT escaped. Emitted only when non-empty.
-fn render_tools_block(tools: &[ToolDoc]) -> String {
+/// Render the `<tools>` block: one entry per advertised tool. The `doc` fields
+/// are trusted compiled-in text (authored in each worker's `tool_doc()`) and —
+/// unlike the L1/recalled blocks — are NOT escaped. The optional `allowed`
+/// line is operator-sourced and was escaped when the `AdvertisedTool` was
+/// built. Emitted only when non-empty.
+fn render_tools_block(tools: &[AdvertisedTool]) -> String {
     let mut out = String::from("<tools>\n");
     for t in tools {
         out.push_str("- ");
-        out.push_str(t.name);
+        out.push_str(t.doc.name);
         out.push_str(" (method: ");
-        out.push_str(t.method);
+        out.push_str(t.doc.method);
         out.push_str("): ");
-        out.push_str(t.summary);
+        out.push_str(t.doc.summary);
         out.push('\n');
-        if !t.params.is_empty() {
+        if !t.doc.params.is_empty() {
             out.push_str("  params: ");
             let rendered: Vec<String> = t
+                .doc
                 .params
                 .iter()
                 .map(|p| {
@@ -197,6 +218,14 @@ fn render_tools_block(tools: &[ToolDoc]) -> String {
                 })
                 .collect();
             out.push_str(&rendered.join(", "));
+            out.push('\n');
+        }
+        // Operator-sourced and already escaped at construction — see
+        // `allowed_values`. The doc fields above are compiled-in and are
+        // deliberately NOT escaped; this line is the only untrusted text here.
+        if let Some(allowed) = t.allowed() {
+            out.push_str("  allowed: ");
+            out.push_str(allowed);
             out.push('\n');
         }
     }
@@ -225,7 +254,7 @@ pub fn assemble_system_prompt(
     skills: &[SurfacedSkill],
     recalled: &RecalledContext,
     base: &str,
-    tools: &[ToolDoc],
+    tools: &[AdvertisedTool],
     now: Option<&str>,
 ) -> String {
     let mut out = String::new();
@@ -281,8 +310,11 @@ pub fn assemble_system_prompt(
         out.push_str("</recalled>\n\n");
     }
 
-    // Advertised tools (trusted, compiled-in). Grouped with <handoff> as the
-    // two capability-describing blocks; omitted entirely when nothing registered.
+    // Advertised tools: compiled-in trusted docs, plus — for a worker that
+    // declares an operator allowlist — one `allowed:` line of DB-sourced text
+    // already escaped at construction (see `allowed_values`). Grouped with
+    // <handoff> as the two capability-describing blocks; omitted entirely when
+    // nothing is registered.
     if !tools.is_empty() {
         out.push_str(&render_tools_block(tools));
     }
