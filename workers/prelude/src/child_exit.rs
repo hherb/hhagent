@@ -240,6 +240,31 @@ mod tests {
         assert!(msg.contains("42 B err"), "msg: {msg}");
     }
 
+    // The core containment e2e tests (`python_exec_e2e`,
+    // `python_exec_container_e2e`, `python_exec_firecracker_e2e`) prove a
+    // signal-killed child printed NOTHING by matching the exact segment
+    // `". 0 B out,"` in this message. That is a cross-crate dependency on this
+    // function's wording, so pin it here, in the crate that owns the wording:
+    // re-tuning the prose then fails one obvious test instead of three e2e
+    // files whose failure would look like a containment regression.
+    //
+    // It also pins the ANCHORING, which is the part that was wrong first time.
+    // An unanchored `contains("0 B out")` also matches `"10 B out"` — and both
+    // payloads those tests guard against ("CONNECTED\n", and a 943718400-byte
+    // allocation printed as "943718400\n") are exactly 10 bytes, so the
+    // unanchored form was defeated by the precise race it exists to catch.
+    #[test]
+    fn the_zero_output_segment_the_e2e_tests_match_on_is_anchored() {
+        let d = SignalDeath::from_signal(libc::SIGSYS);
+        let zero = signal_death_message(&d, "/bin/x", 0, 0);
+        assert!(zero.contains(". 0 B out,"), "zero-output message: {zero}");
+        let ten = signal_death_message(&d, "/bin/x", 10, 0);
+        assert!(
+            !ten.contains(". 0 B out,"),
+            "a 10-byte capture must not satisfy the zero-output check: {ten}"
+        );
+    }
+
     #[test]
     fn a_seccomp_kill_says_so_and_offers_a_repair() {
         let d = SignalDeath::from_signal(libc::SIGSYS);
