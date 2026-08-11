@@ -178,10 +178,13 @@ module compiles, and its tests run, on **both** gate hosts. That is the
 half a guarantee invisible to one host.
 
 **Signal numbers come from `libc`, never from literals.** `SIGSYS` is 31 on
-Linux and **12** on macOS; `SIGXCPU` is 24 and 30. `libc` is already an
-unconditional dependency of prelude (it is how `rlimit` works on both
-platforms), so the table costs nothing. A literal `31` would name the wrong
-signal on the Mac and the test would agree with it.
+Linux and **12** on macOS — the one number in this table that actually
+differs between the two first-class platforms (verified against the `libc`
+crate's per-target constants: `unix/linux_like/linux/gnu/*` vs `unix/bsd/mod.rs`).
+`SIGXCPU` is 24 on both. `libc` is already an unconditional dependency of
+prelude (it is how `rlimit` works on both platforms), so the table costs
+nothing regardless. A literal `31` would name the wrong signal on the Mac and
+the test would agree with it.
 
 ### 3.2 The message is the repair mechanism, so it is budgeted
 
