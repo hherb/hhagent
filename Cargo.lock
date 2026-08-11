@@ -2530,6 +2530,7 @@ dependencies = [
  "anyhow",
  "kastellan-protocol",
  "kastellan-worker-prelude",
+ "libc",
  "serde",
  "serde_json",
 ]

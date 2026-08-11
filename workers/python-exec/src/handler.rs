@@ -3,9 +3,10 @@
 use std::path::PathBuf;
 
 use kastellan_protocol::{codes, server::Handler, RpcError};
+use kastellan_worker_prelude::child_exit::{signal_death_message, ChildEnd};
 use serde::Deserialize;
 
-use crate::exec::{self, run_code, serialize_params, MAX_CODE_BYTES};
+use crate::exec::{self, run_code, serialize_params, ExecOutcome, MAX_CODE_BYTES};
 
 /// Env var carrying the absolute interpreter path. Set by the host
 /// manifest (`core/src/workers/python_exec.rs`) via `policy.env`; the
@@ -46,6 +47,29 @@ impl PythonExecHandler {
     }
 }
 
+/// Render a finished run as either a JSON-RPC result or an error.
+///
+/// Pure — no I/O — so the decision is testable without an interpreter. A
+/// Python **exception** stays a result (nonzero `exit_code` + traceback,
+/// which is what the planner iterates on); only a **signal death** becomes an
+/// error, because it produces no exit code at all and previously surfaced as
+/// a successful call with `"exit_code": null` (#539).
+pub fn outcome_to_rpc(outcome: &ExecOutcome) -> Result<serde_json::Value, RpcError> {
+    match outcome.end {
+        ChildEnd::Exited(code) => Ok(serde_json::json!({
+            "exit_code": code,
+            "stdout": outcome.stdout,
+            "stderr": outcome.stderr,
+            "stdout_truncated": outcome.stdout_truncated,
+            "stderr_truncated": outcome.stderr_truncated,
+        })),
+        ChildEnd::Signalled(death) => Err(RpcError::new(
+            codes::OPERATION_FAILED,
+            signal_death_message(&death, "python", outcome.stdout.len(), outcome.stderr.len()),
+        )),
+    }
+}
+
 impl Handler for PythonExecHandler {
     fn call(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         if method != "python.exec" {
@@ -72,13 +96,7 @@ impl Handler for PythonExecHandler {
         let outcome = run_code(&self.python, &p.code, &params_json, channel)
             .map_err(|e| RpcError::new(codes::OPERATION_FAILED, format!("spawn failed: {e}")))?;
 
-        Ok(serde_json::json!({
-            "exit_code": outcome.exit_code,
-            "stdout": outcome.stdout,
-            "stderr": outcome.stderr,
-            "stdout_truncated": outcome.stdout_truncated,
-            "stderr_truncated": outcome.stderr_truncated,
-        }))
+        outcome_to_rpc(&outcome)
     }
 }
 
@@ -166,5 +184,39 @@ mod tests {
             .call("python.exec", serde_json::json!({"code": "print(1)"}))
             .unwrap_err();
         assert_eq!(err.code, codes::OPERATION_FAILED);
+    }
+
+    use crate::exec::ExecOutcome;
+    use kastellan_worker_prelude::child_exit::{ChildEnd, SignalDeath};
+
+    fn outcome(end: ChildEnd) -> ExecOutcome {
+        ExecOutcome {
+            end,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_signal_killed_interpreter_is_an_error() {
+        let err = outcome_to_rpc(&outcome(ChildEnd::Signalled(SignalDeath::from_signal(
+            libc::SIGKILL,
+        ))))
+        .expect_err("a signal-killed interpreter must not be a successful result");
+        assert_eq!(err.code, codes::OPERATION_FAILED);
+        assert!(err.message.contains("SIGKILL"), "message: {}", err.message);
+    }
+
+    // The documented contract that must NOT move: a Python exception is a
+    // nonzero exit code plus a traceback, not an RPC error.
+    #[test]
+    fn a_nonzero_exit_is_still_a_result_not_an_error() {
+        let mut o = outcome(ChildEnd::Exited(1));
+        o.stderr = "Traceback (most recent call last): …".to_string();
+        let v = outcome_to_rpc(&o).expect("a Python exception is a result");
+        assert_eq!(v["exit_code"], 1);
+        assert!(v["stderr"].as_str().unwrap().contains("Traceback"));
     }
 }

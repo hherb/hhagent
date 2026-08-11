@@ -23,3 +23,8 @@ kastellan-worker-prelude = { path = "../prelude", version = "0.2.0" }
 serde                  = { workspace = true }
 serde_json             = { workspace = true }
 anyhow                 = { workspace = true }
+
+[dev-dependencies]
+# Test-only: signal numbers differ across our two first-class platforms
+# (SIGKILL agrees, SIGSYS does not), so even a test names them via libc.
+libc = "0.2"
