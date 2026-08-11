@@ -9,6 +9,10 @@ authors.workspace      = true
 repository.workspace   = true
 readme      = "../../README.md"
 
+[lib]
+name = "kastellan_worker_shell_exec"
+path = "src/lib.rs"
+
 [[bin]]
 name = "kastellan-worker-shell-exec"
 path = "src/main.rs"
