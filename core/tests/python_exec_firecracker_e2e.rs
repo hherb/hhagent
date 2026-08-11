@@ -96,8 +96,16 @@ async fn run_in_microvm(code: &str) -> serde_json::Value {
 /// `kastellan_worker_prelude::child_exit::signal_death_message`). Local to
 /// this file rather than shared — `python_exec_e2e.rs`,
 /// `python_exec_container_e2e.rs` and `python_exec_firecracker_e2e.rs` are
-/// three separate test binaries, and pulling a three-call-site helper into a
-/// shared crate would be a new dependency edge just to save a few lines.
+/// three separate test binaries, each with its own call site. Sharing it
+/// would not dodge a new dependency edge the way an earlier version of this
+/// comment claimed: all three files already depend on `kastellan-tests-common`,
+/// which already depends on `kastellan-core`, so referencing `ToolHostError`
+/// costs nothing — only `kastellan-protocol` would be genuinely new, and that
+/// is one line in a dev-only manifest. The real trade is smaller: this helper
+/// (doc comment + body) is ~30 lines, so keeping it inline triples ~30 lines
+/// of duplication across the tree to avoid a fourth crate whose only reason
+/// to exist would be this one function — a defensible call either way, but
+/// the dependency-edge framing was not the actual reason for it.
 fn assert_is_signal_death(err: &ToolHostError) {
     match err {
         ToolHostError::Protocol(ClientError::Rpc(rpc)) => {
@@ -167,6 +175,15 @@ async fn microvm_enforces_mem_cap() {
                 err.to_string().contains("SIGKILL"),
                 "a guest OOM-kill sends SIGKILL: {err}"
             );
+            // The teardown race the shapes above already document: the child can
+            // SUCCEED at the forbidden allocation (and print its length) before it
+            // is signalled. `signal_death_message` reports the captured byte count,
+            // so demand it is zero — a non-zero count here would mean the child got
+            // to print before dying, i.e. NOT contained.
+            assert!(
+                err.to_string().contains("0 B out"),
+                "the child printed before dying — not contained: {err}"
+            );
         }
     }
 }
@@ -206,7 +223,18 @@ except Exception:
                 "network must be denied (no CONNECTED): {out}"
             );
         }
-        Err(err) => assert_is_signal_death(&err),
+        Err(err) => {
+            assert_is_signal_death(&err);
+            // Same teardown race as `microvm_enforces_mem_cap`: the child can
+            // print "CONNECTED" before being torn down. A non-zero captured byte
+            // count here would hide exactly that — the connection succeeding,
+            // then a kill racing the print. Zero out bytes is what makes this
+            // Err arm as strong a containment proof as the Ok arm's `!contains`.
+            assert!(
+                err.to_string().contains("0 B out"),
+                "the child printed before dying — not contained: {err}"
+            );
+        }
     }
 }
 

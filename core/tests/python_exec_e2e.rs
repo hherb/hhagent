@@ -191,8 +191,16 @@ async fn exec_in_jail(
 /// `kastellan_worker_prelude::child_exit::signal_death_message`). Local to
 /// this file rather than shared — `python_exec_e2e.rs`,
 /// `python_exec_container_e2e.rs` and `python_exec_firecracker_e2e.rs` are
-/// three separate test binaries, and pulling a three-call-site helper into a
-/// shared crate would be a new dependency edge just to save a few lines.
+/// three separate test binaries, each with its own call site. Sharing it
+/// would not dodge a new dependency edge the way an earlier version of this
+/// comment claimed: all three files already depend on `kastellan-tests-common`,
+/// which already depends on `kastellan-core`, so referencing `ToolHostError`
+/// costs nothing — only `kastellan-protocol` would be genuinely new, and that
+/// is one line in a dev-only manifest. The real trade is smaller: this helper
+/// (doc comment + body) is ~30 lines, so keeping it inline triples ~30 lines
+/// of duplication across the tree to avoid a fourth crate whose only reason
+/// to exist would be this one function — a defensible call either way, but
+/// the dependency-edge framing was not the actual reason for it.
 fn assert_is_signal_death(err: &ToolHostError) {
     match err {
         ToolHostError::Protocol(ClientError::Rpc(rpc)) => {
@@ -267,6 +275,13 @@ fn socket_attempt_is_contained_by_the_jail() {
                 assert!(
                     msg.contains("SIGSYS"),
                     "the seccomp socket(2) denial must SIGSYS-kill the interpreter: {msg}"
+                );
+                // Same teardown-race guard as the container/microvm e2e tests: a
+                // non-zero captured byte count here would mean "escaped" got
+                // printed before the kill landed — not contained.
+                assert!(
+                    msg.contains("0 B out"),
+                    "the child printed before dying — not contained: {msg}"
                 );
             }
         }

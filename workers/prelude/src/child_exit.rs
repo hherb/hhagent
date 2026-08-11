@@ -86,10 +86,13 @@ impl SignalDeath {
     pub fn cause(&self) -> &'static str {
         match self.signal {
             s if s == libc::SIGSYS => {
-                "blocked syscall — a user/group-name lookup needs socket(2), \
-                 which the sandbox denies; try `ls` without `-l`, or `python3 -S`"
+                "seccomp (Linux) blocked a syscall — a user/group-name lookup needs \
+                 socket(2), which the sandbox denies; try `ls` without `-l`, or \
+                 `python3 -S`"
             }
-            s if s == libc::SIGKILL => "the memory cap (cgroup OOM) or an external kill",
+            s if s == libc::SIGKILL => {
+                "the memory cap (cgroup OOM on Linux) or an external kill"
+            }
             s if s == libc::SIGXCPU => "the CPU budget was exhausted",
             s if s == libc::SIGSEGV
                 || s == libc::SIGBUS
@@ -113,7 +116,10 @@ pub fn classify(status: ExitStatus) -> ChildEnd {
         Some(code) => ChildEnd::Exited(code),
         // `signal()` is `Some` whenever `code()` is `None` for a *waited* child;
         // `unwrap_or(0)` keeps this total rather than panicking on a status word
-        // no `wait(2)` we make can produce, and 0 falls through to the unnamed
+        // that is neither WIFEXITED nor WIFSIGNALED — a *stopped* child. `wait(2)`
+        // can report that shape in general (with `WUNTRACED`), but every `wait`
+        // this codebase calls omits it, so in practice the fallback is defensive
+        // totality rather than a reachable path; 0 falls through to the unnamed
         // arm ("signal 0") rather than being mistaken for a real signal.
         None => ChildEnd::Signalled(SignalDeath::from_signal(status.signal().unwrap_or(0))),
     }
@@ -129,6 +135,14 @@ pub fn classify(status: ExitStatus) -> ChildEnd {
 /// captured bytes themselves: an RPC error carries no result, and `RpcError`'s
 /// `data` field reaches neither the planner (`map_dispatch_result` keeps only
 /// `code` + `message`) nor the audit row (which records `e.to_string()`).
+///
+/// `stdout_len`/`stderr_len` are as captured by the caller, not necessarily
+/// the child's true output size: shell-exec passes the raw, uncapped
+/// `output.stdout.len()` / `output.stderr.len()`, while python-exec passes the
+/// post-truncation length already capped at its own 256 KiB ceiling — the
+/// truncation flags themselves are discarded before reaching this function.
+/// A count here can therefore be a cap rather than a measurement, depending
+/// on the caller.
 pub fn signal_death_message(
     death: &SignalDeath,
     what: &str,
@@ -174,8 +188,9 @@ mod tests {
     }
 
     // `classify`'s `unwrap_or(0)` fallback exists for a status word that is
-    // neither `WIFEXITED` nor `WIFSIGNALED` — a *stopped* child, which
-    // `wait(2)` can in principle report. `from_raw(0x7f)` is that encoding
+    // neither `WIFEXITED` nor `WIFSIGNALED` — a *stopped* child, the shape
+    // `wait(2)` can report in general (with `WUNTRACED`), though no `wait`
+    // this codebase calls requests it. `from_raw(0x7f)` is that encoding
     // (low byte 0x7f, stop signal 0): verified by hand on this host that
     // `ExitStatus::from_raw(0x7f)` gives `code() == None` *and*
     // `signal() == None`, which is exactly the shape the fallback is for.
@@ -209,6 +224,7 @@ mod tests {
     fn an_unknown_signal_is_named_by_number_and_invents_no_cause() {
         let d = SignalDeath::from_signal(64);
         assert_eq!(d.name(), None);
+        assert_eq!(d.cause(), "terminated by a signal");
         let msg = signal_death_message(&d, "/usr/bin/thing", 0, 0);
         assert!(msg.contains("signal 64"), "msg: {msg}");
     }
@@ -240,10 +256,39 @@ mod tests {
     // only a total length) is what makes this fail if the arms are reordered.
     #[test]
     fn the_advice_survives_the_clamp_for_the_longest_command_it_can_quote() {
+        // The byte-count segment is itself variable-width, so probe with the
+        // realistic maximum rather than 0 — python-exec's own captured-stream
+        // cap, which is the largest either count can be in practice. Mirrored
+        // as a literal (not a dependency on the python-exec crate, which would
+        // be a new edge just for a test constant): see
+        // `workers/python-exec/src/exec/mod.rs::MAX_CAPTURE_BYTES` (256 KiB).
+        const MAX_REALISTIC_CAPTURE_LEN: usize = 256 * 1024;
         let longest = "/".repeat(kastellan_protocol::STEP_ERR_DETAIL_MAX * 4);
-        for sig in [libc::SIGSYS, libc::SIGKILL, libc::SIGXCPU, libc::SIGSEGV, 64] {
+        // Every signal `name()`/`cause()` name individually, plus 64 for the
+        // unknown-signal fallback arm — the whole table, so the assertion below
+        // actually holds for "every signal in the table" (the doc comment's
+        // claim) rather than a hand-picked subset of it.
+        for sig in [
+            libc::SIGSYS,
+            libc::SIGKILL,
+            libc::SIGXCPU,
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGILL,
+            libc::SIGABRT,
+            libc::SIGFPE,
+            libc::SIGPIPE,
+            libc::SIGTERM,
+            libc::SIGINT,
+            64,
+        ] {
             let d = SignalDeath::from_signal(sig);
-            let msg = signal_death_message(&d, &longest, 0, 0);
+            let msg = signal_death_message(
+                &d,
+                &longest,
+                MAX_REALISTIC_CAPTURE_LEN,
+                MAX_REALISTIC_CAPTURE_LEN,
+            );
             let what_at = msg.find(&longest).expect("the command must be quoted");
             // Everything except the caller's own string fits in the budget.
             assert!(

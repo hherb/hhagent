@@ -54,7 +54,12 @@ impl PythonExecHandler {
 /// which is what the planner iterates on); only a **signal death** becomes an
 /// error, because it produces no exit code at all and previously surfaced as
 /// a successful call with `"exit_code": null` (#539).
-pub fn outcome_to_rpc(outcome: &ExecOutcome) -> Result<serde_json::Value, RpcError> {
+///
+/// `what` is the caller-supplied label for the signal-death message's `ran:`
+/// segment (see [`signal_death_message`]) — the interpreter path, so an
+/// operator reading the error sees *which* interpreter died rather than the
+/// bare word "python".
+pub fn outcome_to_rpc(outcome: &ExecOutcome, what: &str) -> Result<serde_json::Value, RpcError> {
     match outcome.end {
         ChildEnd::Exited(code) => Ok(serde_json::json!({
             "exit_code": code,
@@ -65,7 +70,7 @@ pub fn outcome_to_rpc(outcome: &ExecOutcome) -> Result<serde_json::Value, RpcErr
         })),
         ChildEnd::Signalled(death) => Err(RpcError::new(
             codes::OPERATION_FAILED,
-            signal_death_message(&death, "python", outcome.stdout.len(), outcome.stderr.len()),
+            signal_death_message(&death, what, outcome.stdout.len(), outcome.stderr.len()),
         )),
     }
 }
@@ -96,13 +101,14 @@ impl Handler for PythonExecHandler {
         let outcome = run_code(&self.python, &p.code, &params_json, channel)
             .map_err(|e| RpcError::new(codes::OPERATION_FAILED, format!("spawn failed: {e}")))?;
 
-        outcome_to_rpc(&outcome)
+        outcome_to_rpc(&outcome, &self.python.to_string_lossy())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kastellan_worker_prelude::child_exit::SignalDeath;
 
     fn handler() -> PythonExecHandler {
         // The interpreter is never reached by these tests (they fail
@@ -186,9 +192,6 @@ mod tests {
         assert_eq!(err.code, codes::OPERATION_FAILED);
     }
 
-    use crate::exec::ExecOutcome;
-    use kastellan_worker_prelude::child_exit::{ChildEnd, SignalDeath};
-
     fn outcome(end: ChildEnd) -> ExecOutcome {
         ExecOutcome {
             end,
@@ -201,12 +204,30 @@ mod tests {
 
     #[test]
     fn a_signal_killed_interpreter_is_an_error() {
-        let err = outcome_to_rpc(&outcome(ChildEnd::Signalled(SignalDeath::from_signal(
-            libc::SIGKILL,
-        ))))
+        let err = outcome_to_rpc(
+            &outcome(ChildEnd::Signalled(SignalDeath::from_signal(libc::SIGKILL))),
+            "/usr/bin/python3",
+        )
         .expect_err("a signal-killed interpreter must not be a successful result");
         assert_eq!(err.code, codes::OPERATION_FAILED);
         assert!(err.message.contains("SIGKILL"), "message: {}", err.message);
+    }
+
+    // #539/M10: the message must name the interpreter path, not the bare word
+    // "python" — an operator reading the error should see *which* interpreter
+    // died.
+    #[test]
+    fn a_signal_killed_interpreter_names_the_interpreter_path() {
+        let err = outcome_to_rpc(
+            &outcome(ChildEnd::Signalled(SignalDeath::from_signal(libc::SIGKILL))),
+            "/usr/bin/python3",
+        )
+        .expect_err("a signal-killed interpreter must not be a successful result");
+        assert!(
+            err.message.contains("/usr/bin/python3"),
+            "message must name the interpreter path: {}",
+            err.message
+        );
     }
 
     // The documented contract that must NOT move: a Python exception is a
@@ -215,7 +236,7 @@ mod tests {
     fn a_nonzero_exit_is_still_a_result_not_an_error() {
         let mut o = outcome(ChildEnd::Exited(1));
         o.stderr = "Traceback (most recent call last): …".to_string();
-        let v = outcome_to_rpc(&o).expect("a Python exception is a result");
+        let v = outcome_to_rpc(&o, "/usr/bin/python3").expect("a Python exception is a result");
         assert_eq!(v["exit_code"], 1);
         assert!(v["stderr"].as_str().unwrap().contains("Traceback"));
     }
