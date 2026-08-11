@@ -173,6 +173,28 @@ mod tests {
         }
     }
 
+    // `classify`'s `unwrap_or(0)` fallback exists for a status word that is
+    // neither `WIFEXITED` nor `WIFSIGNALED` — a *stopped* child, which
+    // `wait(2)` can in principle report. `from_raw(0x7f)` is that encoding
+    // (low byte 0x7f, stop signal 0): verified by hand on this host that
+    // `ExitStatus::from_raw(0x7f)` gives `code() == None` *and*
+    // `signal() == None`, which is exactly the shape the fallback is for.
+    // Without this test, changing `unwrap_or(0)` to `unwrap_or(9)` or to
+    // `.unwrap()` passes the rest of the suite untouched.
+    #[test]
+    fn a_stopped_status_falls_through_to_signal_zero_not_a_fabricated_signal() {
+        let end = classify(ExitStatus::from_raw(0x7f));
+        match end {
+            ChildEnd::Signalled(d) => {
+                assert_eq!(d.signal(), 0);
+                assert_eq!(d.name(), None);
+                let msg = signal_death_message(&d, "/usr/bin/thing", 0, 0);
+                assert!(msg.contains("signal 0"), "msg: {msg}");
+            }
+            other => panic!("expected Signalled, got {other:?}"),
+        }
+    }
+
     // The one test that can catch a hard-coded 31: SIGSYS is 31 on Linux and
     // 12 on macOS, so a literal table is wrong on exactly one gate host and
     // agrees with itself on the other.
@@ -189,6 +211,17 @@ mod tests {
         assert_eq!(d.name(), None);
         let msg = signal_death_message(&d, "/usr/bin/thing", 0, 0);
         assert!(msg.contains("signal 64"), "msg: {msg}");
+    }
+
+    // Every other test above passes `stdout_len = stderr_len = 0`, so nothing
+    // catches the two counts being transposed or one of them being dropped.
+    // Two distinct, non-zero values pin each number to its own stream label.
+    #[test]
+    fn stream_byte_counts_are_reported_against_their_own_stream() {
+        let d = SignalDeath::from_signal(libc::SIGKILL);
+        let msg = signal_death_message(&d, "/usr/bin/thing", 7, 42);
+        assert!(msg.contains("7 B out"), "msg: {msg}");
+        assert!(msg.contains("42 B err"), "msg: {msg}");
     }
 
     #[test]
