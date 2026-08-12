@@ -135,3 +135,62 @@ pub fn stdout_of(v: &serde_json::Value) -> &str {
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The exact shape `injection_placeholder::injection_blocked_placeholder`
+    /// builds. Mirrored as a literal rather than imported: the point is to
+    /// prove these guards reject a result with neither `exit_code` nor
+    /// `stdout`, whatever produced it.
+    fn injection_placeholder() -> serde_json::Value {
+        json!({
+            "injection_blocked": true,
+            "note": "[tool output withheld: failed injection screen]",
+            "score": 0.9,
+            "reason_codes": ["x"],
+        })
+    }
+
+    // THE regression this whole guard exists for. `assert_ne!(v["exit_code"], 0)`
+    // passes here, because `Value::Null != Value::from(0)` — which is #539
+    // itself, and is why five containment e2e tests were green for years while
+    // the sandbox reported signal kills as successes.
+    #[test]
+    #[should_panic(expected = "no integer `exit_code`")]
+    fn a_null_exit_code_is_not_a_failure_exit() {
+        assert_nonzero_exit(&json!({"exit_code": null, "stdout": ""}));
+    }
+
+    #[test]
+    #[should_panic(expected = "no integer `exit_code`")]
+    fn a_result_without_an_exit_code_is_rejected() {
+        assert_nonzero_exit(&injection_placeholder());
+    }
+
+    #[test]
+    #[should_panic(expected = "clean 0")]
+    fn a_clean_zero_exit_is_rejected() {
+        assert_nonzero_exit(&json!({"exit_code": 0, "stdout": ""}));
+    }
+
+    #[test]
+    fn a_genuine_nonzero_exit_is_accepted() {
+        assert_nonzero_exit(&json!({"exit_code": 1, "stdout": ""}));
+    }
+
+    // `v["stdout"].as_str().unwrap_or_default()` yields "" here, which makes
+    // every `!contains(payload)` containment assertion pass vacuously.
+    #[test]
+    #[should_panic(expected = "no `stdout` string")]
+    fn a_result_without_stdout_is_rejected_rather_than_read_as_empty() {
+        stdout_of(&injection_placeholder());
+    }
+
+    #[test]
+    fn a_real_stdout_is_returned() {
+        assert_eq!(stdout_of(&json!({"exit_code": 0, "stdout": "hi"})), "hi");
+    }
+}
