@@ -25,18 +25,32 @@
 //!
 //! ## When a SIGSYS is NOT a gap
 //!
-//! glibc's NSS opens a `socket(2)` for every user- or group-name
-//! resolution, and `WorkerStrict` denies `socket(2)`. Measured on the
+//! glibc's NSS opens a `socket(2)` to reach nscd/systemd-userdb for
+//! every user- or group-name resolution, and `WorkerStrict` denies
+//! `socket(2)`. What makes that fatal rather than a fallback to
+//! `/etc/passwd` is the seccomp ACTION: `KILL_PROCESS`, not `ERRNO` —
+//! glibc never gets an error to recover from. Measured on the
 //! deployed host (issue #539): `ls -l`, `id`, and `whoami` are all
 //! SIGSYS-killed by that alone, while `ls` (no `-l`) and `cat` are
 //! not. The full measurement table is in
 //! `docs/superpowers/specs/2026-08-11-signal-killed-child-is-loud-design.md`
-//! §1.2. Widening `BASE_ALLOW` to admit `socket` is **not** the fix
-//! for one of these — that would void `Net::Deny` for every
-//! strict-profile worker; the SIGSYS is the network denial working
-//! as designed, not a coverage gap. The correct fix is to spell the
-//! command so it never resolves a name: `ls` instead of `ls -l`,
-//! `python3 -S` instead of relying on `-I` alone.
+//! §1.2.
+//!
+//! Widening `BASE_ALLOW` to admit `socket` is **not** the fix for one
+//! of these. Be precise about what it would cost, because the obvious
+//! phrasing is wrong: it would NOT "void `Net::Deny`" — network denial
+//! is enforced by the private netns on Linux and by Seatbelt on macOS,
+//! not by seccomp, which is why `WorkerMlClient` can permit the whole
+//! socket family and still be `Net::Deny` (see `sandbox/src/lib.rs`).
+//! What it WOULD do is collapse the `Strict`-vs-`NetClient` boundary
+//! that the seccomp allow-list exists to draw, discarding a
+//! defence-in-depth layer for every strict-profile worker. This is the
+//! same conclusion the pre-existing `tar` note below reaches; see it
+//! for the second worked example.
+//!
+//! The correct fix is to spell the command so it never resolves a
+//! name: `ls` instead of `ls -l`, `python3 -S` instead of relying on
+//! `-I` alone.
 //!
 //! ## Skip pattern
 //!
@@ -523,7 +537,8 @@ fn python3_survives_strict() {
     // a scratch write/read round-trip, so a BASE_ALLOW gap for CPython
     // is found here deterministically instead of in a worker SIGSYS
     // crash log. Flags mirror the worker's invocation (`-I -S -B`,
-    // exec.rs::python_args); `-c` instead of stdin-`-` because the
+    // `workers/python-exec/src/exec/mod.rs::python_args`); `-c`
+    // instead of stdin-`-` because the
     // probe has no stdin plumbing — the syscall surface is the same.
     // `-S` is what keeps this test green: it skips `site`, which is
     // what would otherwise expand `~` via `getpwuid` and open a

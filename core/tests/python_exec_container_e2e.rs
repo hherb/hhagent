@@ -20,9 +20,11 @@ use std::sync::Arc;
 use kastellan_core::secrets::Vault;
 use kastellan_core::tool_host::{dispatch_with_sink, spawn_worker, ToolHostError, WorkerSpec};
 use kastellan_core::workers::python_exec::{container_mode_entry, DEFAULT_IMAGE};
-use kastellan_protocol::{client::ClientError, codes};
 use kastellan_sandbox::{macos_container::MacosContainer, SandboxBackendKind, SandboxBackends};
-use kastellan_tests_common::NoopAuditSink;
+use kastellan_tests_common::{
+    assert_contained_by_signal, assert_contained_signal_death, assert_nonzero_exit, stdout_of,
+    NoopAuditSink,
+};
 
 /// Skip the test (via early-return) when Apple `container` isn't usable
 /// on this host or the python-exec image is absent. Returns `true` when
@@ -120,42 +122,6 @@ async fn run_in_container(code: &str) -> serde_json::Value {
     dispatch_in_container(serde_json::json!({ "code": code })).await
 }
 
-/// Assert `err` is exactly the dispatch-level signal-death error introduced
-/// by #539: an RPC error carrying `OPERATION_FAILED` whose message names the
-/// killing signal (the fixed `killed by <SIG> (...)` shape built by
-/// `kastellan_worker_prelude::child_exit::signal_death_message`). Local to
-/// this file rather than shared — `python_exec_e2e.rs`,
-/// `python_exec_container_e2e.rs` and `python_exec_firecracker_e2e.rs` are
-/// three separate test binaries, each with its own call site. Sharing it
-/// would not dodge a new dependency edge the way an earlier version of this
-/// comment claimed: all three files already depend on `kastellan-tests-common`,
-/// which already depends on `kastellan-core`, so referencing `ToolHostError`
-/// costs nothing — only `kastellan-protocol` would be genuinely new, and that
-/// is one line in a dev-only manifest. The real trade is smaller: this helper
-/// (doc comment + body) is ~30 lines, so keeping it inline triples ~30 lines
-/// of duplication across the tree to avoid a fourth crate whose only reason
-/// to exist would be this one function — a defensible call either way, but
-/// the dependency-edge framing was not the actual reason for it.
-fn assert_is_signal_death(err: &ToolHostError) {
-    match err {
-        ToolHostError::Protocol(ClientError::Rpc(rpc)) => {
-            assert_eq!(
-                rpc.code,
-                codes::OPERATION_FAILED,
-                "expected the #539 signal-death error, got: {rpc:?}"
-            );
-            assert!(
-                rpc.message.contains("killed by"),
-                "signal-death message must name the killing signal: {}",
-                rpc.message
-            );
-        }
-        other => panic!(
-            "expected Protocol(Rpc(_)) carrying the #539 signal-death error, got: {other:?}"
-        ),
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn python_exec_round_trips_through_container() {
     if skip_if_no_container_image() {
@@ -190,35 +156,19 @@ async fn container_enforces_mem_cap() {
     // NOT enforced (the Seatbelt host-mode gap this micro-VM mode closes).
     match result {
         Ok(out) => {
-            assert_ne!(out["exit_code"], 0, "expected an OOM failure exit: {out}");
-            let stdout = out["stdout"].as_str().unwrap_or_default();
+            // `assert_nonzero_exit` rather than `assert_ne!(out["exit_code"], 0)`:
+            // the latter passes on `null`, which is #539, and on the injection
+            // placeholder, which has no `exit_code` at all.
+            assert_nonzero_exit(&out);
             assert!(
-                !stdout.contains(&(900 * 1024 * 1024).to_string()),
+                !stdout_of(&out).contains(&(900 * 1024 * 1024).to_string()),
                 "the allocation print must not appear — it should be killed first: {out}"
             );
         }
-        Err(err) => {
-            assert_is_signal_death(&err);
-            assert!(
-                err.to_string().contains("SIGKILL"),
-                "the cgroup OOM killer sends SIGKILL: {err}"
-            );
-            // The teardown race the shapes above already document: the child can
-            // SUCCEED at the forbidden allocation (and print its length) before it
-            // is signalled. `signal_death_message` reports the captured byte count,
-            // so demand it is zero — a non-zero count here would mean the child got
-            // to print before dying, i.e. NOT contained.
-            assert!(
-                // Anchored on the ". " that `signal_death_message` always emits
-                // after the parenthesised cause: a bare `contains("0 B out")`
-                // also matches "10 B out", and both leak payloads this test
-                // guards against — "CONNECTED\n" and the allocation length —
-                // are exactly 10 bytes, so the unanchored form was defeated by
-                // the very race it exists to catch.
-                err.to_string().contains(". 0 B out,"),
-                "the child printed before dying — not contained: {err}"
-            );
-        }
+        // The teardown race: the child can SUCCEED at the forbidden allocation
+        // and print its length before the OOM killer lands. The zero-stdout
+        // half of this assertion is what rules that out.
+        Err(err) => assert_contained_by_signal(&err, "SIGKILL"),
     }
 }
 
@@ -256,27 +206,24 @@ except Exception as e:
     // would also print no "CONNECTED" and this guard would weaken. Keep them paired.
     match result {
         Ok(out) => {
-            let stdout = out["stdout"].as_str().unwrap_or_default();
-            assert!(!stdout.contains("CONNECTED"), "network must be denied (no CONNECTED): {out}");
-        }
-        Err(err) => {
-            assert_is_signal_death(&err);
-            // Same teardown race as `container_enforces_mem_cap`: the child can
-            // print "CONNECTED" before being torn down. A non-zero captured byte
-            // count here would hide exactly that — the connection succeeding,
-            // then a kill racing the print. Zero out bytes is what makes this
-            // Err arm as strong a containment proof as the Ok arm's `!contains`.
+            // `stdout_of` panics rather than yielding "" for a result with no
+            // `stdout` leaf. The previous `unwrap_or_default()` made this arm
+            // pass vacuously on ANY other Ok shape — including the injection
+            // placeholder `dispatch_with_sink` substitutes for a blocked
+            // Strict-profile worker — which is why this test used to carry an
+            // explicit "worker returned no result object — dispatch broken,
+            // not contained" guard. That guard is back, in stronger form.
             assert!(
-                // Anchored on the ". " that `signal_death_message` always emits
-                // after the parenthesised cause: a bare `contains("0 B out")`
-                // also matches "10 B out", and both leak payloads this test
-                // guards against — "CONNECTED\n" and the allocation length —
-                // are exactly 10 bytes, so the unanchored form was defeated by
-                // the very race it exists to catch.
-                err.to_string().contains(". 0 B out,"),
-                "the child printed before dying — not contained: {err}"
+                !stdout_of(&out).contains("CONNECTED"),
+                "network must be denied (no CONNECTED): {out}"
             );
         }
+        // Same teardown race as `container_enforces_mem_cap`: the child can
+        // print "CONNECTED" and only then be torn down. The zero-stdout half
+        // is what makes this arm as strong a containment proof as the Ok arm.
+        // No signal is named: a denied connect surfaces inconsistently across
+        // harness timing, so the teardown signal is genuinely not determined.
+        Err(err) => assert_contained_signal_death(&err),
     }
 }
 

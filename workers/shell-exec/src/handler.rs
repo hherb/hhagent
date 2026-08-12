@@ -8,12 +8,14 @@ use std::collections::HashSet;
 use std::process::Command;
 
 use kastellan_protocol::{codes, server::Handler, RpcError};
-use kastellan_worker_prelude::child_exit::{classify, signal_death_message, ChildEnd};
+use kastellan_worker_prelude::child_exit::{
+    classify, signal_death_message, Caller, Captured, ChildEnd,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-pub struct ExecParams {
-    pub argv: Vec<String>,
+struct ExecParams {
+    argv: Vec<String>,
 }
 
 pub struct ShellExecHandler {
@@ -60,6 +62,13 @@ impl Handler for ShellExecHandler {
         // A signal-terminated child has no exit code. Reporting that as a
         // successful call with `"exit_code": null` is indistinguishable from a
         // command that printed nothing — the silent failure #539 was filed for.
+        //
+        // Note what the error path costs: whatever the child managed to print
+        // before the kill is DISCARDED (only its byte count survives), and
+        // `inner_loop` aborts the rest of the plan on any `Err`. That is the
+        // deliberate trade — an `RpcError` carries no result, and its `data`
+        // field reaches neither the planner nor the audit row — but it means a
+        // command killed on its last line loses output it had already produced.
         match classify(output.status) {
             ChildEnd::Exited(code) => Ok(serde_json::json!({
                 "exit_code": code,
@@ -68,7 +77,16 @@ impl Handler for ShellExecHandler {
             })),
             ChildEnd::Signalled(death) => Err(RpcError::new(
                 codes::OPERATION_FAILED,
-                signal_death_message(&death, program, output.stdout.len(), output.stderr.len()),
+                signal_death_message(
+                    &death,
+                    // shell-exec's caller chose the argv, so it can respell it.
+                    Caller::Argv,
+                    program,
+                    Captured {
+                        stdout_len: output.stdout.len(),
+                        stderr_len: output.stderr.len(),
+                    },
+                ),
             )),
         }
     }

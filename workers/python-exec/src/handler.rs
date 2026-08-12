@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use kastellan_protocol::{codes, server::Handler, RpcError};
-use kastellan_worker_prelude::child_exit::{signal_death_message, ChildEnd};
+use kastellan_worker_prelude::child_exit::{
+    signal_death_message, Caller, Captured, ChildEnd,
+};
 use serde::Deserialize;
 
 use crate::exec::{self, run_code, serialize_params, ExecOutcome, MAX_CODE_BYTES};
@@ -59,6 +61,13 @@ impl PythonExecHandler {
 /// segment (see [`signal_death_message`]) — the interpreter path, so an
 /// operator reading the error sees *which* interpreter died rather than the
 /// bare word "python".
+///
+/// The signal path DISCARDS whatever the script printed before the kill (only
+/// its byte count survives) and, because `inner_loop` breaks the plan on any
+/// `Err`, ends the plan there. For a long-running script OOM-killed on its
+/// last line that is a real loss of partial output — the deliberate trade for
+/// not reporting the failure as a success, since an `RpcError` carries no
+/// result and its `data` field reaches neither planner nor audit row.
 pub fn outcome_to_rpc(outcome: &ExecOutcome, what: &str) -> Result<serde_json::Value, RpcError> {
     match outcome.end {
         ChildEnd::Exited(code) => Ok(serde_json::json!({
@@ -70,7 +79,19 @@ pub fn outcome_to_rpc(outcome: &ExecOutcome, what: &str) -> Result<serde_json::V
         })),
         ChildEnd::Signalled(death) => Err(RpcError::new(
             codes::OPERATION_FAILED,
-            signal_death_message(&death, what, outcome.stdout.len(), outcome.stderr.len()),
+            signal_death_message(
+                &death,
+                // The caller submitted source, not an argv: it cannot change
+                // the interpreter flags, which `python_args()` pins to
+                // `-I -S -B`. Advice naming `-S` or `ls -l` would be advice it
+                // cannot act on.
+                Caller::Interpreter,
+                what,
+                Captured {
+                    stdout_len: outcome.stdout.len(),
+                    stderr_len: outcome.stderr.len(),
+                },
+            ),
         )),
     }
 }
@@ -205,7 +226,7 @@ mod tests {
     #[test]
     fn a_signal_killed_interpreter_is_an_error() {
         let err = outcome_to_rpc(
-            &outcome(ChildEnd::Signalled(SignalDeath::from_signal(libc::SIGKILL))),
+            &outcome(ChildEnd::Signalled(SignalDeath::from_raw(libc::SIGKILL))),
             "/usr/bin/python3",
         )
         .expect_err("a signal-killed interpreter must not be a successful result");
@@ -219,13 +240,48 @@ mod tests {
     #[test]
     fn a_signal_killed_interpreter_names_the_interpreter_path() {
         let err = outcome_to_rpc(
-            &outcome(ChildEnd::Signalled(SignalDeath::from_signal(libc::SIGKILL))),
+            &outcome(ChildEnd::Signalled(SignalDeath::from_raw(libc::SIGKILL))),
             "/usr/bin/python3",
         )
         .expect_err("a signal-killed interpreter must not be a successful result");
         assert!(
             err.message.contains("/usr/bin/python3"),
             "message must name the interpreter path: {}",
+            err.message
+        );
+    }
+
+    // `Captured`'s two fields are the same type and adjacent, so the ONLY
+    // thing pinning this call site's argument order is a test that uses
+    // distinct, non-zero counts. Every other signal-death test here (and all
+    // five containment e2e assertions) exercises the zero case, where a
+    // transposition is invisible — and those e2e tests read the stdout count
+    // as a CONTAINMENT proof, so a swap would let a child that printed a leak
+    // payload to stdout report "0 B out".
+    #[test]
+    fn the_byte_counts_are_passed_in_the_right_order() {
+        let mut o = outcome(ChildEnd::Signalled(SignalDeath::from_raw(libc::SIGKILL)));
+        o.stdout = "x".repeat(7);
+        o.stderr = "y".repeat(42);
+        let err = outcome_to_rpc(&o, "/usr/bin/python3")
+            .expect_err("a signal-killed interpreter must not be a successful result");
+        assert!(err.message.contains("7 B out"), "message: {}", err.message);
+        assert!(err.message.contains("42 B err"), "message: {}", err.message);
+    }
+
+    // A SIGSYS here cannot be the `site`/`getpwuid` case that motivated #539:
+    // `python_args()` pins `-I -S -B`, so `-S` is already applied. The message
+    // must not tell this caller to retry with a flag it already uses.
+    #[test]
+    fn a_seccomp_kill_does_not_advise_flags_the_interpreter_already_uses() {
+        let err = outcome_to_rpc(
+            &outcome(ChildEnd::Signalled(SignalDeath::from_raw(libc::SIGSYS))),
+            "/usr/bin/python3",
+        )
+        .expect_err("a signal-killed interpreter must not be a successful result");
+        assert!(
+            !err.message.contains("try `python3 -S`"),
+            "message: {}",
             err.message
         );
     }

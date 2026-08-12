@@ -25,6 +25,8 @@ serde_json             = { workspace = true }
 anyhow                 = { workspace = true }
 
 [dev-dependencies]
-# Test-only: signal numbers differ across our two first-class platforms
-# (SIGKILL agrees, SIGSYS does not), so even a test names them via libc.
-libc = "0.2"
+# Test-only: the signal-death tests name signals by constant rather than by
+# number. SIGKILL agrees across our two first-class platforms but SIGSYS does
+# not (31 on Linux, 12 on macOS), so a literal would be wrong on exactly one
+# gate host — and using libc uniformly means no test has to know which is which.
+libc = { workspace = true }

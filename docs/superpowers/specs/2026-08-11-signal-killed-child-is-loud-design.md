@@ -177,14 +177,28 @@ module compiles, and its tests run, on **both** gate hosts. That is the
 `atomic_write` argument (#511) rather than the shape that has repeatedly left
 half a guarantee invisible to one host.
 
-**Signal numbers come from `libc`, never from literals.** `SIGSYS` is 31 on
-Linux and **12** on macOS — the one number in this table that actually
-differs between the two first-class platforms (verified against the `libc`
-crate's per-target constants: `unix/linux_like/linux/gnu/*` vs `unix/bsd/mod.rs`).
-`SIGXCPU` is 24 on both. `libc` is already an unconditional dependency of
-prelude (it is how `rlimit` works on both platforms), so the table costs
-nothing regardless. A literal `31` would name the wrong signal on the Mac and
-the test would agree with it.
+**Signal numbers come from `libc`, never from literals.** **Two** numbers in
+this table differ between the two first-class platforms (verified against the
+`libc` crate's per-target constants: `unix/linux_like/linux/gnu/*` vs
+`unix/bsd/mod.rs`, and against the macOS SDK's `sys/signal.h`):
+
+| signal | Linux | macOS |
+| --- | --- | --- |
+| `SIGSYS` | 31 | **12** |
+| `SIGBUS` | 7 | **10** |
+
+Every other signal the table names agrees across both (`SIGXCPU` 24, `SIGSEGV`
+11, `SIGKILL` 9, …), which matters for the *test* and not only the prose:
+asserting on an agreeing constant cannot distinguish `libc::X` from a
+hard-coded literal, so `signal_names_come_from_libc_not_literals` must probe
+`SIGSYS` **and** `SIGBUS` — exactly the two above — or it is inert on the
+majority of its assertions. Its first cut asserted `SIGSYS`, `SIGXCPU` and
+`SIGSEGV`, i.e. one discriminating probe and two that agree with themselves on
+both hosts, while omitting the one other divergent constant in the table.
+
+`libc` is already an unconditional dependency of prelude (it is how `rlimit`
+works on both platforms), so the table costs nothing regardless. A literal `31`
+would name the wrong signal on the Mac and the test would agree with it.
 
 ### 3.2 The message is the repair mechanism, so it is budgeted
 
@@ -221,13 +235,25 @@ draft appended a tail of stderr, which would have given the message two variable
 segments and broken the fixed-offset property the whole ordering rule exists to
 provide.
 
-**The output is genuinely lost, and there is nowhere to hide it.** `RpcError`
-has a `data` field, but it reaches neither consumer: `map_dispatch_result` keeps
-only `code` and `message`, and the audit row records `"err": e.to_string()`
+**The output is genuinely lost on both consumer paths.** `RpcError` has a
+`data` field, but it reaches neither: `map_dispatch_result` keeps only `code`
+and `message`, and the audit row records `"err": e.to_string()`
 (`tool_host/post_process.rs`), which renders no payload. Stuffing the captured
 bytes into `data` would look thorough and write to nothing — recorded here so a
 later reviewer does not "improve" the design in that direction without changing
 one of the two consumers first.
+
+**Correction to an earlier draft of this section,** which claimed there is
+"nowhere to hide it" at all: there *is* a third channel, just not a
+planner-facing one. `spawn_worker` installs `worker_stderr::spawn_drain` on
+every worker, so anything a worker writes to its **own** stderr is surfaced at
+`debug` in the daemon log. A bounded tail of the discarded child output could
+be logged there without touching the message, the planner contract, or the
+fixed-offset property. Deliberately not done in this change — it is an operator
+-facing diagnostic, not a repair mechanism, and it deserves its own decision
+about byte caps and secret scrubbing (`RpcError.message` is not scrubbed today,
+and neither would that log line be). Stated so the option is known rather than
+foreclosed by a sentence that was wrong.
 
 That loss is the honest cost of choosing "always an error", and it is small in
 practice: the realistic signal deaths (seccomp `KillProcess`, cgroup OOM,

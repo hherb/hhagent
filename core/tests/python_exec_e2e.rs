@@ -18,15 +18,15 @@
 use std::path::PathBuf;
 
 use kastellan_core::secrets::Vault;
-use kastellan_core::tool_host::{dispatch, spawn_worker, ToolHostError, WorkerSpec};
+use kastellan_core::tool_host::{dispatch, spawn_worker, WorkerSpec};
 use kastellan_core::workers::python_exec::{
     interpreter_extra_lib_dirs, python_exec_entry, PYTHON_CANDIDATES,
 };
 use kastellan_db::secrets::{MapKeyProvider, KEY_LEN};
-use kastellan_protocol::{client::ClientError, codes};
 use kastellan_tests_common::{
-    backend, bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_no_supervisor,
-    skip_if_sandbox_unavailable, unique_suffix, workspace_target_binary, PgCluster,
+    assert_contained_by_signal, assert_nonzero_exit, backend, bring_up_pg_cluster,
+    pg_bin_dir_or_skip, skip_if_no_supervisor, skip_if_sandbox_unavailable, stdout_of,
+    unique_suffix, workspace_target_binary, PgCluster,
 };
 
 /// Deterministic key-provider for the secret-scrub test — mirrors
@@ -185,42 +185,6 @@ async fn exec_in_jail(
     dispatch_in_jail(pool, env, &Vault::new(), serde_json::json!({ "code": code })).await
 }
 
-/// Assert `err` is exactly the dispatch-level signal-death error introduced
-/// by #539: an RPC error carrying `OPERATION_FAILED` whose message names the
-/// killing signal (the fixed `killed by <SIG> (...)` shape built by
-/// `kastellan_worker_prelude::child_exit::signal_death_message`). Local to
-/// this file rather than shared — `python_exec_e2e.rs`,
-/// `python_exec_container_e2e.rs` and `python_exec_firecracker_e2e.rs` are
-/// three separate test binaries, each with its own call site. Sharing it
-/// would not dodge a new dependency edge the way an earlier version of this
-/// comment claimed: all three files already depend on `kastellan-tests-common`,
-/// which already depends on `kastellan-core`, so referencing `ToolHostError`
-/// costs nothing — only `kastellan-protocol` would be genuinely new, and that
-/// is one line in a dev-only manifest. The real trade is smaller: this helper
-/// (doc comment + body) is ~30 lines, so keeping it inline triples ~30 lines
-/// of duplication across the tree to avoid a fourth crate whose only reason
-/// to exist would be this one function — a defensible call either way, but
-/// the dependency-edge framing was not the actual reason for it.
-fn assert_is_signal_death(err: &ToolHostError) {
-    match err {
-        ToolHostError::Protocol(ClientError::Rpc(rpc)) => {
-            assert_eq!(
-                rpc.code,
-                codes::OPERATION_FAILED,
-                "expected the #539 signal-death error, got: {rpc:?}"
-            );
-            assert!(
-                rpc.message.contains("killed by"),
-                "signal-death message must name the killing signal: {}",
-                rpc.message
-            );
-        }
-        other => panic!(
-            "expected Protocol(Rpc(_)) carrying the #539 signal-death error, got: {other:?}"
-        ),
-    }
-}
-
 #[test]
 fn print_round_trip_through_sandboxed_worker() {
     let env = match ready_or_skip() {
@@ -263,31 +227,18 @@ fn socket_attempt_is_contained_by_the_jail() {
         .await;
         match result {
             Ok(r) => {
-                assert_ne!(r["exit_code"], 0, "socket attempt must not succeed: {r}");
+                // `assert_nonzero_exit`, not `assert_ne!(r["exit_code"], 0)`:
+                // the latter is satisfied by `null`, which is #539 itself, so
+                // a worker that reverts the fix would take this arm and pass.
+                assert_nonzero_exit(&r);
                 assert!(
-                    !r["stdout"].as_str().unwrap_or("").contains("escaped"),
+                    !stdout_of(&r).contains("escaped"),
                     "network reached from inside the jail: {r}"
                 );
             }
-            Err(err) => {
-                assert_is_signal_death(&err);
-                let msg = err.to_string();
-                assert!(
-                    msg.contains("SIGSYS"),
-                    "the seccomp socket(2) denial must SIGSYS-kill the interpreter: {msg}"
-                );
-                // Same teardown-race guard as the container/microvm e2e tests: a
-                // non-zero captured byte count here would mean "escaped" got
-                // printed before the kill landed — not contained.
-                assert!(
-                    // Anchored on the ". " that `signal_death_message` always
-                    // emits after the parenthesised cause: a bare
-                    // `contains("0 B out")` also matches "10 B out", so an
-                    // escape whose output happens to be 10 bytes would pass.
-                    msg.contains(". 0 B out,"),
-                    "the child printed before dying — not contained: {msg}"
-                );
-            }
+            // Signal death + the killing signal named + zero stdout, so an
+            // "escaped" that got printed before the kill landed cannot pass.
+            Err(err) => assert_contained_by_signal(&err, "SIGSYS"),
         }
         pool.close().await;
     });
