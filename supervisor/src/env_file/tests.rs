@@ -155,6 +155,50 @@ fn parse_env_file_continues_a_value_past_a_closing_quote() {
     assert_eq!(parse_env_file("A=f\"g\n"), pairs(&[("A", "f\"g")]));
 }
 
+/// Fourth DGX measurement (2026-08-14, systemd 255) — the whitespace CLASS.
+///
+/// Run to settle the one point the first #552 pass left unmeasured (which class
+/// the post-close skip uses), it settled that *and* found a second divergence
+/// one layer up: every trim in this module was `char::is_whitespace`, which is
+/// Unicode-aware, while systemd's is ASCII. Same consequence as #552 itself — a
+/// value that differs from the live environment is a false `NOT fully applied`
+/// on Linux and a genuinely different plist value on macOS.
+///
+/// A non-breaking space is not an exotic input here: it is what a copy-paste out
+/// of rendered docs or a chat window leaves behind, and `operator-env.md` hands
+/// operators a block to copy.
+#[test]
+fn the_whitespace_class_is_systemds_ascii_one_not_unicode() {
+    // Measured: the tab IS part of the class, on both sides of a value...
+    assert_eq!(parse_env_file("W=\tx\t\n"), pairs(&[("W", "x")]));
+    assert_eq!(parse_env_file("X=x   \n"), pairs(&[("X", "x")]));
+    // ...and after a closing quote.
+    assert_eq!(parse_env_file("P=\"a\"\tx\n"), pairs(&[("P", "ax")]));
+    // Measured: U+00A0 is NOT. It survives at either end of a value, where a
+    // Unicode trim would have eaten it and reported a value the daemon never
+    // has.
+    assert_eq!(parse_env_file("U=\u{a0}x\n"), pairs(&[("U", "\u{a0}x")]));
+    assert_eq!(parse_env_file("V=x\u{a0}\n"), pairs(&[("V", "x\u{a0}")]));
+    // ...and it ends the post-close skip rather than being skipped, so the
+    // unquoted tail begins AT it.
+    assert_eq!(parse_env_file("Q=\"a\"\u{a0}x\n"), pairs(&[("Q", "a\u{a0}x")]));
+    // Measured: a vertical tab is not in the class either — it is not one of
+    // systemd's four, and this pins that the class is the exact set rather than
+    // "ASCII control-ish".
+    assert_eq!(parse_env_file("T=\"a\"\u{b} x\n"), pairs(&[("T", "a\u{b} x")]));
+    // The worst row, and the reason this is not merely cosmetic: systemd
+    // declares NO variable for a key carrying a U+00A0, because the name is not
+    // a bare identifier. A Unicode trim would have stripped it and invented
+    // `Y=y` — the `export FOO=bar` failure wearing a different hat. Reported by
+    // line number, never silently.
+    let parsed = parse_env_file_reporting("\u{a0}Y=y\n");
+    assert!(parsed.pairs.is_empty(), "must invent no variable: {:?}", parsed.pairs);
+    assert_eq!(parsed.ignored_lines, vec![1], "and must say which line it refused");
+    // A leading TAB before a key is fine on both, so the guard above is not
+    // just rejecting everything with leading whitespace.
+    assert_eq!(parse_env_file("\tZ=z\n"), pairs(&[("Z", "z")]));
+}
+
 #[test]
 fn merge_env_file_values_override_inline_env_keeping_position() {
     let mut env = pairs(&[("A", "1"), ("B", "2")]);

@@ -20,6 +20,31 @@ use std::path::Path;
 
 use crate::{EnvFileRef, SupervisorError};
 
+/// systemd's `WHITESPACE` set, and deliberately **not** [`char::is_whitespace`].
+///
+/// Rust's trims are Unicode-aware; systemd's are ASCII. Measured 2026-08-14 on
+/// the DGX user manager (systemd 255), which is the only reason this const
+/// exists — three rows came back different:
+///
+/// | line | systemd | a Unicode trim would give |
+/// | --- | --- | --- |
+/// | `U=\u{a0}x` | `\u{a0}x` | `x` |
+/// | `V=x\u{a0}` | `x\u{a0}` | `x` |
+/// | `\u{a0}Y=y` | *no variable at all* | `Y=y` |
+/// | `W=\tx\t` | `x` | `x` (agree) |
+/// | `X=x␣␣␣` | `x` | `x` (agree) |
+///
+/// The third row is the worst of them: a Unicode trim **invents a variable
+/// systemd never creates**, which is the same failure the `export FOO=bar`
+/// guard below exists to prevent. The first two are #552's shape — a value that
+/// differs from the live environment produces a false `NOT fully applied` on
+/// Linux and a genuinely different plist value on macOS.
+///
+/// Not exotic: a non-breaking space is what a copy-paste out of rendered
+/// documentation or a chat window leaves behind, and `docs/deploy/operator-env.md`
+/// hands operators a block to copy.
+const SYSTEMD_WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
+
 /// Parse an `EnvironmentFile`-style buffer into ordered `(KEY, value)` pairs.
 ///
 /// Pure (no I/O). Implements the subset of systemd's `EnvironmentFile=` grammar
@@ -40,11 +65,15 @@ use crate::{EnvFileRef, SupervisorError};
 /// | `;A=i` | dropped | dropped |
 /// | `#A=i` | dropped | dropped |
 ///
-/// Re-measured 2026-08-13 (systemd 255) for [#552], which added the rows where
-/// a value **continues past a closing quote** — `A="a b" # note` → `a b# note`,
-/// `A="a" "b" c` → `abc`. `#` does not introduce a comment mid-value, and
-/// multiple quoted sections concatenate with no separator. See [`unquote`] for
-/// the full table and for the one point that is still unmeasured.
+/// Re-measured 2026-08-13/14 (systemd 255) for [#552], which added two families
+/// of row. **A value continuing past a closing quote:** `A="a b" # note` →
+/// `a b# note`, `A="a" "b" c` → `abc` — `#` does not introduce a comment
+/// mid-value, and multiple quoted sections concatenate with no separator; see
+/// [`unquote`] for that table. **And the whitespace class itself**, which the
+/// same probe run showed is ASCII where Rust's trims are Unicode-aware:
+/// `A=\u{a0}x` keeps its non-breaking space and `\u{a0}A=x` declares **nothing
+/// at all**, where a `char::is_whitespace` trim would have silently produced
+/// `x` and invented an `A`. See [`SYSTEMD_WHITESPACE`].
 ///
 /// [#552]: https://github.com/hherb/kastellan/issues/552
 ///
@@ -85,7 +114,7 @@ pub fn parse_env_file_reporting(contents: &str) -> ParsedEnv {
     let mut ignored_lines = Vec::new();
     for (n, raw) in contents.lines().enumerate() {
         let lineno = n + 1;
-        let line = raw.trim();
+        let line = raw.trim_matches(SYSTEMD_WHITESPACE);
         // `;` is a comment introducer to systemd just as `#` is; treating it as
         // a key named `;FOO` invented a variable the Linux side never sees.
         // A blank or commented line declares nothing *on purpose*, so it is not
@@ -97,15 +126,21 @@ pub fn parse_env_file_reporting(contents: &str) -> ParsedEnv {
             ignored_lines.push(lineno);
             continue;
         };
-        let k = k.trim();
+        let k = k.trim_matches(SYSTEMD_WHITESPACE);
         // systemd ignores an assignment whose name is not a bare identifier —
         // notably `export FOO=bar`, which shell users write by reflex. Silently
         // accepting it here created an env var literally named "export FOO".
+        //
+        // The test stays Unicode-aware (`char::is_whitespace`) while the trim
+        // above is ASCII, and the asymmetry is deliberate: a key that keeps a
+        // U+00A0 after the ASCII trim is one systemd drops outright (measured),
+        // so rejecting it here is what agrees — and it is reported by line
+        // number rather than silently skipped.
         if k.is_empty() || k.contains(char::is_whitespace) {
             ignored_lines.push(lineno);
             continue;
         }
-        pairs.push((k.to_string(), unquote(v.trim())));
+        pairs.push((k.to_string(), unquote(v.trim_matches(SYSTEMD_WHITESPACE))));
     }
     ParsedEnv { pairs, ignored_lines }
 }
@@ -145,18 +180,16 @@ pub fn parse_env_file_reporting(contents: &str) -> ParsedEnv {
 /// for the operator-typo cases too: systemd turns `A="a` into `a` and `A="a'`
 /// into `a'`, where a pair-only rule keeps both quotes.
 ///
-/// **One point here is NOT measured:** which whitespace class the post-close
-/// skip uses. Every probe used ASCII spaces. This takes systemd's documented
-/// `WHITESPACE` (`" \t\n\r"`, minus `\n` which cannot survive `lines()`) rather
-/// than Rust's Unicode-aware `trim_start`, because the narrow class can only
-/// differ from systemd on exotic whitespace — a U+00A0 after a closing quote
-/// would be *appended* by systemd and *skipped* by the loose one. Probe recipe
-/// for the next DGX visit is on [#552].
+/// The post-close skip uses [`SYSTEMD_WHITESPACE`], and that class is measured
+/// too (2026-08-14, the follow-up probe this docstring previously flagged as
+/// owed): `"a"\tx` → `ax` (tab **is** skipped), `"a"\u{a0}x` → `a\u{a0}x` and
+/// `"a"\u{b}␣x` → `a\u{b}␣x` (a non-breaking space and a vertical tab are
+/// **not** — they end the skip and begin the unquoted tail). So systemd's class
+/// really is ASCII, and a Unicode-aware `trim_start` here would have been wrong
+/// rather than merely unverified.
 ///
 /// [#552]: https://github.com/hherb/kastellan/issues/552
 fn unquote(v: &str) -> String {
-    // systemd's WHITESPACE, not `char::is_whitespace` — see the doc above.
-    const POST_CLOSE_SKIP: [char; 3] = [' ', '\t', '\r'];
     let mut out = String::with_capacity(v.len());
     let mut rest = v;
     loop {
@@ -176,7 +209,7 @@ fn unquote(v: &str) -> String {
             return out;
         };
         out.push_str(&after_open[..close]);
-        rest = after_open[close + q.len_utf8()..].trim_start_matches(POST_CLOSE_SKIP);
+        rest = after_open[close + q.len_utf8()..].trim_start_matches(SYSTEMD_WHITESPACE);
     }
 }
 

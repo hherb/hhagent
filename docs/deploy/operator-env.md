@@ -53,6 +53,21 @@ the same subset, so one overlay behaves identically on both platforms:
 > behaviour, matched deliberately (measured, [#552]) rather than a kastellan
 > quirk, and it applies on macOS too. **Put comments on their own line.**
 
+> ⚠️ **Only a space or a tab counts as whitespace here.** A non-breaking space
+> (U+00A0) does not — it stays in the value, and a key carrying one declares
+> **nothing at all**. This bites when a line is pasted out of rendered
+> documentation, a web page or a chat window, which is exactly how the block
+> above might reach your file. The symptom is a startup line naming a key you
+> believe you set:
+>
+> ```
+> operator overlay NOT fully applied: … — 1 of 5 keys did not reach this process: KASTELLAN_MAIL_ENDPOINT
+> ```
+>
+> or an `N lines ignored` count where you expected none. `cat -A` shows it:
+> a normal space prints as a space, a non-breaking one as `M-BM-`. Retype the
+> line rather than re-pasting it.
+
 [#552]: https://github.com/hherb/kastellan/issues/552
 
 Backslash line-continuations and C-style escapes inside quotes are *not*
