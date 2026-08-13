@@ -468,7 +468,20 @@ items unlock later ones.
 
 - [ ] Policy gate: per-tool, per-task, per-data-classification routing decision
 - [ ] Frontier escalation through egress proxy (Anthropic / OpenAI)
-- [ ] **Model-based CASSANDRA guard tier — IBM Granite Guardian 4.1 (defense-in-depth, advisory only)** —
+- [ ] **Model-based CASSANDRA guard tier — candidate model RE-OPENED 2026-08-13: Mistral Shieldstral 1.0 3B
+  is now the recommended pick over Granite Guardian**, see
+  [`docs/superpowers/specs/2026-08-13-shieldstral-guard-model-feasibility-study.md`](../superpowers/specs/2026-08-13-shieldstral-guard-model-feasibility-study.md).
+  Same Apache-2.0, same zero-new-egress deployment through the existing `llm-router` local backend, better
+  published numbers at 3B vs 8B — and one property Guardian lacks: the **policy is a plain-language yes/no
+  question supplied at inference time**, returning a calibrated score from a single forward pass, so one set of
+  weights serves every hook point below with no fine-tune each. Verdict is ADOPT-**CONDITIONALLY**: five
+  measurements gate it, and measurement 1 is a hard go/no-go — the score needs token logprobs, which Ollama
+  only serves on `/v1/chat/completions` from **v0.12.11**, so the macOS leg is the single point of failure for
+  the whole design. First slice is the injection-guard `Review` tier (escalate-up only), *not* a plan-review
+  stage. The posture below is unchanged and carries over verbatim; note especially that a "skip the expensive
+  review" gate is **fail-open** and stays ruled out (and is blocked on Stage 3 existing regardless).
+  The Guardian write-up is kept below as the comparison baseline:
+- [ ] **(baseline) Model-based CASSANDRA guard tier — IBM Granite Guardian 4.1 (defense-in-depth, advisory only)** —
   a local safety/judge model (`ibm-granite/granite-guardian-4.1-8b`, **Apache-2.0** ⇒ license-audit clean;
   hybrid Mamba-2/Transformer ⇒ low memory; runs on Ollama `:11434` macOS / vLLM `:8000` Linux, i.e. the
   **existing `kastellan-llm-router` local backend pointer** — no new egress, no vendor lock-in, no NVIDIA dep).
