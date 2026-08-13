@@ -86,7 +86,9 @@
 //!    write time, so a stored L1 body can still forge *other* framing
 //!    (`<recalled>`, `<system>`, a chat-template token) unless escaped
 //!    here. This assembler therefore escapes `&`/`<`/`>` and neutralises
-//!    control chars (incl. newlines) in **every L1 and recalled body** via
+//!    every line-breaking or invisibly-reordering character — C0 controls,
+//!    the Unicode line separators and the bidi controls, see
+//!    [`is_neutralised_control`] — in **every L1 and recalled body** via
 //!    [`escape_untrusted_body`], so no stored row can close a block, forge
 //!    framing, or forge an extra `- ` row. Recall gains a second layer:
 //!    catalogue screening in [`crate::recall_assembly`] drops rows that
@@ -166,9 +168,16 @@ fn render_handoff_block() -> String {
 /// what any upstream writer or builder allowed:
 /// - Escaping `&` / `<` / `>` means no `<tag>` sequence can form, closing the
 ///   delimiter-breakout / framing-forgery vector.
-/// - Replacing every C0 control char (`< 0x20`, which includes `\n` and `\r`)
-///   with a space keeps the one-row-per-line contract, so a body cannot forge
-///   a sibling `- ` row (nor smuggle NUL / ANSI escapes into the prompt).
+/// - Replacing every **line-breaking or invisibly-reordering** character with a
+///   space keeps the one-row-per-line contract, so a body cannot forge a
+///   sibling `- ` row (nor smuggle NUL / ANSI escapes into the prompt). Three
+///   groups, listed by [`is_neutralised_control`].
+///
+/// **What this does NOT buy** (#544, decided rather than inherited): it is not
+/// a general Unicode sanitiser. Zero-width characters (U+200B–U+200D, U+FEFF),
+/// homoglyphs and confusables pass through unchanged. They cannot forge a row
+/// or a tag — the characters that do that are all neutralised above — so they
+/// are a legibility concern for whoever reads the prompt, not a framing one.
 ///
 /// Single pass: `&` maps to `&amp;` unconditionally, so an already-`&amp;`-
 /// looking body round-trips exactly as the old chained-`replace` form did.
@@ -180,11 +189,41 @@ pub(super) fn escape_untrusted_body(body: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
-            c if (c as u32) < 0x20 => out.push(' '),
+            c if is_neutralised_control(c) => out.push(' '),
             c => out.push(c),
         }
     }
     out
+}
+
+/// The character class [`escape_untrusted_body`] replaces with a space.
+///
+/// Enumerated rather than taken from a Unicode-property crate: the set is
+/// small, stable, and each group is here for a stated reason, so a reader can
+/// check the guarantee against the list without resolving a dependency.
+///
+/// 1. **C0 controls** (`< 0x20`) — includes `\n` and `\r`, the direct way to
+///    forge a sibling `- ` row, plus NUL and the ANSI escape introducer.
+/// 2. **Unicode line separators** — U+0085 (NEL), U+2028 (LINE SEPARATOR) and
+///    U+2029 (PARAGRAPH SEPARATOR). Not C0, but a line break to any consumer
+///    following the Unicode line-breaking algorithm, so leaving them in would
+///    make the one-row-per-line contract a claim about Rust's `char` rather
+///    than about the reader (#544).
+/// 3. **Bidi formatting controls** — the marks, embeddings, overrides and
+///    isolates (U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069). They are
+///    invisible and reorder the *displayed* text that follows, so a stored row
+///    can read one way to the operator auditing it and another way in the
+///    prompt. Only the control characters go; RTL script itself is untouched.
+fn is_neutralised_control(c: char) -> bool {
+    // 1. C0.
+    (c as u32) < 0x20
+        // 2. Unicode line separators.
+        || matches!(c, '\u{0085}' | '\u{2028}' | '\u{2029}')
+        // 3. Bidi formatting controls.
+        || matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// Render the `<tools>` block: one entry per advertised tool. The `doc` fields
