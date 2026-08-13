@@ -40,6 +40,14 @@ use crate::{EnvFileRef, SupervisorError};
 /// | `;A=i` | dropped | dropped |
 /// | `#A=i` | dropped | dropped |
 ///
+/// Re-measured 2026-08-13 (systemd 255) for [#552], which added the rows where
+/// a value **continues past a closing quote** — `A="a b" # note` → `a b# note`,
+/// `A="a" "b" c` → `abc`. `#` does not introduce a comment mid-value, and
+/// multiple quoted sections concatenate with no separator. See [`unquote`] for
+/// the full table and for the one point that is still unmeasured.
+///
+/// [#552]: https://github.com/hherb/kastellan/issues/552
+///
 /// Quote-stripping and value-trimming are **not** cosmetic. Before #528 this
 /// took values verbatim, justified by "the installer writes plain values" — a
 /// premise #458 retired, because `kastellan.env.local` is the first env file a
@@ -104,23 +112,71 @@ pub fn parse_env_file_reporting(contents: &str) -> ParsedEnv {
 
 /// Strip systemd's quoting from a value.
 ///
-/// A quote only matters as the value's **first** character: systemd enters a
-/// quoted state there and leaves it at the matching close, or at end-of-line if
-/// there is none. So the leading quote is always removed, a matching trailing
-/// one is removed with it, and a quote anywhere else is literal.
+/// A quote only matters where a *section* begins: systemd enters a quoted state
+/// there and leaves it at the matching close, or at end-of-line if there is
+/// none. After a close it **skips the whitespace run** and then either opens
+/// another quoted section — concatenated with no separator — or resumes
+/// unquoted accumulation, which is verbatim to end-of-line. A quote reached in
+/// the unquoted state is literal.
 ///
-/// Measured, not inferred — the "matched pair only" rule this replaced was the
-/// obvious reading and was wrong for exactly the operator-typo cases: systemd
-/// turns `A="a` into `a` and `A="a'` into `a'`, where a pair-only rule keeps
-/// both quotes.
+/// Measured on a live user manager (systemd 255) for [#552], and the
+/// measurement **overturned that issue's own predicted answer**: it expected
+/// `A="a b" # note` to yield `a b # note` and proposed "append the remainder"
+/// as the fix, but systemd yields `a b# note` — the space after the closing
+/// quote is dropped while the one in `A="a b"x y` → `a bx y` is kept. Appending
+/// the remainder verbatim would have produced a third wrong answer and left the
+/// false `NOT fully applied` warning in place for exactly the trailing-comment
+/// case operators are taught to write.
+///
+/// | value | systemd | here |
+/// | --- | --- | --- |
+/// | `"a b" # note` | `a b# note` | `a b# note` |
+/// | `"x"y` | `xy` | `xy` |
+/// | `"a b"   x` | `a bx` | `a bx` |
+/// | `"a b"x y` | `a bx y` | `a bx y` |
+/// | `"a b" "c d"` | `a bc d` | `a bc d` |
+/// | `"a" "b" c` | `abc` | `abc` |
+/// | `"a" 'b'` | `ab` | `ab` |
+/// | `"a"#c` | `a#c` | `a#c` |
+/// | `'a b' # note` | `a b# note` | `a b# note` |
+/// | `a "b c"` | `a "b c"` | `a "b c"` |
+///
+/// The earlier "matched pair only" rule was the obvious reading and was wrong
+/// for the operator-typo cases too: systemd turns `A="a` into `a` and `A="a'`
+/// into `a'`, where a pair-only rule keeps both quotes.
+///
+/// **One point here is NOT measured:** which whitespace class the post-close
+/// skip uses. Every probe used ASCII spaces. This takes systemd's documented
+/// `WHITESPACE` (`" \t\n\r"`, minus `\n` which cannot survive `lines()`) rather
+/// than Rust's Unicode-aware `trim_start`, because the narrow class can only
+/// differ from systemd on exotic whitespace — a U+00A0 after a closing quote
+/// would be *appended* by systemd and *skipped* by the loose one. Probe recipe
+/// for the next DGX visit is on [#552].
+///
+/// [#552]: https://github.com/hherb/kastellan/issues/552
 fn unquote(v: &str) -> String {
-    let Some(q) = v.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-        return v.to_string();
-    };
-    let rest = &v[q.len_utf8()..];
-    match rest.strip_suffix(q) {
-        Some(inner) => inner.to_string(),
-        None => rest.to_string(),
+    // systemd's WHITESPACE, not `char::is_whitespace` — see the doc above.
+    const POST_CLOSE_SKIP: [char; 3] = [' ', '\t', '\r'];
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    loop {
+        let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            // Unquoted state: verbatim to end-of-line, quotes included. This is
+            // also the empty-`rest` exit, so the loop always terminates — every
+            // other arm consumes at least the opening quote.
+            out.push_str(rest);
+            return out;
+        };
+        let after_open = &rest[q.len_utf8()..];
+        let Some(close) = after_open.find(q) else {
+            // Unterminated: systemd runs the section to end-of-line rather than
+            // treating the quote as literal (measured, and the reason the
+            // pair-only rule was wrong).
+            out.push_str(after_open);
+            return out;
+        };
+        out.push_str(&after_open[..close]);
+        rest = after_open[close + q.len_utf8()..].trim_start_matches(POST_CLOSE_SKIP);
     }
 }
 

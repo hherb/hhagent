@@ -113,6 +113,48 @@ fn parse_env_file_strips_a_leading_quote_even_when_unterminated() {
     assert_eq!(parse_env_file("A='  x  '\n"), pairs(&[("A", "  x  ")]));
 }
 
+/// Third DGX measurement (2026-08-13, systemd 255, same method) — [#552]: what
+/// systemd does when a value **continues past a closing quote**.
+///
+/// This is the table that makes #531's value comparison sound, so every row is
+/// a measured pair and none is derived from the others. It also records a
+/// correction: #552 predicted `A="a b" # note` → `a b # note` and proposed
+/// "append the remainder" as the fix. Measurement says `a b# note` — the
+/// whitespace run immediately after a closing quote is dropped — so that fix
+/// would have produced a *third* answer and left the false `NOT fully applied`
+/// warning firing on exactly the trailing-comment form
+/// `docs/deploy/operator-env.md` teaches operators to write. Same shape as
+/// #530, where measurement ruled out both fixes its issue proposed.
+///
+/// [#552]: https://github.com/hherb/kastellan/issues/552
+#[test]
+fn parse_env_file_continues_a_value_past_a_closing_quote() {
+    // The case the operator docs invite: a comment appended to a quoted value.
+    // The space before `#` is eaten, the `#` is NOT a comment introducer here.
+    assert_eq!(parse_env_file("A=\"a b\" # note\n"), pairs(&[("A", "a b# note")]));
+    assert_eq!(parse_env_file("A='a b' # note\n"), pairs(&[("A", "a b# note")]));
+    // No whitespace to eat: the remainder simply continues the value.
+    assert_eq!(parse_env_file("A=\"x\"y\n"), pairs(&[("A", "xy")]));
+    assert_eq!(parse_env_file("A=\"a\"#c\n"), pairs(&[("A", "a#c")]));
+    // A RUN of whitespace after the close is eaten, not just one space.
+    assert_eq!(parse_env_file("A=\"a b\"   x\n"), pairs(&[("A", "a bx")]));
+    // ...but whitespace inside the resumed UNQUOTED tail survives. This pair is
+    // the load-bearing one: it is what distinguishes "skip the run right after
+    // the close" from "trim the whole remainder", and #552's proposed fix from
+    // the measured behaviour.
+    assert_eq!(parse_env_file("A=\"a b\"x y\n"), pairs(&[("A", "a bx y")]));
+    // Multiple quoted sections concatenate with NO separator — a class #552
+    // did not mention at all.
+    assert_eq!(parse_env_file("A=\"a b\" \"c d\"\n"), pairs(&[("A", "a bc d")]));
+    assert_eq!(parse_env_file("A=\"a\" \"b\" c\n"), pairs(&[("A", "abc")]));
+    // ...and the two quote characters may differ between sections.
+    assert_eq!(parse_env_file("A=\"a\" 'b'\n"), pairs(&[("A", "ab")]));
+    // Unchanged by all of the above: a quote that is not at a section start is
+    // literal, so the JSON and typo cases keep their previous answers.
+    assert_eq!(parse_env_file("A=a \"b c\"\n"), pairs(&[("A", "a \"b c\"")]));
+    assert_eq!(parse_env_file("A=f\"g\n"), pairs(&[("A", "f\"g")]));
+}
+
 #[test]
 fn merge_env_file_values_override_inline_env_keeping_position() {
     let mut env = pairs(&[("A", "1"), ("B", "2")]);
