@@ -7,7 +7,9 @@
 //! production half of the file drops back under the 500-line guideline.
 
 use super::*;
-use crate::worker_manifest::{AllowlistDecl, ResolveCtx, Resolution, WorkerManifest};
+use crate::worker_manifest::{
+    argv0_rows, domain_rows, AllowlistDecl, ResolveCtx, Resolution, WorkerManifest,
+};
 use kastellan_db::tool_allowlists::EntryKind;
 use std::path::{Path, PathBuf};
 
@@ -66,13 +68,17 @@ impl WorkerManifest for FakeManifest {
             FakeOutcome::Register => Resolution::Register(
                 crate::workers::shell_exec::shell_exec_entry(
                     PathBuf::from(format!("/fake/{}", self.name)),
-                    &(ctx.allowlist)(self.name),
+                    &kastellan_db::tool_allowlists::allowlist_values(
+                        &(ctx.allowlist)(self.name),
+                    ),
                 ),
             ),
             FakeOutcome::RegisterWithNet(entries) => {
                 let mut entry = crate::workers::shell_exec::shell_exec_entry(
                     PathBuf::from(format!("/fake/{}", self.name)),
-                    &(ctx.allowlist)(self.name),
+                    &kastellan_db::tool_allowlists::allowlist_values(
+                        &(ctx.allowlist)(self.name),
+                    ),
                 );
                 entry.policy.net = kastellan_sandbox::Net::Allowlist(entries.clone());
                 Resolution::Register(entry)
@@ -81,7 +87,9 @@ impl WorkerManifest for FakeManifest {
             FakeOutcome::RegisterVmWithNet(entries) => {
                 let mut entry = crate::workers::shell_exec::shell_exec_entry(
                     PathBuf::from(format!("/fake/{}", self.name)),
-                    &(ctx.allowlist)(self.name),
+                    &kastellan_db::tool_allowlists::allowlist_values(
+                        &(ctx.allowlist)(self.name),
+                    ),
                 );
                 entry.policy.net = kastellan_sandbox::Net::Allowlist(entries.clone());
                 entry.sandbox_backend =
@@ -91,7 +99,9 @@ impl WorkerManifest for FakeManifest {
             FakeOutcome::RegisterBrokerSearch => {
                 let mut entry = crate::workers::shell_exec::shell_exec_entry(
                     PathBuf::from(format!("/fake/{}", self.name)),
-                    &(ctx.allowlist)(self.name),
+                    &kastellan_db::tool_allowlists::allowlist_values(
+                        &(ctx.allowlist)(self.name),
+                    ),
                 );
                 entry.policy.net = kastellan_sandbox::Net::Allowlist(Vec::new());
                 entry.broker = Some(crate::broker::BrokerSpec::search(
@@ -107,7 +117,7 @@ impl WorkerManifest for FakeManifest {
     }
 }
 
-fn test_ctx<'a>(allowlist: &'a dyn Fn(&str) -> Vec<String>) -> ResolveCtx<'a> {
+fn test_ctx<'a>(allowlist: &'a dyn Fn(&str) -> Vec<kastellan_db::tool_allowlists::AllowlistRow>) -> ResolveCtx<'a> {
     ResolveCtx {
         get_env: &|_k| None,
         exists: &|_p: &Path| false,
@@ -120,7 +130,7 @@ fn test_ctx<'a>(allowlist: &'a dyn Fn(&str) -> Vec<String>) -> ResolveCtx<'a> {
 
 /// Build a ResolveCtx whose env has KASTELLAN_EGRESS_FORCE_ROUTING=1
 /// (the test_ctx helper pins get_env to None, so these build their own).
-fn forced_ctx<'a>(allowlist: &'a dyn Fn(&str) -> Vec<String>) -> ResolveCtx<'a> {
+fn forced_ctx<'a>(allowlist: &'a dyn Fn(&str) -> Vec<kastellan_db::tool_allowlists::AllowlistRow>) -> ResolveCtx<'a> {
     ResolveCtx {
         get_env: &|k| (k == "KASTELLAN_EGRESS_FORCE_ROUTING").then(|| "1".to_string()),
         exists: &|_p: &Path| false,
@@ -133,7 +143,7 @@ fn forced_ctx<'a>(allowlist: &'a dyn Fn(&str) -> Vec<String>) -> ResolveCtx<'a> 
 
 #[test]
 fn force_routed_all_localhost_allowlist_is_refused_like_misconfigured() {
-    let allow = |_t: &str| Vec::<String>::new();
+    let allow = |_t: &str| Vec::new();
     let ctx = forced_ctx(&allow);
     let m = FakeManifest {
         name: "deadtool",
@@ -151,7 +161,7 @@ fn force_routed_all_localhost_allowlist_is_refused_like_misconfigured() {
 
 #[test]
 fn force_routed_subset_localhost_allowlist_warns_but_registers() {
-    let allow = |_t: &str| Vec::<String>::new();
+    let allow = |_t: &str| Vec::new();
     let ctx = forced_ctx(&allow);
     let m = FakeManifest {
         name: "mixedtool",
@@ -169,7 +179,7 @@ fn force_routed_subset_localhost_allowlist_warns_but_registers() {
 
 #[test]
 fn unforced_localhost_allowlist_registers_exactly_as_today() {
-    let allow = |_t: &str| Vec::<String>::new();
+    let allow = |_t: &str| Vec::new();
     let ctx = test_ctx(&allow); // get_env is None ⇒ not force-routed
     let m = FakeManifest {
         name: "hosttool",
@@ -188,7 +198,7 @@ fn unforced_localhost_allowlist_registers_exactly_as_today() {
 #[cfg(target_os = "linux")]
 #[test]
 fn vm_entry_all_localhost_allowlist_is_refused_even_unforced() {
-    let allow = |_t: &str| Vec::<String>::new();
+    let allow = |_t: &str| Vec::new();
     let ctx = test_ctx(&allow); // get_env is None ⇒ host flag off
     let m = FakeManifest {
         name: "vmdead",
@@ -205,7 +215,7 @@ fn vm_entry_all_localhost_allowlist_is_refused_even_unforced() {
 fn force_routed_non_allowlist_net_is_not_screened() {
     // shell_exec_entry's policy is Net::Deny — the screen only inspects
     // Net::Allowlist, so this registers exactly as before.
-    let allow = |_t: &str| Vec::<String>::new();
+    let allow = |_t: &str| Vec::new();
     let ctx = forced_ctx(&allow);
     let m = FakeManifest {
         name: "denytool",
@@ -221,7 +231,7 @@ fn force_routed_non_allowlist_net_is_not_screened() {
 fn broker_worker_registers_when_broker_binary_present() {
     // exists=true + exe_dir set ⇒ the search-broker sibling resolves ⇒
     // broker_bin_present is true ⇒ the broker worker registers.
-    let allow = |_t: &str| Vec::<String>::new();
+    let allow = |_t: &str| Vec::new();
     let exe_dir = PathBuf::from("/install/bin");
     let ctx = ResolveCtx {
         get_env: &|_k| None,
@@ -245,7 +255,7 @@ fn broker_worker_registers_when_broker_binary_present() {
 #[test]
 fn broker_worker_refused_when_broker_binary_absent() {
     // test_ctx: exists=|_|false ⇒ no broker binary discoverable ⇒ refuse.
-    let allow = |_t: &str| Vec::<String>::new();
+    let allow = |_t: &str| Vec::new();
     let ctx = test_ctx(&allow);
     let m = FakeManifest {
         name: "brokerdead",
@@ -262,7 +272,7 @@ fn broker_worker_refused_when_broker_binary_absent() {
 fn broker_worker_refused_even_when_not_force_routed() {
     // test_ctx has get_env=None ⇒ NOT force-routed. The broker refuse is
     // unconditional (independent of force-routing), so it still fires.
-    let allow = |_t: &str| Vec::<String>::new();
+    let allow = |_t: &str| Vec::new();
     let ctx = test_ctx(&allow);
     let m = FakeManifest {
         name: "brokerdead2",
@@ -278,7 +288,7 @@ fn broker_worker_refused_even_when_not_force_routed() {
 fn assemble_inserts_registered_and_records_allowlist_hash() {
     let allowlist = |t: &str| {
         if t == "alpha" {
-            vec!["ls".to_string()]
+            argv0_rows(&["ls"])
         } else {
             Vec::new()
         }
@@ -354,7 +364,7 @@ fn build_registry_loaded_payload_wraps_tools_array() {
 
 #[test]
 fn manifest_claiming_reserved_handoff_name_is_skipped() {
-    let allow = |_t: &str| Vec::<String>::new();
+    let allow = |_t: &str| Vec::new();
     let ctx = test_ctx(&allow);
     let reserved = FakeManifest {
         name: "handoff",
@@ -508,7 +518,7 @@ fn a_declared_allowlist_is_advertised_sorted_and_worded_by_kind() {
     // Deliberately NOT in sorted order — the renderer must sort.
     let allowlist = |t: &str| {
         if t == "shell-exec" {
-            vec!["/usr/bin/ls".to_string(), "/usr/bin/cat".to_string()]
+            argv0_rows(&["/usr/bin/ls", "/usr/bin/cat"])
         } else {
             Vec::new()
         }
@@ -552,7 +562,7 @@ fn advertising_a_permitted_set_follows_the_declaration_not_the_contents() {
         // `argvy` declares an allowlist that is EMPTY — the state in which
         // every dispatch fails, and precisely the live 2026-06-20/21 regime
         // that produced 15 of 15 failures with the planner told nothing.
-        "domainy" => vec!["example.org".to_string()],
+        "domainy" => domain_rows(&["example.org"]),
         _ => Vec::new(),
     };
     let ctx = test_ctx(&allowlist);
@@ -603,7 +613,7 @@ fn advertising_a_permitted_set_follows_the_declaration_not_the_contents() {
 fn statically_dead_rows_are_withheld_from_the_advertisement() {
     // Force-routed (the supervised default), so a `localhost` NAME is dead —
     // the proxy range-denies what it resolves to.
-    let allowlist = |_t: &str| vec!["example.org".to_string(), "localhost".to_string()];
+    let allowlist = |_t: &str| domain_rows(&["example.org", "localhost"]);
     let ctx = forced_ctx(&allowlist);
     let m = FakeManifest {
         name: "domainy",
@@ -625,6 +635,73 @@ fn statically_dead_rows_are_withheld_from_the_advertisement() {
     // Enforcement is untouched — the audit record still counts BOTH rows, so
     // a request naming `localhost` is refused rather than silently allowed.
     assert_eq!(loaded[0].allowlist_len, 2, "withholding is advertisement-only");
+}
+
+/// A row stored under a different `kind` than its tool declares must not be
+/// advertised: the kind is what picks the WORDING, so an argv0 path under a
+/// domain worker would be announced as "only these hosts are reachable:
+/// `/usr/bin/ls`" — a permitted value the planner would then try to use as a
+/// host. Nothing constrains the two to agree (migration `0021` backfilled every
+/// pre-existing row as `argv0` regardless of tool, the CLI falls back to `Argv0`
+/// for an unrecognised tool, and the runtime role holds direct INSERT), so the
+/// disagreement has to be handled rather than assumed away (#541).
+#[test]
+fn a_row_of_another_kind_is_not_advertised_under_this_tools_wording() {
+    let allowlist = |_t: &str| {
+        let mut rows = domain_rows(&["example.org"]);
+        // The mismatch: an argv0-kind row sitting under a Domain-kind tool.
+        rows.extend(argv0_rows(&["/usr/bin/ls"]));
+        rows
+    };
+    let ctx = test_ctx(&allowlist);
+    let m = FakeManifest {
+        name: "domainy",
+        outcome: FakeOutcome::Register,
+        allowlist: Some(AllowlistDecl { tool: "domainy", kind: EntryKind::Domain }),
+        advertise_doc: true,
+    };
+    let (_reg, loaded, docs) = assemble_registry(&[&m], &ctx);
+
+    let line = docs[0].allowed().expect("declared ⇒ advertised");
+    assert!(line.contains("`example.org`"), "the matching row is advertised: {line}");
+    assert!(
+        !line.contains("/usr/bin/ls"),
+        "a row of another kind must not be advertised in this tool's wording: {line}"
+    );
+    // Advertisement-only, exactly like the statically-dead case above:
+    // narrowing what a deployed worker may do — on a host whose operator did
+    // nothing wrong — is a bigger harm than a value the planner must ask about.
+    assert_eq!(loaded[0].allowlist_len, 2, "enforcement keeps both rows");
+}
+
+/// Schema drift is a mismatch too, and must not be an outage. A `kind` this
+/// build does not recognise (a third kind added by a later migration) reads as
+/// "not the declared kind" — withheld and named — rather than failing the
+/// registry build, which is what parsing the column into `EntryKind` here would
+/// have done to a daemon holding one such row.
+#[test]
+fn a_row_with_an_unrecognised_kind_is_withheld_rather_than_fatal() {
+    let allowlist = |_t: &str| {
+        let mut rows = domain_rows(&["example.org"]);
+        rows.push(kastellan_db::tool_allowlists::AllowlistRow {
+            value: "future.example.org".to_string(),
+            kind: "kind-from-a-later-migration".to_string(),
+        });
+        rows
+    };
+    let ctx = test_ctx(&allowlist);
+    let m = FakeManifest {
+        name: "domainy",
+        outcome: FakeOutcome::Register,
+        allowlist: Some(AllowlistDecl { tool: "domainy", kind: EntryKind::Domain }),
+        advertise_doc: true,
+    };
+    let (reg, _loaded, docs) = assemble_registry(&[&m], &ctx);
+
+    assert!(reg.lookup("domainy").is_some(), "an unknown kind must not refuse the tool");
+    let line = docs[0].allowed().expect("declared ⇒ advertised");
+    assert!(line.contains("`example.org`"), "the recognised row is advertised: {line}");
+    assert!(!line.contains("future.example.org"), "the drifted row is withheld: {line}");
 }
 
 /// The CLI and the registry must agree about every declaring worker.

@@ -1,10 +1,11 @@
     use super::*;
+    use crate::worker_manifest::domain_rows;
     use std::path::Path;
 
     fn ctx<'a>(
         get_env: &'a dyn Fn(&str) -> Option<String>,
         exists: &'a dyn Fn(&Path) -> bool,
-        allowlist: &'a dyn Fn(&str) -> Vec<String>,
+        allowlist: &'a dyn Fn(&str) -> Vec<kastellan_db::tool_allowlists::AllowlistRow>,
     ) -> ResolveCtx<'a> {
         ResolveCtx {
             get_env,
@@ -24,7 +25,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["searx.example.org".to_string(), ".docs.example.org".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["searx.example.org", ".docs.example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Register(entry) => {
@@ -64,11 +65,7 @@
             _ => None, // EMBED_MODEL_ENV unset -> default model
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec![
-            "searx.example.org".to_string(),
-            "embed.example.org".to_string(),
-            ".docs.example.org".to_string(),
-        ];
+        let allowlist = |_t: &str| domain_rows(&["searx.example.org", "embed.example.org", ".docs.example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Register(entry) => {
@@ -97,12 +94,7 @@
             _ => None, // EMBED_MODEL_ENV unset -> default model
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| {
-            vec![
-                "searx.example.org".to_string(),
-                ".docs.example.org".to_string(),
-            ]
-        };
+        let allowlist = |_t: &str| domain_rows(&["searx.example.org", ".docs.example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Register(entry) => {
@@ -157,7 +149,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["searx.example.org".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["searx.example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Register(entry) => {
@@ -200,8 +192,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist =
-            |_t: &str| vec!["searx.example.org".to_string(), ".docs.example.org".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["searx.example.org", ".docs.example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Register(entry) => {
@@ -245,7 +236,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["searx.example.org".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["searx.example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Register(entry) => {
@@ -268,7 +259,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["searx.example.org".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["searx.example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
 
         match WebResearchManifest.resolve(&c) {
@@ -347,7 +338,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["localhost".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["localhost"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Misconfigured { detail } => {
@@ -376,7 +367,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["127.0.0.1".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["127.0.0.1"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Register(_) => {}
@@ -397,8 +388,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist =
-            |_t: &str| vec!["searx.example.org".to_string(), "localhost".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["searx.example.org", "localhost"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Register(entry) => {
@@ -421,7 +411,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["localhost".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["localhost"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Misconfigured { detail } => {
@@ -444,7 +434,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["localhost".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["localhost"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Misconfigured { .. } => {}
@@ -504,8 +494,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist =
-            |_t: &str| vec!["searx.example.org".to_string(), "embed.example.org".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["searx.example.org", "embed.example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Misconfigured { detail } => {
@@ -529,7 +518,7 @@
             _ => None, // ENDPOINT_ENV unset
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec![".docs.example.org".to_string()];
+        let allowlist = |_t: &str| domain_rows(&[".docs.example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Misconfigured { detail } => {
@@ -552,7 +541,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["127.0.0.1".to_string(), ".docs.example.org".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["127.0.0.1", ".docs.example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Register(entry) => {
@@ -605,13 +594,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| {
-            vec![
-                "127.0.0.1".to_string(),
-                "embed.example.org".to_string(),
-                ".docs.example.org".to_string(),
-            ]
-        };
+        let allowlist = |_t: &str| domain_rows(&["127.0.0.1", "embed.example.org", ".docs.example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
         match WebResearchManifest.resolve(&c) {
             Resolution::Register(entry) => {
@@ -645,8 +628,7 @@
         // Force-routing + a `localhost`-NAME SearxNG endpoint + USE_SEARCH_BROKER=1
         // → Register: the #452 guard must NOT fire (the broker holds the route).
         let exists = |_p: &Path| true;
-        let allowlist =
-            |_t: &str| vec!["searxng.localhost".to_string(), ".docs.example.org".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["searxng.localhost", ".docs.example.org"]);
 
         let with_broker = |k: &str| match k {
             BIN_ENV => Some("/opt/web-research".to_string()),
@@ -692,7 +674,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["localhost".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["localhost"]);
         match WebResearchManifest.resolve(&ctx(&get_env, &exists, &allowlist)) {
             Resolution::Misconfigured { detail } => {
                 assert!(detail.contains(USE_SEARCH_BROKER_ENV), "search-broker remedy missing: {detail}");
@@ -717,7 +699,7 @@
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["127.0.0.1".to_string(), ".docs.example.org".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["127.0.0.1", ".docs.example.org"]);
         match WebResearchManifest.resolve(&ctx(&get_env, &exists, &allowlist)) {
             Resolution::Register(entry) => {
                 assert!(matches!(

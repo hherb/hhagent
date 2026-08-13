@@ -1,10 +1,11 @@
 use super::*;
+    use crate::worker_manifest::domain_rows;
 use std::path::Path;
 
 fn ctx<'a>(
     get_env: &'a dyn Fn(&str) -> Option<String>,
     exists: &'a dyn Fn(&Path) -> bool,
-    allowlist: &'a dyn Fn(&str) -> Vec<String>,
+    allowlist: &'a dyn Fn(&str) -> Vec<kastellan_db::tool_allowlists::AllowlistRow>,
 ) -> ResolveCtx<'a> {
     ResolveCtx {
         get_env,
@@ -24,7 +25,7 @@ fn resolve_registers_with_net_client_policy_and_endpoint_net() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| vec!["127.0.0.1".to_string()];
+    let allowlist = |_t: &str| domain_rows(&["127.0.0.1"]);
     let c = ctx(&get_env, &exists, &allowlist);
 
     match WebSearchManifest.resolve(&c) {
@@ -60,7 +61,7 @@ fn resolve_https_endpoint_maps_to_port_443() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| vec!["searx.example.org".to_string()];
+    let allowlist = |_t: &str| domain_rows(&["searx.example.org"]);
     let c = ctx(&get_env, &exists, &allowlist);
 
     match WebSearchManifest.resolve(&c) {
@@ -97,7 +98,7 @@ fn resolve_derives_worker_allowlist_from_endpoint_not_db() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| Vec::<String>::new();
+    let allowlist = |_t: &str| Vec::new();
     let c = ctx(&get_env, &exists, &allowlist);
 
     match WebSearchManifest.resolve(&c) {
@@ -142,7 +143,7 @@ fn resolve_broker_mode_drops_egress_and_declares_search_broker() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| Vec::<String>::new();
+    let allowlist = |_t: &str| Vec::new();
     let c = ctx(&get_env, &exists, &allowlist);
 
     match WebSearchManifest.resolve(&c) {
@@ -181,7 +182,7 @@ fn resolve_broker_mode_accepts_non_one_truthy_flag() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| Vec::<String>::new();
+    let allowlist = |_t: &str| Vec::new();
     let c = ctx(&get_env, &exists, &allowlist);
 
     match WebSearchManifest.resolve(&c) {
@@ -201,7 +202,7 @@ fn resolve_direct_mode_unchanged_when_use_broker_unset() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| Vec::<String>::new();
+    let allowlist = |_t: &str| Vec::new();
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Register(entry) => {
@@ -226,7 +227,7 @@ fn resolve_injects_max_batch_env_when_set() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| vec!["127.0.0.1".to_string()];
+    let allowlist = |_t: &str| domain_rows(&["127.0.0.1"]);
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Register(entry) => {
@@ -248,7 +249,7 @@ fn resolve_omits_max_batch_env_when_unset() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| vec!["127.0.0.1".to_string()];
+    let allowlist = |_t: &str| domain_rows(&["127.0.0.1"]);
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Register(entry) => {
@@ -269,7 +270,7 @@ fn resolve_skips_blank_max_batch_env() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| vec!["127.0.0.1".to_string()];
+    let allowlist = |_t: &str| domain_rows(&["127.0.0.1"]);
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Register(entry) => {
@@ -297,7 +298,7 @@ fn resolve_uses_direct_microvm_entry_when_opted_in() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| Vec::<String>::new();
+    let allowlist = |_t: &str| Vec::new();
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Register(entry) => {
@@ -353,7 +354,7 @@ fn resolve_uses_broker_microvm_entry_when_both_opted_in() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| Vec::<String>::new();
+    let allowlist = |_t: &str| Vec::new();
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Register(entry) => {
@@ -394,7 +395,7 @@ fn resolve_vm_entry_still_injects_batch_cap() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| Vec::<String>::new();
+    let allowlist = |_t: &str| Vec::new();
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Register(entry) => {
@@ -420,7 +421,7 @@ fn resolve_forced_host_localhost_name_endpoint_is_misconfigured() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| vec!["localhost".to_string()];
+    let allowlist = |_t: &str| domain_rows(&["localhost"]);
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Misconfigured { detail } => {
@@ -449,7 +450,7 @@ fn resolve_forced_host_literal_loopback_still_registers() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| vec!["127.0.0.1".to_string()];
+    let allowlist = |_t: &str| domain_rows(&["127.0.0.1"]);
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Register(_) => {}
@@ -470,7 +471,7 @@ fn resolve_forced_host_localhost_name_with_broker_still_registers() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| vec!["localhost".to_string()];
+    let allowlist = |_t: &str| domain_rows(&["localhost"]);
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Register(entry) => {
@@ -490,7 +491,7 @@ fn resolve_forced_host_routable_endpoint_still_registers() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| vec!["searx.example.org".to_string()];
+    let allowlist = |_t: &str| domain_rows(&["searx.example.org"]);
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Register(_) => {}
@@ -513,7 +514,7 @@ fn resolve_direct_microvm_localhost_name_endpoint_is_misconfigured() {
         _ => None,
     };
     let exists = |_p: &Path| true;
-    let allowlist = |_t: &str| vec!["localhost".to_string()];
+    let allowlist = |_t: &str| domain_rows(&["localhost"]);
     let c = ctx(&get_env, &exists, &allowlist);
     match WebSearchManifest.resolve(&c) {
         Resolution::Misconfigured { detail } => {

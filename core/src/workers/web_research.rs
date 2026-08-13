@@ -620,7 +620,9 @@ impl WorkerManifest for WebResearchManifest {
         let endpoint = (ctx.get_env)(ENDPOINT_ENV).unwrap_or_default();
         let embed_endpoint = (ctx.get_env)(EMBED_ENDPOINT_ENV).filter(|s| !s.trim().is_empty());
         let embed_model = (ctx.get_env)(EMBED_MODEL_ENV).filter(|s| !s.trim().is_empty());
-        let allowlist = (ctx.allowlist)(TOOL_NAME);
+        // Enforcement is kind-blind (see #541).
+        let allowlist =
+            kastellan_db::tool_allowlists::allowlist_values(&(ctx.allowlist)(TOOL_NAME));
 
         // Single-broker XOR (#464): a worker binds at most one broker socket
         // (single `broker_uds`, one vsock channel), so the search-broker and

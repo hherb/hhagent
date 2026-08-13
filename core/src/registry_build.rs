@@ -100,6 +100,55 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// Keep only the rows stored under the kind this worker declares, warning about
+/// any that are dropped (#541).
+///
+/// **Why a row's kind can disagree with its tool's.** Nothing constrains the two
+/// to match: migration `0021` backfilled every pre-existing row as `argv0`
+/// regardless of tool, `kastellan-cli tools allowlist add` falls back to `Argv0`
+/// for a tool it does not recognise, and the runtime role holds direct `INSERT`
+/// on the table. The kind is what picks the *wording* of the advertised line, so
+/// an `argv0` row under `web-fetch` would otherwise be announced as
+/// "only these hosts are reachable: `/usr/bin/ls`" — a permitted value the
+/// planner would then try to use as a host. A wrong description of a real
+/// restriction is worse than no description, which is the whole premise of
+/// #533.
+///
+/// **Advertisement only — enforcement keeps every row.** Filtering the enforced
+/// set would silently narrow what a deployed worker may do, on a host whose
+/// operator did nothing wrong; withholding from the prompt only costs the
+/// planner a value it must then ask about, and the warning names the row so the
+/// operator can fix it. (Making enforcement kind-aware is a separate decision
+/// with an upgrade hazard — filed as its own issue rather than smuggled in
+/// here.)
+///
+/// An unrecognised `kind` (schema drift) matches no declared kind, so it is
+/// withheld and named too — [`kastellan_db::tool_allowlists::AllowlistRow`]
+/// keeps the column's raw text precisely so this warning can print it.
+fn withhold_kind_mismatches(
+    tool: &str,
+    decl: crate::worker_manifest::AllowlistDecl,
+    rows: &[kastellan_db::tool_allowlists::AllowlistRow],
+) -> Vec<String> {
+    let (matching, mismatched): (Vec<_>, Vec<_>) =
+        rows.iter().partition(|r| r.is_kind(decl.kind));
+    if !mismatched.is_empty() {
+        tracing::warn!(
+            tool,
+            declared_kind = decl.kind.as_str(),
+            mismatched = ?mismatched
+                .iter()
+                .map(|r| format!("{} (kind={})", r.value, r.kind))
+                .collect::<Vec<_>>(),
+            "tool_allowlists rows are stored under a different kind than this worker \
+             declares, so they are NOT advertised to the planner — describing them with \
+             this tool's wording would name a permitted value in the wrong shape. They \
+             are still ENFORCED; fix each row's kind (remove and re-add it) or delete it"
+        );
+    }
+    matching.into_iter().map(|r| r.value.clone()).collect()
+}
+
 /// Operator-facing warnings about the permitted set that is about to be
 /// advertised to the planner.
 ///
@@ -175,7 +224,8 @@ pub async fn build_tool_registry(
     use std::path::Path;
 
     // 1. Pre-fetch allowlists for every manifest that declares one.
-    let mut allowlists: HashMap<String, Vec<String>> = HashMap::new();
+    let mut allowlists: HashMap<String, Vec<kastellan_db::tool_allowlists::AllowlistRow>> =
+        HashMap::new();
     for m in WORKER_MANIFESTS {
         if let Some(decl) = m.allowlist() {
             let tool = decl.tool;
@@ -320,7 +370,13 @@ pub fn assemble_registry(
                 // fix.
                 let declaration = m.allowlist();
                 let al_key = declaration.map(|d| d.tool).unwrap_or(name);
-                let allowlist = (ctx.allowlist)(al_key);
+                let rows = (ctx.allowlist)(al_key);
+                // The ENFORCEMENT view: every stored row, kind-blind, exactly as
+                // the worker itself receives it. The audit record describes this
+                // set, not the advertised one, so `allowlist_len` keeps meaning
+                // "what is enforced" even when #541's kind filter withholds a row
+                // from the prompt.
+                let allowlist = kastellan_db::tool_allowlists::allowlist_values(&rows);
                 tracing::info!(
                     tool = name,
                     binary = %entry.binary.display(),
@@ -340,14 +396,17 @@ pub fn assemble_registry(
                 // either has a kind to word its line with or has no allowlist.
                 //
                 // `declared` carries the LIVE rows only: entries the screen above
-                // proved dead are withheld, so the planner is never told a host is
-                // reachable that the daemon has already computed is not. Fetched
-                // once per manifest, then rendered per doc by `with_allowlist`
-                // (which is where the escaping lives — this site never touches the
-                // raw DB text).
+                // proved dead, and entries stored under a different `kind` than
+                // this worker declares, are both withheld — so the planner is
+                // never told a host is reachable that the daemon has already
+                // computed is not, nor handed a value described in the wrong
+                // shape. Fetched once per manifest, then rendered per doc by
+                // `with_allowlist` (which is where the escaping lives — this site
+                // never touches the raw DB text).
                 let declared = declaration.map(|decl| {
+                    let of_declared_kind = withhold_kind_mismatches(name, decl, &rows);
                     let (live, withheld) = crate::workers::endpoint_guard::partition_dead_rows(
-                        &allowlist,
+                        &of_declared_kind,
                         &dead_net_entries,
                     );
                     if !withheld.is_empty() {

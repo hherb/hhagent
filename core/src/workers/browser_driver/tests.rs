@@ -1,4 +1,5 @@
 use super::*;
+    use crate::worker_manifest::domain_rows;
 
     /// No interpreter canonicalization in most tests — a self-contained venv.
     fn no_canon(_p: &Path) -> Option<PathBuf> {
@@ -166,7 +167,7 @@ use super::*;
     fn ctx<'a>(
         get_env: &'a dyn Fn(&str) -> Option<String>,
         exists: &'a dyn Fn(&Path) -> bool,
-        allowlist: &'a dyn Fn(&str) -> Vec<String>,
+        allowlist: &'a dyn Fn(&str) -> Vec<kastellan_db::tool_allowlists::AllowlistRow>,
     ) -> ResolveCtx<'a> {
         ResolveCtx {
             get_env,
@@ -297,7 +298,7 @@ use super::*;
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["example.com".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["example.com"]);
         // is_dir=false so the shim override path counts as a runnable file
         // (discover_binary requires exists && !is_dir).
         let c = ResolveCtx {
@@ -333,7 +334,7 @@ use super::*;
             _ => None,
         };
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["example.com".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["example.com"]);
         let c = ctx(&get_env, &exists, &allowlist); // exe_dir: None
         assert!(
             matches!(
@@ -595,7 +596,7 @@ use super::*;
             _ => None,
         };
         let exists = |_p: &Path| false; // no venv shim, no lockdown-exec shim
-        let allowlist = |_t: &str| vec!["example.org".to_string()];
+        let allowlist = |_t: &str| domain_rows(&["example.org"]);
         let c = ctx(&get_env, &exists, &allowlist);
 
         match BrowserDriverManifest.resolve(&c) {

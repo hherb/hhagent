@@ -61,6 +61,35 @@ pub struct AllowlistDecl {
     pub kind: kastellan_db::tool_allowlists::EntryKind,
 }
 
+/// Test helper: allowlist rows of one kind, in the shape
+/// [`ResolveCtx::allowlist`] hands a manifest. Lives here, next to the field it
+/// feeds, so every worker's tests build the fake the same way.
+#[cfg(test)]
+pub(crate) fn rows_of_kind(
+    kind: kastellan_db::tool_allowlists::EntryKind,
+    values: &[&str],
+) -> Vec<kastellan_db::tool_allowlists::AllowlistRow> {
+    values
+        .iter()
+        .map(|v| kastellan_db::tool_allowlists::AllowlistRow {
+            value: v.to_string(),
+            kind: kind.as_str().to_string(),
+        })
+        .collect()
+}
+
+/// Test helper: `domain`-kind rows — what the web workers store.
+#[cfg(test)]
+pub(crate) fn domain_rows(values: &[&str]) -> Vec<kastellan_db::tool_allowlists::AllowlistRow> {
+    rows_of_kind(kastellan_db::tool_allowlists::EntryKind::Domain, values)
+}
+
+/// Test helper: `argv0`-kind rows — what `shell-exec` stores.
+#[cfg(test)]
+pub(crate) fn argv0_rows(values: &[&str]) -> Vec<kastellan_db::tool_allowlists::AllowlistRow> {
+    rows_of_kind(kastellan_db::tool_allowlists::EntryKind::Argv0, values)
+}
+
 /// A worker's self-description. One impl per worker, living in that worker's
 /// host-side module. `resolve` is **pure** — every input arrives via
 /// [`ResolveCtx`], so each impl is unit-testable with fakes (no `std::env`,
@@ -145,10 +174,18 @@ pub struct ResolveCtx<'a> {
     /// unreachable in-jail when `/etc/alternatives` isn't bound, even
     /// though `/usr` is.
     pub canonicalize: &'a dyn Fn(&Path) -> Option<PathBuf>,
-    /// Operational argv allowlist, pre-fetched from the DB by the builder,
+    /// Operational allowlist rows, pre-fetched from the DB by the builder,
     /// keyed by tool name. A worker that declared an [`AllowlistDecl`] looks
     /// itself up here under `decl.tool`; absent ⇒ empty.
-    pub allowlist: &'a dyn Fn(&str) -> Vec<String>,
+    ///
+    /// Rows, not bare strings, because each carries the `kind` column it was
+    /// stored with and that can disagree with the kind its tool declares
+    /// (#541). Enforcement is deliberately kind-blind — project with
+    /// [`kastellan_db::tool_allowlists::allowlist_values`] — while the
+    /// planner-facing advertisement in [`crate::registry_build`] withholds a
+    /// mismatched row, since it is the half that would otherwise describe the
+    /// row with the wrong wording.
+    pub allowlist: &'a dyn Fn(&str) -> Vec<kastellan_db::tool_allowlists::AllowlistRow>,
 }
 
 impl ResolveCtx<'_> {

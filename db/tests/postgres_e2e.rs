@@ -1376,7 +1376,8 @@ async fn tool_allowlists_round_trip_and_grant_shape() {
     use kastellan_db::pool::connect_runtime_pool;
     use kastellan_db::probe::run as probe_run;
     use kastellan_db::tool_allowlists::{
-        add, list_all, list_for_tool, list_for_tool_full, remove, AllowlistEntry, EntryKind,
+        add, allowlist_values, list_all, list_for_tool, list_for_tool_full, remove,
+        AllowlistEntry, EntryKind,
         ToolAllowlistError,
     };
     use kastellan_tests_common::{bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_no_supervisor, unique_suffix};
@@ -1410,15 +1411,19 @@ async fn tool_allowlists_round_trip_and_grant_shape() {
     let inserted2 = add(&pool, "shell-exec", EntryKind::Argv0, "/usr/bin/echo", "test").await.unwrap();
     assert!(!inserted2, "duplicate add must be a no-op");
 
-    // (2) list_for_tool returns one entry.
+    // (2) list_for_tool returns one entry, carrying the kind it was stored
+    // under — which is what lets the registry withhold a mismatched row from
+    // the planner-facing advertisement (#541).
     let v = list_for_tool(&pool, "shell-exec").await.unwrap();
-    assert_eq!(v, vec!["/usr/bin/echo".to_string()]);
+    assert_eq!(allowlist_values(&v), vec!["/usr/bin/echo".to_string()]);
+    assert!(v[0].is_kind(EntryKind::Argv0), "the row reports the kind `add` wrote");
+    assert!(!v[0].is_kind(EntryKind::Domain));
 
     // (3) A second entry under the same tool.
     let inserted3 = add(&pool, "shell-exec", EntryKind::Argv0, "/bin/sh", "test").await.unwrap();
     assert!(inserted3);
     let v2 = list_for_tool(&pool, "shell-exec").await.unwrap();
-    assert_eq!(v2, vec!["/bin/sh".to_string(), "/usr/bin/echo".to_string()],
+    assert_eq!(allowlist_values(&v2), vec!["/bin/sh".to_string(), "/usr/bin/echo".to_string()],
         "list_for_tool must order argv0 ascending");
 
     // (4) list_all surfaces metadata.
