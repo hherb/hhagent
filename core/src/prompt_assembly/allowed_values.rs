@@ -47,11 +47,37 @@ use crate::worker_manifest::ToolDoc;
 /// it does — is a bad trade for a value under no live pressure. Changing this
 /// cuts a release.
 ///
-/// Caps the entry COUNT, not the rendered byte length: `validate_argv0` puts
-/// no length bound on an `argv0` row, so 30 long rows can still be large —
-/// tracked as #542. `<tools>` shares the prompt's global untracked budget
-/// (#78) today.
+/// Caps the entry COUNT only; [`ADVERTISED_ALLOWLIST_MAX_BYTES`] caps what
+/// those entries may cost. `<tools>` shares the prompt's global untracked
+/// budget (#78) today.
 pub const ADVERTISED_ALLOWLIST_MAX: usize = 30;
+
+/// Cap on the total rendered byte length of the advertised value list (#542).
+///
+/// The count cap alone bounds the list at 30 × *unbounded*: `validate_argv0`
+/// enforces no length limit on an `argv0` row and migration `0021`'s CHECK adds
+/// none, so `tool_allowlists` is a prompt-content channel with no size gate
+/// behind it. (Domain rows are already bounded — `validate_domain` caps a host
+/// at 253 bytes.)
+///
+/// 4 KiB is roughly triple the largest realistic *full* list — thirty absolute
+/// paths at ~40 bytes each is ~1.2 KiB — so a sane allowlist is never clipped,
+/// while a pathological one cannot dominate the ~16 k-token planner prompt.
+/// Compile-time for the same reason as the count cap: it governs prompt shape.
+///
+/// Measured against the **escaped, quoted, joined** list — the bytes that
+/// actually reach the prompt. Escaping expands (`&` → `&amp;`), so a raw-byte
+/// budget would be a bound on a different string than the one being bounded.
+///
+/// Whole entries only: an entry is shown in full or withheld. Advertising a
+/// truncated path would name a value that is NOT permitted, so the planner
+/// would emit it and burn an iteration on a refusal this feature invented —
+/// the same argument the wildcard-dot gloss makes below.
+pub const ADVERTISED_ALLOWLIST_MAX_BYTES: usize = 4096;
+
+/// Separator between rendered entries. Named because its width is part of the
+/// byte accounting in [`select_advertised`].
+const ENTRY_SEPARATOR: &str = ", ";
 
 /// One advertised tool: its compiled-in doc plus, when the worker declares an
 /// operator allowlist, the escaped rendering of the permitted value set.
@@ -106,6 +132,73 @@ impl AdvertisedTool {
     }
 }
 
+/// What the caps let through, and what they hold back — the single definition
+/// of "advertised".
+///
+/// Both halves come from one pass so the line the *planner* reads and the
+/// warning the *operator* reads can never describe different sets. Deriving
+/// them separately is how a numerator and a denominator end up disagreeing with
+/// no way to tell which is wrong (#549's shape, one layer over).
+pub(crate) struct AdvertisedSelection<'a> {
+    /// Rendered entries in prompt order: sorted, escaped and backtick-quoted,
+    /// a subsequence of the sorted input when a cap withholds something.
+    pub shown: Vec<String>,
+    /// The withheld entries, **raw and unescaped**, in the same sorted order.
+    /// Raw because the operator has to see the row exactly as stored to fix
+    /// it — so this half is for `tracing`, never for the prompt. Anything
+    /// prompt-bound goes through `shown`, which is escaped at construction.
+    pub withheld: Vec<&'a str>,
+}
+
+impl AdvertisedSelection<'_> {
+    /// Entries considered: shown plus withheld, by construction. A method
+    /// rather than a stored field, so "N of M" cannot become two computations.
+    pub fn total(&self) -> usize {
+        self.shown.len() + self.withheld.len()
+    }
+}
+
+/// Apply both advertisement caps to a raw allowlist.
+///
+/// Walks the sorted set once, keeping an entry when it fits under BOTH the
+/// count cap ([`ADVERTISED_ALLOWLIST_MAX`]) and the byte budget
+/// ([`ADVERTISED_ALLOWLIST_MAX_BYTES`]), and withholding it otherwise. An entry
+/// too large to fit is **skipped, not terminal**: a single huge row sorting
+/// early must not cost the planner every row behind it.
+///
+/// Sorted so the rendering is a pure function of the SET, not of row order.
+/// `list_for_tool` does `ORDER BY argv0 ASC` today, but that is Postgres
+/// COLLATION order while this is byte order, and a pure renderer must not
+/// inherit its determinism from one caller's query — a locale change or a
+/// second caller would otherwise reshuffle the prompt between restarts.
+pub(crate) fn select_advertised(entries: &[String]) -> AdvertisedSelection<'_> {
+    let mut sorted: Vec<&str> = entries.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+
+    let mut shown: Vec<String> = Vec::new();
+    let mut withheld: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for entry in sorted {
+        // Each entry is individually quoted, NOT just comma-joined.
+        // `validate_argv0` accepts any absolute path, commas and spaces
+        // included, so the single row `/usr/bin/ls, /usr/bin/cat` would
+        // otherwise render as two permitted values — NEITHER of which is
+        // permitted, since the one permitted argv0 is the whole comma string.
+        // The planner would then fail every dispatch while the line looked
+        // perfectly correct. Quoting makes the row boundaries explicit;
+        // `registry_build` separately warns the operator about such a row.
+        let rendered = format!("`{}`", escape_untrusted_body(entry));
+        let cost = rendered.len() + if shown.is_empty() { 0 } else { ENTRY_SEPARATOR.len() };
+        if shown.len() < ADVERTISED_ALLOWLIST_MAX && used + cost <= ADVERTISED_ALLOWLIST_MAX_BYTES {
+            used += cost;
+            shown.push(rendered);
+        } else {
+            withheld.push(entry);
+        }
+    }
+    AdvertisedSelection { shown, withheld }
+}
+
 /// Render an operator allowlist as one planner-facing line.
 ///
 /// Always returns a line: an empty `entries` is a meaningful state (nothing is
@@ -150,24 +243,7 @@ fn render_allowed_values(kind: EntryKind, entries: &[String]) -> String {
         };
     }
 
-    // Sorted so the rendering is a pure function of the SET, not of row order.
-    // `list_for_tool` does `ORDER BY argv0 ASC` today, but that is Postgres
-    // COLLATION order while this is byte order, and a pure renderer must not
-    // inherit its determinism from one caller's query — a locale change or a
-    // second caller would otherwise reshuffle the prompt between restarts.
-    let mut sorted: Vec<&str> = entries.iter().map(String::as_str).collect();
-    sorted.sort_unstable();
-
-    let shown = sorted.len().min(ADVERTISED_ALLOWLIST_MAX);
-    // Each entry is individually quoted, NOT just comma-joined. `validate_argv0`
-    // accepts any absolute path, commas and spaces included, so the single row
-    // `/usr/bin/ls, /usr/bin/cat` would otherwise render as two permitted values
-    // — NEITHER of which is permitted, since the one permitted argv0 is the
-    // whole comma string. The planner would then fail every dispatch while the
-    // line looked perfectly correct. Quoting makes the row boundaries explicit;
-    // `registry_build` separately warns the operator about such a row.
-    let listed: Vec<String> =
-        sorted[..shown].iter().map(|e| format!("`{}`", escape_untrusted_body(e))).collect();
+    let selection = select_advertised(entries);
 
     let lead = match kind {
         EntryKind::Argv0 => "argv[0] must be exactly one of",
@@ -184,16 +260,34 @@ fn render_allowed_values(kind: EntryKind, entries: &[String]) -> String {
         }
     };
 
-    if shown < sorted.len() {
+    if selection.shown.is_empty() {
+        // Reachable only through the byte cap, and only when EVERY entry is
+        // over-long (`entries` was checked non-empty above). It needs its own
+        // sentence: "showing 0 of 1" followed by an empty list reads as a
+        // rendering bug, and showing a clipped value would fabricate a
+        // permitted one. Says the values still apply, so the planner does not
+        // read this as "unrestricted".
+        return format!(
+            "{} permitted values are configured but each is too long to show here; they are \
+             still enforced, so a value that is not among them is refused — ask an operator \
+             to shorten them",
+            selection.total()
+        );
+    }
+
+    if !selection.withheld.is_empty() {
         // Truncation stated FIRST, so it is the first thing read and survives
-        // any downstream budget that clips a tail.
+        // any downstream budget that clips a tail. One wording for both caps:
+        // which cap clipped the list does not change what the planner must
+        // know, which is that the list is partial.
         format!(
-            "showing {shown} of {} permitted values; {lead}: {}",
-            sorted.len(),
-            listed.join(", ")
+            "showing {} of {} permitted values; {lead}: {}",
+            selection.shown.len(),
+            selection.total(),
+            selection.shown.join(ENTRY_SEPARATOR)
         )
     } else {
-        format!("{lead}: {}", listed.join(", "))
+        format!("{lead}: {}", selection.shown.join(ENTRY_SEPARATOR))
     }
 }
 
@@ -294,6 +388,101 @@ mod tests {
         let line = render_allowed_values(EntryKind::Argv0, &exact);
         assert!(!line.contains("showing"), "boundary must not claim truncation: {line}");
         assert_eq!(line.matches("/usr/bin/tool").count(), ADVERTISED_ALLOWLIST_MAX);
+    }
+
+    #[test]
+    fn over_the_byte_cap_the_line_names_both_numbers() {
+        // #542: `validate_argv0` bounds neither an entry's length nor the
+        // list's, so a handful of long rows can be far larger than thirty
+        // short ones. Well under the COUNT cap, well over the byte cap.
+        let long: Vec<String> = (0..5)
+            .map(|i| format!("/usr/bin/{}{i}", "x".repeat(1500)))
+            .collect();
+        let line = render_allowed_values(EntryKind::Argv0, &long);
+        assert!(line.len() <= ADVERTISED_ALLOWLIST_MAX_BYTES + 200, "bounded: {} bytes", line.len());
+        // Same "showing N of M" shape the count cap uses — one wording, so a
+        // clipped list can never read as exhaustive whichever cap clipped it.
+        assert!(line.contains("showing 2 of 5"), "shown-of-total, in order: {}", &line[..80]);
+    }
+
+    #[test]
+    fn no_advertised_value_is_ever_a_clipped_entry() {
+        // A truncated path advertised as permitted is a value that is NOT
+        // permitted: the planner would emit it and burn an iteration on a
+        // refusal the advertisement invented. Whatever is shown must be shown
+        // in full.
+        let long: Vec<String> = (0..5)
+            .map(|i| format!("/usr/bin/{}{i}", "x".repeat(1500)))
+            .collect();
+        let line = render_allowed_values(EntryKind::Argv0, &long);
+        // Every backtick-delimited value in the line must be an entry, whole.
+        // Asserting the converse ("each shown entry appears in full") is the
+        // trap: these entries share a long prefix, so a substring probe finds
+        // a withheld entry inside a shown one and proves nothing.
+        let values: Vec<&str> = line.split('`').skip(1).step_by(2).collect();
+        assert!(!values.is_empty(), "some values are shown: {}", &line[..60]);
+        for value in values {
+            assert!(
+                long.iter().any(|e| e == value),
+                "an advertised value must be an entry verbatim, not a clipped one: \
+                 {} bytes ending {:?}",
+                value.len(),
+                &value[value.len().saturating_sub(12)..]
+            );
+        }
+    }
+
+    #[test]
+    fn one_over_long_entry_does_not_withhold_the_short_ones_behind_it() {
+        // Selection walks the SORTED set, so a single huge row sorting early
+        // must not cost the planner every row after it — it is skipped, the
+        // rest still fit, and the operator is told which one went.
+        let entries = v(&["/usr/bin/aaa", "/usr/bin/zzz"]);
+        let mut entries = entries;
+        entries.push(format!("/usr/bin/{}", "b".repeat(ADVERTISED_ALLOWLIST_MAX_BYTES)));
+        let sel = select_advertised(&entries);
+        assert_eq!(sel.withheld.len(), 1, "only the over-long row is withheld: {:?}", sel.withheld);
+        assert_eq!(sel.shown.len(), 2, "both short rows survive it: {:?}", sel.shown);
+        assert_eq!(sel.total(), 3);
+    }
+
+    #[test]
+    fn when_no_entry_fits_the_line_states_that_without_naming_a_value() {
+        // The degenerate case has to be its own sentence: "showing 0 of 1"
+        // followed by an empty list would read as a rendering bug, and
+        // rendering a clipped value would fabricate a permitted one.
+        let huge = vec![format!("/usr/bin/{}", "x".repeat(ADVERTISED_ALLOWLIST_MAX_BYTES * 2))];
+        let line = render_allowed_values(EntryKind::Argv0, &huge);
+        assert!(line.len() < 400, "the fallback line is short: {} bytes", line.len());
+        assert!(line.contains('1'), "states how many are configured: {line}");
+        assert!(!line.contains("xxxx"), "no fragment of a value is advertised: {line}");
+        // It must not read as "nothing is permitted" — the values ARE enforced.
+        assert!(line.contains("enforced"), "says the values still apply: {line}");
+    }
+
+    #[test]
+    fn the_selection_the_planner_sees_is_the_selection_the_operator_is_warned_about() {
+        // #549's lesson one layer over: when a numerator and a denominator are
+        // computed in two places they eventually disagree, and the operator has
+        // no way to tell which number is wrong. `select_advertised` is the
+        // single definition of "advertised" — `render_allowed_values` renders
+        // its `shown`, `advertisement_warnings` names its `withheld`, and this
+        // pins that the two halves partition the input exactly.
+        let many: Vec<String> = (0..ADVERTISED_ALLOWLIST_MAX + 3)
+            .map(|i| format!("/usr/bin/tool{i:03}"))
+            .collect();
+        let sel = select_advertised(&many);
+        assert_eq!(sel.shown.len(), ADVERTISED_ALLOWLIST_MAX);
+        assert_eq!(sel.withheld.len(), 3);
+        assert_eq!(sel.total(), many.len(), "shown + withheld is the whole input");
+        let line = render_allowed_values(EntryKind::Argv0, &many);
+        assert!(
+            line.contains(&format!("showing {} of {}", sel.shown.len(), sel.total())),
+            "the line quotes the selection's own numbers: {line}"
+        );
+        for w in &sel.withheld {
+            assert!(!line.contains(w), "a withheld entry must not be advertised: {w}");
+        }
     }
 
     #[test]

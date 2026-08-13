@@ -106,22 +106,26 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// only `system_prompt_sha256` — so an operator cannot read back what the
 /// planner was told.
 fn advertisement_warnings(tool: &str, entries: &[String]) {
-    use crate::prompt_assembly::allowed_values::ADVERTISED_ALLOWLIST_MAX;
+    use crate::prompt_assembly::allowed_values::{
+        select_advertised, ADVERTISED_ALLOWLIST_MAX, ADVERTISED_ALLOWLIST_MAX_BYTES,
+    };
 
-    // The cap is announced to the MODEL ("showing 30 of 31") but was silent to
-    // the operator, who would otherwise have no way to learn that adding a 31st
-    // entry left it permanently invisible to the planner.
-    if entries.len() > ADVERTISED_ALLOWLIST_MAX {
-        // Same sort the renderer applies, so `withheld` names the entries it
-        // actually drops rather than an arbitrary suffix.
-        let mut sorted: Vec<&str> = entries.iter().map(String::as_str).collect();
-        sorted.sort_unstable();
+    // The caps are announced to the MODEL ("showing 30 of 31") but were silent
+    // to the operator, who would otherwise have no way to learn that adding a
+    // 31st entry — or one very long one — left it permanently invisible to the
+    // planner. Asks the renderer's own selection rather than re-deriving the
+    // withheld set here: two computations of one number is how the operator
+    // ends up with two accounts and no way to tell which is wrong.
+    let selection = select_advertised(entries);
+    if !selection.withheld.is_empty() {
         tracing::warn!(
             tool,
-            total = entries.len(),
-            advertised = ADVERTISED_ALLOWLIST_MAX,
-            withheld = ?&sorted[ADVERTISED_ALLOWLIST_MAX..],
-            "allowlist exceeds the advertised cap: these entries are ENFORCED but \
+            total = selection.total(),
+            advertised = selection.shown.len(),
+            count_cap = ADVERTISED_ALLOWLIST_MAX,
+            byte_cap = ADVERTISED_ALLOWLIST_MAX_BYTES,
+            withheld = ?selection.withheld,
+            "allowlist exceeds an advertised cap: these entries are ENFORCED but \
              invisible to the planner, which will never propose them"
         );
     }
