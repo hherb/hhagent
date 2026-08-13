@@ -154,7 +154,7 @@ where
     Err(ResolveSkipReason::PythonNotFound)
 }
 
-/// python-exec's manifest. No `allowlist_tool` (there is no argv-shaped
+/// python-exec's manifest. No `allowlist` declaration (there is no argv-shaped
 /// operational allowlist; the gate is `KASTELLAN_PYTHON_EXEC_ENABLE`).
 pub struct PythonExecManifest;
 

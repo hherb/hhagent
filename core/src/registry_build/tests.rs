@@ -7,28 +7,27 @@
 //! production half of the file drops back under the 500-line guideline.
 
 use super::*;
-use crate::worker_manifest::{ResolveCtx, Resolution, WorkerManifest};
+use crate::worker_manifest::{AllowlistDecl, ResolveCtx, Resolution, WorkerManifest};
+use kastellan_db::tool_allowlists::EntryKind;
 use std::path::{Path, PathBuf};
 
-/// A fake worker for assembly tests. `outcome` selects which arm
-/// `resolve` returns; `allowlist_name` (if Some) is reported from
-/// `allowlist_tool()` so the allowlist-lookup path is exercised (the
-/// *prefetch* itself lives in `build_tool_registry`, which only ever
-/// iterates the real `WORKER_MANIFESTS` and never sees a fake).
+/// A fake worker for assembly tests. `outcome` selects which arm `resolve`
+/// returns; `allowlist` (if Some) is what the manifest declares, so the
+/// allowlist-lookup path is exercised (the *prefetch* itself lives in
+/// `build_tool_registry`, which only ever iterates the real
+/// `WORKER_MANIFESTS` and never sees a fake).
 struct FakeManifest {
     name: &'static str,
     outcome: FakeOutcome,
-    allowlist_name: Option<&'static str>,
+    /// This fake's allowlist declaration, or `None`. ONE field, mirroring the
+    /// trait since #545: a fake cannot express a half-declared manifest either,
+    /// which is exactly the point of the collapse.
+    allowlist: Option<AllowlistDecl>,
     /// When true, `tool_doc()` returns a synthetic doc, so this fake reaches
     /// the ADVERTISED surface (the returned `Vec<AdvertisedTool>`) and not
     /// only the registry. Without it a fake contributes no docs at all and
     /// any assertion over `docs` silently has nothing to look at.
     advertise_doc: bool,
-    /// Reported from `allowlist_kind()`. Deliberately independent of
-    /// `allowlist_name`: the two halves must be declarable *separately* so
-    /// the declared-together guard and the tool-without-kind warn arm are
-    /// both reachable from a test.
-    allowlist_kind: Option<kastellan_db::tool_allowlists::EntryKind>,
 }
 enum FakeOutcome {
     Register,
@@ -51,11 +50,8 @@ impl WorkerManifest for FakeManifest {
     fn name(&self) -> &'static str {
         self.name
     }
-    fn allowlist_tool(&self) -> Option<&'static str> {
-        self.allowlist_name
-    }
-    fn allowlist_kind(&self) -> Option<kastellan_db::tool_allowlists::EntryKind> {
-        self.allowlist_kind
+    fn allowlist(&self) -> Option<AllowlistDecl> {
+        self.allowlist
     }
     fn tool_doc(&self) -> Option<crate::worker_manifest::ToolDoc> {
         self.advertise_doc.then_some(crate::worker_manifest::ToolDoc {
@@ -145,9 +141,8 @@ fn force_routed_all_localhost_allowlist_is_refused_like_misconfigured() {
             "localhost:443".to_string(),
             "svc.localhost:8080".to_string(),
         ]),
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
     assert!(reg.lookup("deadtool").is_none(), "statically dead tool must not register");
@@ -164,9 +159,8 @@ fn force_routed_subset_localhost_allowlist_warns_but_registers() {
             "docs.example.org:443".to_string(),
             "localhost:443".to_string(),
         ]),
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
     assert!(reg.lookup("mixedtool").is_some(), "subset-dead tool still registers");
@@ -180,9 +174,8 @@ fn unforced_localhost_allowlist_registers_exactly_as_today() {
     let m = FakeManifest {
         name: "hosttool",
         outcome: FakeOutcome::RegisterWithNet(vec!["localhost:443".to_string()]),
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
     assert!(reg.lookup("hosttool").is_some(), "no force-routing ⇒ untouched");
@@ -200,9 +193,8 @@ fn vm_entry_all_localhost_allowlist_is_refused_even_unforced() {
     let m = FakeManifest {
         name: "vmdead",
         outcome: FakeOutcome::RegisterVmWithNet(vec!["localhost:443".to_string()]),
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
     assert!(reg.lookup("vmdead").is_none(), "VM ⇒ always forced ⇒ all-dead refused");
@@ -218,9 +210,8 @@ fn force_routed_non_allowlist_net_is_not_screened() {
     let m = FakeManifest {
         name: "denytool",
         outcome: FakeOutcome::Register,
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let (reg, _loaded, _docs) = assemble_registry(&[&m], &ctx);
     assert!(reg.lookup("denytool").is_some());
@@ -243,9 +234,8 @@ fn broker_worker_registers_when_broker_binary_present() {
     let m = FakeManifest {
         name: "brokertool",
         outcome: FakeOutcome::RegisterBrokerSearch,
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
     assert!(reg.lookup("brokertool").is_some(), "broker present ⇒ registers");
@@ -260,9 +250,8 @@ fn broker_worker_refused_when_broker_binary_absent() {
     let m = FakeManifest {
         name: "brokerdead",
         outcome: FakeOutcome::RegisterBrokerSearch,
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let (reg, loaded, _docs) = assemble_registry(&[&m], &ctx);
     assert!(reg.lookup("brokerdead").is_none(), "absent broker binary ⇒ refused");
@@ -278,9 +267,8 @@ fn broker_worker_refused_even_when_not_force_routed() {
     let m = FakeManifest {
         name: "brokerdead2",
         outcome: FakeOutcome::RegisterBrokerSearch,
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let (reg, _loaded, _docs) = assemble_registry(&[&m], &ctx);
     assert!(reg.lookup("brokerdead2").is_none(), "unconditional broker refuse");
@@ -299,9 +287,8 @@ fn assemble_inserts_registered_and_records_allowlist_hash() {
     let m_alpha = FakeManifest {
         name: "alpha",
         outcome: FakeOutcome::Register,
-        allowlist_name: Some("alpha"),
+        allowlist: Some(AllowlistDecl { tool: "alpha", kind: EntryKind::Argv0 }),
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let manifests: &[&dyn WorkerManifest] = &[&m_alpha];
 
@@ -322,16 +309,14 @@ fn assemble_skips_disabled_and_misconfigured_without_recording() {
     let m_off = FakeManifest {
         name: "off",
         outcome: FakeOutcome::Disabled,
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let m_bad = FakeManifest {
         name: "bad",
         outcome: FakeOutcome::Misconfigured,
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let manifests: &[&dyn WorkerManifest] = &[&m_off, &m_bad];
 
@@ -374,9 +359,8 @@ fn manifest_claiming_reserved_handoff_name_is_skipped() {
     let reserved = FakeManifest {
         name: "handoff",
         outcome: FakeOutcome::Register,
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: false,
-        allowlist_kind: None,
     };
     let (reg, loaded, _docs) = assemble_registry(&[&reserved], &ctx);
     assert!(reg.lookup("handoff").is_none(), "reserved name must not register");
@@ -492,7 +476,6 @@ fn assemble_collects_docs_only_for_registered_tools() {
 
 #[test]
 fn allowlist_kind_for_tool_maps_argv0_and_domain_tools() {
-    use kastellan_db::tool_allowlists::EntryKind;
     assert_eq!(allowlist_kind_for_tool("shell-exec"), Some(EntryKind::Argv0));
     assert_eq!(allowlist_kind_for_tool("web-fetch"), Some(EntryKind::Domain));
     assert_eq!(allowlist_kind_for_tool("web-research"), Some(EntryKind::Domain));
@@ -565,7 +548,6 @@ fn a_declared_allowlist_is_advertised_sorted_and_worded_by_kind() {
 ///   * `silent` — advertised but declares no allowlist ⇒ `None`
 #[test]
 fn advertising_a_permitted_set_follows_the_declaration_not_the_contents() {
-    use kastellan_db::tool_allowlists::EntryKind;
     let allowlist = |t: &str| match t {
         // `argvy` declares an allowlist that is EMPTY — the state in which
         // every dispatch fails, and precisely the live 2026-06-20/21 regime
@@ -577,23 +559,20 @@ fn advertising_a_permitted_set_follows_the_declaration_not_the_contents() {
     let argvy = FakeManifest {
         name: "argvy",
         outcome: FakeOutcome::Register,
-        allowlist_name: Some("argvy"),
+        allowlist: Some(AllowlistDecl { tool: "argvy", kind: EntryKind::Argv0 }),
         advertise_doc: true,
-        allowlist_kind: Some(EntryKind::Argv0),
     };
     let domainy = FakeManifest {
         name: "domainy",
         outcome: FakeOutcome::Register,
-        allowlist_name: Some("domainy"),
+        allowlist: Some(AllowlistDecl { tool: "domainy", kind: EntryKind::Domain }),
         advertise_doc: true,
-        allowlist_kind: Some(EntryKind::Domain),
     };
     let silent = FakeManifest {
         name: "silent",
         outcome: FakeOutcome::Register,
-        allowlist_name: None,
+        allowlist: None,
         advertise_doc: true,
-        allowlist_kind: None,
     };
     let manifests: &[&dyn WorkerManifest] = &[&argvy, &domainy, &silent];
 
@@ -622,7 +601,6 @@ fn advertising_a_permitted_set_follows_the_declaration_not_the_contents() {
 /// and costs a plan iteration per attempt. The live rows stay advertised.
 #[test]
 fn statically_dead_rows_are_withheld_from_the_advertisement() {
-    use kastellan_db::tool_allowlists::EntryKind;
     // Force-routed (the supervised default), so a `localhost` NAME is dead —
     // the proxy range-denies what it resolves to.
     let allowlist = |_t: &str| vec!["example.org".to_string(), "localhost".to_string()];
@@ -633,9 +611,8 @@ fn statically_dead_rows_are_withheld_from_the_advertisement() {
             "example.org:443".to_string(),
             "localhost:443".to_string(),
         ]),
-        allowlist_name: Some("domainy"),
+        allowlist: Some(AllowlistDecl { tool: "domainy", kind: EntryKind::Domain }),
         advertise_doc: true,
-        allowlist_kind: Some(EntryKind::Domain),
     };
     let (_reg, loaded, docs) = assemble_registry(&[&m], &ctx);
 
@@ -650,31 +627,30 @@ fn statically_dead_rows_are_withheld_from_the_advertisement() {
     assert_eq!(loaded[0].allowlist_len, 2, "withholding is advertisement-only");
 }
 
-/// `allowlist_tool()` and `allowlist_kind()` must be declared together: the
-/// renderer needs the kind to pick its wording, so a worker declaring only the
-/// tool would advertise nothing at all while still ENFORCING its allowlist —
-/// i.e. #533 reopening for that one tool. `assemble_registry` now `warn!`s on
-/// that arm rather than passing over it silently, but a `warn!` an operator
-/// must notice in a boot log is a weaker guarantee than this list being right,
-/// so both stay.
+/// The CLI and the registry must agree about every declaring worker.
 ///
-/// The other direction has bitten operators since before #533: a network
-/// worker that overrides `allowlist_tool` but forgets `allowlist_kind`
-/// silently inherits the `Argv0` default, and the operator's first
-/// `tools allowlist add <tool> example.org` fails with "argv0 must be an
-/// absolute path" — fail-closed, but thoroughly misleading. The `assert_eq!`
-/// below is bidirectional and covers both.
+/// #545 made the half-declared manifest unrepresentable, which retired the
+/// guard test that used to watch for it — the tool name and the kind are now
+/// one value, so neither half can go missing. What that does NOT make
+/// impossible is the lookup drifting: `allowlist_kind_for_tool` is what
+/// `kastellan-cli tools allowlist add` validates against, and it finds a
+/// manifest by scanning for a matching `tool` key. If that scan and the
+/// declaration ever disagree, the operator is told their tool "is not a known
+/// allowlist consumer" and their domain entry is validated as an argv0 path —
+/// the exact footgun #545 set out to remove, one layer down.
 ///
-/// This guards the trait-declaration pairing and NOTHING adjacent to it (the
-/// standing #516/#524/#525 lesson): it does not check the rendered wording.
+/// Guards that lookup and NOTHING adjacent to it (the standing #516/#524/#525
+/// lesson): it does not check the rendered wording.
 #[test]
-fn every_allowlist_worker_declares_both_tool_and_kind() {
+fn the_cli_resolves_the_declared_kind_for_every_allowlist_worker() {
     for m in WORKER_MANIFESTS {
+        let Some(decl) = m.allowlist() else { continue };
         assert_eq!(
-            m.allowlist_tool().is_some(),
-            m.allowlist_kind().is_some(),
-            "{}: allowlist_tool() and allowlist_kind() must be declared together",
-            m.name()
+            allowlist_kind_for_tool(decl.tool),
+            Some(decl.kind),
+            "{}: `tools allowlist add {}` must validate against the declared kind",
+            m.name(),
+            decl.tool
         );
     }
 }

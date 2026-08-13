@@ -34,6 +34,33 @@ pub struct ToolParam {
     pub required: bool,
 }
 
+/// A worker's declaration that it has an operator allowlist: which
+/// `tool_allowlists` key holds it, and what shape its entries take.
+///
+/// **The two halves are one value on purpose (#545).** They used to be two
+/// independently-defaulting trait methods, which made a half-declared manifest
+/// writable and gave it two distinct symptoms, neither of them an error:
+/// declaring only the tool left the allowlist ENFORCED but never advertised, so
+/// the planner went back to guessing permitted values one iteration at a time
+/// (#533 reopening for that one worker); declaring only the kind left the kind
+/// dead — nothing was fetched, enforced or advertised — while
+/// `kastellan-cli tools allowlist add` told the operator the tool "is not a
+/// known allowlist consumer" and then validated their domain entry as an argv0
+/// path. Both states now fail to compile, so the boot warnings and the
+/// static guard test that used to watch for them are gone with them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllowlistDecl {
+    /// The `tool_allowlists.tool` value to query — usually `== name()`. It is
+    /// its own field rather than an assumed `name()` because the fetch, the
+    /// audit record and the advertisement must all key on the SAME string.
+    pub tool: &'static str,
+    /// The shape of this worker's entries. Picks which validator the CLI
+    /// applies on `add`/`remove` and which wording the planner-facing
+    /// `allowed:` line takes: `shell-exec` stores absolute argv0 exec paths,
+    /// the web workers store host/domain entries.
+    pub kind: kastellan_db::tool_allowlists::EntryKind,
+}
+
 /// A worker's self-description. One impl per worker, living in that worker's
 /// host-side module. `resolve` is **pure** — every input arrives via
 /// [`ResolveCtx`], so each impl is unit-testable with fakes (no `std::env`,
@@ -42,19 +69,14 @@ pub trait WorkerManifest: Sync {
     /// Tool name the registry/planner keys on (e.g. `"shell-exec"`).
     fn name(&self) -> &'static str;
 
-    /// If this worker needs the operational argv allowlist from the
-    /// `tool_allowlists` DB table, the tool name to query (usually
-    /// `== name()`). `None` ⇒ no allowlist. The async fetch stays in the
+    /// This worker's operator allowlist declaration — the `tool_allowlists`
+    /// key to query and the shape its entries take — or `None` (the default)
+    /// for a worker with no operator allowlist. The async fetch stays in the
     /// builder; the result is threaded into [`ResolveCtx::allowlist`].
-    fn allowlist_tool(&self) -> Option<&'static str> {
-        None
-    }
-
-    /// The shape of this worker's `tool_allowlists` entries, when it declares
-    /// an allowlist. `None` ⇒ no allowlist (the default). Drives which
-    /// validator the CLI applies on `add`/`remove`: `shell-exec` stores
-    /// absolute argv0 exec paths, the web workers store host/domain entries.
-    fn allowlist_kind(&self) -> Option<kastellan_db::tool_allowlists::EntryKind> {
+    ///
+    /// One method returning both halves, never two (#545): see
+    /// [`AllowlistDecl`] for what the split state used to cost.
+    fn allowlist(&self) -> Option<AllowlistDecl> {
         None
     }
 
@@ -124,8 +146,8 @@ pub struct ResolveCtx<'a> {
     /// though `/usr` is.
     pub canonicalize: &'a dyn Fn(&Path) -> Option<PathBuf>,
     /// Operational argv allowlist, pre-fetched from the DB by the builder,
-    /// keyed by tool name. A worker that declared `allowlist_tool()` looks
-    /// itself up here; absent ⇒ empty.
+    /// keyed by tool name. A worker that declared an [`AllowlistDecl`] looks
+    /// itself up here under `decl.tool`; absent ⇒ empty.
     pub allowlist: &'a dyn Fn(&str) -> Vec<String>,
 }
 

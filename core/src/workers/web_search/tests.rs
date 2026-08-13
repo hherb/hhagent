@@ -80,8 +80,8 @@ fn web_search_has_no_db_argv0_allowlist() {
     // argv0-path `tool_allowlists` DB table (which structurally cannot hold a
     // hostname — CLI + DB CHECK both require a leading '/').
     assert!(
-        WebSearchManifest.allowlist_tool().is_none(),
-        "web-search must not claim an argv0 DB allowlist"
+        WebSearchManifest.allowlist().is_none(),
+        "web-search must not claim a DB allowlist"
     );
 }
 

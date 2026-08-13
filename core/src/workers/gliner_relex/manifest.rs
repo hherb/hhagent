@@ -59,7 +59,7 @@ impl crate::worker_manifest::WorkerManifest for GlinerRelexManifest {
     }
 
     // No argv allowlist: gliner-relex is a single stateless inference service,
-    // not an argv-dispatch worker. (allowlist_tool defaults to None.)
+    // not an argv-dispatch worker. (`allowlist()` defaults to None.)
 
     fn resolve(
         &self,

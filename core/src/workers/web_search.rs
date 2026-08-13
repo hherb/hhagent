@@ -408,7 +408,7 @@ impl WorkerManifest for WebSearchManifest {
         TOOL_NAME
     }
 
-    // No `allowlist_tool`: web-search has a single operator-configured endpoint,
+    // No `allowlist`: web-search has a single operator-configured endpoint,
     // so its host allowlist is the endpoint's own host — derived below, not read
     // from the argv0-path `tool_allowlists` DB table (which cannot hold a
     // hostname: the CLI and a DB CHECK both require a leading '/').

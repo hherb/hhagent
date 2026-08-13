@@ -90,15 +90,13 @@ const ENTRY_SEPARATOR: &str = ", ";
 /// [`Self::without_allowlist`]); never infer it from whether the entry list
 /// happens to be empty.
 ///
-/// One further way to reach `None` exists and is a **misconfiguration**, not a
-/// declaration: a manifest that overrides `allowlist_tool()` but not
-/// `allowlist_kind()` has no kind for the renderer to word the line with, so
-/// `registry_build` cannot advertise it. That worker's allowlist is still
-/// ENFORCED, so the symptom is the planner guessing again (i.e. #533 reopening
-/// for that one tool) rather than an error — which is why the call site logs a
-/// `warn!` naming the missing override rather than passing silently. #545 would
-/// remove this arm entirely by making the two halves one trait method, so the
-/// half-declared state stops being writable.
+/// `None` therefore means exactly one thing: the manifest declares no
+/// allowlist. It used to mean a second thing as well — a manifest that declared
+/// a tool but no kind had no wording for the renderer, so its allowlist was
+/// ENFORCED but never advertised, and the call site could only `warn!` about
+/// it. #545 made that state unrepresentable
+/// ([`crate::worker_manifest::AllowlistDecl`] carries both halves or neither),
+/// so the ambiguity is gone from this type's contract.
 pub struct AdvertisedTool {
     /// Compiled-in, trusted, never escaped. Invariant unchanged.
     pub doc: ToolDoc,

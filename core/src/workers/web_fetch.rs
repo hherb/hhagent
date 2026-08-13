@@ -187,12 +187,11 @@ impl WorkerManifest for WebFetchManifest {
         TOOL_NAME
     }
 
-    fn allowlist_tool(&self) -> Option<&'static str> {
-        Some(TOOL_NAME)
-    }
-
-    fn allowlist_kind(&self) -> Option<kastellan_db::tool_allowlists::EntryKind> {
-        Some(kastellan_db::tool_allowlists::EntryKind::Domain)
+    fn allowlist(&self) -> Option<crate::worker_manifest::AllowlistDecl> {
+        Some(crate::worker_manifest::AllowlistDecl {
+            tool: TOOL_NAME,
+            kind: kastellan_db::tool_allowlists::EntryKind::Domain,
+        })
     }
 
     fn resolve(&self, ctx: &ResolveCtx<'_>) -> Resolution {

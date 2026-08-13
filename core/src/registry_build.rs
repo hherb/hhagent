@@ -34,13 +34,17 @@ pub static WORKER_MANIFESTS: &[&dyn WorkerManifest] = &[
 /// unrecognized name — the CLI treats `None` as the argv0 default, preserving
 /// today's behaviour for any tool name that is not a known allowlist consumer.
 /// Pure.
+///
+/// A declaring worker can no longer be missed here: since #545 the tool name
+/// and the kind are one value, so matching the name IS having the kind.
 pub fn allowlist_kind_for_tool(
     name: &str,
 ) -> Option<kastellan_db::tool_allowlists::EntryKind> {
     WORKER_MANIFESTS
         .iter()
-        .find(|m| m.allowlist_tool() == Some(name))
-        .and_then(|m| m.allowlist_kind())
+        .filter_map(|m| m.allowlist())
+        .find(|decl| decl.tool == name)
+        .map(|decl| decl.kind)
 }
 
 /// True iff this entry runs as a Firecracker micro-VM worker — the
@@ -173,7 +177,8 @@ pub async fn build_tool_registry(
     // 1. Pre-fetch allowlists for every manifest that declares one.
     let mut allowlists: HashMap<String, Vec<String>> = HashMap::new();
     for m in WORKER_MANIFESTS {
-        if let Some(tool) = m.allowlist_tool() {
+        if let Some(decl) = m.allowlist() {
+            let tool = decl.tool;
             let al = kastellan_db::tool_allowlists::list_for_tool(pool, tool)
                 .await
                 .map_err(|e| {
@@ -305,14 +310,16 @@ pub fn assemble_registry(
                     }
                 }
                 // ONE key for the fetch, the boot log, the audit record and the
-                // advertisement. `allowlist_tool()` is the key `build_tool_registry`
-                // prefetches under, so for a worker where it differs from `name()`
-                // keying the audit record on `name()` would report `allowlist_len: 0`
-                // and the SHA-256 of the empty list while the prompt advertised the
-                // real set — two disagreeing accounts of one allowlist, with no
-                // diagnostic. Every current manifest returns the same constant from
-                // both, so this is drift-proofing, not a live fix.
-                let al_key = m.allowlist_tool().unwrap_or(name);
+                // advertisement. `AllowlistDecl::tool` is the key
+                // `build_tool_registry` prefetches under, so for a worker where it
+                // differs from `name()` keying the audit record on `name()` would
+                // report `allowlist_len: 0` and the SHA-256 of the empty list while
+                // the prompt advertised the real set — two disagreeing accounts of
+                // one allowlist, with no diagnostic. Every current manifest declares
+                // the same constant for both, so this is drift-proofing, not a live
+                // fix.
+                let declaration = m.allowlist();
+                let al_key = declaration.map(|d| d.tool).unwrap_or(name);
                 let allowlist = (ctx.allowlist)(al_key);
                 tracing::info!(
                     tool = name,
@@ -328,11 +335,9 @@ pub fn assemble_registry(
                 });
                 reg.insert(name, entry);
                 // Advertise the operator allowlist when the worker declares one.
-                // Both halves are required: the kind picks the wording, so a
-                // manifest with only `allowlist_tool()` cannot be advertised at
-                // all — warned about below rather than passed over silently,
-                // because its allowlist is still ENFORCED and the symptom is the
-                // planner going back to guessing (#533 reopening for that tool).
+                // Since #545 a declaration carries both halves or neither, so
+                // there is no half-declared state to warn about here: a worker
+                // either has a kind to word its line with or has no allowlist.
                 //
                 // `declared` carries the LIVE rows only: entries the screen above
                 // proved dead are withheld, so the planner is never told a host is
@@ -340,51 +345,24 @@ pub fn assemble_registry(
                 // once per manifest, then rendered per doc by `with_allowlist`
                 // (which is where the escaping lives — this site never touches the
                 // raw DB text).
-                let declared = match (m.allowlist_tool(), m.allowlist_kind()) {
-                    (Some(_), Some(kind)) => {
-                        let (live, withheld) =
-                            crate::workers::endpoint_guard::partition_dead_rows(
-                                &allowlist,
-                                &dead_net_entries,
-                            );
-                        if !withheld.is_empty() {
-                            tracing::warn!(
-                                tool = name,
-                                withheld = ?withheld,
-                                "tool_allowlists rows are statically dead and will NOT be \
-                                 advertised to the planner (they are still enforced, so a \
-                                 request naming one is refused rather than silently allowed) \
-                                 — fix or remove the rows"
-                            );
-                        }
-                        advertisement_warnings(name, &live);
-                        Some((kind, live))
-                    }
-                    (Some(tool), None) => {
+                let declared = declaration.map(|decl| {
+                    let (live, withheld) = crate::workers::endpoint_guard::partition_dead_rows(
+                        &allowlist,
+                        &dead_net_entries,
+                    );
+                    if !withheld.is_empty() {
                         tracing::warn!(
                             tool = name,
-                            allowlist_tool = tool,
-                            "worker declares allowlist_tool() but not allowlist_kind(); its \
-                             operator allowlist is ENFORCED but will NOT be advertised to \
-                             the planner, which then guesses permitted values one plan \
-                             iteration at a time (#533) — and `tools allowlist add` will \
-                             validate its entries as argv0 paths. Add the allowlist_kind() \
-                             override to its WorkerManifest impl"
+                            withheld = ?withheld,
+                            "tool_allowlists rows are statically dead and will NOT be \
+                             advertised to the planner (they are still enforced, so a \
+                             request naming one is refused rather than silently allowed) \
+                             — fix or remove the rows"
                         );
-                        None
                     }
-                    (None, Some(kind)) => {
-                        tracing::warn!(
-                            tool = name,
-                            ?kind,
-                            "worker declares allowlist_kind() but not allowlist_tool(); the \
-                             kind is dead code — no allowlist is fetched, enforced or \
-                             advertised"
-                        );
-                        None
-                    }
-                    (None, None) => None,
-                };
+                    advertisement_warnings(name, &live);
+                    (decl.kind, live)
+                });
                 for doc in m.tool_docs() {
                     docs.push(match &declared {
                         Some((kind, entries)) => {

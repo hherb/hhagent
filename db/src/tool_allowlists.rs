@@ -33,7 +33,7 @@ pub const MAX_TOOL_NAME_LEN: usize = 64;
 /// apply the right shape rule **without SQL needing to know any tool name** —
 /// adding a new tool is then a pure Rust manifest change (no migration), and
 /// only a genuinely new *kind* needs schema work. `add` writes the value from
-/// the single Rust source of truth (`WorkerManifest::allowlist_kind`), so the
+/// the single Rust source of truth (`WorkerManifest::allowlist`), so the
 /// column stays consistent with the tool by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {

@@ -309,7 +309,10 @@ use super::*;
             allowlist: &allowlist,
         };
         assert_eq!(BrowserDriverManifest.name(), "browser-driver");
-        assert_eq!(BrowserDriverManifest.allowlist_tool(), Some("browser-driver"));
+        assert_eq!(
+            BrowserDriverManifest.allowlist().map(|d| d.tool),
+            Some("browser-driver")
+        );
         assert!(matches!(
             BrowserDriverManifest.resolve(&c),
             Resolution::Register(_)
