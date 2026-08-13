@@ -31,7 +31,10 @@ use kastellan_core::secrets::Vault;
 use kastellan_core::tool_host::{dispatch_with_sink, spawn_worker, ToolHostError, WorkerSpec};
 use kastellan_core::workers::python_exec::firecracker_mode_entry;
 use kastellan_tests_common::microvm::{firecracker_backend, image_dir, skip_if_no_microvm};
-use kastellan_tests_common::NoopAuditSink;
+use kastellan_tests_common::{
+    assert_contained_by_signal, assert_contained_signal_death, assert_nonzero_exit, stdout_of,
+    NoopAuditSink,
+};
 
 /// The rootfs image this suite boots. Passed to the shared
 /// `kastellan_tests_common::microvm` helpers, which own the `[SKIP]` wording,
@@ -111,22 +114,33 @@ async fn microvm_enforces_mem_cap() {
     }
     // Allocate ~900 MiB in a 512 MiB VM. KVM enforces the cap at the hypervisor
     // (unlike bwrap's cgroup on a shared kernel, this is a separate guest kernel
-    // with hard RAM); the allocation fails. Observed: exit_code 1 with a Python
-    // MemoryError traceback; a guest OOM-kill of the child would give a null
-    // exit_code. Accept either; reject a clean 0 (would mean the cap leaked).
+    // with hard RAM); the allocation fails.
+    //
+    // Two legitimate containment shapes now that a signal death is a dispatch
+    // ERROR rather than a null `exit_code` (#539):
+    //   (a) Ok(result) with a non-zero exit_code — observed: exit_code 1 with a
+    //       Python MemoryError traceback.
+    //   (b) Err(_) carrying the #539 signal-death error — a guest OOM-kill of
+    //       the child (SIGKILL) before it can raise.
+    // Reject a clean Ok(exit_code: 0) — would mean the cap leaked.
     let code = "x = bytearray(900 * 1024 * 1024); print(len(x))";
-    let out = run_in_microvm(code).await;
-    let exit_indicates_oom =
-        out["exit_code"].is_null() || out["exit_code"].as_i64().is_some_and(|c| c != 0);
-    assert!(
-        exit_indicates_oom,
-        "expected an OOM failure (non-zero or null exit), got: {out}"
-    );
-    let stdout = out["stdout"].as_str().unwrap_or_default();
-    assert!(
-        !stdout.contains(&(900 * 1024 * 1024).to_string()),
-        "the allocation print must not appear — it should fail first: {out}"
-    );
+    let result = try_dispatch_in_microvm(serde_json::json!({ "code": code }), None).await;
+    match result {
+        Ok(out) => {
+            // `assert_nonzero_exit`, not `assert_ne!(out["exit_code"], 0)`:
+            // the latter is satisfied by `null` (#539 itself) and by the
+            // injection placeholder, which carries no `exit_code` at all.
+            assert_nonzero_exit(&out);
+            assert!(
+                !stdout_of(&out).contains(&(900 * 1024 * 1024).to_string()),
+                "the allocation print must not appear — it should fail first: {out}"
+            );
+        }
+        // The teardown race: the child can SUCCEED at the forbidden allocation
+        // and print its length before the guest OOM-kill lands. The
+        // zero-stdout half of this assertion is what rules that out.
+        Err(err) => assert_contained_by_signal(&err, "SIGKILL"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -140,6 +154,13 @@ async fn microvm_net_is_denied() {
     // stdout; its ABSENCE is the containment invariant. Non-vacuity rests on the
     // round-trip test proving this same harness faithfully relays guest stdout,
     // so a real connection could not hide. (Keep that test paired and live.)
+    //
+    // Two legitimate "no egress" shapes now that a signal death is a dispatch
+    // ERROR rather than a null `exit_code` (#539):
+    //   (a) Ok(result) — the caught-exception path: the script runs past the
+    //       try/except and exits 0 with "blocked" on stderr.
+    //   (b) Err(_) carrying the #539 signal-death error — the child is torn
+    //       down mid-attempt instead of reaching its `except` clause.
     let code = "\
 import socket, sys
 try:
@@ -148,16 +169,23 @@ try:
 except Exception:
     print('blocked', file=sys.stderr)
 ";
-    let out = run_in_microvm(code).await;
-    assert!(
-        out.get("exit_code").is_some(),
-        "worker returned no result object — dispatch broken, not contained: {out}"
-    );
-    let stdout = out["stdout"].as_str().unwrap_or_default();
-    assert!(
-        !stdout.contains("CONNECTED"),
-        "network must be denied (no CONNECTED): {out}"
-    );
+    let result = try_dispatch_in_microvm(serde_json::json!({ "code": code }), None).await;
+    match result {
+        Ok(out) => {
+            // `stdout_of` panics rather than yielding "" for a result with no
+            // `stdout` leaf — restoring, in stronger form, the "worker
+            // returned no result object — dispatch broken, not contained"
+            // guard this test used to carry.
+            assert!(
+                !stdout_of(&out).contains("CONNECTED"),
+                "network must be denied (no CONNECTED): {out}"
+            );
+        }
+        // Same teardown race as `microvm_enforces_mem_cap`: the child can
+        // print "CONNECTED" and only then be torn down. No signal is named —
+        // a denied connect surfaces inconsistently across harness timing.
+        Err(err) => assert_contained_signal_death(&err),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

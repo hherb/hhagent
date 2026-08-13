@@ -45,6 +45,8 @@
 
 #![deny(missing_debug_implementations)]
 
+#[cfg(unix)]
+pub mod child_exit;
 #[cfg(target_os = "linux")]
 pub mod landlock_lock;
 pub mod rlimit;

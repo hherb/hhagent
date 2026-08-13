@@ -6,6 +6,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use kastellan_worker_prelude::child_exit::{classify, ChildEnd};
 use serde_json::Value;
 
 /// Byte cap on the submitted source. Far beyond any sane agent-authored
@@ -186,7 +187,16 @@ pub fn serialize_params(params: &Option<Value>) -> Result<String, ParamsError> {
 ///   site dir), and drops the script dir/cwd from `sys.path`.
 /// * `-S` — skip the `site` module: system site-/dist-packages never
 ///   join `sys.path`. This is the roadmap's "curated stdlib bind" — a
-///   determinism measure; the *security* boundary is the jail.
+///   determinism measure; the *security* boundary is the jail. `-S`
+///   is ALSO load-bearing for the worker running at all under
+///   `WorkerStrict`: with `site` enabled, `site` expands `~` via
+///   `getpwuid`, glibc's NSS opens a `socket(2)` to resolve it, the
+///   seccomp profile denies that syscall, and the interpreter is
+///   SIGSYS-killed before it runs a line. `-I` alone is NOT a
+///   substitute — it ignores env vars but never disables `site`, so
+///   the kill still happens. Until #539 this failed *silently*: the
+///   worker reported a null exit code inside an otherwise-successful
+///   result, indistinguishable from a script that printed nothing.
 /// * `-B` — never write `.pyc`.
 /// * `-` — read the program from stdin until EOF (no scratch write, no
 ///   argv-size limit, nothing in `/proc/*/cmdline`).
@@ -197,9 +207,12 @@ pub fn python_args() -> [&'static str; 4] {
 /// Outcome of one interpreter run, pre-truncation already applied.
 #[derive(Debug)]
 pub struct ExecOutcome {
-    /// `None` when the child was killed by a signal (SIGKILL from the
-    /// cgroup OOM-killer, SIGXCPU past the rlimit, SIGSYS from seccomp).
-    pub exit_code: Option<i32>,
+    /// How the interpreter ended. Was `Option<i32>` until #539: a `None` there
+    /// was serialized as `"exit_code": null` inside a *successful* result, so
+    /// a seccomp kill, a cgroup OOM kill and a CPU-budget kill were all
+    /// indistinguishable from a script that printed nothing. The enum makes
+    /// that state unrepresentable rather than merely discouraged.
+    pub end: ChildEnd,
     pub stdout: String,
     pub stderr: String,
     pub stdout_truncated: bool,
@@ -396,7 +409,7 @@ pub fn run_code(
     let (stdout, out_decode_truncated) = truncate_lossy(&out_bytes, MAX_CAPTURE_BYTES);
     let (stderr, err_decode_truncated) = truncate_lossy(&err_bytes, MAX_CAPTURE_BYTES);
     Ok(ExecOutcome {
-        exit_code: status.code(),
+        end: classify(status),
         stdout,
         stderr,
         stdout_truncated: out_raw_truncated || out_decode_truncated,

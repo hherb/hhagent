@@ -29,8 +29,13 @@
 # a live Postgres cluster and the bwrap AppArmor profile; the full
 # `cargo test --workspace` run stays operator/DGX-driven (see HANDOVER).
 #
-# The one exception is `kastellan-tests-common`, whose unit tests are
-# hermetic (no Postgres, no bwrap, no KVM, no network — ~0.1s). They carry
+# The exceptions are the crates whose tests are hermetic (no Postgres, no
+# bwrap, no KVM, no network) AND carry a guard whose whole value is firing on
+# a pull request rather than on an operator's occasional DGX run. Each such
+# step names its reason at the step itself; the rule for adding another is
+# those two properties together, not hermeticity alone.
+#
+# The first was `kastellan-tests-common`, whose unit tests carry
 # the structural guards that only pay off if they fire on a *pull request*:
 # in particular `kernel_pin_is_the_only_place_the_kernel_url_appears`
 # (issue #471), which exists to catch a contributor re-inlining an
@@ -91,6 +96,30 @@ jobs:
       # `tests-common::installable` here after #504.
       - name: cargo test (mail worker — hermetic id/query contract)
         run: cargo test -p kastellan-worker-mail --locked
+
+      # The three crates carrying #539's guards. Same argument as the two steps
+      # above, and it applied the moment those tests were written: a signal-killed
+      # child was reported as a SUCCESSFUL call with `exit_code: null`, and the
+      # containment e2e tests that should have caught it asserted
+      # `assert_ne!(exit_code, 0)` — which passes on `null`. The unit tests that
+      # now pin the real behaviour are hermetic (no Postgres, no bwrap, no KVM,
+      # no network), but the e2e tests that exercise them are DGX-only, so
+      # without these steps the whole fix is guarded by nothing on a pull request.
+      #
+      # `--lib` on the prelude is deliberate: its six `tests/*.rs` integration
+      # files need real bwrap + an unprivileged userns and would skip-as-pass
+      # here, which is the false green this project treats as worse than a
+      # failure. The two worker crates have no such targets — python-exec's
+      # `tests/real_python.rs` needs only a system python3, which ubuntu-latest
+      # has.
+      - name: cargo test (worker prelude — child-exit classification, #539)
+        run: cargo test -p kastellan-worker-prelude --lib --locked
+
+      - name: cargo test (shell-exec — signal death is an error, #539)
+        run: cargo test -p kastellan-worker-shell-exec --locked
+
+      - name: cargo test (python-exec — signal death is an error, #539)
+        run: cargo test -p kastellan-worker-python-exec --locked
 
   # The Matrix worker's live SDK path (`workers/matrix/src/sdk_live.rs`) is
   # behind the optional `live-matrix` feature (`dep:matrix-sdk`). The `check`

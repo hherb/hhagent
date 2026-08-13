@@ -69,6 +69,7 @@ pub mod provisioning;
 pub mod sandbox;
 pub mod scripted_llm;
 pub mod serial;
+pub mod signal_death;
 pub mod skip;
 pub mod temp;
 pub mod tls_origin;
@@ -93,6 +94,10 @@ pub use pg::{
 };
 pub use sandbox::{backend, policy_for_shell_exec, skip_if_sandbox_unavailable};
 pub use serial::serial_lock;
+pub use signal_death::{
+    assert_contained_by_signal, assert_contained_signal_death, assert_is_signal_death,
+    assert_nonzero_exit, stdout_of,
+};
 pub use skip::{pg_bin_dir_or_skip, skip_if_no_supervisor, skip_if_origin_unreachable};
 pub use temp::{current_username, unique_suffix, unique_temp_root};
 pub use wait::{wait_for_log_match, wait_for_socket, wait_for_status};

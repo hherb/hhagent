@@ -24,8 +24,9 @@ use kastellan_core::workers::python_exec::{
 };
 use kastellan_db::secrets::{MapKeyProvider, KEY_LEN};
 use kastellan_tests_common::{
-    backend, bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_no_supervisor,
-    skip_if_sandbox_unavailable, unique_suffix, workspace_target_binary, PgCluster,
+    assert_contained_by_signal, assert_nonzero_exit, backend, bring_up_pg_cluster,
+    pg_bin_dir_or_skip, skip_if_no_supervisor, skip_if_sandbox_unavailable, stdout_of,
+    unique_suffix, workspace_target_binary, PgCluster,
 };
 
 /// Deterministic key-provider for the secret-scrub test — mirrors
@@ -209,22 +210,36 @@ fn socket_attempt_is_contained_by_the_jail() {
     };
     dispatch_runtime().block_on(async {
         let pool = probe_and_pool(&env.cluster.conn_spec).await;
-        // Under seccomp `strict` the socket(2) syscall is not in the
-        // allow-list → CPython dies with SIGSYS (exit_code null); under
-        // Seatbelt the connect is denied → OSError (exit_code 1). Either
-        // way: anything but success.
-        let r = exec_in_jail(
+        // Containment has two legitimate shapes now that a signal death is a
+        // dispatch ERROR rather than a null `exit_code` (#539):
+        //   (a) Ok(result) with a non-zero exit_code — under Seatbelt the
+        //       connect is denied → OSError → CPython exits 1.
+        //   (b) Err(_) carrying the #539 signal-death error — under seccomp
+        //       `strict` the socket(2) syscall is not in the allow-list →
+        //       CPython is SIGSYS-killed before it can raise.
+        // Anything else — a clean Ok(exit_code: 0), or "escaped" in stdout —
+        // means the socket attempt was NOT contained.
+        let result = exec_in_jail(
             &pool,
             &env,
             "import socket\ns = socket.socket()\ns.connect(('127.0.0.1', 9))\nprint('escaped')",
         )
-        .await
-        .expect("dispatch itself must succeed");
-        assert_ne!(r["exit_code"], 0, "socket attempt must not succeed: {r}");
-        assert!(
-            !r["stdout"].as_str().unwrap_or("").contains("escaped"),
-            "network reached from inside the jail: {r}"
-        );
+        .await;
+        match result {
+            Ok(r) => {
+                // `assert_nonzero_exit`, not `assert_ne!(r["exit_code"], 0)`:
+                // the latter is satisfied by `null`, which is #539 itself, so
+                // a worker that reverts the fix would take this arm and pass.
+                assert_nonzero_exit(&r);
+                assert!(
+                    !stdout_of(&r).contains("escaped"),
+                    "network reached from inside the jail: {r}"
+                );
+            }
+            // Signal death + the killing signal named + zero stdout, so an
+            // "escaped" that got printed before the kill landed cannot pass.
+            Err(err) => assert_contained_by_signal(&err, "SIGSYS"),
+        }
         pool.close().await;
     });
 }

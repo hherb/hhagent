@@ -23,3 +23,10 @@ kastellan-worker-prelude = { path = "../prelude", version = "0.2.0" }
 serde                  = { workspace = true }
 serde_json             = { workspace = true }
 anyhow                 = { workspace = true }
+
+[dev-dependencies]
+# Test-only: the signal-death tests name signals by constant rather than by
+# number. SIGKILL agrees across our two first-class platforms but SIGSYS does
+# not (31 on Linux, 12 on macOS), so a literal would be wrong on exactly one
+# gate host — and using libc uniformly means no test has to know which is which.
+libc = { workspace = true }
