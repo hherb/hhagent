@@ -100,6 +100,25 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// What `assemble_registry` decided to tell the planner about one declaring
+/// worker's allowlist. Built once per manifest and rendered per `ToolDoc`.
+///
+/// A third case exists because "the advertisable list came back empty" is
+/// ambiguous, and the two readings have opposite consequences: zero stored rows
+/// really does mean nothing is permitted, while rows that all failed the kind
+/// filter mean the tool is as capable as ever and merely undescribable. Only
+/// this site can tell them apart — it is what holds the fetched rows — so the
+/// distinction is decided here and carried, never re-derived downstream.
+enum Advertisement {
+    /// The live permitted set, worded with the kind the manifest declares.
+    Described(kastellan_db::tool_allowlists::EntryKind, Vec<String>),
+    /// Rows exist and are ENFORCED, but not one is stored under the declared
+    /// kind, so none can be named in this tool's wording. Carries the enforced
+    /// row count — the planner is told the restriction is real without being
+    /// told values it would then use in the wrong shape.
+    Opaque(usize),
+}
+
 /// Keep only the rows stored under the kind this worker declares, warning about
 /// any that are dropped (#541).
 ///
@@ -396,16 +415,33 @@ pub fn assemble_registry(
                 // there is no half-declared state to warn about here: a worker
                 // either has a kind to word its line with or has no allowlist.
                 //
-                // `declared` carries the LIVE rows only: entries the screen above
-                // proved dead, and entries stored under a different `kind` than
-                // this worker declares, are both withheld — so the planner is
-                // never told a host is reachable that the daemon has already
-                // computed is not, nor handed a value described in the wrong
-                // shape. Fetched once per manifest, then rendered per doc by
-                // `with_allowlist` (which is where the escaping lives — this site
-                // never touches the raw DB text).
+                // A `Described` advertisement carries the LIVE rows only: entries
+                // the screen above proved dead, and entries stored under a
+                // different `kind` than this worker declares, are both withheld —
+                // so the planner is never told a host is reachable that the daemon
+                // has already computed is not, nor handed a value described in the
+                // wrong shape. When the kind filter empties a NON-empty row set
+                // there is nothing left to describe and the decision is `Opaque`
+                // instead; see the guard below for why that is not the same as an
+                // empty allowlist. Decided once per manifest, then rendered per
+                // doc by `with_allowlist` (which is where the escaping lives —
+                // this site never touches the raw DB text).
                 let declared = declaration.map(|decl| {
                     let of_declared_kind = withhold_kind_mismatches(name, decl, &rows);
+                    // Every row is of another kind. Falling through with an empty
+                    // list would reach the renderer's zero-rows wording — "every
+                    // call to this tool will be refused" / "this tool can
+                    // currently reach nothing" — which is FALSE here: the rows
+                    // are kind-blindly enforced, so those calls succeed. The
+                    // planner would abandon a working tool, re-inventing #533's
+                    // failure from the opposite side. `partition_dead_rows` guards
+                    // the same inversion for its own filter (`live.is_empty() &&
+                    // !rows.is_empty()`) and cannot guard this one, because by
+                    // the time it runs the mismatched rows are already gone and
+                    // an all-mismatch is indistinguishable from an empty table.
+                    if of_declared_kind.is_empty() && !rows.is_empty() {
+                        return Advertisement::Opaque(rows.len());
+                    }
                     let (live, withheld) = crate::workers::endpoint_guard::partition_dead_rows(
                         &of_declared_kind,
                         &dead_net_entries,
@@ -421,12 +457,15 @@ pub fn assemble_registry(
                         );
                     }
                     advertisement_warnings(name, &live);
-                    (decl.kind, live)
+                    Advertisement::Described(decl.kind, live)
                 });
                 for doc in m.tool_docs() {
                     docs.push(match &declared {
-                        Some((kind, entries)) => {
+                        Some(Advertisement::Described(kind, entries)) => {
                             AdvertisedTool::with_allowlist(doc, *kind, entries)
+                        }
+                        Some(Advertisement::Opaque(configured)) => {
+                            AdvertisedTool::with_opaque_allowlist(doc, *configured)
                         }
                         None => AdvertisedTool::without_allowlist(doc),
                     });

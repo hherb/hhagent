@@ -94,10 +94,19 @@ const ENTRY_SEPARATOR: &str = ", ";
 /// The permitted set is `None` when the worker declares no allowlist. A worker
 /// that declares one which happens to be **empty** gets `Some(warning)` — the
 /// two are different facts and conflating them hides the case where every call
-/// will be refused. Pick the constructor that states which of those two worlds
-/// the *manifest declares* ([`Self::with_allowlist`] /
+/// will be refused. Pick the constructor that states which world the *caller*
+/// is in ([`Self::with_allowlist`] / [`Self::with_opaque_allowlist`] /
 /// [`Self::without_allowlist`]); never infer it from whether the entry list
 /// happens to be empty.
+///
+/// Three worlds, not two, because "no entries to show" is genuinely ambiguous:
+/// a declared allowlist with zero stored rows permits nothing, while one whose
+/// every row is unrenderable (all of another `kind`, #541) permits exactly as
+/// much as it always did — enforcement is kind-blind. Both reach a renderer
+/// holding an empty list, and the difference is knowable only to the caller
+/// that fetched the rows, so it has to be carried in rather than re-derived.
+/// [`Self::with_opaque_allowlist`] exists so the strong "nothing is permitted"
+/// claim stays reserved for the case where it is true.
 ///
 /// `None` therefore means exactly one thing: the manifest declares no
 /// allowlist. It used to mean a second thing as well — a manifest that declared
@@ -124,6 +133,26 @@ impl AdvertisedTool {
     /// list, not an absence of the declaration.
     pub fn with_allowlist(doc: ToolDoc, kind: EntryKind, entries: &[String]) -> Self {
         Self { doc, allowed: Some(render_allowed_values(kind, entries)) }
+    }
+
+    /// Advertise a tool whose allowlist HAS `configured` rows, not one of which
+    /// this build can put into words.
+    ///
+    /// Reached when every stored row sits under a `kind` the worker does not
+    /// declare (#541): the rows are still ENFORCED — enforcement is
+    /// deliberately kind-blind — but describing them in this tool's wording
+    /// would name a permitted value in the wrong shape, which is the failure
+    /// #533 exists to prevent. Neither other constructor can say this:
+    /// `with_allowlist(&[])` would claim nothing is permitted (false, and it
+    /// makes the planner abandon a tool that works) and `without_allowlist`
+    /// would claim the tool is unrestricted (false the other way).
+    ///
+    /// Takes a COUNT, not the values — which is also why this line needs no
+    /// escaping: no operator-sourced text reaches it. Naming the values is
+    /// exactly what is unsafe here; naming how many exist is what tells the
+    /// planner the restriction is real.
+    pub fn with_opaque_allowlist(doc: ToolDoc, configured: usize) -> Self {
+        Self { doc, allowed: Some(render_opaque_allowlist(configured)) }
     }
 
     /// Advertise a tool whose worker declares no allowlist at all — no
@@ -296,6 +325,26 @@ fn render_allowed_values(kind: EntryKind, entries: &[String]) -> String {
     } else {
         format!("{lead}: {}", selection.shown.join(ENTRY_SEPARATOR))
     }
+}
+
+/// Render a permitted set that exists but cannot be worded (see
+/// [`AdvertisedTool::with_opaque_allowlist`]).
+///
+/// Deliberately the SAME sentence shape as the all-over-long branch above:
+/// values are configured, here is why you cannot see them, they are still
+/// enforced, ask an operator. The planner's obligation is identical in both —
+/// do not treat this tool as unrestricted, and do not treat it as dead — so
+/// the two states are worded alike on purpose rather than by accident.
+///
+/// No `kind` parameter, because not having a wording for these rows is the
+/// whole condition; a `lead` chosen from the declared kind would describe them
+/// in the shape they are NOT stored in.
+fn render_opaque_allowlist(configured: usize) -> String {
+    format!(
+        "{configured} permitted values are configured but none is stored in a form this build \
+         can describe, so none can be listed here; they are still enforced, so a value that is \
+         not among them is refused — ask an operator to correct the rows"
+    )
 }
 
 #[cfg(test)]
@@ -549,5 +598,36 @@ mod tests {
         assert_ne!(argv0, domain, "the kinds must not share wording");
         assert!(argv0.contains("argv[0]"), "argv0 wording: {argv0}");
         assert!(domain.contains("host"), "domain wording: {domain}");
+    }
+
+    #[test]
+    fn an_opaque_allowlist_is_neither_empty_nor_unrestricted() {
+        // The third world (#541): rows exist and are enforced, none can be
+        // worded. It must land between the other two — asserting against BOTH
+        // wrong readings, because either one alone would let the wording drift
+        // into the other.
+        let doc = ToolDoc { name: "t", method: "t.run", summary: "s", params: &[] };
+        let tool = AdvertisedTool::with_opaque_allowlist(doc, 3);
+        let line = tool.allowed().expect("a declared allowlist always advertises a line");
+        assert!(line.contains("3 permitted values"), "how many exist: {line}");
+        assert!(line.contains("still enforced"), "the restriction is real: {line}");
+        // Not the zero-rows reading (either kind's wording), which would send
+        // the planner away from a tool whose calls succeed.
+        let empty_argv0 = render_allowed_values(EntryKind::Argv0, &[]);
+        let empty_domain = render_allowed_values(EntryKind::Domain, &[]);
+        assert_ne!(line, empty_argv0, "must not be the empty-argv0 claim");
+        assert_ne!(line, empty_domain, "must not be the empty-domain claim");
+        // Nor the no-declaration reading, which would read as unrestricted.
+        assert!(
+            AdvertisedTool::without_allowlist(ToolDoc {
+                name: "t",
+                method: "t.run",
+                summary: "s",
+                params: &[],
+            })
+            .allowed()
+            .is_none(),
+            "sanity: the third state is not simply 'no line'"
+        );
     }
 }

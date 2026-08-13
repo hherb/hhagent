@@ -704,6 +704,123 @@ fn a_row_with_an_unrecognised_kind_is_withheld_rather_than_fatal() {
     assert!(!line.contains("future.example.org"), "the drifted row is withheld: {line}");
 }
 
+/// When the kind filter withholds EVERY row, the advertisement must not fall
+/// through to the zero-rows wording.
+///
+/// The two states reach the renderer looking identical (an empty entry list)
+/// and mean opposite things: zero stored rows genuinely permits nothing, while
+/// an all-mismatch permits exactly what it always did, because enforcement is
+/// kind-blind. Rendering the second as the first tells the planner "every call
+/// to this tool will be refused" about a tool whose calls succeed — #533's
+/// failure re-invented from the other side, and worse than #533 because the
+/// planner abandons the tool instead of retrying.
+///
+/// Companion to the sibling above: that one pins the mixed case (a matching
+/// row survives), this one pins the total case, which is the one the two
+/// existing filters cannot see (`partition_dead_rows`' own all-withheld guard
+/// runs after the mismatched rows are already gone).
+#[test]
+fn an_all_mismatched_kind_allowlist_is_advertised_as_configured_but_undescribable() {
+    // Every row is argv0-kind under a Domain-kind worker: nothing to word.
+    let allowlist = |_t: &str| argv0_rows(&["/usr/bin/ls", "/usr/bin/cat"]);
+    let ctx = test_ctx(&allowlist);
+    let m = FakeManifest {
+        name: "domainy",
+        outcome: FakeOutcome::Register,
+        allowlist: Some(AllowlistDecl { tool: "domainy", kind: EntryKind::Domain }),
+        advertise_doc: true,
+    };
+    let (_reg, loaded, docs) = assemble_registry(&[&m], &ctx);
+
+    let line = docs[0].allowed().expect("declared ⇒ advertised");
+    // The load-bearing half: the strong claim must NOT appear. Both kind
+    // wordings are checked because the renderer picks one by kind and either
+    // would be the same lie here.
+    assert!(
+        !line.contains("can currently reach nothing") && !line.contains("will be refused until"),
+        "an all-mismatch must not read as 'nothing is permitted': {line}"
+    );
+    // Nor may it name a value: describing an argv0 path under domain wording is
+    // exactly what #541 withholds it for.
+    assert!(!line.contains("/usr/bin/"), "no value may be named: {line}");
+    // What it must say instead: the restriction is real, and how big it is.
+    assert!(line.contains("2 permitted values"), "the enforced count is stated: {line}");
+    assert!(line.contains("still enforced"), "enforcement is stated: {line}");
+    assert_eq!(loaded[0].allowlist_len, 2, "and enforcement really is untouched");
+}
+
+/// A genuinely EMPTY allowlist must keep the strong wording — the regression
+/// guard for the fix above.
+///
+/// This is not a hypothetical branch: the three domain workers sit at zero rows
+/// on the live DGX today, so this line is what the deployed planner reads. If
+/// the all-mismatch fix had been written by softening the empty wording instead
+/// of adding a state, this test is what would have caught it.
+#[test]
+fn a_genuinely_empty_allowlist_still_says_nothing_is_permitted() {
+    let allowlist = |_t: &str| Vec::new();
+    let ctx = test_ctx(&allowlist);
+    let m = FakeManifest {
+        name: "domainy",
+        outcome: FakeOutcome::Register,
+        allowlist: Some(AllowlistDecl { tool: "domainy", kind: EntryKind::Domain }),
+        advertise_doc: true,
+    };
+    let (_reg, loaded, docs) = assemble_registry(&[&m], &ctx);
+
+    let line = docs[0].allowed().expect("declared ⇒ advertised");
+    assert!(
+        line.contains("can currently reach nothing"),
+        "zero rows keeps the strong (and true) claim: {line}"
+    );
+    assert!(!line.contains("still enforced"), "and is not the opaque wording: {line}");
+    assert_eq!(loaded[0].allowlist_len, 0, "zero rows is zero rows");
+}
+
+/// The dead-row screen judges the rows of the DECLARED kind, not every stored
+/// row — pinning a decision, because the answer changed with #541.
+///
+/// `partition_dead_rows` degrades to withholding nothing when its whole input
+/// is dead, on the premise that a `NetScreen::Warn` is a proper subset and so
+/// an all-dead match means the net entries and the rows do not correspond.
+/// Feeding it the kind-filtered subset makes that premise *tighter*, not
+/// looser: a domain worker's net entries are built from its domain rows, so an
+/// argv0 row propping up the "some row is alive" count was never evidence
+/// about reachability at all. The visible consequence is that the degradation
+/// now fires here, where before #541 the unrelated argv0 row would have been
+/// advertised as a host instead — both readings are lossy, and this is the one
+/// that does not name a value in the wrong shape.
+#[test]
+fn the_dead_row_screen_judges_only_the_rows_of_the_declared_kind() {
+    let allowlist = |_t: &str| {
+        let mut rows = domain_rows(&["localhost"]);
+        rows.extend(argv0_rows(&["/usr/bin/ls"]));
+        rows
+    };
+    let ctx = forced_ctx(&allowlist);
+    let m = FakeManifest {
+        name: "domainy",
+        outcome: FakeOutcome::RegisterWithNet(vec![
+            "example.org:443".to_string(),
+            "localhost:443".to_string(),
+        ]),
+        allowlist: Some(AllowlistDecl { tool: "domainy", kind: EntryKind::Domain }),
+        advertise_doc: true,
+    };
+    let (_reg, loaded, docs) = assemble_registry(&[&m], &ctx);
+
+    let line = docs[0].allowed().expect("declared ⇒ advertised");
+    assert!(
+        line.contains("`localhost`"),
+        "all-dead within the declared kind degrades to withholding nothing: {line}"
+    );
+    assert!(
+        !line.contains("/usr/bin/ls"),
+        "the argv0 row is still never worded as a host: {line}"
+    );
+    assert_eq!(loaded[0].allowlist_len, 2, "enforcement stays kind-blind either way");
+}
+
 /// The CLI and the registry must agree about every declaring worker.
 ///
 /// #545 made the half-declared manifest unrepresentable, which retired the
