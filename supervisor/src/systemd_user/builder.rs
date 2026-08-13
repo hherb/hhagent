@@ -70,11 +70,20 @@ const MAX_NAME_LEN: usize = 200;
 /// `program` and each entry in `args` are emitted into `ExecStart=`,
 /// space-separated. Tokens that contain whitespace, quotes, or
 /// backslashes are wrapped in `"..."` with `"` and `\` escaped per
-/// systemd's quoting rules. Same for environment values **and for every
-/// path field** (`WorkingDirectory`, `EnvironmentFile`, `StandardOutput`,
-/// `StandardError`): routing them through [`quote_if_needed`] escapes a
-/// newline as `\n`, so a control character in a path can never break the
-/// line and inject a directive. A clean absolute path is emitted verbatim.
+/// systemd's quoting rules. Same for environment values and for the path
+/// fields `WorkingDirectory`, `StandardOutput` and `StandardError`:
+/// routing them through [`quote_if_needed`] escapes a newline as `\n`, so
+/// a control character in a path can never break the line and inject a
+/// directive. A clean absolute path is emitted verbatim.
+///
+/// **`EnvironmentFile=` is the exception and is emitted bare** (#530):
+/// systemd parses that directive's whole rvalue as a literal path, so a
+/// quoted value is not a path and the directive is silently dropped. It
+/// therefore carries no escaping of its own, and **callers must run
+/// [`crate::env_file::validate_env_file_path`] on every entry first** —
+/// both `SystemdUser::install` and `LaunchAgents::install` do. This
+/// function is `pub`, so that is a call-site obligation, not an invariant
+/// it can enforce.
 pub fn build_unit_file(spec: &ServiceSpec) -> String {
     let mut out = String::with_capacity(512);
 
@@ -118,15 +127,6 @@ pub fn build_unit_file(spec: &ServiceSpec) -> String {
         out.push_str(&quote_if_needed(&kv));
         out.push('\n');
     }
-    // Path fields go through the same `quote_if_needed` as args/env, at the
-    // emission seam. A clean absolute path (the only legitimate input) is
-    // emitted unchanged; a value containing a newline or other fragile char is
-    // quoted with the newline escaped as `\n`, so it can never break the line
-    // and inject a `[Service]` directive — regardless of whether the caller
-    // reached the builder through `SystemdUser::install`'s control-char guard
-    // (audit finding #10). Escaping here, not just at the driver, keeps the
-    // guarantee at the point every directive is written (cf. launchd's
-    // `xml_escape` inside `build_plist`).
     // One directive per entry, in order. systemd applies them in file order with
     // a LATER file overriding an earlier one; the `-` prefix makes a missing file
     // non-fatal. Both behaviours were measured on a live user manager (#458).
@@ -140,17 +140,32 @@ pub fn build_unit_file(spec: &ServiceSpec) -> String {
     // Measured on the DGX's live user manager 2026-08-13: a bare path
     // containing spaces is applied; double-quoted, single-quoted and
     // `-`-prefixed-quoted forms are all dropped while `systemctl start` returns
-    // 0. Bare is therefore correct for every path systemd can express.
+    // 0. Bare is therefore correct for every path systemd can express
+    // VERBATIM. Not handled: a literal `%`, which systemd expands as a
+    // specifier in this rvalue and which would need doubling — pre-existing and
+    // equally true of `ExecStart=`/`Environment=`, tracked separately.
     //
     // Injection is not this line's job to prevent, because there is no escaping
     // systemd accepts here: `env_file::validate_env_file_path` refuses control
-    // characters (and relative paths) at both backends' `install`, before any
-    // path reaches this renderer.
+    // characters, non-UTF-8 and relative paths at both backends' `install`,
+    // which is the only supported route to this renderer. `build_unit_file` is
+    // `pub`, so that ordering is a call-site obligation rather than something
+    // this loop can enforce — see the function doc.
     for ef in &spec.environment_files {
         let prefix = if ef.optional { "-" } else { "" };
         out.push_str(&format!("EnvironmentFile={prefix}{}\n", ef.path.to_string_lossy()));
     }
 
+    // The remaining path fields DO go through `quote_if_needed`, at the emission
+    // seam. A clean absolute path (the only legitimate input) is emitted
+    // unchanged; a value containing a newline or other fragile char is quoted
+    // with the newline escaped as `\n`, so it can never break the line and
+    // inject a `[Service]` directive — regardless of whether the caller reached
+    // the builder through `SystemdUser::install`'s control-char guard (audit
+    // finding #10). Escaping here, not just at the driver, keeps the guarantee
+    // at the point the directive is written (cf. launchd's `xml_escape` inside
+    // `build_plist`). `EnvironmentFile=` above is the one field that cannot have
+    // this, because systemd rejects every quoted form of it.
     if let Some(dir) = &spec.working_dir {
         out.push_str(&format!(
             "WorkingDirectory={}\n",

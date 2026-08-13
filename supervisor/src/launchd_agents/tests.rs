@@ -294,6 +294,49 @@ fn install_errors_when_a_required_environment_file_is_missing() {
     assert!(matches!(err, SupervisorError::Io(_)), "{err}");
 }
 
+#[test]
+fn install_rejects_a_control_character_in_an_environment_file_path() {
+    // #530 moved the injection guarantee from the systemd renderer (where
+    // `quote_if_needed` made it structural) to `validate_env_file_path` at each
+    // backend's `install`. That makes the CALL the guarantee — delete it and a
+    // newline reaches the Linux renderer, where `EnvironmentFile=/tmp/x` and
+    // `ExecStartPre=/evil` become two directives.
+    //
+    // Pinned here, on macOS, as well as on Linux for a reason worth stating:
+    // this backend has no second control-character sweep to fall back on, so on
+    // this host the one call IS the whole check, and nothing else in the suite
+    // would notice its removal.
+    let dir = TestRoot::new("env-file-ctrl");
+    let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
+    let mut spec = minimal_spec("svc");
+    spec.environment_files = vec![EnvFileRef {
+        path: PathBuf::from("/tmp/x\nExecStartPre=/evil"),
+        optional: true,
+    }];
+    let err = sup.install(&spec).expect_err("a newline in an env-file path must be refused");
+    assert!(matches!(err, SupervisorError::Io(_)), "{err}");
+    assert!(
+        !sup.plist_path("svc").exists(),
+        "no plist may be written when an env-file path is rejected"
+    );
+}
+
+#[test]
+fn install_rejects_a_relative_environment_file_path() {
+    // The other half of the same guard, and the fail-OPEN one: systemd drops a
+    // relative `EnvironmentFile=` and starts the unit anyway. This backend
+    // resolves it against the INSTALLER's cwd, which is a different wrong file
+    // rather than none — both are silent, so both fail closed here.
+    let dir = TestRoot::new("env-file-rel");
+    let sup = LaunchAgents::with_agents_dir(dir.path().to_path_buf());
+    let mut spec = minimal_spec("svc");
+    spec.environment_files =
+        vec![EnvFileRef { path: PathBuf::from("kastellan.env"), optional: true }];
+    let err = sup.install(&spec).expect_err("a relative env-file path must be refused");
+    assert!(matches!(err, SupervisorError::Io(_)), "{err}");
+    assert!(!sup.plist_path("svc").exists(), "no plist may be written");
+}
+
 // ---------- atomic-write staging (#509 review) ----------
 //
 // The staging contract itself (unique-per-writer names, cleanup on the

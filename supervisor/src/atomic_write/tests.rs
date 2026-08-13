@@ -170,7 +170,12 @@ fn published_files_are_private_to_the_owner() {
 
     write_atomic(&dest, b"[Unit]\n").expect("write");
 
-    assert_eq!(mode_of(&dest), 0o600, "published unit file must be owner-only");
+    // The claim is "no group or other bits", not the literal 0600: `open`
+    // masks the requested mode by the process umask, so a hardened
+    // `umask 0200` legitimately publishes 0400. Asserting the exact value
+    // would fail there for a reason unrelated to the property.
+    assert_eq!(mode_of(&dest) & 0o077, 0, "published unit file must be owner-only");
+    assert_ne!(mode_of(&dest) & 0o400, 0, "and still readable by its owner");
 }
 
 #[cfg(unix)]
@@ -190,7 +195,7 @@ fn republishing_tightens_a_previously_world_readable_file() {
 
     write_atomic(&dest, b"[Unit]\n").expect("write");
 
-    assert_eq!(mode_of(&dest), 0o600, "reinstall must tighten a legacy 0644 unit file");
+    assert_eq!(mode_of(&dest) & 0o077, 0, "reinstall must tighten a legacy 0644 unit file");
 }
 
 #[test]

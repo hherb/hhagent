@@ -283,11 +283,13 @@ fn an_environment_file_path_with_spaces_is_emitted_bare_not_quoted() {
     //   `EnvironmentFile= path is not absolute, ignoring: "/home/…/a.env"`
     // while `systemctl start` still returns 0.
     //
-    // So a bare path is correct for EVERY path systemd can express, spaces
-    // included, and quoting is what breaks it. Injection is handled instead by
-    // `env_file::validate_env_file_path`, which both backends call at install:
-    // a path can reach this renderer only after control characters have been
-    // refused, which is the property that made quoting look necessary.
+    // So a bare path is correct for every path systemd can express VERBATIM,
+    // spaces included, and quoting is what breaks it. (A literal `%` is the
+    // documented exception — systemd expands specifiers in this rvalue.)
+    // Injection is handled instead by `env_file::validate_env_file_path`, which
+    // both backends call at install: a path reaches this renderer only after
+    // control characters have been refused, which is the property that made
+    // quoting look necessary.
     let mut spec = minimal_spec("svc");
     spec.environment_files = vec![
         EnvFileRef { path: std::path::PathBuf::from("/home/first last/.config/kastellan/kastellan.env"), optional: false },

@@ -240,6 +240,23 @@ fn validate_env_file_path_rejects_control_characters() {
         .expect("a path with spaces is legitimate on both platforms");
 }
 
+#[cfg(unix)]
+#[test]
+fn validate_env_file_path_rejects_a_non_utf8_path() {
+    // The renderer writes the path with `to_string_lossy`, which substitutes
+    // U+FFFD — a DIFFERENT path, which systemd cannot open. U+FFFD is not a
+    // control character, so the control-character rule passes it happily, and on
+    // the `-`-prefixed overlay systemd then ignores the failure: the operator's
+    // tuning silently never applies, which is #530's shape wearing a new hat.
+    // Fail closed at install, where there is still someone to tell.
+    use std::os::unix::ffi::OsStrExt;
+    let bad = Path::new(std::ffi::OsStr::from_bytes(
+        b"/home/\xffuser/.config/kastellan/kastellan.env.local",
+    ));
+    let err = validate_env_file_path(bad).expect_err("a non-UTF-8 path would be rendered mangled");
+    assert!(format!("{err:?}").contains("UTF-8"), "{err:?}");
+}
+
 // ---------- operator-overlay observability (#531) ----------
 
 #[test]
@@ -274,7 +291,7 @@ fn a_present_overlay_reports_its_key_count_and_never_its_values() {
     );
 
     let state = inspect_overlay(&path);
-    assert_eq!(state, OverlayState::Present { keys: 2 });
+    assert_eq!(state, OverlayState::Present { keys: 2, ignored_lines: vec![] });
 
     let line = render_overlay_found(&path, &state);
     assert!(line.contains("2 keys"), "{line}");
@@ -351,11 +368,12 @@ fn a_repeated_key_is_judged_on_its_last_value_and_named_once() {
 fn the_applied_report_names_unapplied_keys_but_never_values() {
     let path = PathBuf::from("/home/u/.config/kastellan/kastellan.env.local");
 
-    let all_ok = render_overlay_applied(&path, 5, &[]);
+    let all_ok = render_overlay_applied(&path, 5, &[], &[]);
     assert!(all_ok.contains("5"), "{all_ok}");
     assert!(all_ok.contains("applied"), "{all_ok}");
 
-    let partial = render_overlay_applied(&path, 5, &["KASTELLAN_MAIL_ENDPOINT".to_string()]);
+    let partial =
+        render_overlay_applied(&path, 5, &["KASTELLAN_MAIL_ENDPOINT".to_string()], &[]);
     assert!(partial.contains("KASTELLAN_MAIL_ENDPOINT"), "{partial}");
     assert!(partial.contains("1 of 5"), "{partial}");
     // The distinction must survive a skim: an operator scanning the log has to
@@ -372,7 +390,7 @@ fn a_repeated_key_counts_once_everywhere_it_is_counted() {
     // does not match their file and has no way to tell which count is wrong.
     //
     // Asserted through `inspect_overlay` against a real file, NOT by recomputing
-    // `declared_keys(...).len()` here: the first cut of this test did the latter
+    // `resolved_pairs(...).len()` here: the first cut of this test did the latter
     // and passed happily with `inspect_overlay` still counting raw pairs, since
     // it never called the function whose behaviour it is named for.
     let dir = TestRoot::new("dupkeys");
@@ -381,11 +399,133 @@ fn a_repeated_key_counts_once_everywhere_it_is_counted() {
     assert_eq!(parse_env_file("A=x\nB=b\nA=y\n").len(), 3, "the parser reports raw pairs, by design");
     assert_eq!(
         inspect_overlay(&path),
-        OverlayState::Present { keys: 2 },
+        OverlayState::Present { keys: 2, ignored_lines: vec![] },
         "three lines, two declared keys"
     );
 
-    // And the count agrees with what the applied-check will report against it.
-    let pairs = parse_env_file(&fs::read_to_string(&path).expect("read back"));
-    assert_eq!(unapplied_keys(&pairs, |_| None).len(), 2);
+    // And the count agrees with what the daemon's check reports against it.
+    assert_eq!(
+        check_overlay(&path, |_| None),
+        OverlayCheck::Checked {
+            declared: 2,
+            unapplied: vec!["A".to_string(), "B".to_string()],
+            ignored_lines: vec![],
+        }
+    );
+}
+
+// ---------- the shapes that otherwise pass as healthy ----------
+
+#[test]
+fn an_overlay_that_declares_nothing_is_a_warning_not_a_confirmation() {
+    // `unapplied.is_empty()` is vacuously true over an empty set, so the obvious
+    // success predicate reports a file that CANNOT apply as "all present in this
+    // process" — #531's own defect one level down, and reached by the most
+    // ordinary mistake there is: writing `export KEY=value` out of shell reflex,
+    // which systemd ignores and this parser drops.
+    let dir = TestRoot::new("zero-keys");
+    let path = dir.file(
+        "kastellan.env.local",
+        "export KASTELLAN_LLM_TIMEOUT_MS=180000\nexport KASTELLAN_MAIL_ENDPOINT=https://10.0.0.3:8443\n",
+    );
+
+    let check = check_overlay(&path, |_| None);
+    assert_eq!(
+        check,
+        OverlayCheck::Checked { declared: 0, unapplied: vec![], ignored_lines: vec![1, 2] }
+    );
+
+    let (severity, line) = render_overlay_check(&path, &check);
+    assert_eq!(severity, OverlaySeverity::Warn, "{line}");
+    assert!(line.contains("NO keys"), "{line}");
+    assert!(line.contains("export"), "must name the likeliest cause: {line}");
+    assert!(!line.contains("applied after"), "must not read as confirmation: {line}");
+    assert!(!line.contains("180000"), "a value leaked: {line}");
+    assert!(!line.contains("10.0.0.3"), "a value leaked: {line}");
+}
+
+#[test]
+fn a_line_the_grammar_refuses_is_reported_by_number_and_never_by_content() {
+    // The key count is the operator's only feedback and it is computed from a
+    // parser that discards its own rejects, so a six-key file with one bad line
+    // otherwise reads as a clean five: "5 keys, all present in this process".
+    // Reporting the line NUMBER keeps the diagnostic while leaving the
+    // right-hand side — which is where a mistyped secret would sit — unlogged.
+    let dir = TestRoot::new("ignored-lines");
+    let path = dir.file(
+        "kastellan.env.local",
+        "# comment\nA=1\nKASTELLAN MAIL ENDPOINT=https://10.0.0.3:8443\nB=2\nnot-an-assignment\n",
+    );
+
+    let check = check_overlay(&path, |k| match k {
+        "A" => Some("1".to_string()),
+        "B" => Some("2".to_string()),
+        _ => None,
+    });
+    assert_eq!(
+        check,
+        OverlayCheck::Checked { declared: 2, unapplied: vec![], ignored_lines: vec![3, 5] }
+    );
+
+    // Every declared key DID reach the process, and it is still a warning:
+    // two lines the operator wrote declare nothing at all.
+    let (severity, line) = render_overlay_check(&path, &check);
+    assert_eq!(severity, OverlaySeverity::Warn, "{line}");
+    assert!(line.contains("2 lines ignored (lines 3, 5)"), "{line}");
+    assert!(!line.contains("10.0.0.3"), "a value leaked: {line}");
+
+    // A blank or commented line declares nothing on purpose and must NOT be
+    // counted, or every well-formed overlay warns and the signal dies.
+    assert!(parse_env_file_reporting("# c\n\n;c\nA=1\n").ignored_lines.is_empty());
+}
+
+#[test]
+fn the_daemon_check_reports_each_outcome_at_the_right_volume() {
+    // All four branches of the daemon's report, pinned where they are pure.
+    // Before the consolidation these lived in `report_operator_overlay`'s match
+    // arms in the core crate, where nothing observed them: swapping `info!` and
+    // `warn!` there passed the whole suite, though the warn level is the only
+    // reason an operator ever sees the "NOT fully applied" line.
+    let dir = TestRoot::new("verdicts");
+
+    // Absent — the normal state, and the one thing here that is not a problem.
+    let absent = dir.path().join("kastellan.env.local");
+    let (sev, line) = render_overlay_check(&absent, &check_overlay(&absent, |_| None));
+    assert_eq!(sev, OverlaySeverity::Info, "{line}");
+    assert!(line.contains("none at"), "{line}");
+
+    // Unreadable — the operator wrote a file and believes it applies.
+    let unreadable = dir.path().join("subdir");
+    fs::create_dir_all(&unreadable).expect("mkdir");
+    let (sev, line) = render_overlay_check(&unreadable, &check_overlay(&unreadable, |_| None));
+    assert_eq!(sev, OverlaySeverity::Warn, "{line}");
+    assert!(line.to_lowercase().contains("unreadable"), "{line}");
+
+    // Applied — every declared key matches the live environment.
+    let ok = dir.file("ok.env", "A=1\nB=2\n");
+    let (sev, line) = render_overlay_check(&ok, &check_overlay(&ok, |_| Some("1".to_string())));
+    assert_eq!(sev, OverlaySeverity::Warn, "B=2 vs live 1 must warn: {line}");
+    let (sev, line) = render_overlay_check(
+        &ok,
+        &check_overlay(&ok, |k| Some(if k == "A" { "1" } else { "2" }.to_string())),
+    );
+    assert_eq!(sev, OverlaySeverity::Info, "{line}");
+    assert!(line.contains("2 keys, all present"), "{line}");
+
+    // NOT fully applied — names the key, never the value.
+    let (sev, line) = render_overlay_check(&ok, &check_overlay(&ok, |k| (k == "A").then(|| "1".to_string())));
+    assert_eq!(sev, OverlaySeverity::Warn, "{line}");
+    assert!(line.contains("1 of 2 keys"), "{line}");
+    assert!(line.contains('B'), "{line}");
+}
+
+#[test]
+fn a_key_declared_empty_is_unapplied_when_the_process_has_it_unset() {
+    // `A=` declares the empty string; an unset variable is a different thing.
+    // Treating them alike (`live(k).unwrap_or_default() == *v`) would report the
+    // key as applied on a host where the overlay never loaded — silence exactly
+    // where #531 wants a signal.
+    let overlay = pairs(&[("A", "")]);
+    assert_eq!(unapplied_keys(&overlay, |_| None), vec!["A"]);
+    assert!(unapplied_keys(&overlay, |_| Some(String::new())).is_empty());
 }

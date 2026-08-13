@@ -80,9 +80,12 @@ async fn main() -> Result<()> {
         "kastellan core starting"
     );
 
-    // Confirm the operator overlay actually took effect (#531). Logged before
-    // anything that reads a tuned setting, because every one of those reads is
-    // downstream of this being true.
+    // Confirm the operator overlay actually took effect (#531). Logged ahead of
+    // every tuned setting the daemon reads EXCEPT the log filter itself, which
+    // is necessarily read above to build the subscriber that emits this line —
+    // so `RUST_LOG` in the overlay is the one setting consumed before its own
+    // confirmation. Do not "fix" that by moving this call up: there would be no
+    // subscriber yet and the output would vanish.
     bootstrap::report_operator_overlay();
 
     // Bring up the database before announcing readiness or accepting

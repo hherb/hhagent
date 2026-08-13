@@ -228,6 +228,13 @@ pub(crate) fn parse_test_vault_seed(spec: &str) -> Option<(&str, &str)> {
 /// and refusing to boot over it would trade a silent misconfiguration for a
 /// loud outage.
 ///
+/// The verdict and its severity are both decided by
+/// [`kastellan_supervisor::env_file::render_overlay_check`], which also warns on
+/// the two shapes that otherwise pass as healthy — an overlay declaring **zero**
+/// keys, and one with lines the grammar refused. This function is deliberately
+/// thin: everything worth testing lives in the shared module that compiles on
+/// both hosts.
+///
 /// **Absent is logged too, naming the path**, even though it is the normal
 /// state on a host that wants no overlay. That line is the whole diagnostic for
 /// #531's own scenario: the operator creates the overlay *after* installing,
@@ -237,10 +244,7 @@ pub(crate) fn parse_test_vault_seed(spec: &str) -> Option<(&str, &str)> {
 /// confirmation. It stays `info!` rather than `warn!`, because on most hosts
 /// nothing is wrong.
 pub(crate) fn report_operator_overlay() {
-    use kastellan_supervisor::env_file::{
-        declared_keys, inspect_overlay, parse_env_file, render_overlay_applied,
-        render_overlay_found, unapplied_keys, OverlayState,
-    };
+    use kastellan_supervisor::env_file::{check_overlay, render_overlay_check, OverlaySeverity};
 
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         tracing::warn!("$HOME unset; cannot check for the operator overlay");
@@ -248,41 +252,17 @@ pub(crate) fn report_operator_overlay() {
     };
     let path = kastellan_core::install::plan::env_local_file_for(&home);
 
-    match inspect_overlay(&path) {
-        OverlayState::Absent => {
-            info!("{}", render_overlay_found(&path, &OverlayState::Absent));
-        }
-        OverlayState::Unreadable { reason } => {
-            tracing::warn!(
-                path = %path.display(),
-                %reason,
-                "operator overlay exists but could not be read; its values did NOT reach this process"
-            );
-        }
-        OverlayState::Present { keys: _ } => {
-            // Re-read rather than thread the pairs out through `OverlayState`:
-            // the state carries a COUNT on purpose, so no call site can print
-            // an operator's values by accident.
-            let pairs = match std::fs::read_to_string(&path) {
-                Ok(c) => parse_env_file(&c),
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "operator overlay became unreadable mid-check");
-                    return;
-                }
-            };
-            // `declared_keys`, not `pairs.len()`: a key the operator appended a
-            // correction for is ONE declared key, and `unapplied_keys` already
-            // counts it once. Using the raw pair count would print "1 of 6"
-            // against a five-key file — numerator deduped, denominator not.
-            let declared = declared_keys(&pairs);
-            let missed = unapplied_keys(&declared, |k| std::env::var(k).ok());
-            let line = render_overlay_applied(&path, declared.len(), &missed);
-            if missed.is_empty() {
-                info!("{line}");
-            } else {
-                tracing::warn!("{line}");
-            }
-        }
+    // One read, one verdict, one wording — all of it in the shared `env_file`
+    // module where both hosts compile it and tests can observe every branch.
+    // The first cut classified here and then re-read the file to get the values
+    // for the comparison, which bought a window where the count and the verdict
+    // could describe different contents, and a second error path whose wording
+    // no test ever saw.
+    let check = check_overlay(&path, |k| std::env::var(k).ok());
+    let (severity, line) = render_overlay_check(&path, &check);
+    match severity {
+        OverlaySeverity::Info => info!("{line}"),
+        OverlaySeverity::Warn => tracing::warn!("{line}"),
     }
 }
 

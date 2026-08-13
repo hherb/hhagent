@@ -82,19 +82,47 @@ operator overlay applied: /home/you/.config/kastellan/kastellan.env.local (5 key
 operator overlay NOT fully applied: /home/you/.config/kastellan/kastellan.env.local — 2 of 5 keys did not reach this process: KASTELLAN_MAIL_ENDPOINT, KASTELLAN_LLM_TIMEOUT_MS
 ```
 
+The daemon log is JSON, so these arrive as the `"message"` field of a log record
+rather than as bare lines — `grep 'operator overlay'` still finds them.
+
 The startup line compares each key you declared against the daemon's own
 environment, so it is a real end-to-end check rather than a statement that a file
 exists. `NOT fully applied` means one of:
 
 - the overlay is listed *before* the generated file, so `kastellan.env` wins;
-- something later in the boot overrode the value;
+- a unit-level `Environment=` directive, or another `EnvironmentFile=` listed
+  after the overlay, already set the key at exec time;
+- on Linux, you edited the overlay but have not restarted the unit
+  (`systemctl --user restart kastellan-core`) — systemd reads `EnvironmentFile=`
+  at start, not on change;
 - on Linux, the `EnvironmentFile=` directive was dropped by systemd (check
   `journalctl --user -u kastellan-core` for `path is not absolute, ignoring`);
 - on macOS, you edited the overlay but have not re-run `install` since — launchd
   bakes the values in at install time, so an edit alone changes nothing.
 
-Neither line ever prints a **value** — only key names and counts. The daemon log
-is a plaintext file without `audit_log`'s role gating.
+Two more shapes are reported, both of which used to pass as healthy:
+
+```
+operator overlay: /home/you/.config/kastellan/kastellan.env.local declares NO keys — nothing in it can apply; note that `export KEY=value` and lines without `=` are ignored
+operator overlay applied: /home/you/.config/kastellan/kastellan.env.local (5 keys, all present in this process, 1 line ignored (line 6))
+```
+
+`export KEY=value` is shell syntax; systemd's env-file grammar has no `export`,
+so such a line declares nothing. A file made entirely of them is not an empty
+overlay, it is a **broken** one, and the count alone would have read `0 keys`
+without saying why. `N lines ignored` names the line numbers — never their
+contents — for the same reason a key count is not enough on its own: without it,
+one mistyped line in a six-key file just reads as a clean five.
+
+An overlay that exists but cannot be read is reported separately and never
+treated as empty:
+
+```
+operator overlay: /home/you/.config/kastellan/kastellan.env.local UNREADABLE (Permission denied (os error 13)) — kastellan cannot confirm any of its values applied
+```
+
+No line ever prints a **value** — only key names, line numbers and counts. The
+daemon log is a plaintext file without `audit_log`'s role gating.
 
 If you see `none at …` when you believe you wrote the file, compare the path in
 the message with where your file actually landed; a heredoc written to

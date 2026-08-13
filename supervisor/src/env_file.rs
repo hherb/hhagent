@@ -52,15 +52,41 @@ use crate::{EnvFileRef, SupervisorError};
 /// continuations, and C-style escapes inside double quotes. A value needing
 /// either is out of contract on both platforms.
 pub fn parse_env_file(contents: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for line in contents.lines() {
-        let line = line.trim();
+    parse_env_file_reporting(contents).pairs
+}
+
+/// What [`parse_env_file`] kept, **and what it threw away**.
+///
+/// The pairs alone are not enough to report on an overlay honestly. Every line
+/// this grammar refuses silently shrinks the key count, and that count is the
+/// only feedback an operator gets: a six-key overlay with one `export` line
+/// reads as `5 keys, all present in this process` — a green line for a file
+/// whose sixth key never existed. Carrying the refused line *numbers* alongside
+/// the pairs lets the report say so without ever naming a line's contents,
+/// which would defeat the values-never-logged rule.
+pub struct ParsedEnv {
+    pub pairs: Vec<(String, String)>,
+    /// 1-based numbers of lines that were neither blank nor a comment and yet
+    /// declared nothing.
+    pub ignored_lines: Vec<usize>,
+}
+
+/// [`parse_env_file`], plus the line numbers it refused. Pure.
+pub fn parse_env_file_reporting(contents: &str) -> ParsedEnv {
+    let mut pairs = Vec::new();
+    let mut ignored_lines = Vec::new();
+    for (n, raw) in contents.lines().enumerate() {
+        let lineno = n + 1;
+        let line = raw.trim();
         // `;` is a comment introducer to systemd just as `#` is; treating it as
         // a key named `;FOO` invented a variable the Linux side never sees.
+        // A blank or commented line declares nothing *on purpose*, so it is not
+        // "ignored" in the sense the operator needs to hear about.
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
         let Some((k, v)) = line.split_once('=') else {
+            ignored_lines.push(lineno);
             continue;
         };
         let k = k.trim();
@@ -68,11 +94,12 @@ pub fn parse_env_file(contents: &str) -> Vec<(String, String)> {
         // notably `export FOO=bar`, which shell users write by reflex. Silently
         // accepting it here created an env var literally named "export FOO".
         if k.is_empty() || k.contains(char::is_whitespace) {
+            ignored_lines.push(lineno);
             continue;
         }
-        out.push((k.to_string(), unquote(v.trim())));
+        pairs.push((k.to_string(), unquote(v.trim())));
     }
-    out
+    ParsedEnv { pairs, ignored_lines }
 }
 
 /// Strip systemd's quoting from a value.
@@ -166,9 +193,17 @@ pub fn fold_env_files(
 ///     `ExecStartPre`. Quoting used to make that case fail safe as a side
 ///     effect of breaking the legitimate cases; with quoting gone this check
 ///     is what carries the guarantee, and it must run before any rendering.
-///     `SystemdUser::install` also screens its other path fields for control
+///     `SystemdUser::install` screens its other path fields for control
 ///     characters — this is the same rule, owned here so the env-file list
 ///     carries it on **both** backends rather than only on Linux.
+///   - **Valid UTF-8.** The renderer writes the path with `to_string_lossy`, so
+///     a non-UTF-8 path is emitted with `U+FFFD` substituted — a *different*
+///     path, which systemd cannot open. `U+FFFD` is not a control character, so
+///     the rule above passes it. On the required `kastellan.env` that fails the
+///     unit loudly; on the `-`-prefixed overlay systemd ignores the error and
+///     the operator's tuning silently never applies, which is exactly #530's
+///     shape. Checking `to_str()` rather than the lossy string is what makes
+///     the guard see the bytes the renderer will mangle.
 ///
 /// A space is deliberately *not* rejected: `$HOME` may contain one, systemd
 /// accepts it in a bare path, and launchd handles it natively. Refusing it
@@ -180,7 +215,13 @@ pub fn validate_env_file_path(path: &Path) -> Result<(), SupervisorError> {
             path.display()
         )));
     }
-    if path.to_string_lossy().contains(|c: char| c.is_control()) {
+    let Some(s) = path.to_str() else {
+        return Err(SupervisorError::Io(format!(
+            "environment_file must be valid UTF-8 (the unit renderer would substitute U+FFFD \
+             and systemd would open a different path), got {path:?}"
+        )));
+    };
+    if s.contains(|c: char| c.is_control()) {
         return Err(SupervisorError::Io(format!(
             "environment_file must not contain control characters, got {path:?}"
         )));
@@ -199,20 +240,26 @@ pub fn validate_env_file_path(path: &Path) -> Result<(), SupervisorError> {
 pub enum OverlayState {
     /// No file at the path. Normal, and not an error.
     Absent,
-    /// Read and parsed; carries how many `KEY=value` pairs it declares.
-    Present { keys: usize },
+    /// Read and parsed. `keys` counts the keys the file **declares** — a
+    /// repeated key counts once — and `ignored_lines` names the lines the
+    /// grammar refused, which is what keeps `keys` from shrinking silently.
+    Present { keys: usize, ignored_lines: Vec<usize> },
     /// Exists but could not be read or decoded. Carries the OS reason.
     Unreadable { reason: String },
 }
 
-/// Resolve parsed pairs to the keys the file actually **declares**, with a
-/// repeated key collapsed onto its last value. Pure.
+/// Resolve parsed pairs, collapsing a repeated key onto its last value. Pure.
 ///
 /// One definition, because every count and every check downstream has to agree
 /// on what "5 keys" means. Counting raw pairs instead would let an overlay with
 /// one appended correction report `1 of 6 keys did not reach this process`
 /// while declaring five — the numerator deduped, the denominator not.
-pub fn declared_keys(pairs: &[(String, String)]) -> Vec<(String, String)> {
+///
+/// Deliberately **not** public and deliberately not called `declared_keys`: it
+/// returns pairs, *values included*, and a name promising keys is how a caller
+/// ends up logging an operator's settings while believing it logged names. The
+/// only things that leave this module are counts, key names and rendered lines.
+fn resolved_pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
     let mut resolved: Vec<(String, String)> = Vec::new();
     merge_env(&mut resolved, pairs.to_vec());
     resolved
@@ -222,9 +269,31 @@ pub fn declared_keys(pairs: &[(String, String)]) -> Vec<(String, String)> {
 /// rendering half is pure, so the wording is testable without a filesystem.
 pub fn inspect_overlay(path: &Path) -> OverlayState {
     match std::fs::read_to_string(path) {
-        Ok(c) => OverlayState::Present { keys: declared_keys(&parse_env_file(&c)).len() },
+        Ok(c) => {
+            let parsed = parse_env_file_reporting(&c);
+            OverlayState::Present {
+                keys: resolved_pairs(&parsed.pairs).len(),
+                ignored_lines: parsed.ignored_lines,
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => OverlayState::Absent,
         Err(e) => OverlayState::Unreadable { reason: e.to_string() },
+    }
+}
+
+/// `", 2 lines ignored (lines 3, 6)"`, or nothing when the file parsed cleanly.
+///
+/// Line **numbers**, never line contents: a refused line is often a mistyped
+/// assignment, and its right-hand side is exactly what must not reach a
+/// plaintext log.
+fn ignored_suffix(ignored: &[usize]) -> String {
+    match ignored.len() {
+        0 => String::new(),
+        1 => format!(", 1 line ignored (line {})", ignored[0]),
+        n => format!(
+            ", {n} lines ignored (lines {})",
+            ignored.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(", ")
+        ),
     }
 }
 
@@ -240,14 +309,25 @@ pub fn inspect_overlay(path: &Path) -> OverlayState {
 pub fn render_overlay_found(path: &Path, state: &OverlayState) -> String {
     let p = path.display();
     match state {
-        OverlayState::Present { keys } => {
-            format!("operator overlay: {p} ({keys} keys) — applied after kastellan.env, so these values win")
-        }
+        // A file that parses to nothing gets its own wording rather than
+        // "(0 keys) — applied": an operator who wrote `export KEY=value` out of
+        // shell reflex has a file that cannot apply, and the generic line reads
+        // as confirmation that it did. Naming the likeliest cause costs one
+        // clause and is the whole diagnostic.
+        OverlayState::Present { keys: 0, ignored_lines } => format!(
+            "operator overlay: {p} declares NO keys{} — nothing in it can apply; note that \
+             `export KEY=value` and lines without `=` are ignored",
+            ignored_suffix(ignored_lines)
+        ),
+        OverlayState::Present { keys, ignored_lines } => format!(
+            "operator overlay: {p} ({keys} keys{}) — applied after kastellan.env, so these values win",
+            ignored_suffix(ignored_lines)
+        ),
         OverlayState::Absent => {
             format!("operator overlay: none at {p} — tuned settings put there survive a reinstall; see docs/deploy/operator-env.md")
         }
         OverlayState::Unreadable { reason } => {
-            format!("operator overlay: {p} UNREADABLE ({reason}) — its values will NOT reach the daemon")
+            format!("operator overlay: {p} UNREADABLE ({reason}) — kastellan cannot confirm any of its values applied")
         }
     }
 }
@@ -271,7 +351,7 @@ pub fn render_overlay_found(path: &Path, state: &OverlayState) -> String {
 /// than editing in place is how an overlay naturally accumulates, and judging
 /// the superseded value would report a key as unapplied exactly when the
 /// correction did apply.
-pub fn unapplied_keys(
+fn unapplied_keys(
     keys: &[(String, String)],
     live: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
@@ -292,16 +372,127 @@ pub fn unapplied_keys(
 ///
 /// The two outcomes are worded differently rather than parameterised so an
 /// operator skimming the log can tell them apart without reading the numbers.
-pub fn render_overlay_applied(path: &Path, total: usize, unapplied: &[String]) -> String {
+fn render_overlay_applied(
+    path: &Path,
+    total: usize,
+    unapplied: &[String],
+    ignored_lines: &[usize],
+) -> String {
     let p = path.display();
+    let ign = ignored_suffix(ignored_lines);
     if unapplied.is_empty() {
-        format!("operator overlay applied: {p} ({total} keys, all present in this process)")
+        format!("operator overlay applied: {p} ({total} keys, all present in this process{ign})")
     } else {
         format!(
-            "operator overlay NOT fully applied: {p} — {} of {total} keys did not reach this process: {}",
+            "operator overlay NOT fully applied: {p} — {} of {total} keys did not reach this process{ign}: {}",
             unapplied.len(),
             unapplied.join(", ")
         )
+    }
+}
+
+/// The daemon-side verdict on the overlay: one read, one classification.
+///
+/// Separate from [`OverlayState`] because the two callers ask different
+/// questions. The installer has no process environment to compare against and
+/// genuinely wants "what is at this path"; the daemon wants "did it take
+/// effect", which needs the values — and having *one* type serve both meant the
+/// daemon re-read and re-parsed the file after `inspect_overlay` had already
+/// done so, opening a window in which the two halves of one log line described
+/// different file contents, plus a second error path with its own hand-rolled
+/// wording that no test covered.
+#[derive(Debug, Eq, PartialEq)]
+pub enum OverlayCheck {
+    /// No file at the path. Normal, and not an error.
+    Absent,
+    /// Exists but could not be read or decoded.
+    Unreadable { reason: String },
+    /// Read, parsed, and compared against the live environment.
+    Checked { declared: usize, unapplied: Vec<String>, ignored_lines: Vec<usize> },
+}
+
+/// How loudly [`render_overlay_check`]'s line deserves to be logged.
+///
+/// Returned rather than logged here so the whole decision stays pure and
+/// testable: which outcomes are `warn!`-worthy is a judgement about operator
+/// attention, and it was previously spread across the daemon's match arms where
+/// no test could observe it.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum OverlaySeverity {
+    Info,
+    Warn,
+}
+
+/// Read the overlay at `path` and compare every key it declares against `live`.
+///
+/// Pure but for the one read: `live` is the environment lookup, so the whole
+/// verdict is testable without touching the process environment. The daemon
+/// passes `|k| std::env::var(k).ok()`.
+///
+/// This is the end-to-end confirmation [#531] asks for, and it is a stronger
+/// claim than "the file exists": it compares what the operator wrote against
+/// what the process actually inherited, which is the only thing that matters.
+/// It catches a dropped `EnvironmentFile=` directive (#530's fail-open), a
+/// mis-pathed overlay, and — because it compares *values*, not just presence —
+/// an overlay listed BEFORE the generated file, where `kastellan.env` wins and
+/// the operator's tuning is silently overridden, which is #458 itself.
+///
+/// [#531]: https://github.com/hherb/kastellan/issues/531
+pub fn check_overlay(path: &Path, live: impl Fn(&str) -> Option<String>) -> OverlayCheck {
+    match std::fs::read_to_string(path) {
+        Ok(c) => {
+            let parsed = parse_env_file_reporting(&c);
+            let declared = resolved_pairs(&parsed.pairs);
+            OverlayCheck::Checked {
+                declared: declared.len(),
+                unapplied: unapplied_keys(&declared, live),
+                ignored_lines: parsed.ignored_lines,
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => OverlayCheck::Absent,
+        Err(e) => OverlayCheck::Unreadable { reason: e.to_string() },
+    }
+}
+
+/// One daemon-startup line, plus how loudly to say it. Pure, and **names keys,
+/// never values** — the daemon log is a plaintext file with none of
+/// `audit_log`'s role gating.
+///
+/// Three things are `Warn`, and the first two are the ones a naive
+/// implementation gets wrong:
+///
+///   - **Zero declared keys.** `unapplied.is_empty()` is vacuously true over an
+///     empty set, so the obvious `if unapplied.is_empty() { info! }` reports an
+///     overlay that cannot possibly apply as `all present in this process`.
+///     That is #531's own defect one level down.
+///   - **Any ignored line.** The key count is the operator's only feedback, and
+///     it is computed from a parser that discards its own rejects; a six-key
+///     file with one `export` line otherwise reads as a clean five.
+///   - Keys that did not reach the process, the case this all exists for.
+pub fn render_overlay_check(path: &Path, check: &OverlayCheck) -> (OverlaySeverity, String) {
+    match check {
+        OverlayCheck::Absent => {
+            (OverlaySeverity::Info, render_overlay_found(path, &OverlayState::Absent))
+        }
+        OverlayCheck::Unreadable { reason } => (
+            OverlaySeverity::Warn,
+            render_overlay_found(path, &OverlayState::Unreadable { reason: reason.clone() }),
+        ),
+        OverlayCheck::Checked { declared: 0, ignored_lines, .. } => (
+            OverlaySeverity::Warn,
+            render_overlay_found(
+                path,
+                &OverlayState::Present { keys: 0, ignored_lines: ignored_lines.clone() },
+            ),
+        ),
+        OverlayCheck::Checked { declared, unapplied, ignored_lines } => {
+            let severity = if unapplied.is_empty() && ignored_lines.is_empty() {
+                OverlaySeverity::Info
+            } else {
+                OverlaySeverity::Warn
+            };
+            (severity, render_overlay_applied(path, *declared, unapplied, ignored_lines))
+        }
     }
 }
 
