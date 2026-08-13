@@ -64,6 +64,43 @@ and drops the whole `KASTELLAN_MATRIX_*` block (which is emitted only when both
 `--matrix-*` flags are passed). On Linux `scripts/upgrade_from_git.sh` scavenges
 the Matrix block back before installing; the macOS path has no such guard.
 
+## Confirming the overlay was actually found
+
+Two places tell you, so a typo in the path cannot pass as "no overlay wanted".
+
+**At install**, one line naming the path that was read:
+
+```
+operator overlay: /home/you/.config/kastellan/kastellan.env.local (5 keys) — applied after kastellan.env, so these values win
+operator overlay: none at /home/you/.config/kastellan/kastellan.env.local — tuned settings put there survive a reinstall; see docs/deploy/operator-env.md
+```
+
+**At daemon startup**, whether the values reached the running process:
+
+```
+operator overlay applied: /home/you/.config/kastellan/kastellan.env.local (5 keys, all present in this process)
+operator overlay NOT fully applied: /home/you/.config/kastellan/kastellan.env.local — 2 of 5 keys did not reach this process: KASTELLAN_MAIL_ENDPOINT, KASTELLAN_LLM_TIMEOUT_MS
+```
+
+The startup line compares each key you declared against the daemon's own
+environment, so it is a real end-to-end check rather than a statement that a file
+exists. `NOT fully applied` means one of:
+
+- the overlay is listed *before* the generated file, so `kastellan.env` wins;
+- something later in the boot overrode the value;
+- on Linux, the `EnvironmentFile=` directive was dropped by systemd (check
+  `journalctl --user -u kastellan-core` for `path is not absolute, ignoring`);
+- on macOS, you edited the overlay but have not re-run `install` since — launchd
+  bakes the values in at install time, so an edit alone changes nothing.
+
+Neither line ever prints a **value** — only key names and counts. The daemon log
+is a plaintext file without `audit_log`'s role gating.
+
+If you see `none at …` when you believe you wrote the file, compare the path in
+the message with where your file actually landed; a heredoc written to
+`~/.config/kastellan.env.local` (missing the `kastellan/` directory component) is
+the common miss. Daemon logs are at `~/.local/state/kastellan/*.out`.
+
 ## If an install reports dropped keys
 
 ```

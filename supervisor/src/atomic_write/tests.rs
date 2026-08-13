@@ -143,6 +143,56 @@ fn failed_write_removes_its_staging_file() {
     );
 }
 
+/// Permission bits of `path`, as the low 12 bits of `st_mode`.
+#[cfg(unix)]
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).expect("stat").permissions().mode() & 0o7777
+}
+
+#[cfg(unix)]
+#[test]
+fn published_files_are_private_to_the_owner() {
+    // #529: the staging file used to be opened with no mode, so every unit
+    // file and every LaunchAgent plist landed at the umask default (0644).
+    //
+    // That matters most on macOS, where launchd has no `EnvironmentFile=`
+    // directive and the backend therefore folds the env files' KEY=value
+    // pairs into the plist's `EnvironmentVariables` at install time — so a
+    // world-readable plist is a world-readable copy of `kastellan.env`,
+    // which `write_private` deliberately writes 0600.
+    //
+    // Asserting on the DESTINATION rather than the staging file is
+    // deliberate and sufficient: `rename` keeps the inode, so the mode the
+    // staging file was created with is the mode the published file has.
+    let dir = TestRoot::new("mode");
+    let dest = dir.path().join("kastellan.service");
+
+    write_atomic(&dest, b"[Unit]\n").expect("write");
+
+    assert_eq!(mode_of(&dest), 0o600, "published unit file must be owner-only");
+}
+
+#[cfg(unix)]
+#[test]
+fn republishing_tightens_a_previously_world_readable_file() {
+    // The upgrade path, and the reason the assertion above is not enough on
+    // its own: hosts installed before #529 already have 0644 units on disk.
+    // Because `write_atomic` publishes by renaming a fresh inode over the
+    // destination rather than truncating it in place, the new mode wins —
+    // one reinstall repairs the mode with no operator step. A truncating
+    // writer would have kept 0644 here and passed the previous test.
+    let dir = TestRoot::new("tighten");
+    let dest = dir.path().join("kastellan.service");
+    fs::write(&dest, b"stale\n").expect("pre-existing file");
+    fs::set_permissions(&dest, <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644))
+        .expect("chmod 644");
+
+    write_atomic(&dest, b"[Unit]\n").expect("write");
+
+    assert_eq!(mode_of(&dest), 0o600, "reinstall must tighten a legacy 0644 unit file");
+}
+
 #[test]
 fn write_into_a_missing_directory_errors_without_leaving_anything() {
     // The create seam: nothing was created, so nothing is removed — and

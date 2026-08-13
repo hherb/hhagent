@@ -204,6 +204,83 @@ pub(crate) fn parse_test_vault_seed(spec: &str) -> Option<(&str, &str)> {
     spec.split_once('=')
 }
 
+/// Log whether the operator overlay actually reached this process (#531).
+///
+/// The overlay (`~/.config/kastellan/kastellan.env.local`) is where tuned
+/// settings live so they survive the `kastellan.env` regeneration every install
+/// performs (#458). Nothing confirmed it was found: "absent by choice" and
+/// "absent by typo" produced identical silence, and the only symptom of the
+/// second was the bot eventually answering wrongly.
+///
+/// **What this checks is deliberately stronger than "the file exists".** The
+/// daemon cannot ask which file a variable came from — systemd merges every
+/// `EnvironmentFile=` into one environment before exec, and launchd bakes the
+/// pairs into the plist at install time — so re-reading the overlay and
+/// printing a key count would assert only that a file is on disk. Comparing
+/// each declared key against this process's own environment instead answers the
+/// question actually being asked, identically on both platforms, and catches
+/// three real failures: a mis-pathed overlay, a dropped `EnvironmentFile=`
+/// directive (#530's fail-open), and an overlay ordered *before* the generated
+/// file, where `kastellan.env` wins and the tuning is silently overridden.
+///
+/// Never fatal and never logs a value. A missing `$HOME` or an unreadable
+/// overlay is reported and startup continues: this is an observability layer,
+/// and refusing to boot over it would trade a silent misconfiguration for a
+/// loud outage.
+///
+/// **Absent is logged too, naming the path**, even though it is the normal
+/// state on a host that wants no overlay. That line is the whole diagnostic for
+/// #531's own scenario: the operator creates the overlay *after* installing,
+/// their heredoc lands in `~/.config/kastellan.env.local` (missing directory
+/// component), and they restart and read the log. Absence at the path we
+/// actually read is the only thing that tells them; silence here reads as
+/// confirmation. It stays `info!` rather than `warn!`, because on most hosts
+/// nothing is wrong.
+pub(crate) fn report_operator_overlay() {
+    use kastellan_supervisor::env_file::{
+        inspect_overlay, parse_env_file, render_overlay_applied, render_overlay_found,
+        unapplied_keys, OverlayState,
+    };
+
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        tracing::warn!("$HOME unset; cannot check for the operator overlay");
+        return;
+    };
+    let path = kastellan_core::install::plan::env_local_file_for(&home);
+
+    match inspect_overlay(&path) {
+        OverlayState::Absent => {
+            info!("{}", render_overlay_found(&path, &OverlayState::Absent));
+        }
+        OverlayState::Unreadable { reason } => {
+            tracing::warn!(
+                path = %path.display(),
+                %reason,
+                "operator overlay exists but could not be read; its values did NOT reach this process"
+            );
+        }
+        OverlayState::Present { keys: _ } => {
+            // Re-read rather than thread the pairs out through `OverlayState`:
+            // the state carries a COUNT on purpose, so no call site can print
+            // an operator's values by accident.
+            let pairs = match std::fs::read_to_string(&path) {
+                Ok(c) => parse_env_file(&c),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "operator overlay became unreadable mid-check");
+                    return;
+                }
+            };
+            let missed = unapplied_keys(&pairs, |k| std::env::var(k).ok());
+            let line = render_overlay_applied(&path, pairs.len(), &missed);
+            if missed.is_empty() {
+                info!("{line}");
+            } else {
+                tracing::warn!("{line}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "bootstrap_tests.rs"]
 mod tests;

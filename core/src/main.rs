@@ -80,6 +80,11 @@ async fn main() -> Result<()> {
         "kastellan core starting"
     );
 
+    // Confirm the operator overlay actually took effect (#531). Logged before
+    // anything that reads a tuned setting, because every one of those reads is
+    // downstream of this being true.
+    bootstrap::report_operator_overlay();
+
     // Bring up the database before announcing readiness or accepting
     // any (future) work. Fail-closed: any error here propagates `?` to
     // a non-zero exit, the supervisor sees the failure, and the next

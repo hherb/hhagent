@@ -95,11 +95,33 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SupervisorEr
 /// into an enforced invariant: a collision becomes a loud error instead
 /// of a silent clobber, and a symlink pre-planted at the staging path is
 /// refused rather than followed (`O_EXCL`).
+///
+/// **Mode 0600, set at creation rather than chmod'd afterwards**
+/// ([#529](https://github.com/hherb/kastellan/issues/529)). Opening with
+/// no mode left every generated file at the umask default, typically
+/// 0644. The launchd backend has no `EnvironmentFile=` directive, so it
+/// folds the env files' `KEY=value` pairs into the plist's
+/// `EnvironmentVariables` at install time — a world-readable plist is
+/// then a world-readable copy of `kastellan.env`, which
+/// `core::install::run::write_private` deliberately writes 0600. Setting
+/// the mode in the `open` call leaves no window in which the file exists
+/// with looser bits; `rename` preserves the inode, so the published file
+/// carries it too, and a reinstall therefore repairs a legacy 0644 file.
+///
+/// Both service managers read these files as the owning user — the
+/// systemd *user* manager and launchd both run as that uid — so 0600
+/// costs nothing operationally. Measured, not assumed: a 0600 unit file
+/// starts fine under the DGX's live `systemd --user` (probe `p5`,
+/// 2026-08-13), and a 0600 LaunchAgent bootstraps fine on macOS.
 fn create_staging(tmp: &Path) -> Result<fs::File, SupervisorError> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(tmp)
         .map_err(|e| SupervisorError::Io(format!("create {}: {e}", tmp.display())))
 }
 

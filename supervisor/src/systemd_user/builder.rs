@@ -130,12 +130,25 @@ pub fn build_unit_file(spec: &ServiceSpec) -> String {
     // One directive per entry, in order. systemd applies them in file order with
     // a LATER file overriding an earlier one; the `-` prefix makes a missing file
     // non-fatal. Both behaviours were measured on a live user manager (#458).
+    //
+    // Emitted BARE — the one path field here that must not go through
+    // `quote_if_needed` (#530). systemd parses this directive's whole rvalue as
+    // a literal path and then demands `path_is_absolute`, so a quoted value is
+    // not a path: the directive is dropped, `EnvironmentFile= path is not
+    // absolute, ignoring: "…"` goes to the journal, and the unit **still loads
+    // and starts** — fail-open, with the daemon getting no environment at all.
+    // Measured on the DGX's live user manager 2026-08-13: a bare path
+    // containing spaces is applied; double-quoted, single-quoted and
+    // `-`-prefixed-quoted forms are all dropped while `systemctl start` returns
+    // 0. Bare is therefore correct for every path systemd can express.
+    //
+    // Injection is not this line's job to prevent, because there is no escaping
+    // systemd accepts here: `env_file::validate_env_file_path` refuses control
+    // characters (and relative paths) at both backends' `install`, before any
+    // path reaches this renderer.
     for ef in &spec.environment_files {
         let prefix = if ef.optional { "-" } else { "" };
-        out.push_str(&format!(
-            "EnvironmentFile={prefix}{}\n",
-            quote_if_needed(&ef.path.to_string_lossy())
-        ));
+        out.push_str(&format!("EnvironmentFile={prefix}{}\n", ef.path.to_string_lossy()));
     }
 
     if let Some(dir) = &spec.working_dir {

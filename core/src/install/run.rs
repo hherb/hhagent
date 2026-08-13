@@ -195,6 +195,21 @@ pub fn prepare_filesystem(
     preserve_and_report_env(&layout.env_file, &layout.env_local_file, &env)?;
     write_private(&layout.env_file, env.as_bytes())?;
 
+    // Say what was found at the overlay path (#531). `preserve_and_report_env`
+    // above reports what this install DESTROYED; this reports what it will
+    // read, which is the other half and the one with no signal before now:
+    // "absent by choice" and "absent by typo" used to be the same silence.
+    // Naming the path is the diagnostic — an operator whose heredoc landed in
+    // `~/.config/kastellan.env.local` cannot see the missing directory
+    // component any other way.
+    eprintln!(
+        "{}",
+        kastellan_supervisor::env_file::render_overlay_found(
+            &layout.env_local_file,
+            &kastellan_supervisor::env_file::inspect_overlay(&layout.env_local_file),
+        )
+    );
+
     // Put the operator CLI on PATH. The flat prefix (`bin_dir`) lives under
     // `~/.local/lib/` which is not on PATH, so without this symlink operators
     // can't reach `kastellan-cli` and tend to hand-copy a binary into
