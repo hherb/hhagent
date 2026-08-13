@@ -119,8 +119,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// operator did nothing wrong; withholding from the prompt only costs the
 /// planner a value it must then ask about, and the warning names the row so the
 /// operator can fix it. (Making enforcement kind-aware is a separate decision
-/// with an upgrade hazard — filed as its own issue rather than smuggled in
-/// here.)
+/// with an upgrade hazard and a live gate — [#554], not smuggled in here.)
+///
+/// [#554]: https://github.com/hherb/kastellan/issues/554
 ///
 /// An unrecognised `kind` (schema drift) matches no declared kind, so it is
 /// withheld and named too — [`kastellan_db::tool_allowlists::AllowlistRow`]

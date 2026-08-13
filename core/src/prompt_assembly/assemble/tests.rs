@@ -158,6 +158,22 @@
     }
 
     #[test]
+    fn the_c1_block_is_neutralised_like_the_c0_block() {
+        // Found reviewing the #544 fix: the old `< 0x20` rule neutralised the
+        // 7-bit ESC (0x1B) but let through U+009B, the 8-bit CSI a terminal
+        // reads as the same escape introducer — and the daemon log is a
+        // plaintext file an operator reads in a terminal. DEL sits in the same
+        // category and was equally exempt. Taking all of `Cc` closes both.
+        for ctrl in ['\u{007F}', '\u{009B}', '\u{0080}', '\u{009F}'] {
+            let escaped = escape_untrusted_body(&format!("safe{ctrl}text"));
+            assert_eq!(
+                escaped, "safe text",
+                "{ctrl:?} must neutralise to a space like any other control code"
+            );
+        }
+    }
+
+    #[test]
     fn bidi_controls_cannot_reorder_the_displayed_body() {
         // #544: bidi overrides and isolates are invisible and change the
         // DISPLAYED order of the text that follows them, so a stored row can

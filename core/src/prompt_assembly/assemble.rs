@@ -202,23 +202,32 @@ pub(super) fn escape_untrusted_body(body: &str) -> String {
 /// small, stable, and each group is here for a stated reason, so a reader can
 /// check the guarantee against the list without resolving a dependency.
 ///
-/// 1. **C0 controls** (`< 0x20`) — includes `\n` and `\r`, the direct way to
-///    forge a sibling `- ` row, plus NUL and the ANSI escape introducer.
-/// 2. **Unicode line separators** — U+0085 (NEL), U+2028 (LINE SEPARATOR) and
-///    U+2029 (PARAGRAPH SEPARATOR). Not C0, but a line break to any consumer
-///    following the Unicode line-breaking algorithm, so leaving them in would
-///    make the one-row-per-line contract a claim about Rust's `char` rather
-///    than about the reader (#544).
+/// 1. **Unicode control codes** — category `Cc`, i.e. C0 (`\n`, `\r`, NUL, the
+///    ESC that introduces an ANSI sequence), DEL, and the C1 block. The old
+///    rule was `< 0x20`, which stopped at C0 and so neutralised the 7-bit ESC
+///    while letting through U+009B, the 8-bit CSI that does the same job in a
+///    terminal — and U+0085 (NEL), a line break. Taking the whole category
+///    removes the seam instead of listing exceptions to it.
+/// 2. **The two line separators outside `Cc`** — U+2028 (LINE SEPARATOR) and
+///    U+2029 (PARAGRAPH SEPARATOR). Line breaks to any consumer following the
+///    Unicode line-breaking algorithm, so leaving them in would make the
+///    one-row-per-line contract a claim about Rust's `char` rather than about
+///    the reader (#544).
 /// 3. **Bidi formatting controls** — the marks, embeddings, overrides and
 ///    isolates (U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069). They are
 ///    invisible and reorder the *displayed* text that follows, so a stored row
 ///    can read one way to the operator auditing it and another way in the
 ///    prompt. Only the control characters go; RTL script itself is untouched.
+///
+/// All three are replaced with a **space**, never deleted: deleting would
+/// silently join the tokens on either side (`a<U+202E>b` → `ab`), and one rule
+/// for the whole class is one fewer thing to get wrong than a per-character
+/// policy.
 fn is_neutralised_control(c: char) -> bool {
-    // 1. C0.
-    (c as u32) < 0x20
-        // 2. Unicode line separators.
-        || matches!(c, '\u{0085}' | '\u{2028}' | '\u{2029}')
+    // 1. Category Cc — C0, DEL, C1 (which contains U+0085 NEL and U+009B CSI).
+    c.is_control()
+        // 2. The line separators that sit outside Cc.
+        || matches!(c, '\u{2028}' | '\u{2029}')
         // 3. Bidi formatting controls.
         || matches!(
             c,

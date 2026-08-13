@@ -31,6 +31,12 @@
 //! way to obtain an [`AdvertisedTool`] carrying a permitted set is
 //! [`AdvertisedTool::with_allowlist`], which escapes. A caller cannot hand the
 //! prompt raw `tool_allowlists` text even by mistake.
+//!
+//! One function does hand out raw text and is worth knowing about when auditing
+//! that invariant: [`select_advertised`]'s `withheld` half is deliberately
+//! **unescaped**, so `registry_build` can name a dropped row to the operator
+//! exactly as it is stored. Its `shown` half — the only half anything
+//! prompt-bound reads — is escaped inside that same pass.
 
 use kastellan_db::tool_allowlists::EntryKind;
 
@@ -68,6 +74,9 @@ pub const ADVERTISED_ALLOWLIST_MAX: usize = 30;
 /// Measured against the **escaped, quoted, joined** list — the bytes that
 /// actually reach the prompt. Escaping expands (`&` → `&amp;`), so a raw-byte
 /// budget would be a bound on a different string than the one being bounded.
+/// It bounds the value list only: the fixed lead ("argv[0] must be exactly one
+/// of: ") and the truncation label sit outside it, so the rendered line is this
+/// many bytes plus a short constant, not this many bytes total.
 ///
 /// Whole entries only: an entry is shown in full or withheld. Advertising a
 /// truncated path would name a value that is NOT permitted, so the planner
