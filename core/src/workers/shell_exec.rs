@@ -77,12 +77,11 @@ impl WorkerManifest for ShellExecManifest {
         TOOL_NAME
     }
 
-    fn allowlist_tool(&self) -> Option<&'static str> {
-        Some(TOOL_NAME)
-    }
-
-    fn allowlist_kind(&self) -> Option<kastellan_db::tool_allowlists::EntryKind> {
-        Some(kastellan_db::tool_allowlists::EntryKind::Argv0)
+    fn allowlist(&self) -> Option<crate::worker_manifest::AllowlistDecl> {
+        Some(crate::worker_manifest::AllowlistDecl {
+            tool: TOOL_NAME,
+            kind: kastellan_db::tool_allowlists::EntryKind::Argv0,
+        })
     }
 
     fn resolve(&self, ctx: &ResolveCtx<'_>) -> Resolution {
@@ -97,7 +96,12 @@ impl WorkerManifest for ShellExecManifest {
                 };
             }
         };
-        let allowlist = (ctx.allowlist)(TOOL_NAME);
+        // Kind-blind on purpose: enforcement takes every stored row, and
+        // #541's kind filtering applies to the ADVERTISEMENT only, so a row
+        // whose `kind` column looks wrong is still refused-or-permitted
+        // exactly as before rather than silently dropped from a live host.
+        let allowlist =
+            kastellan_db::tool_allowlists::allowlist_values(&(ctx.allowlist)(TOOL_NAME));
         Resolution::Register(shell_exec_entry(binary, &allowlist))
     }
 }
@@ -105,12 +109,13 @@ impl WorkerManifest for ShellExecManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker_manifest::argv0_rows;
     use std::path::Path;
 
     fn ctx<'a>(
         get_env: &'a dyn Fn(&str) -> Option<String>,
         exists: &'a dyn Fn(&Path) -> bool,
-        allowlist: &'a dyn Fn(&str) -> Vec<String>,
+        allowlist: &'a dyn Fn(&str) -> Vec<kastellan_db::tool_allowlists::AllowlistRow>,
     ) -> ResolveCtx<'a> {
         ResolveCtx {
             get_env,
@@ -126,7 +131,7 @@ mod tests {
     fn resolve_registers_with_byte_identical_policy() {
         let get_env = |k: &str| (k == BIN_ENV).then(|| "/opt/shell-exec".to_string());
         let exists = |_p: &Path| true;
-        let allowlist = |_t: &str| vec!["ls".to_string(), "cat".to_string()];
+        let allowlist = |_t: &str| argv0_rows(&["ls", "cat"]);
         let c = ctx(&get_env, &exists, &allowlist);
 
         match ShellExecManifest.resolve(&c) {
