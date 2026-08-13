@@ -489,12 +489,11 @@ impl WorkerManifest for BrowserDriverManifest {
         TOOL_NAME
     }
 
-    fn allowlist_tool(&self) -> Option<&'static str> {
-        Some(TOOL_NAME)
-    }
-
-    fn allowlist_kind(&self) -> Option<kastellan_db::tool_allowlists::EntryKind> {
-        Some(kastellan_db::tool_allowlists::EntryKind::Domain)
+    fn allowlist(&self) -> Option<crate::worker_manifest::AllowlistDecl> {
+        Some(crate::worker_manifest::AllowlistDecl {
+            tool: TOOL_NAME,
+            kind: kastellan_db::tool_allowlists::EntryKind::Domain,
+        })
     }
 
     fn resolve(&self, ctx: &ResolveCtx<'_>) -> Resolution {
@@ -518,7 +517,9 @@ impl WorkerManifest for BrowserDriverManifest {
                 return Resolution::Register(browser_driver_firecracker_entry(
                     PathBuf::from(MICROVM_WORKER_BIN),
                     ctx.microvm_image_dir(),
-                    &(ctx.allowlist)(TOOL_NAME),
+                    &kastellan_db::tool_allowlists::allowlist_values(
+                        &(ctx.allowlist)(TOOL_NAME),
+                    ),
                 ));
             }
         }
@@ -531,7 +532,10 @@ impl WorkerManifest for BrowserDriverManifest {
             crate::workers::interpreter_deps::resolve_deps_via_tool,
         ) {
             Ok(env) => {
-                let allowlist = (ctx.allowlist)(TOOL_NAME);
+                // Enforcement is kind-blind (see #541).
+                let allowlist = kastellan_db::tool_allowlists::allowlist_values(
+                    &(ctx.allowlist)(TOOL_NAME),
+                );
                 // Linux: browser-driver is a pure-Python venv worker bwrap
                 // spawns directly, so it needs the lockdown-exec shim to apply
                 // the worker-side seccomp (browser_client) + Landlock layers

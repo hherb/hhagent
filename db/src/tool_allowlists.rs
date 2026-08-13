@@ -33,7 +33,7 @@ pub const MAX_TOOL_NAME_LEN: usize = 64;
 /// apply the right shape rule **without SQL needing to know any tool name** —
 /// adding a new tool is then a pure Rust manifest change (no migration), and
 /// only a genuinely new *kind* needs schema work. `add` writes the value from
-/// the single Rust source of truth (`WorkerManifest::allowlist_kind`), so the
+/// the single Rust source of truth (`WorkerManifest::allowlist`), so the
 /// column stays consistent with the tool by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -90,6 +90,46 @@ pub enum ToolAllowlistError {
 
     #[error(transparent)]
     Db(#[from] sqlx::Error),
+}
+
+/// One `tool_allowlists` row in the cheap shape the registry builder reads:
+/// the entry value plus the `kind` column, without the audit columns
+/// [`AllowlistEntry`] carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowlistRow {
+    /// The entry itself — an absolute argv0 exec path or a host/domain entry,
+    /// according to `kind`.
+    pub value: String,
+    /// The `kind` column **verbatim**, deliberately not parsed into an
+    /// [`EntryKind`].
+    ///
+    /// A value this build does not recognise has to read as "not the kind this
+    /// tool declares" rather than as an error: parsing here would make
+    /// [`EntryKind::from_db_str`] fail the whole registry build — one unknown
+    /// row taking the daemon down — over a column the migration-`0021` CHECK
+    /// already constrains. Keeping the raw text is also what lets a caller name
+    /// it in a warning, which is what an operator needs in order to fix the row.
+    pub kind: String,
+}
+
+impl AllowlistRow {
+    /// True iff this row's stored kind is exactly `kind`. The one place the
+    /// stringly-typed column is compared, so the comparison cannot drift
+    /// between callers.
+    pub fn is_kind(&self, kind: EntryKind) -> bool {
+        self.kind == kind.as_str()
+    }
+}
+
+/// Project the entry values out of a row list, dropping the kinds.
+///
+/// The shape every *enforcement* path wants: a worker receives its allowlist as
+/// plain strings, and enforcement is deliberately kind-blind — a row of the
+/// wrong kind is still enforced (see `registry_build`, which withholds such a
+/// row from the *advertisement* only, so no capability is silently removed from
+/// a deployed host).
+pub fn allowlist_values(rows: &[AllowlistRow]) -> Vec<String> {
+    rows.iter().map(|r| r.value.clone()).collect()
 }
 
 /// One row in `tool_allowlists`. Returned by [`list_all`].
@@ -266,23 +306,27 @@ pub async fn remove(pool: &PgPool, tool: &str, argv0: &str) -> Result<bool, Tool
     Ok(rows.rows_affected() == 1)
 }
 
-/// List the argv0 entries for one tool, ordered by argv0 ascending.
+/// List the entries for one tool as [`AllowlistRow`]s, ordered by argv0
+/// ascending.
 ///
-/// Returns only the argv0 string — the cheap shape used by
-/// `build_tool_registry` at daemon bring-up. Callers that need the full
-/// row (created_at / created_by) should use [`list_for_tool_full`].
+/// The cheap shape used by `build_tool_registry` at daemon bring-up: value plus
+/// `kind`, without the audit columns. The `kind` rides along because the row's
+/// own kind and the kind its *tool* declares can disagree — nothing constrains
+/// them to match, and describing an argv0 path as a reachable host is a lie the
+/// planner would act on (#541). Callers that need the full row (created_at /
+/// created_by) should use [`list_for_tool_full`].
 pub async fn list_for_tool(
     pool: &PgPool,
     tool: &str,
-) -> Result<Vec<String>, ToolAllowlistError> {
+) -> Result<Vec<AllowlistRow>, ToolAllowlistError> {
     validate_tool_name(tool)?;
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT argv0 FROM tool_allowlists WHERE tool = $1 ORDER BY argv0 ASC",
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT argv0, kind FROM tool_allowlists WHERE tool = $1 ORDER BY argv0 ASC",
     )
     .bind(tool)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|(s,)| s).collect())
+    Ok(rows.into_iter().map(|(value, kind)| AllowlistRow { value, kind }).collect())
 }
 
 /// Like [`list_for_tool`] but returns the full [`AllowlistEntry`] shape
@@ -344,6 +388,37 @@ pub async fn list_all(pool: &PgPool) -> Result<Vec<AllowlistEntry>, ToolAllowlis
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(value: &str, kind: &str) -> AllowlistRow {
+        AllowlistRow { value: value.to_string(), kind: kind.to_string() }
+    }
+
+    #[test]
+    fn is_kind_compares_against_the_stored_column_text() {
+        assert!(row("/usr/bin/ls", "argv0").is_kind(EntryKind::Argv0));
+        assert!(!row("/usr/bin/ls", "argv0").is_kind(EntryKind::Domain));
+        assert!(row("example.org", "domain").is_kind(EntryKind::Domain));
+    }
+
+    #[test]
+    fn an_unrecognised_kind_matches_no_kind_instead_of_erroring() {
+        // Schema drift (a third kind added by a later migration) must read as
+        // "not the kind this tool declares" — withheld from the advertisement
+        // and named to the operator — rather than take the daemon's whole
+        // registry build down, which parsing the column here would do.
+        let drifted = row("/usr/bin/ls", "future-kind");
+        assert!(!drifted.is_kind(EntryKind::Argv0));
+        assert!(!drifted.is_kind(EntryKind::Domain));
+        assert_eq!(drifted.kind, "future-kind", "the raw text survives for the warning");
+    }
+
+    #[test]
+    fn allowlist_values_projects_in_order_and_stays_kind_blind() {
+        let rows = vec![row("/usr/bin/cat", "argv0"), row("/usr/bin/ls", "domain")];
+        // Kind-blind on purpose: this is the ENFORCEMENT view, and enforcement
+        // must not silently narrow when a row's kind looks wrong.
+        assert_eq!(allowlist_values(&rows), vec!["/usr/bin/cat", "/usr/bin/ls"]);
+    }
 
     #[test]
     fn validate_tool_name_accepts_canonical_shapes() {

@@ -140,8 +140,19 @@ fn browser_driver_vm_entry_for(hosts: &[String]) -> ToolEntry {
         _ => None,
     };
     let exists = |_p: &std::path::Path| false;
-    let hosts = hosts.to_vec();
-    let allowlist = move |_t: &str| hosts.clone();
+    // Rows carry their stored `kind`, not just a value (#541), because the
+    // advertisement filter reads the row's own kind rather than the manifest's.
+    // `browser-driver` declares `domain`, which is what the real table holds for
+    // it — a fake supplying any other kind would exercise a shape
+    // `tool_allowlists` never produces here.
+    let rows: Vec<kastellan_db::tool_allowlists::AllowlistRow> = hosts
+        .iter()
+        .map(|h| kastellan_db::tool_allowlists::AllowlistRow {
+            value: h.clone(),
+            kind: kastellan_db::tool_allowlists::EntryKind::Domain.as_str().to_string(),
+        })
+        .collect();
+    let allowlist = move |_t: &str| rows.clone();
     let ctx = ResolveCtx {
         get_env: &get_env,
         exists: &exists,
