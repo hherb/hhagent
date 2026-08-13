@@ -362,3 +362,30 @@ fn the_applied_report_names_unapplied_keys_but_never_values() {
     // be able to tell these two lines apart without counting.
     assert_ne!(all_ok, partial);
 }
+
+#[test]
+fn a_repeated_key_counts_once_everywhere_it_is_counted() {
+    // The numerator and the denominator must mean the same thing. `unapplied_keys`
+    // resolves a repeated key to one entry, so a count taken from the raw parsed
+    // pairs would render "1 of 3 keys did not reach this process" against a file
+    // declaring TWO — an operator who appended a correction reads a number that
+    // does not match their file and has no way to tell which count is wrong.
+    //
+    // Asserted through `inspect_overlay` against a real file, NOT by recomputing
+    // `declared_keys(...).len()` here: the first cut of this test did the latter
+    // and passed happily with `inspect_overlay` still counting raw pairs, since
+    // it never called the function whose behaviour it is named for.
+    let dir = TestRoot::new("dupkeys");
+    let path = dir.file("kastellan.env.local", "A=superseded\nB=b\nA=current\n");
+
+    assert_eq!(parse_env_file("A=x\nB=b\nA=y\n").len(), 3, "the parser reports raw pairs, by design");
+    assert_eq!(
+        inspect_overlay(&path),
+        OverlayState::Present { keys: 2 },
+        "three lines, two declared keys"
+    );
+
+    // And the count agrees with what the applied-check will report against it.
+    let pairs = parse_env_file(&fs::read_to_string(&path).expect("read back"));
+    assert_eq!(unapplied_keys(&pairs, |_| None).len(), 2);
+}

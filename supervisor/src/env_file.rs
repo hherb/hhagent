@@ -205,11 +205,24 @@ pub enum OverlayState {
     Unreadable { reason: String },
 }
 
+/// Resolve parsed pairs to the keys the file actually **declares**, with a
+/// repeated key collapsed onto its last value. Pure.
+///
+/// One definition, because every count and every check downstream has to agree
+/// on what "5 keys" means. Counting raw pairs instead would let an overlay with
+/// one appended correction report `1 of 6 keys did not reach this process`
+/// while declaring five — the numerator deduped, the denominator not.
+pub fn declared_keys(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    let mut resolved: Vec<(String, String)> = Vec::new();
+    merge_env(&mut resolved, pairs.to_vec());
+    resolved
+}
+
 /// Read the operator overlay at `path` and classify it. Does I/O; the
 /// rendering half is pure, so the wording is testable without a filesystem.
 pub fn inspect_overlay(path: &Path) -> OverlayState {
     match std::fs::read_to_string(path) {
-        Ok(c) => OverlayState::Present { keys: parse_env_file(&c).len() },
+        Ok(c) => OverlayState::Present { keys: declared_keys(&parse_env_file(&c)).len() },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => OverlayState::Absent,
         Err(e) => OverlayState::Unreadable { reason: e.to_string() },
     }

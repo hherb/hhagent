@@ -238,8 +238,8 @@ pub(crate) fn parse_test_vault_seed(spec: &str) -> Option<(&str, &str)> {
 /// nothing is wrong.
 pub(crate) fn report_operator_overlay() {
     use kastellan_supervisor::env_file::{
-        inspect_overlay, parse_env_file, render_overlay_applied, render_overlay_found,
-        unapplied_keys, OverlayState,
+        declared_keys, inspect_overlay, parse_env_file, render_overlay_applied,
+        render_overlay_found, unapplied_keys, OverlayState,
     };
 
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
@@ -270,8 +270,13 @@ pub(crate) fn report_operator_overlay() {
                     return;
                 }
             };
-            let missed = unapplied_keys(&pairs, |k| std::env::var(k).ok());
-            let line = render_overlay_applied(&path, pairs.len(), &missed);
+            // `declared_keys`, not `pairs.len()`: a key the operator appended a
+            // correction for is ONE declared key, and `unapplied_keys` already
+            // counts it once. Using the raw pair count would print "1 of 6"
+            // against a five-key file — numerator deduped, denominator not.
+            let declared = declared_keys(&pairs);
+            let missed = unapplied_keys(&declared, |k| std::env::var(k).ok());
+            let line = render_overlay_applied(&path, declared.len(), &missed);
             if missed.is_empty() {
                 info!("{line}");
             } else {
