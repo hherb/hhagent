@@ -389,8 +389,14 @@ impl SystemdUser {
         // escapes newlines), but these path fields did not. Specs are
         // code-constructed today, but `ServiceSpec` is `Deserialize`, so reject
         // any control character before the write.
+        // `environment_files` is deliberately NOT in this chain: it is screened
+        // by `validate_env_file_path` above, which is stricter (it also refuses
+        // non-UTF-8, which `to_string_lossy` would mangle into a different path
+        // that systemd silently skips). Listing it here too would let that call
+        // be deleted with every test still green, which is exactly the mutation
+        // this backend cannot afford now that #530 made the driver the only
+        // thing standing between a control character and a rendered directive.
         let path_fields = std::iter::once(("program", &spec.program))
-            .chain(spec.environment_files.iter().map(|ef| ("environment_file", &ef.path)))
             .chain(spec.working_dir.as_ref().map(|p| ("working_dir", p)))
             .chain(spec.stdout_log.as_ref().map(|p| ("stdout_log", p)))
             .chain(spec.stderr_log.as_ref().map(|p| ("stderr_log", p)));

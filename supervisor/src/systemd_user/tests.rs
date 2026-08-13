@@ -104,6 +104,47 @@ fn install_rejects_newline_in_path_field() {
 }
 
 #[test]
+fn install_rejects_a_control_character_in_an_environment_file_path() {
+    // The Linux half of the guarantee #530 relocated. `EnvironmentFile=` is now
+    // emitted BARE (a quoted path is one systemd drops), so `quote_if_needed`
+    // no longer stands between a newline and the rendered unit — the
+    // `validate_env_file_path` call in `write_unit_file` does, and this is what
+    // fails if that call is deleted.
+    //
+    // The sibling `install_rejects_newline_in_path_field` cannot cover it: it
+    // uses `working_dir`, which is still escaped at the emission seam and would
+    // stay safe either way.
+    let dir = TestRoot::new("env-file-ctrl");
+    let sup = SystemdUser::with_units_dir(dir.path().to_path_buf());
+    let mut spec = minimal_spec("svc");
+    spec.environment_files = vec![crate::EnvFileRef {
+        path: PathBuf::from("/tmp/x\nExecStartPre=/evil"),
+        optional: true,
+    }];
+    let err = sup.install(&spec).expect_err("a newline in an env-file path must be refused");
+    assert!(matches!(err, SupervisorError::Io(_)), "{err}");
+    assert!(
+        !sup.unit_path("svc").exists(),
+        "no unit file may be written when an env-file path is rejected"
+    );
+}
+
+#[test]
+fn install_rejects_a_relative_environment_file_path() {
+    // Fail-OPEN without the check: systemd drops a relative `EnvironmentFile=`
+    // with a journal warning and loads the unit anyway, so the daemon starts
+    // with no environment at all — #458's failure in its total form.
+    let dir = TestRoot::new("env-file-rel");
+    let sup = SystemdUser::with_units_dir(dir.path().to_path_buf());
+    let mut spec = minimal_spec("svc");
+    spec.environment_files =
+        vec![crate::EnvFileRef { path: PathBuf::from("kastellan.env"), optional: true }];
+    let err = sup.install(&spec).expect_err("a relative env-file path must be refused");
+    assert!(matches!(err, SupervisorError::Io(_)), "{err}");
+    assert!(!sup.unit_path("svc").exists(), "no unit file may be written");
+}
+
+#[test]
 fn install_rejects_invalid_name() {
     let dir = TestRoot::new("bad-name");
     let sup = SystemdUser::with_units_dir(dir.path().to_path_buf());

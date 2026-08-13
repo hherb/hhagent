@@ -265,6 +265,53 @@ fn environment_files_render_in_order_with_optional_prefixed() {
 }
 
 #[test]
+fn an_environment_file_path_with_spaces_is_emitted_bare_not_quoted() {
+    // #530. `EnvironmentFile=` is the one directive here that must NOT go
+    // through `quote_if_needed`. systemd parses its whole rvalue as a literal
+    // path and then requires `path_is_absolute`, so a quoted value is not a
+    // path at all: the directive is dropped and — this is the dangerous part —
+    // **the unit loads and starts anyway**, with no environment.
+    //
+    // Measured on the DGX's live `systemd --user` (2026-08-13), not recalled:
+    //
+    //   p1  EnvironmentFile=/home/hherb/envprobe/dir with space/a.env   -> applied
+    //   p2  EnvironmentFile="…"                                          -> dropped
+    //   p3  EnvironmentFile=-"…"                                         -> dropped
+    //   p4  EnvironmentFile='…'                                          -> dropped
+    //
+    // and for p2/p3/p4 the journal says:
+    //   `EnvironmentFile= path is not absolute, ignoring: "/home/…/a.env"`
+    // while `systemctl start` still returns 0.
+    //
+    // So a bare path is correct for every path systemd can express VERBATIM,
+    // spaces included, and quoting is what breaks it. (A literal `%` is the
+    // documented exception — systemd expands specifiers in this rvalue.)
+    // Injection is handled instead by `env_file::validate_env_file_path`, which
+    // both backends call at install: a path reaches this renderer only after
+    // control characters have been refused, which is the property that made
+    // quoting look necessary.
+    let mut spec = minimal_spec("svc");
+    spec.environment_files = vec![
+        EnvFileRef { path: std::path::PathBuf::from("/home/first last/.config/kastellan/kastellan.env"), optional: false },
+        EnvFileRef { path: std::path::PathBuf::from("/home/first last/.config/kastellan/kastellan.env.local"), optional: true },
+    ];
+    let unit = build_unit_file(&spec);
+    let lines: Vec<&str> = unit.lines().filter(|l| l.starts_with("EnvironmentFile=")).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "EnvironmentFile=/home/first last/.config/kastellan/kastellan.env",
+            "EnvironmentFile=-/home/first last/.config/kastellan/kastellan.env.local",
+        ],
+        "a $HOME with a space must still produce a directive systemd accepts: {unit}"
+    );
+    assert!(
+        !unit.contains("EnvironmentFile=\"") && !unit.contains("EnvironmentFile=-\""),
+        "quoting this directive makes systemd drop it while the unit still starts: {unit}"
+    );
+}
+
+#[test]
 fn environment_files_absent_when_empty() {
     let spec = minimal_spec("svc");
     let unit = build_unit_file(&spec);

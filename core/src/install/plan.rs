@@ -33,6 +33,19 @@ pub struct Layout {
     pub cli_link: PathBuf,
 }
 
+/// The operator overlay path for a given `$HOME`. Pure.
+///
+/// Split out of [`resolve_layout`] so the **daemon** can find the same file
+/// without constructing a whole `Layout` (it has no `$USER` to supply, and
+/// every other field is an installer concern). One definition, because the two
+/// readers must agree: if this drifted, the daemon would report on a file the
+/// service spec does not read — which is the failure
+/// [#531](https://github.com/hherb/kastellan/issues/531) exists to remove,
+/// reintroduced one level down.
+pub fn env_local_file_for(home: &Path) -> PathBuf {
+    home.join(".config/kastellan").join("kastellan.env.local")
+}
+
 /// Compute the per-user layout from `$HOME` + `$USER`. Pure.
 pub fn resolve_layout(home: &Path, user: &str) -> Layout {
     let assets_dir = home.join(".local/share/kastellan");
@@ -45,7 +58,7 @@ pub fn resolve_layout(home: &Path, user: &str) -> Layout {
         l0_rules_file: assets_dir.join("seeds/memory/l0_meta_rules.toml"),
         data_dir: assets_dir.join("pg/data"),
         env_file: config_dir.join("kastellan.env"),
-        env_local_file: config_dir.join("kastellan.env.local"),
+        env_local_file: env_local_file_for(home),
         log_dir: home.join(".local/state/kastellan"),
         cli_link: home.join(".local/bin/kastellan-cli"),
         assets_dir,
@@ -649,6 +662,17 @@ mod tests {
         assert_eq!(l.log_dir, PathBuf::from("/home/u/.local/state/kastellan"));
         // The operator CLI is symlinked onto PATH (~/.local/bin), not left in the lib prefix.
         assert_eq!(l.cli_link, PathBuf::from("/home/u/.local/bin/kastellan-cli"));
+    }
+
+    #[test]
+    fn the_daemons_overlay_path_is_the_one_the_installer_wires_up() {
+        // #531's daemon-side check derives the overlay path from `$HOME` alone,
+        // because it has no `$USER` to build a whole `Layout` with. The two
+        // must not drift: if they did, the daemon would confirm a file the
+        // service spec never reads — the failure #531 exists to remove,
+        // reintroduced one level down and just as silent.
+        let l = layout();
+        assert_eq!(env_local_file_for(Path::new("/home/u")), l.env_local_file);
     }
 
     #[test]
