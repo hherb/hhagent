@@ -113,6 +113,92 @@ fn parse_env_file_strips_a_leading_quote_even_when_unterminated() {
     assert_eq!(parse_env_file("A='  x  '\n"), pairs(&[("A", "  x  ")]));
 }
 
+/// Third DGX measurement (2026-08-13, systemd 255, same method) — [#552]: what
+/// systemd does when a value **continues past a closing quote**.
+///
+/// This is the table that makes #531's value comparison sound, so every row is
+/// a measured pair and none is derived from the others. It also records a
+/// correction: #552 predicted `A="a b" # note` → `a b # note` and proposed
+/// "append the remainder" as the fix. Measurement says `a b# note` — the
+/// whitespace run immediately after a closing quote is dropped — so that fix
+/// would have produced a *third* answer and left the false `NOT fully applied`
+/// warning firing on exactly the trailing-comment form
+/// `docs/deploy/operator-env.md` teaches operators to write. Same shape as
+/// #530, where measurement ruled out both fixes its issue proposed.
+///
+/// [#552]: https://github.com/hherb/kastellan/issues/552
+#[test]
+fn parse_env_file_continues_a_value_past_a_closing_quote() {
+    // The case the operator docs invite: a comment appended to a quoted value.
+    // The space before `#` is eaten, the `#` is NOT a comment introducer here.
+    assert_eq!(parse_env_file("A=\"a b\" # note\n"), pairs(&[("A", "a b# note")]));
+    assert_eq!(parse_env_file("A='a b' # note\n"), pairs(&[("A", "a b# note")]));
+    // No whitespace to eat: the remainder simply continues the value.
+    assert_eq!(parse_env_file("A=\"x\"y\n"), pairs(&[("A", "xy")]));
+    assert_eq!(parse_env_file("A=\"a\"#c\n"), pairs(&[("A", "a#c")]));
+    // A RUN of whitespace after the close is eaten, not just one space.
+    assert_eq!(parse_env_file("A=\"a b\"   x\n"), pairs(&[("A", "a bx")]));
+    // ...but whitespace inside the resumed UNQUOTED tail survives. This pair is
+    // the load-bearing one: it is what distinguishes "skip the run right after
+    // the close" from "trim the whole remainder", and #552's proposed fix from
+    // the measured behaviour.
+    assert_eq!(parse_env_file("A=\"a b\"x y\n"), pairs(&[("A", "a bx y")]));
+    // Multiple quoted sections concatenate with NO separator — a class #552
+    // did not mention at all.
+    assert_eq!(parse_env_file("A=\"a b\" \"c d\"\n"), pairs(&[("A", "a bc d")]));
+    assert_eq!(parse_env_file("A=\"a\" \"b\" c\n"), pairs(&[("A", "abc")]));
+    // ...and the two quote characters may differ between sections.
+    assert_eq!(parse_env_file("A=\"a\" 'b'\n"), pairs(&[("A", "ab")]));
+    // Unchanged by all of the above: a quote that is not at a section start is
+    // literal, so the JSON and typo cases keep their previous answers.
+    assert_eq!(parse_env_file("A=a \"b c\"\n"), pairs(&[("A", "a \"b c\"")]));
+    assert_eq!(parse_env_file("A=f\"g\n"), pairs(&[("A", "f\"g")]));
+}
+
+/// Fourth DGX measurement (2026-08-14, systemd 255) — the whitespace CLASS.
+///
+/// Run to settle the one point the first #552 pass left unmeasured (which class
+/// the post-close skip uses), it settled that *and* found a second divergence
+/// one layer up: every trim in this module was `char::is_whitespace`, which is
+/// Unicode-aware, while systemd's is ASCII. Same consequence as #552 itself — a
+/// value that differs from the live environment is a false `NOT fully applied`
+/// on Linux and a genuinely different plist value on macOS.
+///
+/// A non-breaking space is not an exotic input here: it is what a copy-paste out
+/// of rendered docs or a chat window leaves behind, and `operator-env.md` hands
+/// operators a block to copy.
+#[test]
+fn the_whitespace_class_is_systemds_ascii_one_not_unicode() {
+    // Measured: the tab IS part of the class, on both sides of a value...
+    assert_eq!(parse_env_file("W=\tx\t\n"), pairs(&[("W", "x")]));
+    assert_eq!(parse_env_file("X=x   \n"), pairs(&[("X", "x")]));
+    // ...and after a closing quote.
+    assert_eq!(parse_env_file("P=\"a\"\tx\n"), pairs(&[("P", "ax")]));
+    // Measured: U+00A0 is NOT. It survives at either end of a value, where a
+    // Unicode trim would have eaten it and reported a value the daemon never
+    // has.
+    assert_eq!(parse_env_file("U=\u{a0}x\n"), pairs(&[("U", "\u{a0}x")]));
+    assert_eq!(parse_env_file("V=x\u{a0}\n"), pairs(&[("V", "x\u{a0}")]));
+    // ...and it ends the post-close skip rather than being skipped, so the
+    // unquoted tail begins AT it.
+    assert_eq!(parse_env_file("Q=\"a\"\u{a0}x\n"), pairs(&[("Q", "a\u{a0}x")]));
+    // Measured: a vertical tab is not in the class either — it is not one of
+    // systemd's four, and this pins that the class is the exact set rather than
+    // "ASCII control-ish".
+    assert_eq!(parse_env_file("T=\"a\"\u{b} x\n"), pairs(&[("T", "a\u{b} x")]));
+    // The worst row, and the reason this is not merely cosmetic: systemd
+    // declares NO variable for a key carrying a U+00A0, because the name is not
+    // a bare identifier. A Unicode trim would have stripped it and invented
+    // `Y=y` — the `export FOO=bar` failure wearing a different hat. Reported by
+    // line number, never silently.
+    let parsed = parse_env_file_reporting("\u{a0}Y=y\n");
+    assert!(parsed.pairs.is_empty(), "must invent no variable: {:?}", parsed.pairs);
+    assert_eq!(parsed.ignored_lines, vec![1], "and must say which line it refused");
+    // A leading TAB before a key is fine on both, so the guard above is not
+    // just rejecting everything with leading whitespace.
+    assert_eq!(parse_env_file("\tZ=z\n"), pairs(&[("Z", "z")]));
+}
+
 #[test]
 fn merge_env_file_values_override_inline_env_keeping_position() {
     let mut env = pairs(&[("A", "1"), ("B", "2")]);

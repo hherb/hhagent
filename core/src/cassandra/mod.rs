@@ -14,6 +14,7 @@
 //! the scheduler-side contract.
 
 pub mod constitutional;
+pub mod data_ceiling;
 pub mod deterministic;
 pub mod injection_guard;
 pub mod review;

@@ -157,7 +157,7 @@ fn task_complete_plan(body: &str) -> Plan {
         rationale: "done".into(),
         steps: vec![],
         result: Some(serde_json::json!({"kind": "text", "body": body})),
-        data_ceiling: DataClass::Public,
+        data_ceiling: Some(DataClass::Public),
         refused: None,
         floor_request: None,
         l1_insight: None,
@@ -181,7 +181,7 @@ fn one_step_plan(tool: &str, method: &str) -> Plan {
             classification: DataClass::Public,
         }],
         result: None,
-        data_ceiling: DataClass::Public,
+        data_ceiling: Some(DataClass::Public),
         refused: None,
         floor_request: None,
         l1_insight: None,
@@ -231,7 +231,7 @@ fn invoke_plan(name: &str, arg_key: &str, arg_val: &str) -> Plan {
     args.insert(arg_key.to_string(), arg_val.to_string());
     Plan {
         context: "c".into(), decision: "act".into(), rationale: "r".into(),
-        steps: vec![], result: None, data_ceiling: DataClass::Public, refused: None,
+        steps: vec![], result: None, data_ceiling: Some(DataClass::Public), refused: None,
         floor_request: None, l1_insight: None, l3_skill: None,
         invoke_skill: Some(InvokeDirective { name: name.into(), args, params: serde_json::Value::Null }),
         python_skill: None,
@@ -569,7 +569,7 @@ async fn refusal_plan_terminates_with_state_refused() {
             "kind": "text",
             "body": "I cannot help with that; it would risk physical harm.",
         })),
-        data_ceiling: DataClass::Public,
+        data_ceiling: Some(DataClass::Public),
         refused: Some(kastellan_core::cassandra::types::RefusedReason {
             principle: 1,
             reason: "physical_harm".into(),
@@ -692,7 +692,7 @@ async fn reviewer_constitutional_block_wins_over_agent_refusal() {
             "kind": "text",
             "body": "agent prose mentioning P1",
         })),
-        data_ceiling: DataClass::Public,
+        data_ceiling: Some(DataClass::Public),
         refused: Some(kastellan_core::cassandra::types::RefusedReason {
             principle: 1,
             reason: "physical_harm_agent_side".into(),
@@ -758,7 +758,7 @@ async fn verdict_block_on_refusal_plan_does_not_loop() {
             "kind": "text",
             "body": "I will not proceed — privacy boundary.",
         })),
-        data_ceiling: DataClass::Public,
+        data_ceiling: Some(DataClass::Public),
         refused: Some(kastellan_core::cassandra::types::RefusedReason {
             principle: 4,
             reason: "privacy_violation".into(),
@@ -856,7 +856,7 @@ async fn agent_floor_raise_chain_blocks_low_classification_step() {
             classification: DataClass::Public,  // BELOW the elevated floor
         }],
         result: None,
-        data_ceiling: DataClass::ClinicalConfidential,
+        data_ceiling: Some(DataClass::ClinicalConfidential),
         refused: None,
         floor_request: Some(DataClass::ClinicalConfidential),  // RAISE!
         l1_insight: None,
@@ -1098,4 +1098,110 @@ async fn invoke_driven_task_suppresses_recrystallisation() {
     assert!(matches!(result.outcome, Outcome::Completed(_)));
     assert!(result.terminal_l3_skill.is_none(),
         "invoke-driven task must NOT re-crystallise a skill");
+}
+
+/// #506: an omitted `data_ceiling` is resolved against the task floor, the
+/// audit row says so, and — the part no unit test can reach — the resolution
+/// happens **after** an agent floor-raise.
+///
+/// The ordering is the reason this is an e2e rather than a unit test. It is
+/// asserted in a comment at the call site, and a comment does not survive a
+/// refactor: moving the resolve above `apply_floor_raise` would pin the ceiling
+/// to the *producer's* lower floor while every unit test still passed. Here the
+/// two orders are distinguishable, because the plan raises the floor to
+/// `ClinicalConfidential` and the resolved ceiling is read back out of the
+/// `plan.formulate` payload.
+///
+/// Also pins the provenance key, which is the other half of #506: once an
+/// absent ceiling is filled in, the serialised plan reads exactly like a model
+/// decision, so `data_ceiling_source` is the only thing that tells an operator
+/// which of the two happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn omitted_data_ceiling_resolves_against_the_raised_floor_and_is_audited() {
+    let Some((pool, _cluster)) = bring_up_pg("idc").await else {
+        return; // [SKIP]
+    };
+    let id = insert_pending(&pool, Lane::Fast, serde_json::json!({}))
+        .await
+        .unwrap();
+    let _ = tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+
+    // A terminal plan that (a) omits data_ceiling entirely and (b) raises the
+    // floor from the producer's `Public` to `ClinicalConfidential`.
+    let mut plan = task_complete_plan("pong");
+    plan.data_ceiling = None;
+    plan.floor_request = Some(DataClass::ClinicalConfidential);
+
+    let formulator = Arc::new(ScriptedFormulator::new(vec![plan]));
+    let review = Arc::new(ChainReviewStage::new(vec![Arc::new(NoopReviewStage)]));
+    let dispatcher = Arc::new(ScriptedDispatcher { table: Default::default(), tools: Default::default() });
+
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3))
+        .await
+        .unwrap();
+    assert!(matches!(result.outcome, Outcome::Completed(_)), "got {:?}", result.outcome);
+
+    let rows = kastellan_db::audit::fetch_since(&pool, 0, 100).await.expect("fetch audit rows");
+    let plan_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.actor == "agent" && r.action == "plan.formulate")
+        .collect();
+    assert_eq!(plan_rows.len(), 1, "expected exactly 1 agent/plan.formulate row");
+    let payload = &plan_rows[0].payload;
+
+    // Provenance: the daemon filled the field, not the model.
+    assert_eq!(
+        payload["data_ceiling_source"], "floor_resolved",
+        "an omitted ceiling must be recorded as daemon-resolved, not as a model decision"
+    );
+
+    // The ORDERING assertion. `ClinicalConfidential` is the RAISED floor;
+    // `Public` is what the ceiling would be if resolution ran first.
+    let plan_back: Plan = serde_json::from_value(payload["plan"].clone())
+        .expect("plan payload key must deserialise into a Plan");
+    assert_eq!(
+        plan_back.data_ceiling,
+        Some(DataClass::ClinicalConfidential),
+        "the ceiling must resolve against the RAISED floor; Public here would mean the \
+         resolution ran before apply_floor_raise"
+    );
+    assert_eq!(
+        payload["classification_floor"], "ClinicalConfidential",
+        "sanity: the raise itself took effect, so the assertion above is meaningful"
+    );
+}
+
+/// The other half of the provenance contract: a ceiling the model DID declare
+/// is recorded as `declared` and used verbatim.
+///
+/// Paired with the test above deliberately — a single-sided provenance test
+/// passes just as well against an implementation that hard-codes one token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_data_ceiling_is_audited_as_declared() {
+    let Some((pool, _cluster)) = bring_up_pg("idd").await else {
+        return; // [SKIP]
+    };
+    let id = insert_pending(&pool, Lane::Fast, serde_json::json!({}))
+        .await
+        .unwrap();
+    let _ = tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+
+    // task_complete_plan declares Public explicitly.
+    let formulator = Arc::new(ScriptedFormulator::new(vec![task_complete_plan("pong")]));
+    let review = Arc::new(ChainReviewStage::new(vec![Arc::new(NoopReviewStage)]));
+    let dispatcher = Arc::new(ScriptedDispatcher { table: Default::default(), tools: Default::default() });
+
+    run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3))
+        .await
+        .unwrap();
+
+    let rows = kastellan_db::audit::fetch_since(&pool, 0, 100).await.expect("fetch audit rows");
+    let payload = &rows
+        .iter()
+        .find(|r| r.actor == "agent" && r.action == "plan.formulate")
+        .expect("a plan.formulate row")
+        .payload;
+    assert_eq!(payload["data_ceiling_source"], "declared");
+    let plan_back: Plan = serde_json::from_value(payload["plan"].clone()).expect("plan");
+    assert_eq!(plan_back.data_ceiling, Some(DataClass::Public), "declared value used verbatim");
 }

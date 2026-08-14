@@ -324,7 +324,7 @@ fn terminal_plan() -> Plan {
         rationale: "".into(),
         steps: vec![],
         result: Some(serde_json::json!({"kind": "text", "body": "ok"})),
-        data_ceiling: DataClass::Public,
+        data_ceiling: Some(DataClass::Public),
         refused: None,
         floor_request: None,
         l1_insight: None,

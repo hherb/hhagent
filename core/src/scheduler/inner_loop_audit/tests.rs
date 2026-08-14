@@ -6,6 +6,8 @@
 //! compiled under `#[cfg(test)]`.
 
 use super::*;
+use crate::cassandra::data_ceiling::DataCeilingSource;
+use super::ClassificationProvenance;
 use crate::cassandra::types::{DataClass, Plan, PlannedStep};
 
 /// Canonical text-only terminal Plan; tests vary single fields via
@@ -17,7 +19,7 @@ fn make_text_plan() -> Plan {
         rationale: "".into(),
         steps: vec![],
         result: Some(serde_json::json!({"kind": "text", "body": "ok"})),
-        data_ceiling: DataClass::Public,
+        data_ceiling: Some(DataClass::Public),
         refused: None,
         floor_request: None,
         l1_insight: None,
@@ -65,7 +67,7 @@ fn build_plan_formulate_payload_carries_full_plan_and_classification_floor() {
             classification: DataClass::Public,
         }],
         result: None,
-        data_ceiling: DataClass::Personal,
+        data_ceiling: Some(DataClass::Personal),
         refused: None,
         floor_request: None,
         l1_insight: None,
@@ -84,8 +86,13 @@ fn build_plan_formulate_payload_carries_full_plan_and_classification_floor() {
         ..make_default_meta()
     };
     let payload = build_plan_formulate_payload(
-        7, 1, DataClass::ClinicalConfidential,
-        ClassificationFloorSource::Default, &[], &plan, &meta,
+        7, 1, &plan, &meta,
+        ClassificationProvenance {
+            floor: DataClass::ClinicalConfidential,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
 
     // Full Plan JSON round-trips byte-for-byte.
@@ -113,7 +120,7 @@ fn build_plan_formulate_payload_carries_full_plan_and_classification_floor() {
 }
 
 #[test]
-fn build_plan_formulate_payload_pins_twenty_seven_keys_for_default_source() {
+fn build_plan_formulate_payload_pins_twenty_eight_keys_for_default_source() {
     // Slice D (2026-05-17, recall-lane wiring) bumped the
     // default-source key count from 17 to 20 by adding
     // recalled_memory_ids, recall_count, recall_query_sha256.
@@ -133,8 +140,13 @@ fn build_plan_formulate_payload_pins_twenty_seven_keys_for_default_source() {
         ..make_default_meta()
     };
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::Public, ClassificationFloorSource::Default,
-        &[], &make_text_plan(), &meta,
+        1, 1, &make_text_plan(), &meta,
+        ClassificationProvenance {
+            floor: DataClass::Public,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     let obj = payload.as_object().expect("payload object");
     let got: std::collections::BTreeSet<&str> =
@@ -144,13 +156,14 @@ fn build_plan_formulate_payload_pins_twenty_seven_keys_for_default_source() {
         "llm_model", "llm_backend", "latency_ms", "retry_count",
         "plan_step_count", "decision_kind", "refused",
         "plan", "classification_floor", "classification_floor_source",
+        "data_ceiling_source",
         "system_prompt_sha256", "l0_count", "l1_count", "skill_count",
         "recalled_memory_ids", "recall_count", "recall_query_sha256",
         "l1_insight", "l3_skill", "invoke_skill",
         "graph_seed_entity_ids", "graph_seed_count", "graph_seed_source",
     ].into_iter().collect();
     assert_eq!(got, expected,
-        "default-source payload must carry exactly 27 keys; diff:\n\
+        "default-source payload must carry exactly 28 keys; diff:\n\
          missing = {:?}\nextra = {:?}",
         expected.difference(&got).collect::<Vec<_>>(),
         got.difference(&expected).collect::<Vec<_>>(),
@@ -158,16 +171,19 @@ fn build_plan_formulate_payload_pins_twenty_seven_keys_for_default_source() {
 }
 
 #[test]
-fn build_plan_formulate_payload_cli_inferred_source_has_28_keys_with_signals() {
+fn build_plan_formulate_payload_cli_inferred_source_has_29_keys_with_signals() {
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::ClinicalConfidential,
-        ClassificationFloorSource::CliInferred,
-        &["patient".to_string(), "pathology".to_string()],
-        &make_text_plan(), &make_default_meta(),
+        1, 1, &make_text_plan(), &make_default_meta(),
+        ClassificationProvenance {
+            floor: DataClass::ClinicalConfidential,
+            floor_source: ClassificationFloorSource::CliInferred,
+            floor_signals: &["patient".to_string(), "pathology".to_string()],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     let obj = payload.as_object().expect("payload object");
-    assert_eq!(obj.len(), 28,
-        "cli_inferred + signals must carry 28 keys (27 default + signals); got {} keys: {:?}",
+    assert_eq!(obj.len(), 29,
+        "cli_inferred + signals must carry 29 keys (28 default + signals); got {} keys: {:?}",
         obj.len(), obj.keys().collect::<Vec<_>>(),
     );
     assert_eq!(
@@ -186,8 +202,13 @@ fn build_plan_formulate_payload_recall_keys_round_trip_through_meta() {
         ..make_default_meta()
     };
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::Public, ClassificationFloorSource::Default,
-        &[], &make_text_plan(), &meta,
+        1, 1, &make_text_plan(), &meta,
+        ClassificationProvenance {
+            floor: DataClass::Public,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     assert_eq!(payload["recalled_memory_ids"], serde_json::json!([42, 99, 7]));
     assert_eq!(payload["recall_count"], 3u64);
@@ -206,8 +227,13 @@ fn build_plan_formulate_payload_graph_seed_keys_round_trip_through_meta() {
         ..make_default_meta()
     };
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::Public, ClassificationFloorSource::Default,
-        &[], &make_text_plan(), &meta,
+        1, 1, &make_text_plan(), &meta,
+        ClassificationProvenance {
+            floor: DataClass::Public,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     assert_eq!(payload["graph_seed_entity_ids"], serde_json::json!([11, 22, 33]));
     assert_eq!(payload["graph_seed_count"], 3u64);
@@ -219,8 +245,13 @@ fn build_plan_formulate_payload_graph_seed_source_serializes_none_as_snake_case(
     // Default meta has SeedSource::None — must serialize as "none",
     // matching the snake_case rename_all on the enum.
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::Public, ClassificationFloorSource::Default,
-        &[], &make_text_plan(), &make_default_meta(),
+        1, 1, &make_text_plan(), &make_default_meta(),
+        ClassificationProvenance {
+            floor: DataClass::Public,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     assert_eq!(payload["graph_seed_source"], serde_json::json!("none"));
     assert_eq!(payload["graph_seed_entity_ids"], serde_json::json!([] as [i64; 0]));
@@ -233,8 +264,13 @@ fn build_plan_formulate_payload_recall_query_sha256_is_64_hex_chars_in_empty_def
     // empty string still satisfies the 64-hex-char contract.
     // Observation phase SQL can pin the format without a special case.
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::Public, ClassificationFloorSource::Default,
-        &[], &make_text_plan(), &make_default_meta(),
+        1, 1, &make_text_plan(), &make_default_meta(),
+        ClassificationProvenance {
+            floor: DataClass::Public,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     let sha = payload["recall_query_sha256"].as_str().expect("string");
     assert_eq!(sha.len(), 64, "recall_query_sha256 must always be 64 chars; got {sha}");
@@ -245,11 +281,16 @@ fn build_plan_formulate_payload_recall_query_sha256_is_64_hex_chars_in_empty_def
 #[test]
 fn build_plan_formulate_payload_default_source_omits_signals_key() {
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::Public, ClassificationFloorSource::Default,
-        &[], &make_text_plan(), &make_default_meta(),
+        1, 1, &make_text_plan(), &make_default_meta(),
+        ClassificationProvenance {
+            floor: DataClass::Public,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     let obj = payload.as_object().expect("payload is an object");
-    assert_eq!(obj.len(), 27);
+    assert_eq!(obj.len(), 28);
     assert_eq!(obj["classification_floor_source"], serde_json::Value::String("default".into()));
     assert!(obj.get("classification_floor_signals").is_none(),
         "signals key must be ABSENT when source is not cli_inferred");
@@ -261,18 +302,22 @@ fn build_plan_formulate_payload_agent_raised_source_omits_signals() {
     // the original CLI inference, not the elevated floor.
     let plan = Plan {
         floor_request: Some(DataClass::ClinicalConfidential),
-        data_ceiling: DataClass::ClinicalConfidential,
+        data_ceiling: Some(DataClass::ClinicalConfidential),
         ..make_text_plan()
     };
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::ClinicalConfidential,
-        ClassificationFloorSource::AgentRaised,
-        &[],  // empty: signals are cleared on raise
+        1, 1, // empty: signals are cleared on raise
         &plan, &make_default_meta(),
+        ClassificationProvenance {
+            floor: DataClass::ClinicalConfidential,
+            floor_source: ClassificationFloorSource::AgentRaised,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     let obj = payload.as_object().expect("payload is an object");
-    assert_eq!(obj.len(), 27,
-        "agent_raised should have 27 keys (no signals); got: {:?}", obj.keys().collect::<Vec<_>>());
+    assert_eq!(obj.len(), 28,
+        "agent_raised should have 28 keys (no signals); got: {:?}", obj.keys().collect::<Vec<_>>());
     assert_eq!(obj["classification_floor_source"], serde_json::Value::String("agent_raised".into()));
     assert!(obj.get("classification_floor_signals").is_none());
 }
@@ -284,8 +329,13 @@ fn plan_formulate_payload_carries_l1_insight_when_set() {
         ..make_text_plan()
     };
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::Public, ClassificationFloorSource::Default,
-        &[], &plan, &make_default_meta(),
+        1, 1, &plan, &make_default_meta(),
+        ClassificationProvenance {
+            floor: DataClass::Public,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     assert_eq!(
         payload.get("l1_insight").expect("l1_insight key must be present"),
@@ -298,8 +348,13 @@ fn plan_formulate_payload_carries_explicit_null_l1_insight_when_unset() {
     // The key must be present-but-null when the agent does not set it,
     // so JSONB queries `WHERE payload ? 'l1_insight'` find the row.
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::Public, ClassificationFloorSource::Default,
-        &[], &make_text_plan(), &make_default_meta(),
+        1, 1, &make_text_plan(), &make_default_meta(),
+        ClassificationProvenance {
+            floor: DataClass::Public,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     assert_eq!(
         payload.get("l1_insight").expect("l1_insight key must be present even when None"),
@@ -321,8 +376,13 @@ fn build_plan_formulate_payload_l3_skill_compact_shape() {
         }],
     });
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::Public, ClassificationFloorSource::Default,
-        &[], &plan, &make_default_meta(),
+        1, 1, &plan, &make_default_meta(),
+        ClassificationProvenance {
+            floor: DataClass::Public,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     assert_eq!(payload["l3_skill"], serde_json::json!({
         "name": "summarise_repo_readme", "step_count": 1, "param_count": 1
@@ -330,8 +390,13 @@ fn build_plan_formulate_payload_l3_skill_compact_shape() {
 
     // None case: explicit JSON null, not key-absent.
     let none_payload = build_plan_formulate_payload(
-        1, 1, DataClass::Public, ClassificationFloorSource::Default,
-        &[], &make_text_plan(), &make_default_meta(),
+        1, 1, &make_text_plan(), &make_default_meta(),
+        ClassificationProvenance {
+            floor: DataClass::Public,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     assert_eq!(none_payload["l3_skill"], serde_json::Value::Null);
     assert!(none_payload.as_object().unwrap().contains_key("l3_skill"));
@@ -352,8 +417,13 @@ fn build_plan_formulate_payload_invoke_skill_compact_shape() {
         params: serde_json::Value::Null,
     });
     let payload = build_plan_formulate_payload(
-        1, 1, DataClass::Public, ClassificationFloorSource::Default,
-        &[], &plan, &make_default_meta(),
+        1, 1, &plan, &make_default_meta(),
+        ClassificationProvenance {
+            floor: DataClass::Public,
+            floor_source: ClassificationFloorSource::Default,
+            floor_signals: &[],
+            ceiling_source: DataCeilingSource::Declared,
+        },
     );
     assert_eq!(payload["invoke_skill"]["name"], "summarise_repo_readme");
     assert_eq!(payload["invoke_skill"]["arg_count"], 2);

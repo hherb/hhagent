@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use thiserror::Error;
 
+use crate::cassandra::data_ceiling::{resolve_data_ceiling, DataCeilingSource};
 use crate::cassandra::review::{ChainReviewStage, ReviewStage, ReviewStageContext};
 use crate::cassandra::types::{DataClass, PlannedStep, Verdict};
 use crate::scheduler::audit::{
@@ -326,7 +327,35 @@ pub async fn run_to_terminal(
             );
         }
 
-        write_audit_plan_formulate(pool, &ctx, &plan, &meta).await?;
+        // Resolve an absent `data_ceiling` against the task floor (#506).
+        //
+        // Position is load-bearing on all three sides:
+        //   * AFTER `apply_floor_raise`, so an agent-raised floor is the one
+        //     resolved against — resolving first would pin the ceiling to the
+        //     producer's lower floor and let I1 pass on a plan the agent itself
+        //     said needed a higher one.
+        //   * BEFORE the audit write, so the `plan.formulate` row records the
+        //     value policy actually enforced, together with its provenance.
+        //   * BEFORE L3 expansion and review, which are the two readers of the
+        //     resolved value (expansion stamps it onto generated steps; the
+        //     deterministic screen enforces I1/I3 with it).
+        //
+        // Written back into `plan` so there is exactly ONE resolved value in
+        // play. Recomputing it per reader is how a numerator and a denominator
+        // end up disagreeing with no way to tell which is wrong.
+        let resolved = resolve_data_ceiling(plan.data_ceiling, ctx.classification_floor);
+        plan.data_ceiling = Some(resolved.ceiling);
+        if resolved.source == DataCeilingSource::FloorResolved {
+            tracing::warn!(
+                task_id = ctx.task_id,
+                plan_count = ctx.plan_count,
+                resolved_to = resolved.ceiling.as_pascal_str(),
+                "plan omitted `data_ceiling`; resolved to the task classification floor. \
+                 The model should emit the field explicitly."
+            );
+        }
+
+        write_audit_plan_formulate(pool, &ctx, &plan, &meta, resolved.source).await?;
 
         // 1b. L3 autonomous invoke expansion (before review, so the
         // reviewer governs the concrete steps). Presence of `invoke_skill`
@@ -337,7 +366,7 @@ pub async fn run_to_terminal(
         // from `validate_invoke` ends before we assign `plan.steps`.
         let mut current_invoke: Option<(i64, String)> = None;
         if plan.invoke_skill.is_some() {
-            match expand_invoke_skill(pool, dispatcher.as_ref(), &plan).await? {
+            match expand_invoke_skill(pool, dispatcher.as_ref(), &plan, resolved.ceiling).await? {
                 InvokeExpansion::Refused(reasons) => {
                     for r in &reasons {
                         ctx.blocks.push(format!("invoke_rejected: {r}"));
