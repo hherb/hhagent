@@ -23,6 +23,7 @@
 
 use sqlx::PgPool;
 
+use crate::cassandra::data_ceiling::DataCeilingSource;
 use crate::cassandra::types::{DataClass, Plan, Verdict};
 
 use super::agent::FormulationMeta;
@@ -82,15 +83,51 @@ use super::inner_loop::{ClassificationFloorSource, InnerLoopError, TaskContext};
 /// plan, or explicit JSON `null` when absent — mirrors the `l1_insight` /
 /// `l3_skill` precedent). This brings the default-source key count to 27,
 /// and `CliInferred`+signals to 28.
+///
+/// #506 (2026-08-14) added `data_ceiling_source`, always present. The
+/// serialised `plan` above carries the *resolved* `data_ceiling`, which reads
+/// exactly like a model decision — so without this key an operator cannot tell
+/// a ceiling the model declared from one the daemon filled in from the task
+/// floor. The old constant default only ever announced itself via a `warn!` in
+/// the daemon log, which is not the oversight record. Deliberately shaped like
+/// `classification_floor_source`, whose reading convention operators already
+/// know. This brings the default-source key count to 28, and
+/// `CliInferred`+signals to 29.
+/// The classification facts one `plan.formulate` row records.
+///
+/// Grouped rather than passed as four positional parameters: they are one
+/// concept (how this plan's data-classification bounds were arrived at), they
+/// are always supplied together, and three of the four are `DataClass`-shaped
+/// or provenance-shaped — exactly the arrangement where a positional call
+/// silently survives two arguments being swapped. Same reasoning as #545's
+/// `AllowlistDecl`, which collapsed two independently-defaulting values into
+/// one that cannot be half-supplied.
+pub(crate) struct ClassificationProvenance<'a> {
+    /// The task's effective floor at the time the plan was formulated —
+    /// post-raise, since `apply_floor_raise` runs first.
+    pub floor: DataClass,
+    /// How `floor` was set (producer default, CLI inference, agent raise).
+    pub floor_source: ClassificationFloorSource,
+    /// Signal tags behind a `CliInferred` floor; empty for every other source.
+    pub floor_signals: &'a [String],
+    /// Whether the plan's `data_ceiling` was declared by the model or
+    /// resolved from `floor` by the daemon (#506).
+    pub ceiling_source: DataCeilingSource,
+}
+
 pub(crate) fn build_plan_formulate_payload(
     task_id: i64,
     plan_count: u32,
-    classification_floor: DataClass,
-    classification_floor_source: ClassificationFloorSource,
-    classification_floor_signals: &[String],
     plan: &Plan,
     meta: &FormulationMeta,
+    classification: ClassificationProvenance<'_>,
 ) -> serde_json::Value {
+    let ClassificationProvenance {
+        floor: classification_floor,
+        floor_source: classification_floor_source,
+        floor_signals: classification_floor_signals,
+        ceiling_source: data_ceiling_source,
+    } = classification;
     // Issue #23 (spec §3): "refused" takes precedence over the
     // is_terminal-derived "task_complete" so a refusal payload is
     // wire-distinguishable from a successful completion via the same
@@ -181,6 +218,13 @@ pub(crate) fn build_plan_formulate_payload(
         "classification_floor_source".into(),
         serde_json::json!(classification_floor_source.as_snake_str()),
     );
+    // #506: provenance for the ceiling, alongside the provenance for the
+    // floor. `plan.data_ceiling` is resolved by the time this runs, so the
+    // value in `plan` above is what policy enforced; this says who chose it.
+    obj.insert(
+        "data_ceiling_source".into(),
+        serde_json::json!(data_ceiling_source.as_snake_str()),
+    );
     // Slice C (prompt-assembler, 2026-05-16): drift detection for
     // L0/L1 across daemon restarts and operator edits. `prompt_sha256`
     // above is the BASE prompt only; `system_prompt_sha256` here is
@@ -243,15 +287,19 @@ pub(super) async fn write_audit_plan_formulate(
     ctx: &TaskContext,
     plan: &Plan,
     meta: &FormulationMeta,
+    data_ceiling_source: DataCeilingSource,
 ) -> Result<(), InnerLoopError> {
     let payload = build_plan_formulate_payload(
         ctx.task_id,
         ctx.plan_count,
-        ctx.classification_floor,
-        ctx.classification_floor_source,
-        &ctx.classification_floor_signals,
         plan,
         meta,
+        ClassificationProvenance {
+            floor: ctx.classification_floor,
+            floor_source: ctx.classification_floor_source,
+            floor_signals: &ctx.classification_floor_signals,
+            ceiling_source: data_ceiling_source,
+        },
     );
     kastellan_db::audit::insert(pool, "agent", "plan.formulate", payload).await?;
     Ok(())

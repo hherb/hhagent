@@ -173,7 +173,7 @@ mod tests {
             rationale: "r".into(),
             steps: vec![],
             result: Some(serde_json::json!("ok")),
-            data_ceiling: DataClass::Public,
+            data_ceiling: Some(DataClass::Public),
             refused: None,
             floor_request: None,
             l1_insight: None,
@@ -287,7 +287,7 @@ mod tests {
                 classification: DataClass::Public,
             }],
             result: None,
-            data_ceiling: DataClass::Public,
+            data_ceiling: Some(DataClass::Public),
             refused: None,
             floor_request: None,
             l1_insight: None,
@@ -309,7 +309,7 @@ mod tests {
             rationale: "r".into(),
             steps: vec![],
             result: None,
-            data_ceiling: DataClass::Public,
+            data_ceiling: Some(DataClass::Public),
             refused: None,
             floor_request: None,
             l1_insight: None,
@@ -352,7 +352,7 @@ mod tests {
                 classification: DataClass::Public,
             }],
             result: None,
-            data_ceiling: DataClass::ClinicalConfidential,
+            data_ceiling: Some(DataClass::ClinicalConfidential),
             refused: None,
             floor_request: None,
             l1_insight: None,
@@ -418,7 +418,7 @@ mod tests {
         // I1 fixture
         let v1 = dp
             .review(
-                &mk_plan(DataClass::Public, vec![]),
+                &mk_plan(Some(DataClass::Public), vec![]),
                 &mk_ctx(DataClass::ClinicalConfidential),
             )
             .await;
@@ -427,7 +427,7 @@ mod tests {
         // I2 fixture
         let v2 = dp
             .review(
-                &mk_plan(DataClass::ClinicalConfidential, vec![DataClass::Public]),
+                &mk_plan(Some(DataClass::ClinicalConfidential), vec![DataClass::Public]),
                 &mk_ctx(DataClass::ClinicalConfidential),
             )
             .await;
@@ -436,7 +436,7 @@ mod tests {
         // I3 fixture
         let v3 = dp
             .review(
-                &mk_plan(DataClass::Public, vec![DataClass::ClinicalConfidential]),
+                &mk_plan(Some(DataClass::Public), vec![DataClass::ClinicalConfidential]),
                 &mk_ctx(DataClass::Public),
             )
             .await;
@@ -445,7 +445,7 @@ mod tests {
         // Clean plan stays Approve.
         let v_ok = dp
             .review(
-                &mk_plan(DataClass::Public, vec![DataClass::Public]),
+                &mk_plan(Some(DataClass::Public), vec![DataClass::Public]),
                 &mk_ctx(DataClass::Public),
             )
             .await;
@@ -469,7 +469,7 @@ mod tests {
                 classification: DataClass::ClinicalConfidential,
             }],
             result: None,
-            data_ceiling: DataClass::Public,
+            data_ceiling: Some(DataClass::Public),
             refused: None,
             floor_request: None,
             l1_insight: None,

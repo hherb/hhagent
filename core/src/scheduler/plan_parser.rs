@@ -141,7 +141,7 @@ mod tests {
     fn expect_terminal_plan(plan: &Plan) {
         assert_eq!(plan.decision, "task_complete");
         assert!(plan.steps.is_empty());
-        assert_eq!(plan.data_ceiling, DataClass::Public);
+        assert_eq!(plan.data_ceiling, Some(DataClass::Public));
         assert!(plan.refused.is_none());
     }
 
@@ -158,7 +158,7 @@ mod tests {
     /// replacement is
     /// [#506](https://github.com/hherb/kastellan/issues/506).
     #[test]
-    fn omitted_data_ceiling_is_accepted_at_the_most_permissive_ceiling() {
+    fn omitted_data_ceiling_parses_as_absent_and_is_not_resolved_here() {
         let raw = r#"{
             "context": "c",
             "decision": "task_complete",
@@ -168,12 +168,15 @@ mod tests {
         }"#;
         let plan = parse_plan_lenient(raw)
             .expect("a plan omitting data_ceiling must still parse");
-        assert_eq!(plan.data_ceiling, DataClass::Secret);
+        // The absence SURVIVES parsing. This test previously asserted the
+        // opposite — that the field defaulted to `Secret` here — which was
+        // #506's fail-open: `Secret` is rank 3, the most PERMISSIVE ceiling,
+        // so I1 and I3 both passed vacuously for a defaulted plan.
         assert_eq!(
-            plan.data_ceiling.rank(),
-            3,
-            "the default is the MAXIMUM rank — i.e. the loosest ceiling, \
-             not a restrictive one"
+            plan.data_ceiling, None,
+            "the parser must not invent a ceiling; only a caller holding the \
+             task's classification_floor can resolve one (see \
+             cassandra::data_ceiling)"
         );
     }
 
@@ -183,7 +186,7 @@ mod tests {
     fn explicit_data_ceiling_is_not_overridden_by_the_default() {
         let plan = parse_plan_lenient(canonical_plan_json())
             .expect("canonical plan parses");
-        assert_eq!(plan.data_ceiling, DataClass::Public);
+        assert_eq!(plan.data_ceiling, Some(DataClass::Public));
     }
 
     /// The regression this module's contract point 5 exists for: a

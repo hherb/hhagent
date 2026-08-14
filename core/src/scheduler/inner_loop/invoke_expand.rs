@@ -15,7 +15,7 @@
 
 use sqlx::PgPool;
 
-use crate::cassandra::types::{Plan, PlannedStep};
+use crate::cassandra::types::{DataClass, Plan, PlannedStep};
 use crate::memory::l3_approval::SkillTrust;
 use crate::memory::l3_invoke::{expand_for_agent, load_pinned_skill_by_name};
 use crate::memory::l3py_invoke::{
@@ -59,10 +59,19 @@ pub(super) enum InvokeExpansion {
 /// directive (`validate_invoke` rejects co-supplied steps / terminal plans /
 /// an `l3_skill`) is also a refusal — never a silent fall-through to the
 /// agent's own co-supplied steps.
+///
+/// `ceiling` is the plan's **resolved** `data_ceiling`, passed in rather than
+/// read off `plan` (#506). Expanded steps are not model-written — this function
+/// stamps each one's `classification` with the ceiling — so reading an
+/// unresolved `Option` here would either need a second default (reintroducing
+/// the fail-open this change removes) or an `unwrap`. Taking the concrete value
+/// as an argument makes the dependency on prior resolution part of the
+/// signature, so a caller cannot forget it.
 pub(super) async fn expand_invoke_skill(
     pool: &PgPool,
     dispatcher: &dyn StepDispatcher,
     plan: &Plan,
+    ceiling: DataClass,
 ) -> Result<InvokeExpansion, InnerLoopError> {
     // Mirror of the old inline `refuse_invoke!`, but it yields an
     // `InvokeExpansion::Refused` value instead of `continue`-ing the loop —
@@ -106,7 +115,7 @@ pub(super) async fn expand_invoke_skill(
                     SkillTrust::Pinned,
                     &args,
                     &live_tools,
-                    plan.data_ceiling,
+                    ceiling,
                 ) {
                     Err(refusal) => refuse!(
                         &name,
@@ -151,7 +160,7 @@ pub(super) async fn expand_invoke_skill(
                     &py.candidate,
                     SkillTrust::Pinned,
                     &py.body_sha256,
-                    plan.data_ceiling,
+                    ceiling,
                     &params,
                 ) {
                     Err(refusal) => refuse!(
