@@ -8,14 +8,22 @@
 //! invariant catalogue readable in one sitting and lets the helper be
 //! exercised without the async trait machinery.
 //!
-//! ## Scope (the three invariants)
+//! ## Scope (the invariants)
 //!
-//! This is the **first real** Stage 0 rule. It enforces three
+//! This is the **first real** Stage 0 rule. It enforces the following
 //! invariants over the typed [`DataClass`] fields already on
 //! [`Plan`](super::types::Plan),
 //! [`PlannedStep`](super::types::PlannedStep), and
 //! [`ReviewStageContext`](super::review::ReviewStageContext):
 //!
+//! - **I0: `plan.data_ceiling` is resolved at all.** The model may omit
+//!   the field; `scheduler::inner_loop` resolves the absence against the
+//!   task floor before review runs. If it somehow did not, every check
+//!   below would have no ceiling to read — so this fails closed rather
+//!   than substituting a constant, because *any* constant here silently
+//!   restores the [#506] fail-open (`Secret` is the most permissive
+//!   ceiling, `Public` blocks legitimate plans). Unreachable on a
+//!   correctly wired path, and that is the point.
 //! - **I1: `plan.data_ceiling >= ctx.classification_floor`** — the
 //!   spec invariant from [`types.rs:105-110`](super::types). Catches
 //!   the "upgrading without justification" shape where the agent
@@ -28,7 +36,7 @@
 //!   plan-internal consistency: a step labelled at a class higher than
 //!   the plan's declared ceiling is the agent self-contradicting.
 //!
-//! Invariants checked in declared order (I1, then I2, then I3); first
+//! Invariants checked in declared order (I0, then I1, I2, I3); first
 //! hit wins. Within per-step invariants, lowest `step_index` wins.
 //! Same precedence shape as [`super::constitutional`]'s
 //! "first principle wins".
@@ -53,6 +61,23 @@ use super::types::{DataClass, Plan};
 /// [`Self::format_reason`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClassificationViolation {
+    /// I0 — `plan.data_ceiling` is still `None` at review time.
+    ///
+    /// Not a model error: the model is *allowed* to omit the field, and
+    /// `inner_loop` resolves the absence against the task floor
+    /// ([`super::data_ceiling::resolve_data_ceiling`]) before anything
+    /// here runs. Reaching this arm means that resolution did not
+    /// happen — a wiring defect in the daemon, not a bad plan.
+    ///
+    /// It is a **violation** rather than a second default because the
+    /// whole of [#506] is that defaulting a ceiling silently is
+    /// fail-open: any constant chosen here would be either permissive
+    /// (`Secret`, the original bug) or spuriously blocking (`Public`).
+    /// Blocking loudly is the only option that cannot quietly restore
+    /// the defect, and it is unreachable on a correctly wired path.
+    ///
+    /// [#506]: https://github.com/hherb/kastellan/issues/506
+    CeilingUnresolved,
     /// I1 — `plan.data_ceiling < ctx.classification_floor`.
     CeilingBelowFloor {
         ceiling: DataClass,
@@ -80,6 +105,7 @@ impl ClassificationViolation {
             Self::CeilingBelowFloor { .. } => "ceiling_below_floor",
             Self::StepClassificationBelowFloor { .. } => "step_classification_below_floor",
             Self::StepClassificationAboveCeiling { .. } => "step_classification_above_ceiling",
+            Self::CeilingUnresolved => "ceiling_unresolved",
         }
     }
 
@@ -116,19 +142,24 @@ impl ClassificationViolation {
                 step_class.as_pascal_str(),
                 ceiling.as_pascal_str(),
             ),
+            Self::CeilingUnresolved => format!(
+                "data-classification: {} — plan.data_ceiling was never resolved against \
+                 task.classification_floor; this is a daemon wiring defect, not a bad plan",
+                self.reason_tag(),
+            ),
         }
     }
 }
 
-/// Screen a plan against the three classification invariants.
+/// Screen a plan against the classification invariants.
 ///
-/// Returns `Some(violation)` on the first hit (declared order: I1, I2,
-/// I3; within per-step invariants, lowest `step_index` wins); `None`
+/// Returns `Some(violation)` on the first hit (declared order: I0, I1,
+/// I2, I3; within per-step invariants, lowest `step_index` wins); `None`
 /// on a clean plan.
 ///
-/// The three checks form a total enforcement: every plan that round-
-/// trips the helper as `None` satisfies all three invariants
-/// simultaneously. Conversely, a violating plan always surfaces the
+/// The checks form a total enforcement: every plan that round-trips the
+/// helper as `None` satisfies all of them simultaneously, and carries a
+/// ceiling that was actually resolved. Conversely, a violating plan always surfaces the
 /// *single most fundamental* violation per the declared order —
 /// the caller never needs to interpret a list of co-occurring
 /// violations.
@@ -136,12 +167,15 @@ pub fn screen_plan_for_classification_violations(
     plan: &Plan,
     floor: DataClass,
 ) -> Option<ClassificationViolation> {
+    // I0: the ceiling must already have been resolved. Checked FIRST and
+    // fail-closed: every invariant below reads `ceiling`, so an unresolved
+    // field cannot be allowed to reach them under any substitute value.
+    let Some(ceiling) = plan.data_ceiling else {
+        return Some(ClassificationViolation::CeilingUnresolved);
+    };
     // I1: plan.data_ceiling >= floor
-    if plan.data_ceiling.rank() < floor.rank() {
-        return Some(ClassificationViolation::CeilingBelowFloor {
-            ceiling: plan.data_ceiling,
-            floor,
-        });
+    if ceiling.rank() < floor.rank() {
+        return Some(ClassificationViolation::CeilingBelowFloor { ceiling, floor });
     }
     // I2: every step.classification >= floor (lowest violating index wins)
     for (i, s) in plan.steps.iter().enumerate() {
@@ -160,11 +194,11 @@ pub fn screen_plan_for_classification_violations(
     // lower index. Fusing the two loops with `if/else` would silently break the
     // declared-order precedence pinned by `i2_wins_over_i3_when_both_could_fire`.
     for (i, s) in plan.steps.iter().enumerate() {
-        if s.classification.rank() > plan.data_ceiling.rank() {
+        if s.classification.rank() > ceiling.rank() {
             return Some(ClassificationViolation::StepClassificationAboveCeiling {
                 step_index: i,
                 step_class: s.classification,
-                ceiling:    plan.data_ceiling,
+                ceiling,
             });
         }
     }
@@ -251,7 +285,7 @@ mod tests {
             rationale: "r".into(),
             steps: steps.into_iter().map(step).collect(),
             result: None,
-            data_ceiling: ceiling,
+            data_ceiling: Some(ceiling),
             refused: None,
             floor_request: None,
             l1_insight: None,
@@ -259,6 +293,65 @@ mod tests {
             invoke_skill: None,
             python_skill: None,
         }
+    }
+
+    /// An UNRESOLVED ceiling fails closed (I0), and does so before every
+    /// other invariant.
+    ///
+    /// Unreachable on a correctly wired daemon — `inner_loop` resolves the
+    /// absence first — so this pins the *contract*, not a live path: if a
+    /// future refactor drops the resolution call, the plan is blocked rather
+    /// than silently unconstrained, which is how #506 shipped in the first
+    /// place.
+    #[test]
+    fn an_unresolved_ceiling_is_blocked_rather_than_defaulted() {
+        let mut p = plan(DataClass::Public, vec![]);
+        p.data_ceiling = None;
+        assert_eq!(
+            screen_plan_for_classification_violations(&p, DataClass::Public),
+            Some(ClassificationViolation::CeilingUnresolved),
+            "an unresolved ceiling must not pass the screen"
+        );
+        // It outranks the other invariants: a plan that ALSO violates I2 still
+        // reports I0, because nothing below it has a ceiling to read.
+        let mut p = plan(DataClass::Public, vec![DataClass::Public]);
+        p.data_ceiling = None;
+        assert_eq!(
+            screen_plan_for_classification_violations(&p, DataClass::Personal),
+            Some(ClassificationViolation::CeilingUnresolved),
+            "I0 precedes I2"
+        );
+    }
+
+    /// The #506 defect itself, as a behavioural test: with the ceiling
+    /// resolved to a LOW floor, I3 acquires teeth it did not have under the
+    /// old constant `Secret`.
+    ///
+    /// Written as a pair — same plan, two ceilings — so it cannot pass for the
+    /// wrong reason. Under the old default this step was `Secret`-ceilinged and
+    /// I3 could not fire for any step class at all.
+    #[test]
+    fn a_floor_resolved_ceiling_gives_i3_teeth_the_permissive_default_lacked() {
+        // Floor Public ⇒ resolved ceiling Public. A step the model labelled
+        // Personal now exceeds the ceiling and is caught.
+        let p = plan(DataClass::Public, vec![DataClass::Personal]);
+        assert_eq!(
+            screen_plan_for_classification_violations(&p, DataClass::Public),
+            Some(ClassificationViolation::StepClassificationAboveCeiling {
+                step_index: 0,
+                step_class: DataClass::Personal,
+                ceiling: DataClass::Public,
+            }),
+            "a step above a floor-resolved ceiling must trip I3"
+        );
+        // The SAME plan under the old permissive default (rank 3) sails
+        // through — this is what the fix removes.
+        let permissive = plan(DataClass::Secret, vec![DataClass::Personal]);
+        assert_eq!(
+            screen_plan_for_classification_violations(&permissive, DataClass::Public),
+            None,
+            "documents the old fail-open: at ceiling=Secret, I3 cannot fire"
+        );
     }
 
     #[test]
