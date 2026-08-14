@@ -285,6 +285,56 @@ mod tests {
         plans.iter().flatten().map(|s| s.text.len()).sum()
     }
 
+    /// #559: `workers/mail` attaches a plain-language ordering note to every
+    /// `mail.search` response, because a successful step reaches the planner as
+    /// [`extract_scannable_text`]'s output — string values only, **keys
+    /// discarded**, capped at [`STEP_OK_SUMMARY_MAX`].
+    ///
+    /// This pins the half that lives in *this* crate: whether such a note is
+    /// readable at all depends entirely on where its key sorts, because
+    /// `serde_json::Map` is a `BTreeMap` here and a full page of hits exhausts
+    /// the 4 KiB budget by itself. `ordering_note` sorts before `results` and
+    /// survives; the tidier-sounding `sort_applied` sorts after it and is
+    /// silently clipped — the same trap that swallowed #536's repair advice.
+    ///
+    /// Deliberately structural rather than a check on the worker's exact
+    /// sentence: `core` owns the cap, `workers/mail` owns the wording, and
+    /// there is no shared constant between them (a leaf worker must not gain a
+    /// dependency edge to `core`). `workers/mail`'s own
+    /// `ordering_key_sorts_before_results` fails first if the key is renamed.
+    #[test]
+    fn a_note_keyed_before_results_survives_the_planner_head_cap() {
+        let hits: Vec<serde_json::Value> = (0..50)
+            .map(|i| {
+                serde_json::json!({
+                    "message_id": format!("{}", 37000 + i),
+                    "subject": "x".repeat(200),
+                    "date": "2026-08-14T12:13:53+00:00",
+                })
+            })
+            .collect();
+        let note = "These results are in rank order, NOT date order.";
+        let v = serde_json::json!({
+            "ordering_note": note,
+            "results": hits,
+            "sort_applied": "clipped-because-it-sorts-after-results",
+        });
+
+        let rendered = render_step_outcome("mail", "mail.search", &StepOutcome::Ok(v));
+
+        assert!(
+            rendered.text.contains(note),
+            "the ordering note must reach the planner; got {} chars starting {:?}",
+            rendered.text.len(),
+            rendered.text.chars().take(120).collect::<String>()
+        );
+        assert!(
+            !rendered.text.contains("clipped-because-it-sorts-after-results"),
+            "a key sorting after `results` should NOT survive — if this now fits, the \
+             cap or the fixture grew and this test has stopped proving anything"
+        );
+    }
+
     #[test]
     fn budget_is_a_no_op_when_under() {
         let mut plans = vec![vec![ok("small"), err("nope")]];
