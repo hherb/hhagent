@@ -44,14 +44,16 @@ impl MailHandler {
         if let Some(f) = p.filters {
             body["filters"] = f;
         }
-        // Sent unconditionally, unlike every other optional field here: the
-        // ordering is the one property the response is annotated with, and
-        // inferring it from a field we did not send would make that annotation
-        // a claim about localmail's default rather than about this request.
-        // `resolve_sort` yields localmail's own default when none was asked
-        // for, so this changes no result — see `sort::DEFAULT_SORT`.
-        let sort = sort::resolve_sort(p.sort.as_deref());
-        body["sort"] = serde_json::json!(sort);
+        // The ordering is the one property the response gets annotated with, so
+        // it is decided up front rather than inferred from a field we may not
+        // have sent. `plan_sort` also decides *whether* to send one at all: on a
+        // paging request the cursor already carries the ordering, and defaulting
+        // one there contradicts it (#561). Needs the cursor before the body is
+        // built, hence the early `is_some`.
+        let plan = sort::plan_sort(p.sort.as_deref(), p.cursor.is_some());
+        if let sort::SortPlan::Send(s) = plan {
+            body["sort"] = serde_json::json!(s);
+        }
         if let Some(l) = p.limit {
             body["limit"] = serde_json::json!(l);
         }
@@ -61,7 +63,7 @@ impl MailHandler {
         // `smart` (LLM query rewrite) deliberately never set — workers do not
         // call the LLM. The planner already decomposes/rewrites queries.
         let mut out = self.client.post_json("/v1/search", &body).map_err(mail_err_to_rpc)?;
-        sort::annotate(&mut out, sort);
+        sort::annotate(&mut out, plan);
         Ok(out)
     }
 
@@ -399,6 +401,35 @@ mod tests {
         let out = h.call("mail.search", serde_json::json!({"query": "q", "sort": "date"})).unwrap();
         let note = out[sort::ORDERING_KEY].as_str().expect("no ordering note");
         assert!(note.contains("newest first"), "{note}");
+    }
+
+    /// #561: paging without a named sort must send **no** `sort` field, so the
+    /// cursor's own ordering stands. A defaulted `rank` here contradicts a date
+    /// cursor and localmail silently restarts at page one.
+    #[test]
+    fn search_sends_no_sort_when_paging_without_one() {
+        let mut h = MailHandler::with_client(client_with(Box::new(SortEchoFake)));
+        let out = h
+            .call("mail.search", serde_json::json!({"query": "q", "cursor": "K|abc"}))
+            .unwrap();
+        assert_eq!(out["sent_sort"], serde_json::Value::Null, "sort must be absent while paging");
+        let note = out[sort::ORDERING_KEY].as_str().expect("no ordering note");
+        assert!(note.contains("cannot tell which"), "{note}");
+    }
+
+    /// A sort the planner named explicitly is still sent while paging — this
+    /// worker does not adjudicate the mismatch (that needs the cursor format,
+    /// which belongs to localmail).
+    #[test]
+    fn search_still_sends_an_explicit_sort_while_paging() {
+        let mut h = MailHandler::with_client(client_with(Box::new(SortEchoFake)));
+        let out = h
+            .call(
+                "mail.search",
+                serde_json::json!({"query": "q", "cursor": "K|abc", "sort": "date"}),
+            )
+            .unwrap();
+        assert_eq!(out["sent_sort"], serde_json::json!("date"));
     }
 
     // --- GET path assertions for get_message / list_messages / list_accounts ---
