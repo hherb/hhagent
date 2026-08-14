@@ -122,7 +122,14 @@ impl WorkerManifest for MailManifest {
                         description: "object: date_from, date_to, from, to, subject, has_attachment, account_ids, folder_ids, lang",
                         required: false,
                     },
-                    ToolParam { name: "sort", description: "'rank' (default) or 'date'", required: false },
+                    ToolParam {
+                        name: "sort",
+                        description: "'rank' (default, best match first) or 'date' (newest \
+                                      first). Rank order is NOT date order: the top hits are \
+                                      whatever matched best, from any year. A 'most recent' / \
+                                      'latest' question must pass sort: \"date\".",
+                        required: false,
+                    },
                     ToolParam { name: "limit", description: "max hits (default 50)", required: false },
                     ToolParam { name: "cursor", description: "next_cursor from a prior page", required: false },
                 ],

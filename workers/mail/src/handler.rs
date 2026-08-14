@@ -9,6 +9,7 @@ use kastellan_protocol::{codes, server::Handler, RpcError};
 
 use crate::client::{MailClient, MailError};
 use crate::ids::{self, LocalmailId};
+use crate::sort;
 
 pub struct MailHandler {
     client: MailClient,
@@ -43,7 +44,14 @@ impl MailHandler {
         if let Some(f) = p.filters {
             body["filters"] = f;
         }
-        if let Some(s) = p.sort {
+        // The ordering is the one property the response gets annotated with, so
+        // it is decided up front rather than inferred from a field we may not
+        // have sent. `plan_sort` also decides *whether* to send one at all: on a
+        // paging request the cursor already carries the ordering, and defaulting
+        // one there contradicts it (#561). Needs the cursor before the body is
+        // built, hence the early `is_some`.
+        let plan = sort::plan_sort(p.sort.as_deref(), p.cursor.is_some());
+        if let sort::SortPlan::Send(s) = plan {
             body["sort"] = serde_json::json!(s);
         }
         if let Some(l) = p.limit {
@@ -54,7 +62,9 @@ impl MailHandler {
         }
         // `smart` (LLM query rewrite) deliberately never set — workers do not
         // call the LLM. The planner already decomposes/rewrites queries.
-        self.client.post_json("/v1/search", &body).map_err(mail_err_to_rpc)
+        let mut out = self.client.post_json("/v1/search", &body).map_err(mail_err_to_rpc)?;
+        sort::annotate(&mut out, plan);
+        Ok(out)
     }
 
     fn get_message(&self, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
@@ -344,6 +354,82 @@ mod tests {
         let mut h = MailHandler::with_client(client_with(Box::new(SearchFake)));
         let out = h.call("mail.search", serde_json::json!({"query": "qantas"})).unwrap();
         assert!(out["results"].is_array());
+    }
+
+    /// Echoes the sort back into the POST body so the test can read what was
+    /// sent, which is the half `SearchFake` cannot show.
+    struct SortEchoFake;
+    impl HttpGet for SortEchoFake {
+        fn get(&self, _: &Url) -> Result<RawResponse, String> { unreachable!() }
+        fn transport_kind(&self) -> &'static str { "fake" }
+        fn post_authed(&self, _: &Url, _: &str, _: &str, body: &[u8], _m: usize) -> Result<RawResponse, String> {
+            let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
+            Ok(json_resp(
+                serde_json::to_vec(&serde_json::json!({"results": [], "sent_sort": sent["sort"]}))
+                    .unwrap()
+                    .as_slice(),
+            ))
+        }
+    }
+
+    /// #559: a planner that names no sort still gets a request whose ordering
+    /// this worker knows, rather than one that inherits localmail's default.
+    #[test]
+    fn search_sends_an_explicit_sort_when_the_planner_omits_it() {
+        let mut h = MailHandler::with_client(client_with(Box::new(SortEchoFake)));
+        let out = h.call("mail.search", serde_json::json!({"query": "q"})).unwrap();
+        assert_eq!(out["sent_sort"], serde_json::json!(sort::DEFAULT_SORT));
+    }
+
+    #[test]
+    fn search_forwards_an_explicit_sort_unchanged() {
+        let mut h = MailHandler::with_client(client_with(Box::new(SortEchoFake)));
+        let out = h.call("mail.search", serde_json::json!({"query": "q", "sort": "date"})).unwrap();
+        assert_eq!(out["sent_sort"], serde_json::json!("date"));
+    }
+
+    /// The defect #559 actually fixes: the ordering has to be readable in the
+    /// output, because that is where this planner has been shown to act on
+    /// advice (`ids::explain`) and not act on it (the parameter docs).
+    #[test]
+    fn search_annotates_the_response_with_the_ordering_it_requested() {
+        let mut h = MailHandler::with_client(client_with(Box::new(SortEchoFake)));
+        let out = h.call("mail.search", serde_json::json!({"query": "q"})).unwrap();
+        let note = out[sort::ORDERING_KEY].as_str().expect("no ordering note");
+        assert!(note.contains("NOT date order"), "{note}");
+
+        let out = h.call("mail.search", serde_json::json!({"query": "q", "sort": "date"})).unwrap();
+        let note = out[sort::ORDERING_KEY].as_str().expect("no ordering note");
+        assert!(note.contains("newest first"), "{note}");
+    }
+
+    /// #561: paging without a named sort must send **no** `sort` field, so the
+    /// cursor's own ordering stands. A defaulted `rank` here contradicts a date
+    /// cursor and localmail silently restarts at page one.
+    #[test]
+    fn search_sends_no_sort_when_paging_without_one() {
+        let mut h = MailHandler::with_client(client_with(Box::new(SortEchoFake)));
+        let out = h
+            .call("mail.search", serde_json::json!({"query": "q", "cursor": "K|abc"}))
+            .unwrap();
+        assert_eq!(out["sent_sort"], serde_json::Value::Null, "sort must be absent while paging");
+        let note = out[sort::ORDERING_KEY].as_str().expect("no ordering note");
+        assert!(note.contains("cannot tell which"), "{note}");
+    }
+
+    /// A sort the planner named explicitly is still sent while paging — this
+    /// worker does not adjudicate the mismatch (that needs the cursor format,
+    /// which belongs to localmail).
+    #[test]
+    fn search_still_sends_an_explicit_sort_while_paging() {
+        let mut h = MailHandler::with_client(client_with(Box::new(SortEchoFake)));
+        let out = h
+            .call(
+                "mail.search",
+                serde_json::json!({"query": "q", "cursor": "K|abc", "sort": "date"}),
+            )
+            .unwrap();
+        assert_eq!(out["sent_sort"], serde_json::json!("date"));
     }
 
     // --- GET path assertions for get_message / list_messages / list_accounts ---
