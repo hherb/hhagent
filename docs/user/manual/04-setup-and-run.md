@@ -125,17 +125,31 @@ out of the box.
 
 Kastellan talks to an OpenAI-style local model server — you tell it where
 that server is and which model to use. The one-command install (Step 5)
-**defaults to a local Ollama** at `http://127.0.0.1:11434` and pulls its
-default models for you (after checking they'll fit in memory), so if that
-describes your setup you can skip ahead. Otherwise, pass the details to the
-installer:
+defaults to a different server per platform:
+
+| Platform | Default server | Default chat model | Default embedding model |
+|---|---|---|---|
+| **macOS** | oMLX, `http://127.0.0.1:8000` | `Qwen3.8-27B-8bit` | `embeddinggemma-300m-bf16` |
+| **Linux** | Ollama, `http://127.0.0.1:11434` | `gemma4:26b-a4b-it-q8_0` | `embeddinggemma` |
+
+On **Linux** the installer pulls those models for you (after checking they'll
+fit in memory). On **macOS** it cannot — oMLX manages its own model library,
+so install the two models from oMLX's admin UI first; the installer prints a
+note rather than attempting a download it has no way to perform.
+
+If that describes your setup you can skip ahead. Otherwise, pass the details
+to the installer:
 
 ```sh
 kastellan-cli install --llm-url "http://127.0.0.1:8000" --llm-model "<your-model-name>"
 ```
 
-On a Linux GPU host running vLLM or SGLang, the model server usually listens
-on port `8000`; on macOS with Ollama it is `11434`. You can change these at
+Model names are **not** interchangeable between the two: oMLX takes MLX repo
+ids (`Qwen3.8-27B-8bit`), Ollama takes registry tags (`gemma4:26b-a4b-it-q8_0`).
+If you change `--llm-url` to the other server, change `--llm-model` with it.
+
+On a Linux GPU host running vLLM or SGLang, the model server also listens
+on port `8000`. You can change these at
 any time by putting them in `~/.config/kastellan/kastellan.env.local` and
 restarting the service — **not** in `kastellan.env`, which the installer
 regenerates from these flags on every run. See

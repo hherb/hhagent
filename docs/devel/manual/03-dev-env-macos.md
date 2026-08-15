@@ -97,17 +97,51 @@ normal development.
 ## Optional: Local LLM for integration tests
 
 The scheduler integration tests that call `formulate_plan` need an LLM. On
-macOS the default is Ollama:
+macOS the default is **oMLX** on `:8000` — it serves MLX-quantised models
+through the same OpenAI-compatible surface and is materially faster than
+Ollama on Apple silicon, the gap widening with model size. Install its
+models from oMLX's own admin UI, then:
+
+```sh
+export KASTELLAN_LLM_LOCAL_URL=http://127.0.0.1:8000/v1
+export KASTELLAN_LLM_LOCAL_MODEL=Qwen3.8-27B-8bit
+export KASTELLAN_LLM_EMBEDDING_MODEL=embeddinggemma-300m-bf16
+```
+
+These are the defaults, so an unset environment reaches the same place; set
+them explicitly when you want a different model.
+
+### The macOS fallback runtime: llama.cpp
+
+oMLX is the default, not the only option. **llama.cpp's `llama-server` is the
+designated fallback on macOS** for anything oMLX cannot serve — it also speaks
+OpenAI-compat, so it needs no code, only a URL. Point the router at it with an
+explicit `KASTELLAN_LLM_LOCAL_URL` (llama.cpp has no conventional port, which
+is why it is not a default anywhere).
+
+The concrete gap driving this today is **token logprobs**. oMLX does not
+return them: `logprobs`/`top_logprobs` are absent from `/v1/chat/completions`
+entirely, and while `top_logprobs` *is* declared on `/v1/responses` it is
+accepted and ignored — no response schema in oMLX's OpenAPI document emits
+them. Measured against the live server on 2026-08-15; re-check when oMLX
+updates, since a declared-but-inert parameter suggests the wiring is partly
+there.
+
+Anything needing a **calibrated score** rather than a bare token therefore
+cannot use oMLX. The live example is the Phase 5 model-based guard tier
+(Shieldstral), whose whole design rests on renormalising the `yes`/`no`
+logprobs into a confidence band — see
+[`docs/superpowers/specs/2026-08-13-shieldstral-guard-model-feasibility-study.md`](../../superpowers/specs/2026-08-13-shieldstral-guard-model-feasibility-study.md).
+llama.cpp is reported to cover both halves that model needs, logprobs and
+multimodal; that is the fallback's first real customer and the measurement
+that will confirm it.
+
+Ollama also still works, and remains the Linux install default:
 
 ```sh
 brew install ollama
 ollama serve &          # runs in background
 ollama pull gemma2:9b   # or any OpenAI-chat-compatible model
-```
-
-Set the environment variable that points the LLM router to Ollama:
-
-```sh
 export KASTELLAN_LLM_LOCAL_URL=http://127.0.0.1:11434/v1
 export KASTELLAN_LLM_LOCAL_MODEL=gemma2:9b
 ```

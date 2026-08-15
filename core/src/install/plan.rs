@@ -108,12 +108,28 @@ pub fn cli_path_precedence_note(path_var: &str, home: &Path) -> Option<String> {
     }
 }
 
-/// The default local LLM URL: Ollama `:11434` on both OSes — it pairs with the
-/// Ollama default models ([`DEFAULT_LLM_MODEL`]/[`DEFAULT_EMBEDDING_MODEL`]) and
-/// is the backend the installer can `ollama pull` into. Operators on vLLM/MLX/etc.
-/// override with `--llm-url` (and the matching `--llm-model`).
+/// The default local LLM URL, per OS. Pairs with the matching per-OS models
+/// ([`default_llm_model`]/[`default_embedding_model`]); override with
+/// `--llm-url` (and the matching `--llm-model`).
+///
+/// * **macOS:** oMLX `:8000`. Materially faster than Ollama on Apple silicon,
+///   and the gap widens with model size. The installer cannot fetch models for
+///   it — see [`is_local_ollama`] and the note in `run::ensure_ollama_model`.
+/// * **Linux (and other Unixes):** Ollama `:11434` — the one backend the
+///   installer *can* `ollama pull` into.
+///
+/// Note this is the **installer's** default, which is not the same question as
+/// `llm_router::config::default_local_url_for_os` (the daemon's fallback when
+/// no `KASTELLAN_LLM_LOCAL_URL` is set at all). They differ on Linux on
+/// purpose: the installer writes an explicit URL into `kastellan.env` and
+/// targets the backend it can populate, while the router's bare default
+/// assumes the vLLM/SGLang deployment.
 pub fn default_llm_url() -> &'static str {
-    "http://127.0.0.1:11434"
+    if cfg!(target_os = "macos") {
+        "http://127.0.0.1:8000"
+    } else {
+        "http://127.0.0.1:11434"
+    }
 }
 
 /// Ensure an OpenAI-compatible base URL ends in exactly one `/v1` segment — the
@@ -534,9 +550,9 @@ pub fn parse_install_args(args: &[String]) -> Result<InstallArgs, String> {
         );
     }
     Ok(InstallArgs {
-        llm_model: model.unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string()),
+        llm_model: model.unwrap_or_else(|| default_llm_model().to_string()),
         llm_url: url.unwrap_or_else(|| default_llm_url().to_string()),
-        embedding_model: Some(emb.unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string())),
+        embedding_model: Some(emb.unwrap_or_else(|| default_embedding_model().to_string())),
         pg_bin_dir: pg,
         from,
         no_start,
@@ -545,12 +561,36 @@ pub fn parse_install_args(args: &[String]) -> Result<InstallArgs, String> {
     })
 }
 
-/// Default chat model (Ollama tag). Spike-tested as a strong general-purpose
-/// default; override with `--llm-model`.
-pub const DEFAULT_LLM_MODEL: &str = "gemma4:26b-a4b-it-q8_0";
+/// Default chat model, per OS — an **MLX repo id** on macOS (oMLX), an
+/// **Ollama tag** elsewhere. Both spike-tested as strong general-purpose
+/// defaults; override with `--llm-model`.
+///
+/// The two naming schemes are not interchangeable, which is why this tracks
+/// [`default_llm_url`]: an Ollama tag means nothing to oMLX and an MLX repo id
+/// is not pullable by Ollama. Overriding one without the other is the mistake
+/// this pairing exists to prevent.
+pub fn default_llm_model() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Qwen3.8-27B-8bit"
+    } else {
+        "gemma4:26b-a4b-it-q8_0"
+    }
+}
 
-/// Default embedding model (Ollama tag). Override with `--embedding-model`.
-pub const DEFAULT_EMBEDDING_MODEL: &str = "embeddinggemma";
+/// Default embedding model, per OS. Override with `--embedding-model`.
+///
+/// Deliberately the **same model** on both — embeddinggemma, at its native 768
+/// dims, client-side Matryoshka-truncated to `db::memories::EMBEDDING_DIM`
+/// (256). Only the packaging differs (MLX repo id vs Ollama tag). Vectors
+/// written on one host must remain comparable to vectors written on the other,
+/// so this pairing is a storage-compatibility constraint, not a preference.
+pub fn default_embedding_model() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "embeddinggemma-300m-bf16"
+    } else {
+        "embeddinggemma"
+    }
+}
 
 /// True when `url` looks like a *local* Ollama endpoint (loopback `:11434`),
 /// the only case where the installer can drive `ollama pull` to fetch a model.
@@ -806,12 +846,47 @@ mod tests {
         );
     }
 
+    /// Pin the *values* of the per-OS install defaults.
+    ///
+    /// `parse_defaults_models_and_url_overridable` below compares the
+    /// parsed value against the same default it came from, so it passes
+    /// for any value — it pins the wiring, not the choice. This is the
+    /// test that makes changing the choice deliberate.
+    #[test]
+    fn install_defaults_are_per_os_and_pinned() {
+        if cfg!(target_os = "macos") {
+            // oMLX. Model names are MLX repo ids, NOT Ollama tags.
+            assert_eq!(default_llm_url(), "http://127.0.0.1:8000");
+            assert_eq!(default_llm_model(), "Qwen3.8-27B-8bit");
+            assert_eq!(default_embedding_model(), "embeddinggemma-300m-bf16");
+        } else {
+            // Linux (and other Unixes): Ollama — the one endpoint the
+            // installer can drive `ollama pull` against.
+            assert_eq!(default_llm_url(), "http://127.0.0.1:11434");
+            assert_eq!(default_llm_model(), "gemma4:26b-a4b-it-q8_0");
+            assert_eq!(default_embedding_model(), "embeddinggemma");
+        }
+    }
+
+    /// The macOS default endpoint must NOT read as a local Ollama one.
+    ///
+    /// `ensure_ollama_model` keys off [`is_local_ollama`]: when it says
+    /// yes, install runs `ollama pull <model>`. The macOS defaults are
+    /// MLX repo ids served by oMLX, which `ollama pull` cannot fetch, so
+    /// a future port change that made these agree would turn every
+    /// macOS install into a guaranteed pull failure. Cheap invariant,
+    /// and it is meaningful on both hosts.
+    #[test]
+    fn ollama_pull_is_not_attempted_for_the_default_macos_endpoint() {
+        assert_eq!(is_local_ollama(default_llm_url()), !cfg!(target_os = "macos"));
+    }
+
     #[test]
     fn parse_defaults_models_and_url_overridable() {
         // No flags → both models + url default.
         let d = parse_install_args(&[]).unwrap();
-        assert_eq!(d.llm_model, DEFAULT_LLM_MODEL);
-        assert_eq!(d.embedding_model.as_deref(), Some(DEFAULT_EMBEDDING_MODEL));
+        assert_eq!(d.llm_model, default_llm_model());
+        assert_eq!(d.embedding_model.as_deref(), Some(default_embedding_model()));
         assert_eq!(d.llm_url, default_llm_url());
         assert!(!d.no_start);
         // Overrides.

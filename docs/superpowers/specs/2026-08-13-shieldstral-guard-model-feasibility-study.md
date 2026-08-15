@@ -2,6 +2,7 @@
 
 **Date:** 2026-08-13
 **Status:** Investigation, no code. Input for the Phase 5 "Model-based CASSANDRA guard tier" ROADMAP item.
+**Amended 2026-08-15:** the macOS runtime changed to oMLX, which serves no logprobs; the guard model moves to llama.cpp. See the amendment under [Cross-platform inference](#cross-platform-inference--the-one-thing-that-could-sink-it) and the rewritten measurement 1.
 **Question asked:** is Mistral's Shieldstral suitable for kastellan — specifically as a
 decision gate for *whether the more expensive CASSANDRA analysis is needed*, decided at
 high confidence?
@@ -100,10 +101,48 @@ The scoring mechanism depends on **token logprobs**, and that is where the two l
 - **Linux/DGX:** vLLM on `http://127.0.0.1:8000/v1` — already the default
   `KASTELLAN_LLM_LOCAL_URL` for Linux (`llm-router/src/config.rs:81`). vLLM has served
   `logprobs`/`top_logprobs` for a long time. No new egress, no new port, no new dependency.
-- **macOS:** Ollama on `http://127.0.0.1:11434/v1` — the per-OS default. Ollama gained
-  `logprobs`/`top_logprobs` on its OpenAI-compat `/v1/chat/completions` **only in
-  v0.12.11**. So the macOS leg needs (a) a GGUF build of Shieldstral in the Ollama
-  registry or hand-imported via a Modelfile, and (b) an Ollama floor of v0.12.11.
+- **macOS:** ~~Ollama on `http://127.0.0.1:11434/v1` — the per-OS default.~~ **Superseded
+  2026-08-15 — see the amendment below.** The macOS default is now oMLX on
+  `http://127.0.0.1:8000/v1`, which does **not** serve logprobs, so the guard model runs
+  on a *second* runtime rather than on the default one.
+
+> ### Amendment, 2026-08-15 — the macOS leg changed runtime
+>
+> macOS moved to **oMLX** as the default chat + embedding backend (`:8000`), for
+> performance on Apple silicon; the switch is unrelated to this study but lands squarely
+> on it. Measured against the live oMLX server that day:
+>
+> - **oMLX does not return token logprobs.** `logprobs`/`top_logprobs` are absent from
+>   `/v1/chat/completions` altogether. `top_logprobs` *is* declared on `ResponsesRequest`
+>   (`/v1/responses`) — the only mention of logprobs anywhere in the 120 KB OpenAPI
+>   document — but it is accepted and ignored: a call with `top_logprobs: 20` **and**
+>   `include: ["message.output_text.logprobs"]` returns HTTP 200 with output content
+>   carrying only `text` and an empty `annotations`, and **no response schema in the
+>   document declares a logprobs field at all**. Declared-but-inert, which is worth
+>   re-checking after an oMLX update — it suggests the wiring is partly present.
+> - **Shieldstral itself runs fine on oMLX.** `Shieldstral-1.0-3B-MLX-8bit` returned
+>   correct bare verdicts through `/v1/chat/completions` — `yes` on a prompt-injection /
+>   exfiltration sample, `no` on a benign control — at `max_tokens=4`, `temperature=0`.
+>   So the *model* works on the default runtime; only the *score* is unavailable.
+>   That is precisely the degradation this section warned about: a hard, unmovable
+>   τ=0.5 with no confidence band.
+>
+> **Resolution: llama.cpp, not Ollama.** `llama-server` is the designated macOS fallback
+> runtime for models or capabilities oMLX cannot serve, and is reported to support both
+> halves Shieldstral needs — logprobs **and** the multimodal (Pixtral vision) path that
+> Ollama would not have given us. It is OpenAI-compatible, so it costs no code, only an
+> explicit `KASTELLAN_LLM_LOCAL_URL` (llama.cpp has no conventional port). This keeps the
+> cross-platform constraint satisfied — DGX vLLM `:8000` and macOS llama.cpp both serve
+> calibrated scores — so the banded design survives intact and there is **no Linux-only
+> security behaviour**. The llama.cpp capability claim is research, not yet measured here;
+> confirming it is measurement 1 below.
+>
+> **Two consequences for sequencing.** (a) The Ollama hand-import path is dropped, and
+> with it the v0.12.11 floor and the broken-stub-template hazard that a hand-rolled
+> Modelfile carries. (b) **Do not build a `guard_url`/`guard_model` seam in `RouterConfig`
+> yet.** A second endpoint is needed only for as long as oMLX lacks logprobs; if it gains
+> them, the guard model runs on the existing `local_url` and that seam becomes dead code
+> in the sole core-side LLM egress. Defer until measurement 1 settles.
 
 **If either fails, the calibrated score is unavailable on macOS** and the model degrades to
 a bare `yes`/`no` token — i.e. a hard, unmovable τ=0.5 with no confidence band. That
@@ -260,10 +299,13 @@ contends for the same CPU and the failure looks like a runaway-thinking bug.
 
 ## What to measure before committing (the gate)
 
-1. **macOS logprobs.** Import a Shieldstral GGUF into Ollama ≥ v0.12.11 and confirm
-   `/v1/chat/completions` with `logprobs: true, top_logprobs: 20` returns per-token
-   alternatives including both `yes` and `no`. **If this fails, stop** — the confidence-band
-   design is not cross-platform and the whole triage framing collapses to a fixed τ=0.5.
+1. **macOS logprobs.** *(Rewritten 2026-08-15 — the runtime changed; see the amendment
+   above. The oMLX half is already answered: **no logprobs**, measured.)* Run Shieldstral
+   under **llama.cpp's `llama-server`** on macOS and confirm `/v1/chat/completions` with
+   `logprobs: true, top_logprobs: 20` returns per-token alternatives including both `yes`
+   and `no`. Confirm the multimodal path in the same pass, since that is the other reason
+   llama.cpp was chosen over Ollama. **If this fails, stop** — the confidence-band design
+   is not cross-platform and the whole triage framing collapses to a fixed τ=0.5.
 2. **`llm-router` round trip.** Add `logprobs`/`top_logprobs` request fields and response
    parsing; pin that an unset field serialises byte-identically, on both the vLLM and Ollama
    legs. Confirm `disable_thinking`'s `chat_template_kwargs` does not 4xx against
@@ -297,7 +339,9 @@ Roughly 3–4 sessions to a shippable advisory tier, with the go/no-go probe fir
 - **Every performance number is a vendor claim with no independent replication.** Treat the
   table as a reason to run the measurement, not as the measurement.
 - **The macOS logprobs leg is the single point of failure for the whole design.** Check it
-  first, not last.
+  first, not last. *Half-answered 2026-08-15 — and checking it first is exactly what paid:
+  the oMLX default has no logprobs, found before any code was written. The remaining half
+  is llama.cpp. See the amendment under "Cross-platform inference".*
 - **Quantisation moves the calibration.** A threshold fitted on BF16 does not transfer to
   Q4_K_M. Pin one quantisation across hosts, or calibrate per host and say so.
 - **The advisory posture is not a formality.** It is what keeps a probabilistic component out

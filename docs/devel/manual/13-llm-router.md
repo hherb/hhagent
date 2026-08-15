@@ -60,7 +60,7 @@ The router is configured from environment variables (see `config.rs`):
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `KASTELLAN_LLM_LOCAL_URL` | `http://127.0.0.1:8000/v1` (Linux), `http://127.0.0.1:11434/v1` (macOS) | OpenAI-compatible base URL |
+| `KASTELLAN_LLM_LOCAL_URL` | `http://127.0.0.1:8000/v1` — vLLM/SGLang on Linux, oMLX on macOS | OpenAI-compatible base URL |
 | `KASTELLAN_LLM_LOCAL_MODEL` | `""` | Model name to pass in the request body |
 | Frontier vars (Phase 5) | — | Endpoint + secret-store key; gated by `PolicyGate` |
 
