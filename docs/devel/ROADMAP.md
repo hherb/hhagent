@@ -464,7 +464,18 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   warned about. **Resolution: the guard model targets llama.cpp on macOS** — the designated fallback runtime,
   reported to serve logprobs *and* Shieldstral's multimodal half (which the previously-planned Ollama route
   would not have), so the confidence-band design stays cross-platform and no Linux-only security behaviour is
-  introduced. Confirming that is the rewritten measurement 1. **Explicitly deferred:** do not add a
+  introduced. **Measurement 1 RUN the same day — PASS, the go/no-go is cleared.** llama.cpp (build 9910) with
+  `Shieldstral-1.0-3B` Q4_K_M + `mmproj-F16` returns 20 logprob alternatives with both `yes` and `no` present
+  on every call, scores **14/14** on a labelled smoke set at τ=0.5 with a **+0.796 margin** and 14 distinct
+  scores (so banding is mechanically possible), at **p50 40 ms** on a quiet Mac; multimodal confirmed
+  (injection rendered into a PNG → 0.997). Harness `scripts/eval/run-shieldstral-llamacpp.sh`.
+  **The load-bearing finding is not the pass — it is that the policy prompt decides the outcome.** Identical
+  weights and documents scored 11/14 with a *negative* margin (a textbook indirect injection at 0.0038,
+  confidently safe) until `<Instruct>` named the candidate classes as the model card instructs. Read wrong,
+  that run was a no-go about the model rather than about the prompt. The `<Instruct>` block is therefore a
+  **tuned artefact under version control with its measurements**, and measurement 3 must re-run whenever it
+  changes. Numbers are Q4_K_M and do not transfer to a DGX BF16 leg; ≥100-example calibration (measurement 3)
+  and the OOD false-negative rate remain open. **Explicitly deferred:** do not add a
   `guard_url`/`guard_model` seam to `RouterConfig` yet — a second endpoint is needed only while oMLX lacks
   logprobs, and the seam becomes dead code in the sole core-side LLM egress the moment it gains them.
   First slice is the injection-guard `Review` tier (escalate-up only), *not* a plan-review
