@@ -126,6 +126,20 @@ async fn main() -> Result<()> {
     // LLM router (existing skeleton).
     let router_cfg = kastellan_llm_router::RouterConfig::from_env()
         .map_err(|e| anyhow!("RouterConfig::from_env: {e}"))?;
+    // Log what was actually resolved, once. A misconfigured endpoint surfaces
+    // much later as a bare `Transport("error sending request")` at the first
+    // plan, and the single most useful fact then is what the daemon was
+    // dialling — which is otherwise nowhere in the logs. Values only, no
+    // secrets: the frontier API key is fetched at dispatch time, not here.
+    info!(
+        local_url = %router_cfg.local_url,
+        local_model = %router_cfg.local_model,
+        embedding_url = %router_cfg.embedding_url,
+        embedding_model = %router_cfg.embedding_model,
+        timeout_ms = router_cfg.timeout.as_millis() as u64,
+        disable_thinking = router_cfg.disable_thinking,
+        "llm router configured"
+    );
     let router = Arc::new(
         kastellan_llm_router::Router::new(router_cfg)
             .map_err(|e| anyhow!("Router::new: {e}"))?,

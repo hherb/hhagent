@@ -121,6 +121,25 @@ jobs:
       - name: cargo test (python-exec — signal death is an error, #539)
         run: cargo test -p kastellan-worker-python-exec --locked
 
+      # The per-OS install defaults + the router's default local URL. Same
+      # argument as every step above, with one twist that makes it sharper:
+      # these modules encode BOTH platforms' values, but only one `cfg!` arm
+      # compiles per host — so before #568 pinned the values in `const`s, a
+      # mutation of any macOS default passed GitHub CI *and* the DGX leg, and
+      # was killed only by the operator remembering to run the Mac leg. The
+      # values are now assertable from either host; these steps make that
+      # assertion actually run on every pull request.
+      #
+      # Module-scoped rather than whole-crate: both crates' wider suites need
+      # Postgres (`kastellan-core`) or are covered by the DGX run. These two
+      # paths are pure functions plus `ENV_LOCK`-scoped env reads — no PG, no
+      # bwrap, no network.
+      - name: cargo test (llm-router config — default local URL pin)
+        run: "cargo test -p kastellan-llm-router --lib config:: --locked"
+
+      - name: cargo test (core install plan — per-OS defaults, #568)
+        run: "cargo test -p kastellan-core --lib install::plan:: --locked"
+
   # The Matrix worker's live SDK path (`workers/matrix/src/sdk_live.rs`) is
   # behind the optional `live-matrix` feature (`dep:matrix-sdk`). The `check`
   # job above builds the default `--workspace`, which deliberately excludes that

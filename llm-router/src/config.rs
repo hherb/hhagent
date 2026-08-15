@@ -3,22 +3,25 @@
 //!
 //! The config is populated from environment variables (test-friendly
 //! seam, same shape as `KASTELLAN_DATA_DIR` / `KASTELLAN_STATE_DIR` in
-//! `core`) with a per-OS default for the local backend so a fresh
-//! checkout works without any setup on a machine that has the
-//! expected runtime installed:
+//! `core`) with a default local-backend URL — per *host runtime* by
+//! contract, one value on every OS today — so a fresh checkout works
+//! without any setup on a machine that has the expected runtime
+//! installed:
 //!
 //! * **Linux:** `http://127.0.0.1:8000/v1` — the default vLLM /
 //!   SGLang OpenAI-compat port.
-//! * **macOS:** `http://127.0.0.1:11434/v1` — the default Ollama
-//!   port. Ollama is the most common local-LLM runtime on macOS;
-//!   llama.cpp's `--api` server lives on a user-chosen port and
-//!   so doesn't have a sane default.
+//! * **macOS:** `http://127.0.0.1:8000/v1` — the default oMLX port.
+//!   oMLX serves MLX-quantised models through the same
+//!   OpenAI-compatible surface and is materially faster than Ollama
+//!   on Apple silicon, the gap widening with model size. Ollama
+//!   (`:11434`) and llama.cpp's `--api` server remain supported —
+//!   set `KASTELLAN_LLM_LOCAL_URL`.
 //!
 //! ## Environment variables
 //!
 //! | Var | Purpose | Default |
 //! | --- | --- | --- |
-//! | `KASTELLAN_LLM_LOCAL_URL` | Base URL of the local backend (no trailing `/`) | per-OS, see above |
+//! | `KASTELLAN_LLM_LOCAL_URL` | Base URL of the local backend (no trailing `/`) | `http://127.0.0.1:8000/v1`, see above |
 //! | `KASTELLAN_LLM_LOCAL_MODEL` | Default model name passed to the local backend | `local-default` |
 //! | `KASTELLAN_LLM_EMBEDDING_URL` | Base URL of the embedding backend | falls back to local URL |
 //! | `KASTELLAN_LLM_EMBEDDING_MODEL` | Default model name passed to the embedding backend | `embedding-default` |
@@ -73,23 +76,28 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = "embedding-default";
 /// override with `KASTELLAN_LLM_TIMEOUT_MS`.
 pub const DEFAULT_TIMEOUT_MS: u64 = 180_000;
 
-/// Per-OS default base URL for the local backend.
+/// Default base URL for the local backend — per host runtime by contract,
+/// one value on every OS today.
 ///
 /// Pure function (no env reads, no I/O). Returned as `&'static str`
 /// so it composes into [`RouterConfig::default`] without an
-/// allocation. Linux gets the vLLM/SGLang port; macOS gets Ollama.
+/// allocation.
+///
+/// **Every OS currently resolves to the same value**, because the
+/// default runtimes happen to agree on the port: vLLM/SGLang on Linux,
+/// oMLX on macOS, and `:8000` as the least-bad guess elsewhere (better
+/// to point at *something* than to require an env var — an unsupported
+/// host then fails fast with connection-refused, which is the right
+/// signal). It was per-OS while macOS defaulted to Ollama's `:11434`;
+/// git history has the migration, this comment does not need to.
+///
+/// The function is kept — rather than inlined to a constant — because
+/// the *contract* is "whatever this host's default local runtime
+/// listens on", and that is what callers depend on. It is the seam
+/// where a future divergence goes; a `cfg!` chain whose arms all agree
+/// is not (clippy's `if_same_then_else` rejects it, correctly).
 pub fn default_local_url_for_os() -> &'static str {
-    if cfg!(target_os = "linux") {
-        "http://127.0.0.1:8000/v1"
-    } else if cfg!(target_os = "macos") {
-        "http://127.0.0.1:11434/v1"
-    } else {
-        // Other Unixes: pick the vLLM/SGLang port. Better to point at
-        // *something* than to require an env var; the smoke test on
-        // an unsupported host will fail fast with a connection-refused
-        // error, which is the right signal.
-        "http://127.0.0.1:8000/v1"
-    }
+    "http://127.0.0.1:8000/v1"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,8 +105,8 @@ pub struct RouterConfig {
     pub local_url: String,
     pub local_model: String,
     /// Base URL for the embedding backend. Defaults to `local_url`
-    /// so a single OpenAI-compat server (Ollama, vLLM with both chat
-    /// and embed loaded) works without setting two env vars.
+    /// so a single OpenAI-compat server (oMLX, Ollama, or vLLM with
+    /// both chat and embed loaded) works without setting two env vars.
     pub embedding_url: String,
     /// Default model name passed in the `model` field of
     /// `POST /embeddings`. Defaults to `"embedding-default"` — a
@@ -273,18 +281,25 @@ mod tests {
         ])
     }
 
+    /// Pin the default URL so a port change is deliberate.
+    ///
+    /// Deliberately **not** a `cfg!` chain, and the reason is stronger
+    /// than "the arms would be duplicates": `default_local_url_for_os`
+    /// now contains no conditional compilation at all, so a run on any
+    /// single host proves the value for *every* target. A `cfg!` chain
+    /// here would assert less, not more — on a given host two of its
+    /// three arms are dead code.
+    ///
+    /// Should a host's runtime diverge again, the `cfg!` split belongs
+    /// here *and* in the function together. Note that nothing mechanical
+    /// enforces that pairing: this crate's tests do not run in CI (see
+    /// `.github/workflows/linux-check.yml`), so a macOS-only arm added to
+    /// one side would pass the Linux gate untouched. Pin both platforms'
+    /// values through `const`s if that day comes — the pattern is
+    /// `install::plan::both_platform_default_sets_are_pinned_and_paired`.
     #[test]
-    fn default_local_url_resolves_per_os() {
-        // Pure function — no env. Pin the per-OS strings so a
-        // refactor that swaps ports does so deliberately.
-        let url = default_local_url_for_os();
-        if cfg!(target_os = "linux") {
-            assert_eq!(url, "http://127.0.0.1:8000/v1");
-        } else if cfg!(target_os = "macos") {
-            assert_eq!(url, "http://127.0.0.1:11434/v1");
-        } else {
-            assert_eq!(url, "http://127.0.0.1:8000/v1");
-        }
+    fn default_local_url_is_port_8000_on_every_os() {
+        assert_eq!(default_local_url_for_os(), "http://127.0.0.1:8000/v1");
     }
 
     #[test]
@@ -445,8 +460,8 @@ mod tests {
     #[test]
     fn router_config_default_embedding_url_falls_back_to_local_url() {
         // No env vars touched here; the constructor default uses the
-        // per-OS default for *both* local_url and embedding_url so a
-        // Ollama-on-macOS deployment works with one URL set.
+        // per-OS default for *both* local_url and embedding_url so an
+        // oMLX-on-macOS deployment works with one URL set.
         let cfg = RouterConfig::default();
         assert_eq!(cfg.embedding_url, cfg.local_url);
     }
@@ -499,7 +514,7 @@ mod tests {
     fn router_config_from_env_local_url_drives_embedding_url_when_embedding_unset() {
         // The fallback path: with only LOCAL_URL set, embedding_url
         // resolves to the same value (the load-bearing semantic that
-        // makes Ollama-on-macOS work with one env var set).
+        // makes oMLX-on-macOS work with one env var set).
         let _lock = ENV_LOCK.lock().unwrap();
         let _scope = EnvScope::new(&[
             ("KASTELLAN_LLM_LOCAL_URL", Some("http://local:8080/v1")),

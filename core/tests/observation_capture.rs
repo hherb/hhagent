@@ -72,7 +72,14 @@ const CAT_PATH: &str = "/usr/bin/cat";
 #[cfg(target_os = "macos")]
 const CAT_PATH: &str = "/bin/cat";
 
-const DEFAULT_LLM_MODEL: &str = "gemma4:26b-a4b-it-q8_0";
+/// Fallback chat model when `KASTELLAN_LLM_LOCAL_MODEL` is unset.
+///
+/// Tracks the installer's per-OS default rather than hardcoding the Ollama
+/// tag: an operator running this on a Mac gets the MLX repo id their oMLX
+/// server actually serves, not a tag it has never heard of.
+fn default_llm_model() -> &'static str {
+    kastellan_core::install::plan::default_llm_model()
+}
 
 /// Default per-fixture wall-clock budget. Sized to allow up to the
 /// fast-lane plan cap on a moderately fast local model; reasoning-heavy or
@@ -497,11 +504,12 @@ async fn capture_all_fixtures_against_live_llm() {
     let llm_base_url = std::env::var("KASTELLAN_LLM_LOCAL_URL").unwrap_or_else(|_| {
         panic!(
             "KASTELLAN_LLM_LOCAL_URL is required; set it to your local LLM \
-             OpenAI-compat base URL (e.g. http://127.0.0.1:11434/v1)"
+             OpenAI-compat base URL (macOS/oMLX: http://127.0.0.1:8000/v1, \
+             Linux/Ollama: http://127.0.0.1:11434/v1)"
         )
     });
     let llm_model = std::env::var("KASTELLAN_LLM_LOCAL_MODEL")
-        .unwrap_or_else(|_| DEFAULT_LLM_MODEL.to_string());
+        .unwrap_or_else(|_| default_llm_model().to_string());
     if let Err(why) = check_llm_reachable(&llm_base_url) {
         panic!(
             "LLM at {} unreachable: {}. Start your local LLM before running this test.",

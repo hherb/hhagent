@@ -10,11 +10,12 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use kastellan_supervisor::default_supervisor;
+use kastellan_supervisor::{default_supervisor, ServiceStatus, Supervisor};
 
 use super::plan::{
     build_specs, cli_path_precedence_note, estimate_model_bytes, is_local_ollama, memory_suffices,
-    optional_binaries, render_env_file, required_binaries, InstallArgs, Layout,
+    optional_binaries, render_env_file, required_binaries, required_memory_bytes, InstallArgs,
+    Layout,
 };
 use crate::install::env_diff::EnvDiff;
 
@@ -37,6 +38,34 @@ pub(crate) const OVERLAY_APPLY_HINT: &str =
 #[cfg(not(target_os = "macos"))]
 pub(crate) const OVERLAY_APPLY_HINT: &str =
     "then `systemctl --user restart kastellan-core` to pick them up";
+
+/// What the supervisor backend calls the things it just installed.
+#[cfg(target_os = "macos")]
+pub(crate) const UNIT_NOUN: &str = "launchd agents";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const UNIT_NOUN: &str = "systemd units";
+
+/// How the operator starts the target by hand after `--no-start`.
+#[cfg(target_os = "macos")]
+pub(crate) const START_TARGET_HINT: &str = "launchctl kickstart gui/$UID/kastellan-core";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const START_TARGET_HINT: &str = "systemctl --user start kastellan.target";
+
+/// How the operator inspects a running (or failed) install.
+///
+/// Both backends redirect the daemon's stdout/stderr into `log_dir`, so the
+/// files are the portable half and come first; the service-manager command
+/// differs and must not name a binary the host does not have — advising
+/// `journalctl` on macOS is exactly the kind of dead-end this const exists to
+/// prevent.
+#[cfg(target_os = "macos")]
+pub(crate) const INSPECT_LOGS_HINT: &str =
+    "~/.local/state/kastellan/kastellan-core.err (and -postgres.err), \
+     or `launchctl print gui/$UID/kastellan-core`";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const INSPECT_LOGS_HINT: &str =
+    "~/.local/state/kastellan/kastellan-core.err (and -postgres.err), \
+     or `journalctl --user -u kastellan-core -n 50`";
 
 /// Build the operator-facing warning for a destructive env-file rewrite.
 ///
@@ -239,17 +268,14 @@ pub fn run_install(args: InstallArgs) -> Result<(), String> {
     // Assets source = the repo (cwd) prompts/ + seeds/.
     let assets_src = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
 
-    // Ensure the chat + embedding models are present (local Ollama: pull if
-    // missing, after a memory-fit check). Fail-closed if a model won't fit;
-    // a no-op note for non-Ollama endpoints. Done before any filesystem change
-    // so a too-big model aborts cleanly. Skipped under `--no-start`: that mode
-    // only lays down artifacts, so it shouldn't trigger a (potentially multi-GB)
-    // `ollama pull` for a target the operator isn't bringing up yet.
-    if !args.no_start {
-        ensure_ollama_model(&args.llm_url, &args.llm_model)?;
-        if let Some(em) = &args.embedding_model {
-            ensure_ollama_model(&args.llm_url, em)?;
-        }
+    // Ensure the chat + embedding models will fit and are available. Runs
+    // before any filesystem change so a too-big model aborts cleanly. The
+    // memory-fit half runs unconditionally — including under `--no-start`,
+    // which still bakes the model name into `kastellan.env` — while only the
+    // (potentially multi-GB) `ollama pull` is gated on actually starting.
+    ensure_model_available(&args.llm_url, &args.llm_model, !args.no_start)?;
+    if let Some(em) = &args.embedding_model {
+        ensure_model_available(&args.llm_url, em, !args.no_start)?;
     }
 
     let copied = prepare_filesystem(&layout, &from, &assets_src, &args)?;
@@ -287,10 +313,10 @@ pub fn run_install(args: InstallArgs) -> Result<(), String> {
 
     let sup = default_supervisor();
     sup.install_target(&specs.target, &specs.members).map_err(|e| format!("install units: {e}"))?;
-    eprintln!("installed systemd units for kastellan.target");
+    eprintln!("installed {UNIT_NOUN} for kastellan.target");
 
     if args.no_start {
-        eprintln!("--no-start: units installed but not started. Start with: systemctl --user start kastellan.target");
+        eprintln!("--no-start: units installed but not started. Start with: {START_TARGET_HINT}");
         // The units ARE enabled (`install_target` did that, #508), but this
         // early return skips the linger call below — so on a headless host
         // the per-user manager still won't be running at boot to act on it.
@@ -333,8 +359,8 @@ pub fn run_install(args: InstallArgs) -> Result<(), String> {
     // On a fresh install nothing is running, so the stop is a harmless no-op.
     let _ = sup.stop_target(&specs.target);
     sup.start_target(&specs.target).map_err(|e| format!("start kastellan.target: {e}"))?;
-    verify_running(&layout)?;
-    eprintln!("kastellan.target is up. Check: systemctl --user status kastellan.target");
+    verify_running(sup.as_ref(), &layout)?;
+    eprintln!("kastellan.target is up. Inspect: {INSPECT_LOGS_HINT}");
     Ok(())
 }
 
@@ -387,17 +413,33 @@ pub fn run_uninstall(purge: bool) -> Result<(), String> {
 /// `Restart=on-failure` backoff) before the cluster accepts connections — this
 /// poll gives the target time to converge rather than failing on the first
 /// not-yet-active read.
-fn verify_running(layout: &Layout) -> Result<(), String> {
+///
+/// Queries through the [`Supervisor`] trait rather than shelling to
+/// `systemctl` directly. The old direct call was Linux-only and mapped *"I
+/// could not run the query"* onto the state `"unknown"` — two different facts
+/// the caller could not tell apart. On macOS, where the backend is launchd and
+/// `systemctl` does not exist, that made every install spin the full 90 s and
+/// then fail with `postgres=unknown, core=unknown` plus a `journalctl` hint,
+/// about services that may well have been running fine.
+fn verify_running(sup: &dyn Supervisor, layout: &Layout) -> Result<(), String> {
     let socket = layout.data_dir.join("sockets/.s.PGSQL.5432");
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut last = String::new();
     while Instant::now() < deadline {
-        let pg = service_state("kastellan-postgres");
-        let core = service_state("kastellan-core");
-        if socket.exists() && pg == "active" && core == "active" {
+        // A supervisor ERROR is not a service state — it means the query
+        // itself cannot succeed (no launchd user domain, unspawnable
+        // systemctl). Polling that for 90 s is not patience, it is a hidden
+        // hard failure, so fail immediately and say which query broke.
+        let pg = sup
+            .status("kastellan-postgres")
+            .map_err(|e| format!("cannot query kastellan-postgres via the service manager: {e}"))?;
+        let core = sup
+            .status("kastellan-core")
+            .map_err(|e| format!("cannot query kastellan-core via the service manager: {e}"))?;
+        if socket.exists() && pg == ServiceStatus::Active && core == ServiceStatus::Active {
             return Ok(());
         }
-        last = format!("postgres={pg}, core={core}, socket={}", socket.exists());
+        last = format!("postgres={pg:?}, core={core:?}, socket={}", socket.exists());
         std::thread::sleep(Duration::from_secs(2));
     }
     // A cluster created by an older install (superuser != $USER) yields a role
@@ -414,19 +456,9 @@ fn verify_running(layout: &Layout) -> Result<(), String> {
         ));
     }
     Err(format!(
-        "kastellan.target did not become healthy within 90s ({last}). \
-         Inspect: journalctl --user -u kastellan-core -n 50 (and -u kastellan-postgres)",
+        "kastellan.target did not become healthy within 90s ({last}). Inspect: {}",
+        INSPECT_LOGS_HINT,
     ))
-}
-
-/// `systemctl --user is-active <svc>` → trimmed state (e.g. "active",
-/// "activating", "failed", "inactive"); "unknown" if the command can't run.
-fn service_state(svc: &str) -> String {
-    Command::new("systemctl")
-        .args(["--user", "is-active", svc])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// Unique staging path beside `dest`, for a replace-by-rename.
@@ -571,14 +603,66 @@ fn run_checked(cmd: &mut Command, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Ensure `model` is available for a *local Ollama* endpoint: if it isn't
-/// pulled, check it will fit in memory, then `ollama pull` it. No-op (with a
-/// note) for non-Ollama endpoints or when the `ollama` CLI isn't installed —
-/// the model is then the operator's responsibility to serve. Fail-closed when
-/// a model clearly won't fit.
-fn ensure_ollama_model(url: &str, model: &str) -> Result<(), String> {
+/// Fail-closed memory-fit guard for `model` on *this* host.
+///
+/// Deliberately independent of the backend. A model's footprint is a property
+/// of `(model, host)`, not of the mechanism that fetches it — this check used
+/// to sit *below* the `is_local_ollama` branch in [`ensure_model_available`],
+/// so when macOS moved to oMLX (never a local-Ollama endpoint) the default
+/// macOS install silently stopped being checked at all. The macOS default is a
+/// 27B 8-bit model needing ~34 GiB by this rule; on a 16/24/32 GB Mac the
+/// install used to complete cleanly and hand the operator a daemon that dies
+/// at its first plan.
+///
+/// Approximate by design — embedding models carry no `<n>b` token and are
+/// skipped rather than guessed at.
+fn check_model_fits(model: &str) -> Result<(), String> {
+    let (Some(est), Some(total)) = (estimate_model_bytes(model), total_system_memory_bytes())
+    else {
+        return Ok(());
+    };
+    if memory_suffices(est, total) {
+        return Ok(());
+    }
+    // Quote the number actually compared against, not the bare weight
+    // estimate: "needs ~25 GiB but the host has ~32 GiB" reads as a
+    // contradiction, because the 20% headroom + 2 GiB reserve is invisible.
+    Err(format!(
+        "model {model} needs ~{} GiB of RAM (weights ~{} GiB + 20% headroom + 2 GiB OS reserve) \
+         but this host has ~{} GiB total. Choose a smaller model with --llm-model{}, or serve it \
+         from another host with --llm-url + --llm-model.",
+        required_memory_bytes(est) >> 30,
+        est >> 30,
+        total >> 30,
+        if cfg!(target_os = "macos") { " (an MLX repo id — e.g. a -4bit or smaller-B variant)" } else { "" },
+    ))
+}
+
+/// Ensure `model` is available to serve at `url`.
+///
+/// Order matters and is the point of this function: the memory-fit guard runs
+/// **first, for every backend**, and only the *fetch* is Ollama-specific. For
+/// a local Ollama endpoint the installer pulls a missing model; for anything
+/// else — oMLX, vLLM, llama.cpp — it cannot, and says so with the remedy
+/// rather than merely reporting that nothing happened.
+///
+/// `may_fetch` is false under `--no-start`: that mode only lays down
+/// artifacts, so it should not trigger a multi-GB pull for a target the
+/// operator is not bringing up. The fit check still runs — `--no-start` writes
+/// the model name into `kastellan.env` all the same, so a model that cannot
+/// fit is just as wrong there, and checking costs nothing.
+fn ensure_model_available(url: &str, model: &str, may_fetch: bool) -> Result<(), String> {
+    check_model_fits(model)?;
     if !is_local_ollama(url) {
-        eprintln!("note: {url} is not a local Ollama endpoint — ensure model {model:?} is served there");
+        // Worded for the operator's mental model, not the code's: on macOS
+        // the default backend is oMLX, and a note about *Ollama* reads as an
+        // aside about someone else's setup. This line is the only notice a
+        // macOS operator gets that the installer cannot fetch for them.
+        eprintln!(
+            "note: the installer cannot fetch models for {url} (not a local Ollama endpoint). \
+             Load {model:?} into that server yourself before starting — on macOS that is oMLX's \
+             own admin UI."
+        );
         return Ok(());
     }
     if Command::new("ollama").arg("--version").output().is_err() {
@@ -590,21 +674,15 @@ fn ensure_ollama_model(url: &str, model: &str) -> Result<(), String> {
             eprintln!("model {model} already present");
             return Ok(());
         }
-        Ok(false) => {} // fall through to memory-check + pull
+        Ok(false) => {} // fall through to pull
         Err(e) => {
             eprintln!("note: could not query Ollama ({e}) — ensure model {model:?} is pulled at {url}");
             return Ok(());
         }
     }
-    // Memory-fit guard (approximate; embedding models have no `<n>b` size and skip).
-    if let (Some(est), Some(total)) = (estimate_model_bytes(model), total_system_memory_bytes()) {
-        if !memory_suffices(est, total) {
-            return Err(format!(
-                "model {model} needs ~{} GiB but the system has ~{} GiB total — choose a smaller model (--llm-model) or free memory",
-                est >> 30,
-                total >> 30
-            ));
-        }
+    if !may_fetch {
+        eprintln!("--no-start: skipping `ollama pull {model}` — pull it before starting the target");
+        return Ok(());
     }
     eprintln!("pulling {model} via ollama (this can take a while)...");
     let status = Command::new("ollama")

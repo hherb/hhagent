@@ -125,17 +125,45 @@ out of the box.
 
 Kastellan talks to an OpenAI-style local model server — you tell it where
 that server is and which model to use. The one-command install (Step 5)
-**defaults to a local Ollama** at `http://127.0.0.1:11434` and pulls its
-default models for you (after checking they'll fit in memory), so if that
-describes your setup you can skip ahead. Otherwise, pass the details to the
-installer:
+defaults to a different server per platform:
+
+| Platform | Default server | Default chat model | Default embedding model | RAM the default chat model needs |
+|---|---|---|---|---|
+| **macOS** | oMLX, `http://127.0.0.1:8000` | `Qwen3.8-27B-8bit` | `embeddinggemma-300m-bf16` | **~33 GiB** |
+| **Linux** | Ollama, `http://127.0.0.1:11434` | `gemma4:26b-a4b-it-q8_0` | `embeddinggemma` | **~32 GiB** |
+
+Neither server ships with Kastellan. On macOS, install
+[oMLX](https://github.com/madroidmaq/omlx) and start it on `:8000`; on Linux,
+install [Ollama](https://ollama.com).
+
+On **Linux** the installer pulls the default models for you. On **macOS** it
+cannot — oMLX manages its own model library, so add the two models from oMLX's
+admin UI first; the installer prints a note rather than attempting a download
+it has no way to perform. (`--no-start` skips the pull on both, since it only
+lays down files without bringing anything up.)
+
+The **memory check runs on every platform** and is fail-closed: if the model
+you asked for cannot fit in this machine's RAM, the install stops and tells
+you what it needs rather than handing you a system that dies at its first
+task. The last column above is what the defaults ask for — on a smaller
+machine, choose a smaller model:
 
 ```sh
-kastellan-cli install --llm-url "http://127.0.0.1:8000" --llm-model "<your-model-name>"
+# macOS: an MLX repo id — a -4bit variant, or fewer parameters
+kastellan-cli install --llm-url "http://127.0.0.1:8000" --llm-model "Qwen3.8-27B-4bit"
+
+# Linux: an Ollama registry tag
+kastellan-cli install --llm-url "http://127.0.0.1:11434" --llm-model "gemma4:9b"
 ```
 
-On a Linux GPU host running vLLM or SGLang, the model server usually listens
-on port `8000`; on macOS with Ollama it is `11434`. You can change these at
+Model names are **not** interchangeable between the two: oMLX takes MLX repo
+ids (`Qwen3.8-27B-8bit`), Ollama takes registry tags (`gemma4:26b-a4b-it-q8_0`).
+Because of that, `--llm-url` **must** be given together with `--llm-model` —
+passing the URL alone is rejected, rather than silently pairing your endpoint
+with a model name it has never heard of.
+
+On a Linux GPU host running vLLM or SGLang, the model server also listens
+on port `8000`. You can change these at
 any time by putting them in `~/.config/kastellan/kastellan.env.local` and
 restarting the service — **not** in `kastellan.env`, which the installer
 regenerates from these flags on every run. See
