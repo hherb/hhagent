@@ -9,6 +9,7 @@ use kastellan_protocol::{codes, server::Handler, RpcError};
 
 use crate::client::{MailClient, MailError};
 use crate::ids::{self, LocalmailId};
+use crate::problem;
 use crate::sort;
 
 pub struct MailHandler {
@@ -228,8 +229,15 @@ fn mail_err_to_rpc(e: MailError) -> RpcError {
             codes::POLICY_DENIED,
             "localmail auth/permission denied (check token / account ACL)".to_string(),
         ),
+        // localmail reports a caller error as problem+json, where only `detail`
+        // is written for the caller. Forwarding the whole envelope spent 91 of
+        // the planner's 200-char budget on `type`/`title`/`status` and pushed
+        // the sort/cursor advice 7 chars over the clamp, truncating it mid-word
+        // — measured live, see `problem`. Fall back to the raw body for
+        // anything that is not problem+json.
         MailError::Upstream { status, body } => {
-            RpcError::new(codes::OPERATION_FAILED, format!("localmail {status}: {body}"))
+            let shown = problem::problem_detail(&body).unwrap_or(body);
+            RpcError::new(codes::OPERATION_FAILED, format!("localmail {status}: {shown}"))
         }
         MailError::Transport(m) => {
             RpcError::new(codes::OPERATION_FAILED, format!("transport: {m}"))
@@ -401,6 +409,43 @@ mod tests {
         let out = h.call("mail.search", serde_json::json!({"query": "q", "sort": "date"})).unwrap();
         let note = out[sort::ORDERING_KEY].as_str().expect("no ordering note");
         assert!(note.contains("newest first"), "{note}");
+    }
+
+    /// A localmail problem+json refusal, reproduced from the wire.
+    struct Problem400;
+    impl HttpGet for Problem400 {
+        fn get(&self, _: &Url) -> Result<RawResponse, String> { unreachable!() }
+        fn transport_kind(&self) -> &'static str { "fake" }
+        fn post_authed(&self, _: &Url, _: &str, _: &str, _: &[u8], _m: usize) -> Result<RawResponse, String> {
+            Ok(RawResponse {
+                status: 400,
+                location: None,
+                content_type: "application/problem+json".into(),
+                body: br#"{"type": "/problems/validation-failed", "title": "Validation failed", "status": 400, "detail": "cursor: this cursor continues a date-sorted search; pass sort='date' or omit sort (got 'rank')"}"#.to_vec(),
+            })
+        }
+    }
+
+    /// The end of the chain the `problem` module exists for: a refusal must
+    /// reach the planner as localmail's sentence, not as an envelope that
+    /// spends the budget on `type`/`title`/`status` and truncates the advice.
+    #[test]
+    fn an_upstream_problem_json_surfaces_its_detail_not_the_envelope() {
+        let mut h = MailHandler::with_client(client_with(Box::new(Problem400)));
+        let err = h
+            .call("mail.search", serde_json::json!({"query": "q", "sort": "rank", "cursor": "K|abc"}))
+            .unwrap_err();
+        assert_eq!(err.code, codes::OPERATION_FAILED);
+        assert!(err.message.contains("pass sort='date'"), "{}", err.message);
+        assert!(
+            !err.message.contains("validation-failed"),
+            "the envelope must not reach the planner: {}",
+            err.message
+        );
+        // The whole sentence has to fit, tail included — that is the guarantee.
+        let seen: String =
+            err.message.chars().take(kastellan_protocol::STEP_ERR_DETAIL_MAX).collect();
+        assert!(seen.contains("(got 'rank')"), "clamped to: {seen:?}");
     }
 
     /// #561: paging without a named sort must send **no** `sort` field, so the
