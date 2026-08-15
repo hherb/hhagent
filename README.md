@@ -321,10 +321,12 @@ per-user Kastellan** — Postgres + the agent daemon under `systemd --user`
 
 Prerequisites: PostgreSQL 18 (Linux: PGDG apt — `scripts/linux/install-postgres.sh`;
 macOS: Postgres.app or Homebrew, pass `--pg-bin-dir`), and an LLM endpoint. The
-default endpoint is per-platform: **oMLX** at `http://127.0.0.1:8000` on macOS,
-**Ollama** at `http://127.0.0.1:11434` on Linux — where the default models are
-also pulled automatically if missing (after a memory-fit check). oMLX manages
-its own model library, so on macOS install the models there first.
+default endpoint is per-platform: **oMLX** at `http://127.0.0.1:8000` on macOS
+([install it separately](https://github.com/madroidmaq/omlx)), **Ollama** at
+`http://127.0.0.1:11434` on Linux — where the default models are also pulled
+automatically if missing (`--no-start` skips the pull). oMLX manages its own
+model library, so on macOS install the models there first. A memory-fit check
+runs on every platform and refuses a model this host cannot hold.
 
 ```sh
 cargo build --release --workspace

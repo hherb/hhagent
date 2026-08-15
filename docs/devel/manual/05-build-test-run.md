@@ -106,8 +106,8 @@ The CLI for interacting with a running daemon:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `KASTELLAN_LLM_LOCAL_URL` | `http://127.0.0.1:8000/v1` (Linux) / `:11434/v1` (macOS) | Local LLM endpoint |
-| `KASTELLAN_LLM_LOCAL_MODEL` | `""` | Model name to pass to the local LLM |
+| `KASTELLAN_LLM_LOCAL_URL` | `http://127.0.0.1:8000/v1` — vLLM/SGLang on Linux, oMLX on macOS | Local LLM endpoint |
+| `KASTELLAN_LLM_LOCAL_MODEL` | `local-default` (a placeholder — set it) | Model name to pass to the local LLM |
 | `KASTELLAN_SHELL_ALLOWLIST` | `[]` | JSON array of allowed argv patterns (read by the shell-exec worker) |
 | `KASTELLAN_EGRESS_FORCE_ROUTING` | `1` (on) | Route `Net::Allowlist` workers through their per-worker egress proxy. Fail-closed. |
 | `KASTELLAN_WEB_SEARCH_ENDPOINT` | (unset) | SearxNG `/search` endpoint for the web-search worker |

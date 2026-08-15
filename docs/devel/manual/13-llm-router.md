@@ -61,7 +61,7 @@ The router is configured from environment variables (see `config.rs`):
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `KASTELLAN_LLM_LOCAL_URL` | `http://127.0.0.1:8000/v1` — vLLM/SGLang on Linux, oMLX on macOS | OpenAI-compatible base URL |
-| `KASTELLAN_LLM_LOCAL_MODEL` | `""` | Model name to pass in the request body |
+| `KASTELLAN_LLM_LOCAL_MODEL` | `local-default` (a placeholder every real deployment overrides) | Model name to pass in the request body |
 | Frontier vars (Phase 5) | — | Endpoint + secret-store key; gated by `PolicyGate` |
 
 Only `rustls-tls` and `json` features of `reqwest` are enabled

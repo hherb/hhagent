@@ -3,9 +3,10 @@
 //!
 //! The config is populated from environment variables (test-friendly
 //! seam, same shape as `KASTELLAN_DATA_DIR` / `KASTELLAN_STATE_DIR` in
-//! `core`) with a per-OS default for the local backend so a fresh
-//! checkout works without any setup on a machine that has the
-//! expected runtime installed:
+//! `core`) with a default local-backend URL — per *host runtime* by
+//! contract, one value on every OS today — so a fresh checkout works
+//! without any setup on a machine that has the expected runtime
+//! installed:
 //!
 //! * **Linux:** `http://127.0.0.1:8000/v1` — the default vLLM /
 //!   SGLang OpenAI-compat port.
@@ -20,7 +21,7 @@
 //!
 //! | Var | Purpose | Default |
 //! | --- | --- | --- |
-//! | `KASTELLAN_LLM_LOCAL_URL` | Base URL of the local backend (no trailing `/`) | per-OS, see above |
+//! | `KASTELLAN_LLM_LOCAL_URL` | Base URL of the local backend (no trailing `/`) | `http://127.0.0.1:8000/v1`, see above |
 //! | `KASTELLAN_LLM_LOCAL_MODEL` | Default model name passed to the local backend | `local-default` |
 //! | `KASTELLAN_LLM_EMBEDDING_URL` | Base URL of the embedding backend | falls back to local URL |
 //! | `KASTELLAN_LLM_EMBEDDING_MODEL` | Default model name passed to the embedding backend | `embedding-default` |
@@ -75,7 +76,8 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = "embedding-default";
 /// override with `KASTELLAN_LLM_TIMEOUT_MS`.
 pub const DEFAULT_TIMEOUT_MS: u64 = 180_000;
 
-/// Per-OS default base URL for the local backend.
+/// Default base URL for the local backend — per host runtime by contract,
+/// one value on every OS today.
 ///
 /// Pure function (no env reads, no I/O). Returned as `&'static str`
 /// so it composes into [`RouterConfig::default`] without an
@@ -86,8 +88,8 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 180_000;
 /// oMLX on macOS, and `:8000` as the least-bad guess elsewhere (better
 /// to point at *something* than to require an env var — an unsupported
 /// host then fails fast with connection-refused, which is the right
-/// signal). It was per-OS until 2026-08-15, when macOS moved off
-/// Ollama's `:11434`.
+/// signal). It was per-OS while macOS defaulted to Ollama's `:11434`;
+/// git history has the migration, this comment does not need to.
 ///
 /// The function is kept — rather than inlined to a constant — because
 /// the *contract* is "whatever this host's default local runtime
@@ -281,15 +283,20 @@ mod tests {
 
     /// Pin the default URL so a port change is deliberate.
     ///
-    /// Deliberately **not** a `cfg!` chain: every OS resolves to the
-    /// same value today, so per-OS arms would be three copies of one
-    /// assertion, two of which are vacuous on any given host. When a
-    /// host's runtime does diverge again, the `cfg!` split belongs here
-    /// *and* in `default_local_url_for_os` at the same time — which is
-    /// the property this shape makes hard to get half-right.
+    /// Deliberately **not** a `cfg!` chain, and the reason is stronger
+    /// than "the arms would be duplicates": `default_local_url_for_os`
+    /// now contains no conditional compilation at all, so a run on any
+    /// single host proves the value for *every* target. A `cfg!` chain
+    /// here would assert less, not more — on a given host two of its
+    /// three arms are dead code.
     ///
-    /// Note macOS ran on Ollama's `:11434` until 2026-08-15; the value
-    /// below is oMLX's.
+    /// Should a host's runtime diverge again, the `cfg!` split belongs
+    /// here *and* in the function together. Note that nothing mechanical
+    /// enforces that pairing: this crate's tests do not run in CI (see
+    /// `.github/workflows/linux-check.yml`), so a macOS-only arm added to
+    /// one side would pass the Linux gate untouched. Pin both platforms'
+    /// values through `const`s if that day comes — the pattern is
+    /// `install::plan::both_platform_default_sets_are_pinned_and_paired`.
     #[test]
     fn default_local_url_is_port_8000_on_every_os() {
         assert_eq!(default_local_url_for_os(), "http://127.0.0.1:8000/v1");

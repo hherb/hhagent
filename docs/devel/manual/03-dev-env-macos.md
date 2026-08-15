@@ -99,8 +99,18 @@ normal development.
 The scheduler integration tests that call `formulate_plan` need an LLM. On
 macOS the default is **oMLX** on `:8000` — it serves MLX-quantised models
 through the same OpenAI-compatible surface and is materially faster than
-Ollama on Apple silicon, the gap widening with model size. Install its
-models from oMLX's own admin UI, then:
+Ollama on Apple silicon, the gap widening with model size.
+
+oMLX is a separate application you install yourself (it is not fetched by
+Kastellan's installer, and it manages its own model library): get it from
+<https://github.com/madroidmaq/omlx>, start its server on `:8000`, then add
+the two models below from its admin UI.
+
+> **Memory:** `Qwen3.8-27B-8bit` is a 27-billion-parameter model at 8 bits —
+> ~29 GB of weights, and the installer's rule wants **~33 GiB** of unified
+> memory for it (weights + 20% headroom + a 2 GiB OS reserve). It does not fit
+> a 16, 24, or 32 GB Mac. Pick a smaller MLX repo id there — `Qwen3.8-27B-4bit`
+> needs ~18 GiB — and pass it as `KASTELLAN_LLM_LOCAL_MODEL`.
 
 ```sh
 export KASTELLAN_LLM_LOCAL_URL=http://127.0.0.1:8000/v1
@@ -108,8 +118,12 @@ export KASTELLAN_LLM_LOCAL_MODEL=Qwen3.8-27B-8bit
 export KASTELLAN_LLM_EMBEDDING_MODEL=embeddinggemma-300m-bf16
 ```
 
-These are the defaults, so an unset environment reaches the same place; set
-them explicitly when you want a different model.
+Only the **URL** here is a router default — leave it unset and you get the
+same value. The two model names are **not**: they are the *installer's*
+defaults, which reach the daemon through the generated `kastellan.env`, and a
+dev checkout running `cargo test` never loads that file. With them unset the
+router falls back to the placeholders `local-default` and `embedding-default`,
+which oMLX will reject. Export all three.
 
 ### The macOS fallback runtime: llama.cpp
 
@@ -132,9 +146,12 @@ cannot use oMLX. The live example is the Phase 5 model-based guard tier
 (Shieldstral), whose whole design rests on renormalising the `yes`/`no`
 logprobs into a confidence band — see
 [`docs/superpowers/specs/2026-08-13-shieldstral-guard-model-feasibility-study.md`](../../superpowers/specs/2026-08-13-shieldstral-guard-model-feasibility-study.md).
-llama.cpp is reported to cover both halves that model needs, logprobs and
-multimodal; that is the fallback's first real customer and the measurement
-that will confirm it.
+That is the fallback's first real customer, and it has been **measured**:
+llama.cpp returns 20 logprob alternatives with both `yes` and `no` present on
+every call, and covers the multimodal half too. Reproduce with
+`sh scripts/eval/run-shieldstral-llamacpp.sh` — the script's exit status is
+the measurement's verdict, so a re-run on other weights or a reworded policy
+prompt fails loudly rather than printing a table and exiting 0.
 
 Ollama also still works, and remains the Linux install default:
 

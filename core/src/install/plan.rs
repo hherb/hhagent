@@ -108,27 +108,48 @@ pub fn cli_path_precedence_note(path_var: &str, home: &Path) -> Option<String> {
     }
 }
 
+/// The installer's macOS default endpoint: oMLX. Materially faster than
+/// Ollama on Apple silicon, and the gap widens with model size.
+pub const MACOS_LLM_URL: &str = "http://127.0.0.1:8000";
+/// The installer's default endpoint everywhere else: Ollama — the one
+/// backend it can `ollama pull` into.
+pub const OLLAMA_LLM_URL: &str = "http://127.0.0.1:11434";
+/// macOS default chat model. An **MLX repo id**, not an Ollama tag.
+pub const MACOS_LLM_MODEL: &str = "Qwen3.8-27B-8bit";
+/// Default chat model everywhere else. An **Ollama tag**, not an MLX repo id.
+pub const OLLAMA_LLM_MODEL: &str = "gemma4:26b-a4b-it-q8_0";
+/// macOS default embedding model — embeddinggemma, MLX packaging.
+pub const MACOS_EMBED_MODEL: &str = "embeddinggemma-300m-bf16";
+/// Default embedding model everywhere else — embeddinggemma, Ollama packaging.
+pub const OLLAMA_EMBED_MODEL: &str = "embeddinggemma";
+
 /// The default local LLM URL, per OS. Pairs with the matching per-OS models
 /// ([`default_llm_model`]/[`default_embedding_model`]); override with
 /// `--llm-url` (and the matching `--llm-model`).
 ///
-/// * **macOS:** oMLX `:8000`. Materially faster than Ollama on Apple silicon,
-///   and the gap widens with model size. The installer cannot fetch models for
-///   it — see [`is_local_ollama`] and the note in `run::ensure_ollama_model`.
-/// * **Linux (and other Unixes):** Ollama `:11434` — the one backend the
-///   installer *can* `ollama pull` into.
+/// * **macOS:** oMLX [`MACOS_LLM_URL`]. The installer cannot fetch models for
+///   it — see [`is_local_ollama`], and the operator-facing `note:` that
+///   `run::ensure_model_available` prints for non-Ollama endpoints.
+/// * **Linux (and other Unixes):** Ollama [`OLLAMA_LLM_URL`].
+///
+/// The values live in `pub const`s rather than inline in the `cfg!` arms so
+/// that **both** platforms' defaults can be asserted on *either* host. An arm
+/// that a host does not compile is untestable there, and the only gate that
+/// runs `cargo test` for this crate is the operator's two-host run — so an
+/// inline macOS value was pinned by the Mac leg alone. See
+/// `both_platform_default_sets_are_pinned_and_paired`.
 ///
 /// Note this is the **installer's** default, which is not the same question as
 /// `llm_router::config::default_local_url_for_os` (the daemon's fallback when
-/// no `KASTELLAN_LLM_LOCAL_URL` is set at all). They differ on Linux on
-/// purpose: the installer writes an explicit URL into `kastellan.env` and
-/// targets the backend it can populate, while the router's bare default
-/// assumes the vLLM/SGLang deployment.
+/// no `KASTELLAN_LLM_LOCAL_URL` is set at all). They differ everywhere except
+/// macOS: the installer writes an explicit URL into `kastellan.env` and targets
+/// the backend it can populate, while the router's bare default is `:8000` on
+/// every host (see `default_local_url_for_os` for why).
 pub fn default_llm_url() -> &'static str {
     if cfg!(target_os = "macos") {
-        "http://127.0.0.1:8000"
+        MACOS_LLM_URL
     } else {
-        "http://127.0.0.1:11434"
+        OLLAMA_LLM_URL
     }
 }
 
@@ -549,6 +570,22 @@ pub fn parse_install_args(args: &[String]) -> Result<InstallArgs, String> {
             "--matrix-homeserver-url and --matrix-user must be given together".to_string(),
         );
     }
+    // A URL without a model silently pairs the operator's endpoint with the
+    // *default* model — and the two naming schemes are not interchangeable
+    // (oMLX takes MLX repo ids, Ollama takes registry tags). On macOS that
+    // combination is `ollama pull Qwen3.8-27B-8bit`, which can only ever
+    // fail; on Linux it is an Ollama tag handed to a server that has never
+    // heard of it. Reject it rather than let the default look deliberate.
+    // (Not the converse: `--llm-model` alone is a normal way to swap models
+    // on the default endpoint.)
+    if url.is_some() && model.is_none() {
+        return Err(format!(
+            "--llm-url without --llm-model: model names are not interchangeable between \
+             backends (oMLX takes MLX repo ids like {MACOS_LLM_MODEL}, Ollama takes registry \
+             tags like {OLLAMA_LLM_MODEL}), so the default model almost certainly does not \
+             exist on the endpoint you passed. Pass --llm-model (and --embedding-model) to match."
+        ));
+    }
     Ok(InstallArgs {
         llm_model: model.unwrap_or_else(|| default_llm_model().to_string()),
         llm_url: url.unwrap_or_else(|| default_llm_url().to_string()),
@@ -568,12 +605,13 @@ pub fn parse_install_args(args: &[String]) -> Result<InstallArgs, String> {
 /// The two naming schemes are not interchangeable, which is why this tracks
 /// [`default_llm_url`]: an Ollama tag means nothing to oMLX and an MLX repo id
 /// is not pullable by Ollama. Overriding one without the other is the mistake
-/// this pairing exists to prevent.
+/// this pairing exists to prevent — and `parse_install_args` *enforces* it, by
+/// rejecting a `--llm-url` given without a `--llm-model`.
 pub fn default_llm_model() -> &'static str {
     if cfg!(target_os = "macos") {
-        "Qwen3.8-27B-8bit"
+        MACOS_LLM_MODEL
     } else {
-        "gemma4:26b-a4b-it-q8_0"
+        OLLAMA_LLM_MODEL
     }
 }
 
@@ -586,9 +624,9 @@ pub fn default_llm_model() -> &'static str {
 /// so this pairing is a storage-compatibility constraint, not a preference.
 pub fn default_embedding_model() -> &'static str {
     if cfg!(target_os = "macos") {
-        "embeddinggemma-300m-bf16"
+        MACOS_EMBED_MODEL
     } else {
-        "embeddinggemma"
+        OLLAMA_EMBED_MODEL
     }
 }
 
@@ -648,16 +686,23 @@ pub fn parse_param_count(tag: &str) -> Option<u64> {
 pub fn estimate_model_bytes(tag: &str) -> Option<u64> {
     let params = parse_param_count(tag)?;
     let lower = tag.to_ascii_lowercase();
-    // bytes per parameter by quant family (q8≈1B, q6≈0.82, q5≈0.68, q4≈0.56,
-    // fp16/f16≈2B); default to ~1B (conservative) when unlabelled.
-    let bpp = if lower.contains("q8") {
+    // Bytes per parameter by quant family. Two spellings, because the two
+    // default backends name the same thing differently: Ollama tags say
+    // `q8_0`/`q4_K_M`, MLX repo ids say `-8bit`/`-4bit`. Both must be
+    // understood — an unrecognised MLX suffix silently fell through to the
+    // 1.0 default, which is right for 8-bit only by coincidence and 2× over
+    // for 4-bit (fail-closed, so it would wrongly REFUSE a model that fits).
+    // `bf16`/`fp16`/`f16` ≈ 2 B.
+    let bpp = if lower.contains("q8") || lower.contains("8bit") {
         1.06
-    } else if lower.contains("q6") {
+    } else if lower.contains("q6") || lower.contains("6bit") {
         0.82
-    } else if lower.contains("q5") {
+    } else if lower.contains("q5") || lower.contains("5bit") {
         0.68
-    } else if lower.contains("q4") {
+    } else if lower.contains("q4") || lower.contains("4bit") {
         0.56
+    } else if lower.contains("3bit") {
+        0.44
     } else if lower.contains("fp16") || lower.contains("f16") {
         2.0
     } else {
@@ -666,11 +711,20 @@ pub fn estimate_model_bytes(tag: &str) -> Option<u64> {
     Some((params as f64 * bpp) as u64)
 }
 
-/// Whether `total_mem_bytes` is enough to run a model of `model_bytes`: require
-/// 1.2× the weights (KV cache / activations headroom) plus a 2 GiB OS reserve.
+/// RAM a model of `model_bytes` actually needs: 1.2× the weights (KV cache /
+/// activations headroom) plus a 2 GiB OS reserve.
+///
+/// Split out from [`memory_suffices`] so the operator-facing error can quote
+/// the number it was *compared against*. Reporting the bare weight estimate
+/// produced messages like "needs ~25 GiB but the system has ~32 GiB" — which
+/// reads as a contradiction, because the 20% + 2 GiB was invisible.
+pub fn required_memory_bytes(model_bytes: u64) -> u64 {
+    model_bytes.saturating_mul(12) / 10 + 2 * 1024 * 1024 * 1024
+}
+
+/// Whether `total_mem_bytes` is enough to run a model of `model_bytes`.
 pub fn memory_suffices(model_bytes: u64, total_mem_bytes: u64) -> bool {
-    let needed = model_bytes.saturating_mul(12) / 10 + 2 * 1024 * 1024 * 1024;
-    total_mem_bytes >= needed
+    total_mem_bytes >= required_memory_bytes(model_bytes)
 }
 
 fn take(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
@@ -846,39 +900,72 @@ mod tests {
         );
     }
 
-    /// Pin the *values* of the per-OS install defaults.
+    /// Pin the *values* of BOTH platforms' default sets, on every host.
     ///
-    /// `parse_defaults_models_and_url_overridable` below compares the
-    /// parsed value against the same default it came from, so it passes
-    /// for any value — it pins the wiring, not the choice. This is the
-    /// test that makes changing the choice deliberate.
+    /// This is deliberately `cfg`-free. The per-OS dispatch below lives in
+    /// `cfg!` arms, and an arm a host does not take is untestable there — so
+    /// while these values were inline, the macOS set was pinned by the Mac leg
+    /// alone. Since CI runs `cargo test` for five crates (this is not one of
+    /// them) and the workspace gate is the operator's own two-host run, a
+    /// mutation of any macOS value passed GitHub CI *and* the DGX leg. Reading
+    /// them out of `const`s makes both sets assertable from either host.
+    ///
+    /// `parse_defaults_models_and_url_overridable` below compares the parsed
+    /// value against the same default it came from, so it passes for any
+    /// value — it pins the wiring, not the choice. This is the test that makes
+    /// changing the choice deliberate.
     #[test]
-    fn install_defaults_are_per_os_and_pinned() {
-        if cfg!(target_os = "macos") {
-            // oMLX. Model names are MLX repo ids, NOT Ollama tags.
-            assert_eq!(default_llm_url(), "http://127.0.0.1:8000");
-            assert_eq!(default_llm_model(), "Qwen3.8-27B-8bit");
-            assert_eq!(default_embedding_model(), "embeddinggemma-300m-bf16");
-        } else {
-            // Linux (and other Unixes): Ollama — the one endpoint the
-            // installer can drive `ollama pull` against.
-            assert_eq!(default_llm_url(), "http://127.0.0.1:11434");
-            assert_eq!(default_llm_model(), "gemma4:26b-a4b-it-q8_0");
-            assert_eq!(default_embedding_model(), "embeddinggemma");
-        }
+    fn both_platform_default_sets_are_pinned_and_paired() {
+        // oMLX. Model names are MLX repo ids, NOT Ollama tags.
+        assert_eq!(MACOS_LLM_URL, "http://127.0.0.1:8000");
+        assert_eq!(MACOS_LLM_MODEL, "Qwen3.8-27B-8bit");
+        assert_eq!(MACOS_EMBED_MODEL, "embeddinggemma-300m-bf16");
+        // Ollama — the one endpoint the installer can drive `ollama pull`
+        // against.
+        assert_eq!(OLLAMA_LLM_URL, "http://127.0.0.1:11434");
+        assert_eq!(OLLAMA_LLM_MODEL, "gemma4:26b-a4b-it-q8_0");
+        assert_eq!(OLLAMA_EMBED_MODEL, "embeddinggemma");
+
+        // The pairing that stops a doomed `ollama pull`:
+        // `run::ensure_model_available` keys off `is_local_ollama`, and when
+        // it says yes, install may run `ollama pull <model>`. The macOS
+        // defaults are MLX repo ids served by oMLX, which `ollama pull`
+        // cannot fetch, so a port change making these agree would have every
+        // macOS install ATTEMPT that pull. (Not always fatally — the pull is
+        // skipped when the `ollama` CLI is absent, the common macOS case —
+        // which is precisely why the invariant needs its own test rather
+        // than being caught in practice.)
+        assert!(!is_local_ollama(MACOS_LLM_URL));
+        assert!(is_local_ollama(OLLAMA_LLM_URL));
+
+        // The naming schemes are not interchangeable. An Ollama tag is
+        // `name:tag`; an MLX repo id is a bare HF-style repo name.
+        assert!(!MACOS_LLM_MODEL.contains(':'), "MLX repo id, not an Ollama tag");
+        assert!(OLLAMA_LLM_MODEL.contains(':'), "Ollama tag, not an MLX repo id");
+
+        // Same embedding MODEL on both — only the packaging differs. Vectors
+        // written on one host must stay comparable to vectors written on the
+        // other under the 256-d Matryoshka truncation, so this is a storage-
+        // compatibility constraint, not a preference.
+        assert!(MACOS_EMBED_MODEL.starts_with("embeddinggemma"));
+        assert!(OLLAMA_EMBED_MODEL.starts_with("embeddinggemma"));
     }
 
-    /// The macOS default endpoint must NOT read as a local Ollama one.
+    /// The per-OS dispatch picks the right set for the host it runs on.
     ///
-    /// `ensure_ollama_model` keys off [`is_local_ollama`]: when it says
-    /// yes, install runs `ollama pull <model>`. The macOS defaults are
-    /// MLX repo ids served by oMLX, which `ollama pull` cannot fetch, so
-    /// a future port change that made these agree would turn every
-    /// macOS install into a guaranteed pull failure. Cheap invariant,
-    /// and it is meaningful on both hosts.
+    /// Values themselves are pinned above; this pins only the wiring, which
+    /// is all a single host can honestly check.
     #[test]
-    fn ollama_pull_is_not_attempted_for_the_default_macos_endpoint() {
-        assert_eq!(is_local_ollama(default_llm_url()), !cfg!(target_os = "macos"));
+    fn install_defaults_dispatch_per_os() {
+        let macos = cfg!(target_os = "macos");
+        assert_eq!(default_llm_url(), if macos { MACOS_LLM_URL } else { OLLAMA_LLM_URL });
+        assert_eq!(default_llm_model(), if macos { MACOS_LLM_MODEL } else { OLLAMA_LLM_MODEL });
+        assert_eq!(
+            default_embedding_model(),
+            if macos { MACOS_EMBED_MODEL } else { OLLAMA_EMBED_MODEL }
+        );
+        // And the live default endpoint never reads as pullable on macOS.
+        assert_eq!(is_local_ollama(default_llm_url()), !macos);
     }
 
     #[test]
@@ -903,6 +990,47 @@ mod tests {
         assert!(parse_install_args(&["--bogus".into()]).is_err());
     }
 
+    /// `--llm-url` alone is rejected; `--llm-model` alone is not.
+    ///
+    /// Retargeting the endpoint while silently keeping the default model is
+    /// the one combination that cannot work: the two backends' naming schemes
+    /// are disjoint, so the default model does not exist on the endpoint just
+    /// passed. Swapping only the model on the default endpoint is normal, so
+    /// the guard is deliberately one-directional.
+    #[test]
+    fn llm_url_without_llm_model_is_rejected() {
+        let Err(err) = parse_install_args(&["--llm-url".into(), "http://127.0.0.1:11434".into()])
+        else {
+            panic!("--llm-url without --llm-model must be rejected");
+        };
+        assert!(err.contains("--llm-url without --llm-model"), "{err}");
+        // The converse is fine.
+        let ok = parse_install_args(&["--llm-model".into(), "m".into()]).unwrap();
+        assert_eq!(ok.llm_model, "m");
+        assert_eq!(ok.llm_url, default_llm_url());
+    }
+
+    /// A flagless install must render a *coherent* env file: the defaults
+    /// composed through the real path, not literals chosen by a test.
+    ///
+    /// Every other `render_env_file` test builds `InstallArgs` by hand, so
+    /// nothing asserted that the file an operator actually receives pairs the
+    /// default URL with the default models — or that chat and embedding share
+    /// one base URL, which is the whole point of the single-endpoint default.
+    #[test]
+    fn a_flagless_install_renders_a_coherent_env_file() {
+        let args = parse_install_args(&[]).unwrap();
+        let s = render_env_file(&args, &layout());
+        let base = ensure_v1_suffix(default_llm_url());
+        assert!(s.contains(&format!("KASTELLAN_LLM_LOCAL_URL={base}\n")), "{s}");
+        assert!(s.contains(&format!("KASTELLAN_LLM_LOCAL_MODEL={}\n", default_llm_model())), "{s}");
+        assert!(s.contains(&format!("KASTELLAN_LLM_EMBEDDING_URL={base}\n")), "{s}");
+        assert!(
+            s.contains(&format!("KASTELLAN_LLM_EMBEDDING_MODEL={}\n", default_embedding_model())),
+            "{s}"
+        );
+    }
+
     #[test]
     fn parses_param_count_total_not_active() {
         assert_eq!(parse_param_count("gemma4:26b-a4b-it-q8_0"), Some(26_000_000_000));
@@ -921,6 +1049,54 @@ mod tests {
         let q4 = estimate_model_bytes("foo:26b-q4_0").unwrap();
         assert!(q4 < q8);
         assert_eq!(estimate_model_bytes("embeddinggemma"), None);
+    }
+
+    /// MLX repo ids spell the quantisation `-8bit`/`-4bit`, not `q8`/`q4`.
+    ///
+    /// Unrecognised suffixes fall through to the 1.0 bytes/param default,
+    /// which is right for 8-bit only by coincidence and ~2× over for 4-bit.
+    /// Since the guard is fail-closed, an over-estimate REFUSES a model that
+    /// would have fitted — so the macOS spelling has to be understood, not
+    /// merely tolerated.
+    #[test]
+    fn estimates_model_bytes_for_mlx_repo_ids() {
+        // The macOS default: 27B at 8-bit ≈ 27e9 * 1.06 ≈ 28.6 GB.
+        let macos = estimate_model_bytes(MACOS_LLM_MODEL).unwrap();
+        assert!((28_000_000_000..31_000_000_000).contains(&macos), "got {macos}");
+        // 4-bit of the same must be materially smaller, not identical.
+        let four_bit = estimate_model_bytes("Qwen3.8-27B-4bit").unwrap();
+        assert!(four_bit < macos / 2 + macos / 10, "4bit not recognised: {four_bit} vs {macos}");
+        // bf16 is ~2 B/param — caught via the `f16` arm.
+        let bf16 = estimate_model_bytes("Some-Model-7B-bf16").unwrap();
+        assert_eq!(bf16, 14_000_000_000);
+        // The macOS embedding default has no `<n>b` token, so it is skipped
+        // exactly like its Ollama counterpart.
+        assert_eq!(estimate_model_bytes(MACOS_EMBED_MODEL), None);
+    }
+
+    /// The refusal message must quote the number actually compared against.
+    #[test]
+    fn required_memory_includes_headroom_and_reserve() {
+        let twenty_gb = 20u64 * 1024 * 1024 * 1024;
+        let needed = required_memory_bytes(twenty_gb);
+        assert!(needed > twenty_gb, "must exceed the raw weights");
+        assert!(memory_suffices(twenty_gb, needed));
+        assert!(!memory_suffices(twenty_gb, needed - 1));
+    }
+
+    /// The macOS default chat model does not fit a 16/24/32 GB Mac.
+    ///
+    /// This is the fact the install path must surface. It is pinned here so
+    /// that changing the default to something that *does* fit, or changing
+    /// the headroom rule, is a deliberate edit rather than a silent one.
+    #[test]
+    fn the_macos_default_chat_model_needs_more_than_32_gib() {
+        let est = estimate_model_bytes(MACOS_LLM_MODEL).unwrap();
+        let gib = |n: u64| n * 1024 * 1024 * 1024;
+        assert!(!memory_suffices(est, gib(16)));
+        assert!(!memory_suffices(est, gib(24)));
+        assert!(!memory_suffices(est, gib(32)));
+        assert!(memory_suffices(est, gib(48)));
     }
 
     #[test]

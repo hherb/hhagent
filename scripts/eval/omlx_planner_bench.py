@@ -12,9 +12,12 @@ history in the handover.
 Measures, per configuration:
   * time to first token and decode throughput
   * total wall clock against the router's 180 s budget
-  * whether the completion is a VALID plan -- required keys present,
-    `steps` and `data_ceiling` present (the single most common rejection)
-  * how much of the generation went to thinking rather than the plan
+  * whether the completion is a VALID plan -- the keys the DAEMON requires
+    (`REQUIRED_PLAN_KEYS`), with `steps` a list; `missing field 'steps'` is
+    the rejection that has actually bitten this project
+  * how much of the generation went to thinking rather than the plan,
+    counting both `<think>` tags in `content` and the separate
+    `reasoning_content` stream
 
 The thinking comparison is the point of the exercise. Qwen3.8 reports
 `thinking_default: true`, and `RouterConfig::disable_thinking` defaults ON
@@ -26,6 +29,7 @@ Stdlib only.
 
 Usage:
     python3 omlx_planner_bench.py --model Qwen3.8-27B-8bit [--repeat 2]
+    python3 omlx_planner_bench.py --cache-probe     # cold-vs-warm numbers
 
 ## Measured 2026-08-15 -- Qwen3.8-27B-8bit on oMLX, M-series Mac
 ##
@@ -35,8 +39,11 @@ Usage:
 ##                  router's `disable_thinking` default is load-bearing here
 ##   plan validity: 4/4 across both tasks and both settings
 ##
-## Prompt cache is the biggest single lever and is invisible to a one-shot
-## timing. Same system prompt three times:
+## Two tasks x one repeat: a smoke test, not a distribution.
+##
+## Prompt cache is the biggest single lever and is invisible to the default
+## run above, which times only cold calls. Reproduce with `--cache-probe`;
+## the numbers below came from that path:
 ##   call 1  36.6 s  cached=0     (4402 prompt tokens, all cold)
 ##   call 2  14.6 s  cached=4096
 ##   call 3  14.4 s  cached=4096
@@ -61,7 +68,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-REQUIRED_PLAN_KEYS = ("context", "decision", "rationale", "steps", "data_ceiling")
+# What the DAEMON requires, not what a strict reading of the prompt asks for.
+# `data_ceiling` is deliberately absent: `cassandra::types::Plan` marks it
+# `Option` + `serde(default)` and its field doc notes the model omits it
+# "fairly often on terminal plans", so grading it as mandatory would score a
+# plan INVALID that the daemon accepts and resolves against the floor -- and
+# the `terminal` task below is exactly that shape. The rejection that has
+# actually bitten this project is `missing field 'steps'` (ROADMAP #505).
+REQUIRED_PLAN_KEYS = ("context", "decision", "rationale", "steps")
 
 # Two tasks: one that should terminate immediately (tests the minimum
 # terminal plan, the shape the prompt says is most often got wrong), and
@@ -109,7 +123,20 @@ def post(base_url: str, payload: dict, timeout: float = 300.0):
 
 
 def stream_first_token(base_url: str, payload: dict, timeout: float = 300.0):
-    """Measure TTFT properly, by streaming. Returns (ttft, total, text)."""
+    """Measure TTFT properly, by streaming.
+
+    Returns (ttft, total, text, reasoning). `reasoning` is the separate
+    `delta.reasoning_content` channel: Qwen3-family models on OpenAI-compat
+    servers commonly put thinking there rather than inlining `<think>` tags
+    in `content`. Collecting only `content` reported `think=0%` for every
+    thinking-ON run as though it had been measured, and undercounted the
+    generated volume those runs actually paid for.
+
+    Raises RuntimeError on a server error frame. Such a frame is valid JSON,
+    so `obj.get("choices", [{}])[0]` yields `{}` and the piece is `""` --
+    dropped silently, after which the run is reported "INVALID (empty
+    completion)", blaming the model for a server-side failure.
+    """
     p = dict(payload)
     p["stream"] = True
     req = urllib.request.Request(
@@ -119,7 +146,7 @@ def stream_first_token(base_url: str, payload: dict, timeout: float = 300.0):
     )
     t0 = time.perf_counter()
     ttft = None
-    chunks = []
+    chunks, thinking, undecodable = [], [], 0
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             line = raw.decode(errors="replace").strip()
@@ -131,14 +158,23 @@ def stream_first_token(base_url: str, payload: dict, timeout: float = 300.0):
             try:
                 obj = json.loads(data)
             except json.JSONDecodeError:
+                undecodable += 1
                 continue
+            if "error" in obj:
+                raise RuntimeError(f"backend error frame: {obj['error']}")
             delta = obj.get("choices", [{}])[0].get("delta", {})
             piece = delta.get("content") or ""
-            if piece:
+            reasoning = delta.get("reasoning_content") or ""
+            if reasoning:
+                thinking.append(reasoning)
+            if piece or reasoning:
                 if ttft is None:
                     ttft = time.perf_counter() - t0
+            if piece:
                 chunks.append(piece)
-    return ttft, time.perf_counter() - t0, "".join(chunks)
+    if undecodable:
+        print(f"    ({undecodable} undecodable SSE frame(s) skipped)", file=sys.stderr)
+    return ttft, time.perf_counter() - t0, "".join(chunks), "".join(thinking)
 
 
 def extract_plan(text: str):
@@ -181,12 +217,19 @@ def grade(plan, note):
     return True, "valid plan"
 
 
-def thinking_share(text: str):
-    """Fraction of the completion inside a thinking block, if one leaked."""
-    m = re.findall(r"<think>(.*?)</think>", text, re.S)
-    if not m:
+def thinking_share(text: str, reasoning: str = ""):
+    """Fraction of the generation spent thinking rather than planning.
+
+    Counts BOTH channels a backend can use: `<think>` tags inlined in
+    `content`, and the separate `reasoning_content` stream. Measuring only
+    the first reports a flat 0% against any server that uses the second,
+    which is the majority of them for this model family.
+    """
+    inline = sum(len(x) for x in re.findall(r"<think>(.*?)</think>", text, re.S))
+    total = len(text) + len(reasoning)
+    if total == 0:
         return 0.0
-    return sum(len(x) for x in m) / max(len(text), 1)
+    return (inline + len(reasoning)) / total
 
 
 def run(base_url, model, system_prompt, task_name, task, disable_thinking, timeout_ms):
@@ -204,10 +247,12 @@ def run(base_url, model, system_prompt, task_name, task, disable_thinking, timeo
         # Exactly what `ChatRequest::without_thinking` puts on the wire.
         payload["chat_template_kwargs"] = {"enable_thinking": False}
 
-    ttft, total, text = stream_first_token(base_url, payload, timeout=timeout_ms / 1000.0)
+    ttft, total, text, reasoning = stream_first_token(
+        base_url, payload, timeout=timeout_ms / 1000.0
+    )
     plan, note = extract_plan(text)
     ok, why = grade(plan, note)
-    approx_tokens = max(len(text) // 4, 1)
+    approx_tokens = max((len(text) + len(reasoning)) // 4, 1)
     decode_tps = approx_tokens / max(total - (ttft or 0), 1e-6)
     return {
         "task": task_name,
@@ -218,9 +263,46 @@ def run(base_url, model, system_prompt, task_name, task, disable_thinking, timeo
         "approx_tok_s": decode_tps,
         "valid": ok,
         "why": why,
-        "think_share": thinking_share(text),
+        "think_share": thinking_share(text, reasoning),
+        "over_budget": total > timeout_ms / 1000.0,
         "text": text,
     }
+
+
+def run_cache_probe(base_url, model, system_prompt, timeout_ms, calls: int = 3):
+    """Send the SAME system prompt `calls` times and report prompt-cache reuse.
+
+    This is the biggest single lever on plan latency and is invisible to a
+    one-shot timing: kastellan re-sends an identical planner system prompt on
+    every call, so the WARM number is the operational one. Non-streaming on
+    purpose -- `usage.prompt_tokens_details.cached_tokens` only comes back on
+    the final (non-streamed) body, which is why `post` exists.
+    """
+    print("\n--- prompt-cache probe (identical system prompt, "
+          f"{calls} calls) ---")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(TASKS["terminal"], indent=2)},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 512,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    for i in range(1, calls + 1):
+        try:
+            body, elapsed = post(base_url, payload, timeout=timeout_ms / 1000.0)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            print(f"  call {i}: FAILED {type(e).__name__}: {e}")
+            continue
+        usage = body.get("usage", {}) or {}
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        prompt_toks = usage.get("prompt_tokens")
+        cached_s = "not reported" if cached is None else str(cached)
+        print(f"  call {i}: {elapsed:6.1f} s   prompt_tokens={prompt_toks}   "
+              f"cached={cached_s}")
+    print("  Benchmark the SECOND call, never the first.")
 
 
 def main() -> int:
@@ -231,6 +313,10 @@ def main() -> int:
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--timeout-ms", type=int, default=180_000,
                     help="the router's KASTELLAN_LLM_TIMEOUT_MS budget")
+    ap.add_argument("--cache-probe", action="store_true",
+                    help="also re-send one identical prompt 3x and report "
+                         "prompt-cache reuse (reproduces the docstring's "
+                         "cold-vs-warm numbers)")
     args = ap.parse_args()
 
     p = Path(args.prompt)
@@ -251,8 +337,23 @@ def main() -> int:
                 try:
                     r = run(args.base_url, args.model, system_prompt,
                             task_name, task, disable, args.timeout_ms)
-                except urllib.error.URLError as e:
-                    print(f"FAIL {task_name} thinking_disabled={disable}: {e}")
+                # A read-phase timeout raises a bare `TimeoutError` (an
+                # OSError) -- only CONNECT-phase timeouts get wrapped in
+                # URLError. Catching URLError alone therefore let the single
+                # most interesting outcome, "the plan blew the router's
+                # budget", kill the script with a traceback and discard every
+                # result already collected. That is the exact condition this
+                # benchmark exists to measure, so it is recorded, not raised.
+                except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as e:
+                    print(f"FAIL {task_name} thinking_disabled={disable}: "
+                          f"{type(e).__name__}: {e}")
+                    results.append({
+                        "task": task_name, "thinking_disabled": disable,
+                        "ttft": None, "total": args.timeout_ms / 1000.0,
+                        "chars": 0, "approx_tok_s": 0.0, "valid": False,
+                        "why": f"{type(e).__name__}: {e}", "think_share": 0.0,
+                        "over_budget": True, "text": "",
+                    })
                     continue
                 results.append(r)
                 th = "OFF" if disable else "ON "
@@ -272,11 +373,15 @@ def main() -> int:
             continue
         tot = [r["total"] for r in sub]
         valid = sum(1 for r in sub if r["valid"])
+        # Read the recorded flag, not `total > budget`: a run that DIED on the
+        # budget records `total == budget` exactly, and `>` would score that
+        # as inside it — turning the most important failure into a zero.
+        over = sum(1 for r in sub if r["over_budget"])
         print(f"thinking {'OFF' if disable else 'ON '}: "
               f"median {statistics.median(tot):6.1f} s   "
               f"max {max(tot):6.1f} s   "
               f"valid {valid}/{len(sub)}   "
-              f"over-budget {sum(1 for t in tot if t > args.timeout_ms/1000)}/{len(sub)}")
+              f"over-budget {over}/{len(sub)}")
 
     off = [r["total"] for r in results if r["thinking_disabled"]]
     on = [r["total"] for r in results if not r["thinking_disabled"]]
@@ -290,6 +395,9 @@ def main() -> int:
         else:
             print("  oMLX honours `chat_template_kwargs.enable_thinking` -- the router's")
             print("  `disable_thinking` default is doing real work on this backend.")
+
+    if args.cache_probe:
+        run_cache_probe(args.base_url, args.model, system_prompt, args.timeout_ms)
     return 0
 
 
