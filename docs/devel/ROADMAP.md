@@ -455,9 +455,19 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   published numbers at 3B vs 8B — and one property Guardian lacks: the **policy is a plain-language yes/no
   question supplied at inference time**, returning a calibrated score from a single forward pass, so one set of
   weights serves every hook point below with no fine-tune each. Verdict is ADOPT-**CONDITIONALLY**: five
-  measurements gate it, and measurement 1 is a hard go/no-go — the score needs token logprobs, which Ollama
-  only serves on `/v1/chat/completions` from **v0.12.11**, so the macOS leg is the single point of failure for
-  the whole design. First slice is the injection-guard `Review` tier (escalate-up only), *not* a plan-review
+  measurements gate it, and measurement 1 is a hard go/no-go — the score needs token logprobs, and the macOS
+  leg is the single point of failure for the whole design. **Measurement 1 half-answered 2026-08-15, and the
+  answer changed the plan:** macOS moved to **oMLX** as the default backend, and oMLX **returns no logprobs**
+  (absent from `/v1/chat/completions`; `top_logprobs` is declared on `/v1/responses` but accepted and ignored,
+  with no response schema emitting them anywhere in its OpenAPI document — measured against the live server).
+  Shieldstral *runs* correctly on oMLX but yields a bare `yes`/`no`, i.e. exactly the unmovable τ=0.5 the study
+  warned about. **Resolution: the guard model targets llama.cpp on macOS** — the designated fallback runtime,
+  reported to serve logprobs *and* Shieldstral's multimodal half (which the previously-planned Ollama route
+  would not have), so the confidence-band design stays cross-platform and no Linux-only security behaviour is
+  introduced. Confirming that is the rewritten measurement 1. **Explicitly deferred:** do not add a
+  `guard_url`/`guard_model` seam to `RouterConfig` yet — a second endpoint is needed only while oMLX lacks
+  logprobs, and the seam becomes dead code in the sole core-side LLM egress the moment it gains them.
+  First slice is the injection-guard `Review` tier (escalate-up only), *not* a plan-review
   stage. The posture below is unchanged and carries over verbatim; note especially that a "skip the expensive
   review" gate is **fail-open** and stays ruled out (and is blocked on Stage 3 existing regardless).
   The Guardian write-up is kept below as the comparison baseline:
