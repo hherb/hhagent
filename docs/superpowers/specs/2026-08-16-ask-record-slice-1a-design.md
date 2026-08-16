@@ -50,17 +50,24 @@ This keeps "every plan is reviewed" intact, needs no bypass, and closes the appr
 by construction. The cost is real and accepted: a nondeterministic planner may never reproduce the
 approved plan, in which case the task escalates twice and the operator sees a near-duplicate ask.
 
-### D2 — The digest covers the executable surface only
+### D2 — The digest excludes narration and includes everything else
 
-`plan_digest(&Plan) -> String` is SHA-256 over a canonical serialization of:
+`plan_digest(&Plan) -> String` is SHA-256 over a canonical serialization of the plan with exactly
+four fields removed: plan-level `context` and `rationale`, and per-step `returns` and `done_when`.
+Everything else counts — `decision`, `result`, `data_ceiling`, `refused`, `floor_request`, and per
+step `tool`, `method`, `parameters`, `classification`.
 
-- per step: `tool`, `method`, `parameters`, `classification`
-- plan-level: `data_ceiling`
+**The rule is stated as an exclusion list on purpose, and that is load-bearing.** An earlier
+formulation named the included fields instead, and it had already silently dropped `floor_request`
+— which feeds `apply_floor_raise` and therefore changes the classification floor the whole plan is
+reviewed against. An inclusion list makes *forgetting* the failure mode, and forgetting fails in
+the unsafe direction: an approval that carries to a plan differing in the forgotten field. With an
+exclusion list a new `Plan` field defaults to **counted**, so the worst a future omission does is
+re-escalate a plan that did not need it.
 
-It **excludes** `context`, `rationale`, and the per-step `returns` and `done_when`. Those are
-narration the model regenerates differently on every call, and none of them is read by the
-dispatcher — `dispatch_step` uses `tool`/`method`/`parameters`, and `classification` and
-`data_ceiling` are what the deterministic policy enforces.
+The four excluded fields are narration the model regenerates differently on every call, and none is
+read by anything that acts: `dispatch_step` uses `tool`/`method`/`parameters`, and
+`cassandra::deterministic` reads `classification` and `data_ceiling`.
 
 The trade-off cuts both ways and is the reason the boundary sits exactly here. Digest the whole
 plan and it will essentially never match on replan, so approvals never carry and the binding is
@@ -70,10 +77,10 @@ actually match.
 
 > ⚠️ **This selection is provisional and must prove itself in real use.** The revisit trigger is
 > the first real escalation that re-escalates on a semantically identical replan — that is the
-> signal the boundary is drawn too wide. The opposite signal (an approval carrying to a plan the
-> operator would not recognise) is the more serious one and would mean it is drawn too narrow.
-> Whichever fires first, re-derive the field list from what `dispatch_step` and
-> `cassandra::deterministic` actually read at that time, not from this table.
+> signal the boundary is drawn too wide, and with an exclusion list it is the *expected* direction
+> to be wrong in. The opposite signal (an approval carrying to a plan the operator would not
+> recognise) is far more serious. Whichever fires first, re-derive the exclusion list from what
+> `dispatch_step` and `cassandra::deterministic` actually read at that time, not from this section.
 
 ### D3 — The nonce is stored hashed, and returned in plaintext exactly once
 
