@@ -309,3 +309,89 @@ fn resolve_is_exactly_once_and_re_enqueues_the_task() {
         ).await.unwrap());
     });
 }
+
+#[test]
+fn expire_due_fails_the_task_closed_and_leaves_others_alone() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let bin_dir = match pg_bin_dir_or_skip() {
+        Some(d) => d,
+        None => return,
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "aske-d",
+        "aske-l",
+        &format!("kastellan-supervisor-test-pg-aske-{suffix}"),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        use kastellan_db::{asks, tasks};
+        use kastellan_db::tasks::Lane;
+
+        kastellan_db::probe::run(
+            &cluster.conn_spec, "core", "startup",
+            serde_json::json!({"version": "test", "purpose": "asks-expire-e2e"}),
+        ).await.expect("probe run");
+        let pool = kastellan_db::pool::connect_admin_pool(&cluster.conn_spec)
+            .await.expect("admin pool");
+
+        // (a) an ask already past its deadline
+        let stale_task = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "stale"}),
+        ).await.unwrap();
+        tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let stale = asks::raise(
+            &pool, stale_task, "plan_approval", "approve?",
+            &serde_json::json!(["approve"]), None,
+            time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
+        ).await.unwrap();
+
+        // (b) an ask with plenty of time left
+        let fresh_task = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "fresh"}),
+        ).await.unwrap();
+        tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let fresh = asks::raise(
+            &pool, fresh_task, "plan_approval", "approve?",
+            &serde_json::json!(["approve"]), None,
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(3600),
+        ).await.unwrap();
+
+        let expired = asks::expire_due(&pool).await.unwrap();
+        assert_eq!(expired.len(), 1, "only the past-deadline ask expires: {expired:?}");
+        assert_eq!(expired[0].ask_id, stale.ask_id);
+        assert_eq!(expired[0].task_id, stale_task);
+
+        // The stale ask is expired and its task failed CLOSED with a
+        // distinguishable detail.
+        assert_eq!(asks::get(&pool, stale.ask_id).await.unwrap().unwrap().state, "expired");
+        let t = tasks::get(&pool, stale_task).await.unwrap().unwrap();
+        assert_eq!(t.state, "failed");
+        assert!(t.finished_at.is_some(), "a failed task must be stamped finished");
+        assert_eq!(
+            t.result.as_ref().and_then(|r| r.get("detail")).and_then(|d| d.as_str()),
+            Some("ask_timeout"),
+            "the failure must name the ask timeout, not read as a generic error: {:?}", t.result,
+        );
+
+        // The fresh one is untouched.
+        assert_eq!(asks::get(&pool, fresh.ask_id).await.unwrap().unwrap().state, "pending");
+        assert_eq!(tasks::observe_state(&pool, fresh_task).await.unwrap(), "awaiting_operator");
+
+        // Idempotent: a second sweep finds nothing.
+        assert!(asks::expire_due(&pool).await.unwrap().is_empty());
+
+        // An expired ask can no longer be resolved.
+        assert!(!asks::resolve(
+            &pool, stale.ask_id, "operator/cli", &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap());
+    });
+}

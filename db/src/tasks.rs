@@ -445,6 +445,44 @@ where
     Ok(r.rows_affected() == 1)
 }
 
+/// Terminal write for a task whose ask expired (#564).
+///
+/// Separate from [`finalize`] rather than widening its guard. `finalize`
+/// means "the lane runner finished a task it was running" and matches
+/// `state = 'running'`; keeping that true is worth one small function,
+/// because a widened guard would also let a stray `finalize` terminalise a
+/// task that is merely suspended.
+///
+/// The result payload matches `Outcome::Failed`'s shape
+/// (`{"kind":"error","detail":…}`) so a reader does not have to know which
+/// path produced it. State is `failed` rather than `timed_out`: `timed_out`
+/// means the task's own wall-clock deadline elapsed while it was working,
+/// and conflating the two would make lane-latency queries count tasks that
+/// spent their time waiting on a human.
+pub async fn fail_awaiting_operator<'e, E>(
+    executor: E,
+    task_id: i64,
+    detail: &str,
+) -> Result<bool, DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let r = sqlx::query(
+        "UPDATE tasks \
+         SET state = 'failed', \
+             result = $2, \
+             finished_at = now(), \
+             updated_at = now() \
+         WHERE id = $1 AND state = 'awaiting_operator'",
+    )
+    .bind(task_id)
+    .bind(serde_json::json!({"kind": "error", "detail": detail}))
+    .execute(executor)
+    .await
+    .map_err(|e| DbError::Query(format!("tasks fail_awaiting_operator: {e}")))?;
+    Ok(r.rows_affected() == 1)
+}
+
 /// Fetch one task by id (any state). Used by CLI status subcommand
 /// and by the synthetic-load harness.
 pub async fn get(pool: &PgPool, task_id: i64) -> Result<Option<Task>, DbError> {

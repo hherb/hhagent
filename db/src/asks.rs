@@ -279,6 +279,66 @@ pub async fn resolve(
     Ok(true)
 }
 
+/// The detail string a task's result carries when its ask timed out.
+/// A named const because slice 1b's audit rows and any operator query
+/// will both want to match on it, and two spellings would silently
+/// partition the same population.
+pub const ASK_TIMEOUT_DETAIL: &str = "ask_timeout";
+
+/// Expire every ask past its deadline and fail its task closed.
+///
+/// A headless daemon cannot leave a question pending forever the way a
+/// desktop app can — there is no window a human will eventually look at.
+/// Without this, a raised ask nobody answers is a permanently wedged task.
+///
+/// One transaction over the whole sweep: a partially-applied sweep would
+/// leave asks expired with their tasks still suspended, which is exactly
+/// the wedge this exists to prevent.
+///
+/// Idempotent — the `state = 'pending'` guard means a second call finds
+/// nothing. Returns the retired rows so the caller can emit one audit row
+/// each; an empty vec is the normal case.
+pub async fn expire_due(pool: &PgPool) -> Result<Vec<ExpiredAsk>, DbError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| DbError::Query(format!("asks expire_due begin: {e}")))?;
+
+    let rows = sqlx::query(
+        "UPDATE asks \
+         SET state = 'expired' \
+         WHERE state = 'pending' AND deadline_at < now() \
+         RETURNING id, task_id",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| DbError::Query(format!("asks expire_due: {e}")))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let ask_id: i64 = row
+            .try_get("id")
+            .map_err(|e| DbError::Query(format!("decode asks.id: {e}")))?;
+        let task_id: i64 = row
+            .try_get("task_id")
+            .map_err(|e| DbError::Query(format!("decode asks.task_id: {e}")))?;
+
+        // Best-effort on the task side by design: if the task already left
+        // `awaiting_operator` (cancelled in the same instant, say) the ask
+        // still expires. What must not happen is the reverse — an expired
+        // ask with a still-suspended task — and that is what the shared
+        // transaction guarantees.
+        tasks::fail_awaiting_operator(&mut *tx, task_id, ASK_TIMEOUT_DETAIL).await?;
+
+        out.push(ExpiredAsk { ask_id, task_id });
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| DbError::Query(format!("asks expire_due commit: {e}")))?;
+    Ok(out)
+}
+
 /// Fetch one ask by id, in any state.
 pub async fn get(pool: &PgPool, ask_id: i64) -> Result<Option<Ask>, DbError> {
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
