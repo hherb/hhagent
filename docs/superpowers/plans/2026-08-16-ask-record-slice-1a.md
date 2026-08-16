@@ -20,7 +20,12 @@
 - **Mac cargo blocks on rust-analyzer's `target/debug/.cargo-lock`.** Use `CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate`, under `$HOME` and never `/tmp` (macOS scrubs `/tmp` mid-run). See [[mac-cargo-buildlock-prefer-dgx]] and [[dgx-run-logs-tmp-scrubbed]].
 - **Files stay under 500 lines.** `db/src/asks.rs` is budgeted at ~300 production lines with its tests in a `db/src/asks/tests.rs` sibling if it grows past that.
 - **Clippy is `-D warnings` and the tree is clean.** Suppression is debt; fix rather than `#[allow]`.
-- **PG e2e skip-as-pass.** Without a supervisor or a PG install these tests print `[SKIP]` and pass. A green Mac run proves nothing about them — reconcile on the DGX.
+- **PG e2e on this Mac need `KASTELLAN_PG_BIN_DIR`, and then they really run.** `pg_bin_dir_or_skip()` returns `None` by default because `default_pg_bin_dir_candidates()` deliberately excludes the Postgres.app paths — that is an opt-in, not an absent capability. Export the override and the suite is a real local red-green loop:
+  ```sh
+  export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"   # v18, port 5532
+  ```
+  (v16 is at `/Applications/Postgres.app/Contents/Versions/16/bin`. Mind the space in both paths — always quote.) **Run this suite on its own, never as part of a full-workspace run under the override:** a full-workspace run flakes ~4 tests in `core/tests/embedding_recall_e2e.rs` at PG bring-up from parallel `initdb`/launchd churn (issue #130 territory). They pass single-threaded and in isolation. So: targeted suites under the override on the Mac, full workspace on the DGX.
+- **A `[SKIP]` line is still a pass.** If you forget the override, every PG e2e in this plan prints `[SKIP]` and the run is green having verified nothing. Check for the skip line before believing a green — that is this repo's standing reading rule.
 
 ---
 
@@ -594,11 +599,13 @@ fn asks_schema_and_task_state_round_trip() {
 ```sh
 source "$HOME/.cargo/env"
 export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
+export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"
 cargo test -p kastellan-db --test asks_e2e -- --nocapture 2>&1 | tail -20
 ```
 
-Expected on a host WITH Postgres: FAIL with `relation "asks" does not exist`.
-Expected on a host WITHOUT: a `[SKIP]` line and a pass — in which case you cannot red-green this task locally and must reconcile it on the DGX (Task 8). Note which happened.
+Expected: FAIL with `relation "asks" does not exist`.
+
+If you instead see a `[SKIP]` line and a pass, `KASTELLAN_PG_BIN_DIR` is not set (or points at a bin dir without `initdb`) — fix that before continuing, because every remaining task in this plan would otherwise "pass" without running.
 
 - [ ] **Step 3: Write the migration**
 
@@ -883,6 +890,7 @@ fn raise_suspends_the_task_and_releases_the_lease() {
 ```sh
 source "$HOME/.cargo/env"
 export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
+export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"
 cargo test -p kastellan-db --test asks_e2e raise_suspends -- --nocapture 2>&1 | tail -20
 ```
 
@@ -1172,6 +1180,7 @@ In `db/src/lib.rs`, add `pub mod asks;` alphabetically (before `pub mod audit;`)
 ```sh
 source "$HOME/.cargo/env"
 export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
+export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"
 cargo test -p kastellan-db --test asks_e2e -- --nocapture 2>&1 | tail -20
 cargo clippy -p kastellan-db --all-targets -- -D warnings 2>&1 | tail -5
 ```
@@ -1312,6 +1321,7 @@ fn resolve_is_exactly_once_and_re_enqueues_the_task() {
 ```sh
 source "$HOME/.cargo/env"
 export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
+export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"
 cargo test -p kastellan-db --test asks_e2e resolve_is_exactly_once -- --nocapture 2>&1 | tail -20
 ```
 
@@ -1434,6 +1444,7 @@ pub async fn resolve(
 ```sh
 source "$HOME/.cargo/env"
 export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
+export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"
 cargo test -p kastellan-db --test asks_e2e -- --nocapture 2>&1 | tail -20
 ```
 
@@ -1570,6 +1581,7 @@ fn expire_due_fails_the_task_closed_and_leaves_others_alone() {
 ```sh
 source "$HOME/.cargo/env"
 export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
+export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"
 cargo test -p kastellan-db --test asks_e2e expire_due -- --nocapture 2>&1 | tail -20
 ```
 
@@ -1688,6 +1700,7 @@ pub async fn expire_due(pool: &PgPool) -> Result<Vec<ExpiredAsk>, DbError> {
 ```sh
 source "$HOME/.cargo/env"
 export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
+export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"
 cargo test -p kastellan-db --test asks_e2e -- --nocapture 2>&1 | tail -20
 ```
 
@@ -1809,6 +1822,7 @@ fn cancelling_a_suspended_task_cancels_its_ask() {
 ```sh
 source "$HOME/.cargo/env"
 export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
+export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"
 cargo test -p kastellan-db --test asks_e2e cancelling_a_suspended -- --nocapture 2>&1 | tail -20
 ```
 
@@ -1917,6 +1931,7 @@ pub async fn mark_cancelled(pool: &PgPool, task_id: i64) -> Result<Option<Task>,
 ```sh
 source "$HOME/.cargo/env"
 export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
+export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"
 cargo test -p kastellan-db -- --nocapture 2>&1 | tail -25
 cargo test -p kastellan-core --lib -- --nocapture 2>&1 | tail -10
 cargo clippy -p kastellan-db -p kastellan-core --all-targets -- -D warnings 2>&1 | tail -5
@@ -2042,6 +2057,7 @@ fn resolving_fires_tasks_resumed_and_pending_asks_are_listable() {
 ```sh
 source "$HOME/.cargo/env"
 export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
+export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"
 cargo test -p kastellan-db --test asks_e2e resolving_fires -- --nocapture 2>&1 | tail -20
 ```
 
@@ -2095,6 +2111,7 @@ In `core/src/scheduler/runner.rs`, after the existing `tasks_cancelled` LISTEN b
 ```sh
 source "$HOME/.cargo/env"
 export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
+export KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin"
 cargo test -p kastellan-db --test asks_e2e -- --nocapture 2>&1 | tail -25
 cargo test -p kastellan-core --test scheduler_lanes_e2e -- --nocapture 2>&1 | tail -10
 cargo clippy -p kastellan-db -p kastellan-core --all-targets -- -D warnings 2>&1 | tail -5
@@ -2177,7 +2194,7 @@ grep -c "^ *Checking" $HOME/kastellan-mac-clippy.log   # expect ~27 workspace cr
 
 - [ ] **Step 3: Gate the DGX — this is the authoritative run**
 
-The Mac skips every PG e2e in this branch, so **the Mac leg proves almost nothing here**. Run it as exactly `ssh dgx '<cmd>'` (the allow rule is a prefix match; flags before the hostname get denied), write logs under `$HOME` and never `/tmp`, and include an explicit exit-code line plus a DONE sentinel.
+The Mac's full-workspace run skips every PG e2e in this branch (the override is only safe for targeted suites — see Global Constraints), so **the Mac leg alone does not cover this slice**. Run it as exactly `ssh dgx '<cmd>'` (the allow rule is a prefix match; flags before the hostname get denied), write logs under `$HOME` and never `/tmp`, and include an explicit exit-code line plus a DONE sentinel.
 
 ```sh
 ssh dgx 'cd ~/src/kastellan && git fetch && git checkout feat/564-slice-1a-ask-record && source ~/.cargo/env && cargo test --workspace -- --nocapture > ~/gate-564.log 2>&1; echo "TEST_EXIT=$?" >> ~/gate-564.log; echo DONE >> ~/gate-564.log'
