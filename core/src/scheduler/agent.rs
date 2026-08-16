@@ -242,6 +242,13 @@ impl RouterAgent {
             // it — the plan is JSON, not prose, and a reasoning model that
             // thinks freely here overruns the request timeout.
             chat_template_kwargs: None,
+            // The planner is read from its *text*, so it asks for no
+            // distribution. Logprobs are for classifier calls that are
+            // read from the token distribution instead (see
+            // `llm_router::logprob_score`); requesting them here would
+            // enlarge every planner response for nothing.
+            logprobs: None,
+            top_logprobs: None,
         };
 
         let start = std::time::Instant::now();

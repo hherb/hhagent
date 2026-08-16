@@ -92,6 +92,25 @@ pub struct ChatRequest {
     /// with [`ChatRequest::without_thinking`] rather than by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+
+    /// Ask the backend to return per-token log-probabilities.
+    ///
+    /// Needed by classifier models that are read from the *distribution*
+    /// at the first output position rather than from their emitted text —
+    /// a `yes`/`no` safety classifier renormalised into a calibrated score
+    /// is the motivating case. Without it such a model degrades to a bare
+    /// verdict token, i.e. a hard threshold with no confidence band.
+    ///
+    /// Set both this and [`ChatRequest::top_logprobs`] together via
+    /// [`ChatRequest::with_logprobs`]: vLLM rejects a `top_logprobs`
+    /// arriving without `logprobs: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+
+    /// How many alternatives to return at each position (OpenAI caps this
+    /// at 20). Only meaningful with `logprobs: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u8>,
 }
 
 impl ChatRequest {
@@ -102,7 +121,29 @@ impl ChatRequest {
             max_tokens: None,
             temperature: None,
             chat_template_kwargs: None,
+            logprobs: None,
+            top_logprobs: None,
         }
+    }
+
+    /// Ask for `top_n` token alternatives at each output position.
+    ///
+    /// Sets `logprobs: true` as well, because the two are one decision on
+    /// the wire — vLLM 4xxs on a `top_logprobs` that arrives without it,
+    /// and that failure reaches core as a `RouterError::Transport`, which
+    /// reads as "the backend is unreachable" rather than "your request was
+    /// malformed" (the misdiagnosis that cost the whole #505 session).
+    ///
+    /// Measured safe to combine with [`ChatRequest::without_thinking`]:
+    /// against Shieldstral on llama.cpp the `chat_template_kwargs` key is
+    /// accepted and inert — both calls returned 200 with an identical
+    /// 26-token prompt, the second reporting `cached_tokens: 25`, which is
+    /// positive evidence the rendered prompt was byte-identical rather
+    /// than merely "no error".
+    pub fn with_logprobs(mut self, top_n: u8) -> Self {
+        self.logprobs = Some(true);
+        self.top_logprobs = Some(top_n);
+        self
     }
 
     /// Ask the backend's chat template to skip the model's thinking
@@ -128,6 +169,45 @@ impl ChatRequest {
     }
 }
 
+/// One alternative token the backend considered at a given position,
+/// with its log-probability.
+///
+/// `bytes` is the token's raw UTF-8, which OpenAI-compatible backends
+/// return alongside the display form. It is the *reliable* identity of a
+/// token: tokenizers render the same word with family-specific markers
+/// (`Ġyes` for byte-BPE, `▁yes` for SentencePiece) that no amount of
+/// trimming removes, whereas the bytes decode to plain ` yes` on every
+/// one of them. See [`crate::logprob_score`], which prefers it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopLogProb {
+    pub token: String,
+    pub logprob: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+}
+
+/// The token actually chosen at one position, plus the alternatives that
+/// were in contention there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenLogProbs {
+    pub token: String,
+    pub logprob: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+    /// Empty when the backend returned `logprobs: true` but no
+    /// `top_logprobs` count — a shape that carries no distribution to
+    /// renormalise, and which callers must treat as unmeasurable.
+    #[serde(default)]
+    pub top_logprobs: Vec<TopLogProb>,
+}
+
+/// Per-position log-probabilities for one choice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LogProbs {
+    #[serde(default)]
+    pub content: Vec<TokenLogProbs>,
+}
+
 /// One completion choice returned by the backend.
 ///
 /// We model `index` and `finish_reason` because they're load-bearing
@@ -136,13 +216,21 @@ impl ChatRequest {
 /// but we do *not* require them to be present — vLLM omits
 /// `finish_reason` when streaming is disabled and the response is
 /// truncated mid-token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Note this is deliberately **not** `Eq`: `logprobs` carries floats, and
+/// a derived `Eq` on a struct holding log-probabilities would invite
+/// exact-equality comparisons on values that are the output of a softmax.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatChoice {
     #[serde(default)]
     pub index: u32,
     pub message: ChatMessage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// Present only when the request asked for it. Every call the planner
+    /// makes leaves this `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<LogProbs>,
 }
 
 /// Token-accounting envelope returned by the backend.
@@ -232,6 +320,8 @@ mod tests {
             max_tokens: Some(42),
             temperature: Some(0.7),
             chat_template_kwargs: None,
+            logprobs: None,
+            top_logprobs: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(s.contains("\"max_tokens\":42"), "max_tokens missing: {s}");
@@ -276,6 +366,8 @@ mod tests {
             max_tokens: Some(8192),
             temperature: Some(0.2),
             chat_template_kwargs: None,
+            logprobs: None,
+            top_logprobs: None,
         }
         .without_thinking();
         assert_eq!(req.model, "m");
@@ -311,6 +403,95 @@ mod tests {
         let usage = resp.usage.unwrap();
         assert_eq!(usage.prompt_tokens, Some(11));
         assert_eq!(usage.total_tokens, Some(14));
+    }
+
+    /// The planner path must stay byte-identical to what it sends today:
+    /// neither logprobs field may appear on a request nobody asked to
+    /// score. Same guarantee `chat_template_kwargs` carries, and the same
+    /// reason — a backend that has never heard of the field must not start
+    /// seeing it merely because the struct grew.
+    #[test]
+    fn logprobs_fields_are_absent_unless_asked_for() {
+        let req = ChatRequest::new("m", vec![ChatMessage::user("hi")]);
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(!s.contains("logprobs"), "logprobs leaked: {s}");
+        assert!(!s.contains("top_logprobs"), "top_logprobs leaked: {s}");
+    }
+
+    /// The exact pair OpenAI-compatible backends look for. `logprobs` is a
+    /// bool and `top_logprobs` a count, and sending only the count is a 4xx
+    /// on vLLM — so the builder sets both or neither.
+    #[test]
+    fn with_logprobs_emits_the_openai_wire_shape() {
+        let req =
+            ChatRequest::new("m", vec![ChatMessage::user("hi")]).with_logprobs(20);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(v["logprobs"], serde_json::Value::Bool(true), "shape: {v}");
+        assert_eq!(v["top_logprobs"], serde_json::json!(20), "shape: {v}");
+    }
+
+    /// `with_logprobs` must not disturb anything else the caller set —
+    /// notably `chat_template_kwargs`, which the local leg stamps on
+    /// unconditionally.
+    #[test]
+    fn with_logprobs_preserves_the_other_fields() {
+        let req = ChatRequest::new("m", vec![ChatMessage::user("hi")])
+            .without_thinking()
+            .with_logprobs(5);
+        assert_eq!(req.model, "m");
+        assert_eq!(req.messages.len(), 1);
+        assert!(req.chat_template_kwargs.is_some());
+        assert_eq!(req.top_logprobs, Some(5));
+    }
+
+    /// Decoded from a real response measured against DGX Ollama 0.22.0 on
+    /// 2026-08-16 (`/v1/chat/completions`, `top_logprobs: 5`) rather than
+    /// reconstructed by hand — a fixture written from what we believe the
+    /// shape to be pins our belief, not the wire ([[#566's lesson]]).
+    #[test]
+    fn chat_response_decodes_the_logprobs_envelope() {
+        let raw = json!({
+            "id": "chatcmpl-800",
+            "model": "gemma4:26b-a4b-it-q8_0-ctx64k",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": "length",
+                "logprobs": {"content": [{
+                    "token": "yes",
+                    "logprob": -0.000000004074,
+                    "bytes": [121, 101, 115],
+                    "top_logprobs": [
+                        {"token": "yes", "logprob": -0.000000004074, "bytes": [121, 101, 115]},
+                        {"token": "no",  "logprob": -20.2255,        "bytes": [110, 111]}
+                    ]
+                }]}
+            }],
+            "usage": {"prompt_tokens": 28, "completion_tokens": 1, "total_tokens": 29}
+        });
+        let resp: ChatResponse = serde_json::from_value(raw).unwrap();
+        let lp = resp.choices[0].logprobs.as_ref().expect("logprobs decoded");
+        assert_eq!(lp.content.len(), 1);
+        assert_eq!(lp.content[0].token, "yes");
+        assert_eq!(lp.content[0].top_logprobs.len(), 2);
+        assert_eq!(lp.content[0].top_logprobs[1].token, "no");
+        assert_eq!(
+            lp.content[0].top_logprobs[0].bytes.as_deref(),
+            Some([121u8, 101, 115].as_slice())
+        );
+    }
+
+    /// Every backend that returns no logprobs — which is every call the
+    /// planner makes — must keep decoding exactly as before.
+    #[test]
+    fn chat_response_without_logprobs_decodes_with_none() {
+        let raw = json!({
+            "model": "m",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        });
+        let resp: ChatResponse = serde_json::from_value(raw).unwrap();
+        assert!(resp.choices[0].logprobs.is_none());
     }
 
     #[test]

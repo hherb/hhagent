@@ -4,6 +4,7 @@
 **Status:** Investigation, no code. Input for the Phase 5 "Model-based CASSANDRA guard tier" ROADMAP item.
 **Amended 2026-08-15:** the macOS runtime changed to oMLX, which serves no logprobs; the guard model moves to llama.cpp. See the amendment under [Cross-platform inference](#cross-platform-inference--the-one-thing-that-could-sink-it).
 **Measurement 1 RUN 2026-08-15 — PASS.** llama.cpp serves logprobs and multimodal on macOS; 14/14 at τ=0.5, margin +0.796, p50 40 ms. **The go/no-go is cleared.** Biggest finding is not the pass but that the **policy prompt is load-bearing** — the same weights scored 11/14 with a *negative* margin under a naively-worded `<Instruct>`. Harness: `scripts/eval/run-shieldstral-llamacpp.sh`.
+**Re-run on Q8_0 2026-08-16 — PASS, and the harness was repaired to make it honest.** The shipping quantisation is now **Q8_0 on llama.cpp on both hosts** (vLLM ruled out with reasons below); 14/14, margin **+0.8151**, p50 43 ms. Two defects in the wrapper were found and fixed on the way, both of the "a check that cannot fail" family — see [Measurement 1, Q8 leg](#measurement-1-q8-leg-2026-08-16). **Measurement 2 (`llm-router` plumbing) is DONE.**
 **Question asked:** is Mistral's Shieldstral suitable for kastellan — specifically as a
 decision gate for *whether the more expensive CASSANDRA analysis is needed*, decided at
 high confidence?
@@ -357,10 +358,42 @@ contends for the same CPU and the failure looks like a runaway-thinking bug.
    run before any threshold is shared across hosts. The false-negative rate on
    out-of-distribution agentic-policy questions — the number that actually gates adoption —
    remains unmeasured.
-2. **`llm-router` round trip.** Add `logprobs`/`top_logprobs` request fields and response
-   parsing; pin that an unset field serialises byte-identically, on both the vLLM and Ollama
-   legs. Confirm `disable_thinking`'s `chat_template_kwargs` does not 4xx against
-   Shieldstral's template.
+2. ~~**`llm-router` round trip.**~~ **DONE 2026-08-16.** `ChatRequest` gained
+   `logprobs`/`top_logprobs` behind `skip_serializing_if` (set together via
+   `with_logprobs`, because vLLM 4xxs on a count without the bool), `ChatChoice`
+   gained `logprobs: Option<LogProbs>`, and the renormalisation lives in the new
+   pure `llm-router::logprob_score`. Additive only: no existing caller passes the
+   fields and no dispatcher signature moved.
+
+   Two things worth carrying forward from building it:
+
+   - **`None` means UNMEASURED and the type enforces it.**
+     `binary_token_probability` returns `Option<f32>` and yields `None` unless
+     **both** verdict spellings are observed. This is the Python probe's
+     fail-open defect made unrepresentable rather than commented against: a
+     sentinel floor on the missing side renormalises to exactly 0.5 when neither
+     spelling is present — which reads as "below τ", i.e. safe — and to a
+     confident 0.9999 when only one is. Mutation-tested: reintroducing the floor
+     (`unwrap_or(-10.0)`) fails four tests.
+   - **Token identity is a tokenizer problem.** `Ġyes` (byte-BPE) and `▁yes`
+     (SentencePiece) survive any amount of trimming, so a matcher on the display
+     string can floor an entire run at once when the backend changes. The scorer
+     prefers the wire's `bytes` (which decode to plain ` yes` on every family)
+     and falls back to marker-stripping on the display form. **The first test for
+     this was vacuous** — `Ġyes` with `bytes: " yes"` passes whether or not
+     `bytes` is consulted, because the normaliser strips `Ġ` by itself — so it
+     was rewritten with display forms no folding rule can rescue.
+
+   **`disable_thinking` is safe against Shieldstral's template — measured, not
+   assumed.** Against llama.cpp both calls returned **HTTP 200 with an identical
+   26-token prompt**, and the one carrying
+   `chat_template_kwargs: {"enable_thinking": false}` reported `cached_tokens: 25`
+   — positive evidence the *rendered prompt was byte-identical*, which is a
+   stronger claim than "no 4xx". So the guard call needs no opt-out seam.
+
+   Still owed on this measurement: the **vLLM leg is unpinned**, because the DGX
+   has no vLLM serving Shieldstral (below). The Ollama leg is pinned by a fixture
+   copied from a real DGX Ollama 0.22.0 response rather than reconstructed.
 3. **A calibration set.** `tests/observation/captures/` holds **7** fixtures
    (five principles, one clinical-leak edge case, one safe control). Seven is not a
    calibration set — a threshold fitted to it means nothing. Target ≥ 100 labelled
@@ -373,6 +406,77 @@ contends for the same CPU and the failure looks like a runaway-thinking bug.
    of input Mistral flags as its weak spot. Buying it unmeasured would be buying the claim.
 5. **Latency.** p50/p99 of a single `max_tokens=1` call on a quiet DGX and a quiet Mac.
    This lands on the dispatcher hot path; a number is required, not an estimate.
+
+### Measurement 1, Q8 leg (2026-08-16)
+
+**Runtime decision: llama.cpp + `Shieldstral-1.0-3B-Q8_0.gguf` + `mmproj-BF16` on BOTH
+hosts.** Same bits, same chat template, one calibration — so a fitted τ transfers instead of
+needing a per-host story. The alternatives were both measured and rejected:
+
+- **vLLM on the DGX.** The architecture is *not* the blocker this time — Shieldstral's
+  `config.json` declares `Mistral3ForConditionalGeneration`, which is in the 272-arch
+  registry of the DGX's `nvcr.io/nvidia/vllm:26.02-py3` container. Two other things are:
+  that container ships **vLLM 0.15.1** against a model card asking for **≥ 0.26.0** (the
+  model postdates the image by six months), and vLLM's GGUF path is an **experimental,
+  single-file-only, now out-of-tree plugin** with `mmproj` being a llama.cpp convention. So
+  vLLM would serve **BF16 safetensors** — different weights, and the study's own
+  "quantisation moves calibration" caveat then forbids sharing a threshold. It buys
+  throughput nothing else needs and costs the property the decision was made for.
+- **Ollama on the DGX.** Newly measured and *capable*: Ollama **0.22.0** returns
+  `logprobs`/`top_logprobs` on `/v1/chat/completions` (probed 2026-08-16 — the study had
+  this as research only). Rejected anyway, because the GGUF would need a hand-rolled
+  Modelfile, which is the broken-stub-template hazard that bit the Agents-A1 import, and
+  because two packagings means two calibrations.
+
+**Result: PASS, 14/14, and slightly better separation than Q4.**
+
+| | Q4_K_M (2026-08-15) | **Q8_0 (2026-08-16)** |
+| --- | --- | --- |
+| accuracy at τ=0.5 | 14 / 14 | **14 / 14**, all measured |
+| should-flag | min 0.8596, median 0.9958 | min **0.9036**, median 0.9920 |
+| should-pass | max 0.0635 | max 0.0886 |
+| **margin** | +0.7961 | **+0.8151** |
+| distinct scores | 14 / 14 | 14 / 14 |
+| latency (quiet Mac) | p50 40 ms, p90 54 ms | p50 **43 ms**, p90 57 ms |
+| multimodal inject / benign | 0.9970 / 0.0014 | 0.9968 / 0.0013 |
+| chat template | 7 095 chars | 7 095 chars, verified via `/props` |
+
+Leetspeak — Mistral's own stated weak spot and the weakest attack score in both runs —
+improves most (0.8596 → 0.9036). The `<Instruct>` block was unchanged (`POLICY_DIGEST`
+`342e3d9661b2cbe2`), so these two runs are comparable.
+
+#### The harness could not have produced these numbers, and that is the transferable part
+
+Both defects are the "a check that cannot fail" family the previous review round was already
+hunting in this same file — one layer over, in the *setup* rather than the measurement.
+
+1. **The readiness loop could never wait.** `curl` exits **7** on a refused connection, and
+   under `set -eu` a command substitution's status becomes the assignment's — so
+   `code=$(curl …)` killed the script on iteration 1, every time, with curl's own 7 surfacing
+   as the harness's exit status. The loop could therefore only ever succeed against a server
+   **someone else had already started**. Its comment reasoned carefully about curl's *stdout*
+   (`000`, hence no `|| echo 000` fallback) and never considered its *exit status*.
+   Consequence worth stating plainly: the wrapper the study names as its reproduction path
+   had never run end to end, and the Q4 numbers were produced by hand.
+2. **An occupied port was indistinguishable from a healthy start.** With the loop fixed, a
+   second server already on the port means our `llama-server` cannot bind and dies, while the
+   readiness probe takes its 200 from the stranger — and `--alias` makes every Shieldstral
+   server answer to the same name, so the run reports a clean pass **over unknown weights**.
+   Now refused explicitly (exit 8). This is the most likely mechanism behind (1) going
+   unnoticed.
+
+**And the chat-template preflight was checking the wrong thing.** It grepped the server's
+startup log for a template line; llama.cpp's startup wording is build-dependent and the build
+measured here prints **no such line at any verbosity**, so a grep miss was indistinguishable
+from "this GGUF carries no template" — collapsing a clean model and the exact
+silent-corruption hazard being guarded into one output. It now asks `/props` what template is
+actually in force and rejects both an absent one and a chatml fallback (llama.cpp's
+substitute when a GGUF carries none, which parses fine and silently reframes every
+`<Instruct>` block). That is how the Q8 template was confirmed at 7 095 chars.
+
+**Still owed:** the **DGX leg**. `llama-server` is not installed there, so "one τ across
+hosts" is currently an argument from identical bits, not a measurement. Until it runs, no
+threshold should be described as cross-host.
 
 ## Effort estimate
 

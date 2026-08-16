@@ -97,6 +97,12 @@ mod tests {
             max_tokens: Some(8192),
             temperature: Some(0.9),
             chat_template_kwargs: None,
+            // Populated rather than left None: this test's stated pin is
+            // "no matter what the request looks like", so a request
+            // carrying every optional field — including the classifier
+            // shape — is the stronger version of the same assertion.
+            logprobs: Some(true),
+            top_logprobs: Some(20),
         };
         assert_eq!(p.pick(&req2), Backend::Local);
     }

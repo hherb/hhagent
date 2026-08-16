@@ -53,6 +53,7 @@ pub mod backend;
 pub mod config;
 pub mod embeddings;
 pub mod error;
+pub mod logprob_score;
 pub mod messages;
 pub mod policy;
 
