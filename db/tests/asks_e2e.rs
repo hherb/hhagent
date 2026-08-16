@@ -515,3 +515,78 @@ fn cancelling_a_suspended_task_cancels_its_ask() {
         assert!(tasks::mark_cancelled(&pool, plain).await.unwrap().is_none());
     });
 }
+
+#[test]
+fn resolving_fires_tasks_resumed_and_pending_asks_are_listable() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let bin_dir = match pg_bin_dir_or_skip() {
+        Some(d) => d,
+        None => return,
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "askn-d",
+        "askn-l",
+        &format!("kastellan-supervisor-test-pg-askn-{suffix}"),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        use kastellan_db::{asks, tasks};
+        use kastellan_db::tasks::Lane;
+
+        kastellan_db::probe::run(
+            &cluster.conn_spec, "core", "startup",
+            serde_json::json!({"version": "test", "purpose": "asks-notify-e2e"}),
+        ).await.expect("probe run");
+        let pool = kastellan_db::pool::connect_admin_pool(&cluster.conn_spec)
+            .await.expect("admin pool");
+
+        let task_id = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "notify probe"}),
+        ).await.unwrap();
+        tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            &pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve"]), Some("d1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        ).await.unwrap();
+
+        // list_pending surfaces it for an operator inbox.
+        let pending = asks::list_pending(&pool, 50).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, raised.ask_id);
+
+        // LISTEN before resolving: PG does not queue notifications for
+        // late subscribers, so subscribing afterwards would prove nothing.
+        let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+            .await.expect("listener");
+        listener.listen("tasks_resumed").await.expect("LISTEN tasks_resumed");
+
+        asks::resolve(
+            &pool, raised.ask_id, "operator/cli",
+            &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap();
+
+        // Without the trigger, a resumed task waits out the lane runner's
+        // 30 s HEARTBEAT. Five seconds is generous for a local socket and
+        // still far under that, so a timeout here means the trigger is
+        // missing rather than that the box is slow.
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
+            .await
+            .expect("tasks_resumed must fire within 5s of a resolve")
+            .expect("notification");
+        assert_eq!(got.channel(), "tasks_resumed");
+        assert_eq!(got.payload(), task_id.to_string());
+
+        // Resolved asks leave the pending list.
+        assert!(asks::list_pending(&pool, 50).await.unwrap().is_empty());
+    });
+}

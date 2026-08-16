@@ -120,6 +120,15 @@ async fn lane_loop(
         eprintln!("scheduler[{}]: LISTEN tasks_cancelled failed: {e}", lane.as_sql());
         return;
     }
+    // A task resumed from `awaiting_operator` (#564) is an UPDATE, which
+    // the INSERT-only `tasks_inserted` trigger cannot see — without this
+    // the resumed task waits out a full HEARTBEAT. Its own channel rather
+    // than overloading `tasks_inserted`, whose name would then no longer
+    // describe what it carries.
+    if let Err(e) = listener.listen("tasks_resumed").await {
+        eprintln!("scheduler[{}]: LISTEN tasks_resumed failed: {e}", lane.as_sql());
+        return;
+    }
 
     // Initial drain: a task inserted *before* the LISTEN above does
     // not produce a NOTIFY visible to this listener (PG does not queue

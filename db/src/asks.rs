@@ -364,6 +364,29 @@ where
     Ok(r.rows_affected())
 }
 
+/// Every ask still awaiting a human, oldest first — the operator inbox
+/// read. Capped at `limit`; `created_at ASC` because the oldest question
+/// is the one holding a task up longest.
+pub async fn list_pending(pool: &PgPool, limit: i64) -> Result<Vec<Ask>, DbError> {
+    let limit = limit.max(0); // LIMIT -1 is a PG error
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {ASK_COLUMNS} FROM asks \
+         WHERE state = 'pending' \
+         ORDER BY created_at ASC \
+         LIMIT $1"
+    )))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| DbError::Query(format!("asks list_pending: {e}")))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(decode_ask_row(row)?);
+    }
+    Ok(out)
+}
+
 /// Fetch one ask by id, in any state.
 pub async fn get(pool: &PgPool, ask_id: i64) -> Result<Option<Ask>, DbError> {
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
