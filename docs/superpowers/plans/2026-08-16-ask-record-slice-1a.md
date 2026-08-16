@@ -2159,7 +2159,7 @@ For each: make the edit, run the named test, confirm it FAILS, then **revert by 
 
 | # | Mutation | Must fail |
 | --- | --- | --- |
-| 1 | `asks::resolve` — drop `AND state = 'pending'` | `resolve_is_exactly_once_and_re_enqueues_the_task` (the second resolve would win) |
+| 1 | `asks::resolve` — drop `AND state = 'pending'` | `resolve_is_exactly_once_and_re_enqueues_the_task`. **Expect `Ok(false)` → `Err("task N is not awaiting_operator")`, NOT a silent overwrite.** The write is transactional and `resume_from_ask`'s inner guard makes an overwrite structurally impossible, so the outer guard buys the clean-loss *contract*, not data safety. Verified in Task 4's fix round |
 | 2 | `tasks::suspend_for_ask` — drop `lease_expires_at = NULL` | `raise_suspends_the_task_and_releases_the_lease` |
 | 3 | `tasks::mark_cancelled` — drop `'awaiting_operator'` from the `IN` list | `cancelling_a_suspended_task_cancels_its_ask` |
 | 4 | `asks::expire_due` — replace the `deadline_at < now()` predicate with `TRUE` | `expire_due_fails_the_task_closed_and_leaves_others_alone` (the fresh ask would expire too) |
