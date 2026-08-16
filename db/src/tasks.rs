@@ -377,6 +377,42 @@ pub async fn increment_plan_count(
     Ok(())
 }
 
+/// Suspend a `running` task while an operator ask is outstanding
+/// (#564). Sets `state = 'awaiting_operator'` and **releases the lease**.
+///
+/// Returns `true` iff a row moved. `false` means the task was not
+/// `running` — already terminal, cancelled out from under the caller, or
+/// never claimed — and the caller must treat that as a refusal to
+/// suspend, not as success.
+///
+/// Releasing the lease is load-bearing, not tidiness. `any_live_worker`
+/// counts `running` rows with an unexpired lease as evidence a daemon is
+/// alive and consuming a lane; a suspended task that kept its lease would
+/// make a completely idle daemon look busy to `memory l3 run`'s
+/// busy-vs-absent discrimination. (The crash sweep is a separate story
+/// and needs no help here: `sweep_crashed` filters `state = 'running'`,
+/// so a suspended task is already outside it.)
+///
+/// Executor-generic so `asks::raise` can call it inside its transaction —
+/// the ask INSERT and this UPDATE must commit together.
+pub async fn suspend_for_ask<'e, E>(executor: E, task_id: i64) -> Result<bool, DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let r = sqlx::query(
+        "UPDATE tasks \
+         SET state = 'awaiting_operator', \
+             lease_expires_at = NULL, \
+             updated_at = now() \
+         WHERE id = $1 AND state = 'running'",
+    )
+    .bind(task_id)
+    .execute(executor)
+    .await
+    .map_err(|e| DbError::Query(format!("tasks suspend_for_ask: {e}")))?;
+    Ok(r.rows_affected() == 1)
+}
+
 /// Fetch one task by id (any state). Used by CLI status subcommand
 /// and by the synthetic-load harness.
 pub async fn get(pool: &PgPool, task_id: i64) -> Result<Option<Task>, DbError> {
