@@ -55,6 +55,22 @@ CREATE INDEX asks_pending_deadline ON asks (deadline_at) WHERE state = 'pending'
 -- Every read from the task side ("does this task have an open ask?").
 CREATE INDEX asks_task ON asks (task_id);
 
+-- One pending ask per task, enforced by the database rather than only by
+-- `raise`'s application-level guard (`UPDATE tasks … WHERE state =
+-- 'running'`, which only stops a SECOND raise against the same task from
+-- the same process — it is not a substitute for a constraint). This is
+-- exactly the invariant `asks::resolve`'s loud `Err` branch exists to
+-- detect a violation of; making it a UNIQUE index turns "detect after the
+-- fact" into "cannot happen".
+CREATE UNIQUE INDEX asks_one_pending_per_task ON asks (task_id) WHERE state = 'pending';
+
+-- The nonce lookup `asks::resolve_with_nonce` (#564 fix wave) performs
+-- would otherwise seq-scan a table that, by design (no DELETE grant),
+-- never shrinks. UNIQUE also makes a nonce collision impossible rather
+-- than merely improbable — cheap insurance on top of `nonce_sha256` being
+-- SHA-256 over 32 bytes of OS CSPRNG output.
+CREATE UNIQUE INDEX asks_nonce ON asks (nonce_sha256);
+
 -- (2) The suspended task state.
 ALTER TABLE tasks DROP CONSTRAINT tasks_state_check;
 ALTER TABLE tasks

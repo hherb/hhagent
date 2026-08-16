@@ -52,6 +52,24 @@
 //! `dispatch_step` and `cassandra::deterministic` read *at that time*, not
 //! from this comment.
 //!
+//! ⚠️ **Canonical serialization is a property of one build, not an eternal
+//! one, and that matters because the digest outlives the process that
+//! computed it.** `asks.plan_digest` is written to Postgres and a raised
+//! ask can survive a daemon restart — it sits `pending` for up to its
+//! `deadline_at`, which is measured in hours, not the seconds a process
+//! lives for. So a digest computed by build N and a digest computed by
+//! build N+1 for what a human would call "the same plan" can be compared
+//! against each other for real, not just hypothetically. Any change to
+//! `canonical_form` between those builds — a field added or removed from
+//! the constructed `json!`, one reordered inside a nested structure that
+//! is not itself a `serde_json::Map` — makes the two digests disagree.
+//! This still fails SAFE: a mismatch only re-escalates, and the operator
+//! sees what looks like a duplicate ask rather than a stale approval
+//! silently carrying over to a different plan. That is why this is
+//! recorded as a caveat rather than fixed — there is nothing here to fix,
+//! only a property future readers should not assume holds across a
+//! deploy.
+//!
 //! # Canonicality
 //!
 //! The digest is SHA-256 over `serde_json`'s serialization of a reduced

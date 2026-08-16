@@ -258,11 +258,35 @@ pub async fn observe_state(pool: &PgPool, task_id: i64) -> Result<String, DbErro
 /// strand the ask. One cancel path that cannot be bypassed is worth the
 /// coupling; same argument `AllowlistDecl` made in #545 for making the
 /// half-declared state unrepresentable.
+///
+/// # Lock order: asks → tasks, and it is NOT arbitrary
+///
+/// This function cancels the task's asks **before** running the guarded
+/// `tasks` UPDATE — asks locked first, tasks second. That matches
+/// `asks::resolve`, `asks::resolve_with_nonce`, and `asks::expire_due`,
+/// which all write `asks` then `tasks` inside one transaction. Locking
+/// tasks first (the order this function used before this comment was
+/// added) inverts that order relative to the other three, and PG detects
+/// the resulting lock cycle between a concurrent `mark_cancelled(T)` and
+/// `resolve(A)` on the same (task, ask) pair as a deadlock (SQLSTATE
+/// 40P01) and aborts one side — surfacing as a database error on either
+/// the operator's cancel or their approval, for no reason but acquisition
+/// order. **If you are tempted to swap this back so the "primary" tasks
+/// UPDATE runs first: don't — it silently reintroduces that deadlock.**
+///
+/// Cancelling the ask before the tasks UPDATE succeeds is still correct
+/// when the task turns out NOT to be cancellable: the function returns
+/// `Ok(None)` without committing, and dropping `tx` rolls the ask cancel
+/// back along with it. The ask cancel here is therefore provisional on the
+/// task actually being cancelled, exactly as before — only the lock
+/// acquisition order changed, not the outcome.
 pub async fn mark_cancelled(pool: &PgPool, task_id: i64) -> Result<Option<Task>, DbError> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| DbError::Query(format!("tasks mark_cancelled begin: {e}")))?;
+
+    crate::asks::cancel_for_task(&mut *tx, task_id).await?;
 
     let row = sqlx::query(
         "UPDATE tasks \
@@ -279,12 +303,12 @@ pub async fn mark_cancelled(pool: &PgPool, task_id: i64) -> Result<Option<Task>,
     .map_err(|e| DbError::Query(format!("tasks mark_cancelled: {e}")))?;
 
     let Some(row) = row else {
-        // Not cancellable. Dropping `tx` rolls back; nothing was written.
+        // Not cancellable. Dropping `tx` rolls back — including the ask
+        // cancel above, which must not survive a task that stayed
+        // uncancelled.
         return Ok(None);
     };
     let task = decode_task_row(&row)?;
-
-    crate::asks::cancel_for_task(&mut *tx, task_id).await?;
 
     tx.commit()
         .await
@@ -426,8 +450,14 @@ pub async fn increment_plan_count(
 /// so a suspended task is already outside it.)
 ///
 /// Executor-generic so `asks::raise` can call it inside its transaction —
-/// the ask INSERT and this UPDATE must commit together.
-pub async fn suspend_for_ask<'e, E>(executor: E, task_id: i64) -> Result<bool, DbError>
+/// the ask INSERT and this UPDATE must commit together. **Sole intended
+/// caller:** `asks::raise`.
+///
+/// `pub(crate)`, not `pub`: called from anywhere else, this parks a task
+/// in `awaiting_operator` with no ask backing it — `claim_one`,
+/// `sweep_crashed`, and `expire_due` all skip that state, so the task
+/// wedges permanently until a manual cancel.
+pub(crate) async fn suspend_for_ask<'e, E>(executor: E, task_id: i64) -> Result<bool, DbError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
@@ -455,12 +485,30 @@ where
 /// on this transition, which is what wakes the lane runner immediately
 /// rather than at its next 30 s heartbeat.
 ///
-/// `started_at` and `plan_count` are deliberately left alone: the resumed
-/// run is a continuation of the same task, and `plan_count` is the
-/// plans-so-far counter the CLI shows.
+/// `started_at` and `plan_count` are deliberately left alone **by this
+/// UPDATE** — it does not reset either to a fresh-task value.
 ///
-/// Executor-generic so `asks::resolve` can call it inside its transaction.
-pub async fn resume_from_ask<'e, E>(executor: E, task_id: i64) -> Result<bool, DbError>
+/// That is true of the SQL and false of the observed outcome, and slice
+/// 1b must not read this comment as "the plan budget carries forward."
+/// `core::scheduler::runner::task_exec::run_one` rebuilds the resumed
+/// task's `TaskContext` with `plan_count: 0` regardless of what this
+/// column holds, and `inner_loop` writes that absolute value straight
+/// back via `increment_plan_count` on the next `formulate_plan`. So a task
+/// that burned 4 of its 5-plan budget, escalated, and got approved
+/// resumes with a **fresh full budget** — the CLI's plans-so-far column
+/// reads 4 → 1, not 4 → 4. Whether that reset is fine (a resumed task
+/// deserves a full retry budget) or wrong (the operator approved a
+/// continuation, not a new attempt) is slice 1b's call, not made here;
+/// this comment previously implied the count survives, which it does not.
+///
+/// Executor-generic so `asks::resolve` and `asks::resolve_with_nonce` can
+/// call it inside their transactions. **Sole intended caller:**
+/// `asks::resolve` / `asks::resolve_with_nonce`.
+///
+/// `pub(crate)`, not `pub`: called from anywhere else, this resurrects a
+/// task from `awaiting_operator` with no resolved ask behind it, silently
+/// bypassing the human decision the state exists to wait on.
+pub(crate) async fn resume_from_ask<'e, E>(executor: E, task_id: i64) -> Result<bool, DbError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
@@ -491,7 +539,13 @@ where
 /// means the task's own wall-clock deadline elapsed while it was working,
 /// and conflating the two would make lane-latency queries count tasks that
 /// spent their time waiting on a human.
-pub async fn fail_awaiting_operator<'e, E>(
+///
+/// **Sole intended caller:** `asks::expire_due`. `pub(crate)`, not `pub`:
+/// called from anywhere else, this terminalises a task that may still have
+/// a `pending` ask attached, leaving a resolvable ask pointing at a dead
+/// task — the same wedge `mark_cancelled`'s coupled ask-cancel exists to
+/// prevent, reintroduced from a different call site.
+pub(crate) async fn fail_awaiting_operator<'e, E>(
     executor: E,
     task_id: i64,
     detail: &str,

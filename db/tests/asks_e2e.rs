@@ -590,3 +590,392 @@ fn resolving_fires_tasks_resumed_and_pending_asks_are_listable() {
         assert!(asks::list_pending(&pool, 50).await.unwrap().is_empty());
     });
 }
+
+// ---------------------------------------------------------------------
+// FIX 1 (task-9 fix wave): `resolve_with_nonce` must be the easy, safe
+// path for an untrusted (channel/transport) caller. These mirror
+// `resolve_is_exactly_once_and_re_enqueues_the_task` above but drive the
+// nonce-keyed entry point instead of the by-id one.
+// ---------------------------------------------------------------------
+
+#[test]
+fn resolve_with_nonce_succeeds_and_re_enqueues_the_task() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let bin_dir = match pg_bin_dir_or_skip() {
+        Some(d) => d,
+        None => return,
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "asko-d",
+        "asko-l",
+        &format!("kastellan-supervisor-test-pg-asko-{suffix}"),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        use kastellan_db::{asks, tasks};
+        use kastellan_db::tasks::Lane;
+
+        kastellan_db::probe::run(
+            &cluster.conn_spec, "core", "startup",
+            serde_json::json!({"version": "test", "purpose": "asks-resolve-nonce-e2e"}),
+        ).await.expect("probe run");
+        let pool = kastellan_db::pool::connect_admin_pool(&cluster.conn_spec)
+            .await.expect("admin pool");
+
+        let task_id = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "nonce resolve probe"}),
+        ).await.unwrap();
+        tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            &pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve", "deny"]), Some("digest1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        ).await.unwrap();
+
+        let won = asks::resolve_with_nonce(
+            &pool, &raised.nonce, "matrix/@horst:kastellan.dev",
+            &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap();
+        assert!(won, "resolving with the correct plaintext nonce must succeed");
+
+        // The task is back in the queue, claimable again — same outcome
+        // as the by-id path.
+        assert_eq!(tasks::observe_state(&pool, task_id).await.unwrap(), "pending");
+        let reclaimed = tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap();
+        assert_eq!(reclaimed.map(|t| t.id), Some(task_id));
+
+        let got = asks::get(&pool, raised.ask_id).await.unwrap().unwrap();
+        assert_eq!(got.state, "resolved");
+        assert_eq!(got.resolved_by.as_deref(), Some("matrix/@horst:kastellan.dev"));
+        assert_eq!(got.resolution, Some(serde_json::json!({"choice": "approve"})));
+    });
+}
+
+#[test]
+fn resolve_with_nonce_rejects_a_wrong_nonce_and_leaves_the_ask_pending() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let bin_dir = match pg_bin_dir_or_skip() {
+        Some(d) => d,
+        None => return,
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "askw-d",
+        "askw-l",
+        &format!("kastellan-supervisor-test-pg-askw-{suffix}"),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        use kastellan_db::{asks, tasks};
+        use kastellan_db::tasks::Lane;
+
+        kastellan_db::probe::run(
+            &cluster.conn_spec, "core", "startup",
+            serde_json::json!({"version": "test", "purpose": "asks-resolve-nonce-wrong-e2e"}),
+        ).await.expect("probe run");
+        let pool = kastellan_db::pool::connect_admin_pool(&cluster.conn_spec)
+            .await.expect("admin pool");
+
+        let task_id = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "wrong nonce probe"}),
+        ).await.unwrap();
+        tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            &pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve", "deny"]), Some("digest1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        ).await.unwrap();
+
+        // Syntactically valid — 64 lowercase hex chars, the exact shape a
+        // real nonce takes — but never issued by `raise`. Deliberately NOT
+        // a garbage string: this exercises the hash-mismatch path, not a
+        // decode/format failure.
+        let unissued_nonce = "0".repeat(64);
+        assert_ne!(unissued_nonce, raised.nonce, "test setup: must not collide with the real nonce");
+
+        let lost = asks::resolve_with_nonce(
+            &pool, &unissued_nonce, "matrix/@stranger:evil.example",
+            &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap();
+        assert!(!lost, "an unissued nonce must not resolve the ask");
+
+        // Nothing moved: the ask is still pending, unresolved, and the
+        // task is still suspended.
+        let got = asks::get(&pool, raised.ask_id).await.unwrap().unwrap();
+        assert_eq!(got.state, "pending");
+        assert!(got.resolved_at.is_none());
+        assert!(got.resolved_by.is_none());
+        assert_eq!(tasks::observe_state(&pool, task_id).await.unwrap(), "awaiting_operator");
+
+        // The real nonce still works afterwards — a failed guess must not
+        // have consumed or corrupted the row.
+        let won = asks::resolve_with_nonce(
+            &pool, &raised.nonce, "matrix/@horst:kastellan.dev",
+            &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap();
+        assert!(won, "the correct nonce must still resolve the ask after a wrong guess");
+    });
+}
+
+#[test]
+fn resolve_with_nonce_on_an_already_resolved_ask_returns_false() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let bin_dir = match pg_bin_dir_or_skip() {
+        Some(d) => d,
+        None => return,
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "askz-d",
+        "askz-l",
+        &format!("kastellan-supervisor-test-pg-askz-{suffix}"),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        use kastellan_db::{asks, tasks};
+        use kastellan_db::tasks::Lane;
+
+        kastellan_db::probe::run(
+            &cluster.conn_spec, "core", "startup",
+            serde_json::json!({"version": "test", "purpose": "asks-resolve-nonce-twice-e2e"}),
+        ).await.expect("probe run");
+        let pool = kastellan_db::pool::connect_admin_pool(&cluster.conn_spec)
+            .await.expect("admin pool");
+
+        let task_id = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "double nonce resolve probe"}),
+        ).await.unwrap();
+        tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            &pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve", "deny"]), Some("digest1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        ).await.unwrap();
+
+        let first = asks::resolve_with_nonce(
+            &pool, &raised.nonce, "matrix/@horst:kastellan.dev",
+            &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap();
+        assert!(first, "the first resolve must win");
+
+        // Same nonce, second call: the ask is no longer `pending`, so the
+        // guarded UPDATE finds nothing — clean `Ok(false)`, not an error,
+        // and the winner's decision is untouched.
+        let second = asks::resolve_with_nonce(
+            &pool, &raised.nonce, "matrix/@someone-else:evil.example",
+            &serde_json::json!({"choice": "deny"}),
+        ).await.unwrap();
+        assert!(!second, "resolving an already-resolved ask by nonce must lose cleanly");
+
+        let got = asks::get(&pool, raised.ask_id).await.unwrap().unwrap();
+        assert_eq!(got.resolved_by.as_deref(), Some("matrix/@horst:kastellan.dev"),
+            "a losing nonce resolve must not overwrite the winner");
+        assert_eq!(got.resolution, Some(serde_json::json!({"choice": "approve"})));
+    });
+}
+
+// ---------------------------------------------------------------------
+// FIX 5 (task-9 fix wave): the one-pending-ask-per-task invariant is now
+// a database fact (`asks_one_pending_per_task`), not just a theorem about
+// `raise`'s guard.
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_one_pending_ask_per_task_index_rejects_a_second_pending_ask() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let bin_dir = match pg_bin_dir_or_skip() {
+        Some(d) => d,
+        None => return,
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "askp-d",
+        "askp-l",
+        &format!("kastellan-supervisor-test-pg-askp-{suffix}"),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        use kastellan_db::tasks;
+        use kastellan_db::tasks::Lane;
+
+        kastellan_db::probe::run(
+            &cluster.conn_spec, "core", "startup",
+            serde_json::json!({"version": "test", "purpose": "asks-one-pending-e2e"}),
+        ).await.expect("probe run");
+        let pool = kastellan_db::pool::connect_admin_pool(&cluster.conn_spec)
+            .await.expect("admin pool");
+
+        let task_id = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "double pending probe"}),
+        ).await.unwrap();
+
+        // Insert directly via SQL, bypassing `raise`'s application-level
+        // guard entirely — this test is about the DATABASE constraint,
+        // not the API that happens to also prevent this today.
+        sqlx::query(
+            "INSERT INTO asks (task_id, kind, body, options, nonce_sha256, deadline_at) \
+             VALUES ($1, 'plan_approval', 'first', '[]'::jsonb, 'one-pending-nonce-hash-1', \
+                     now() + interval '1 hour')",
+        )
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .expect("first pending ask insert");
+
+        let second = sqlx::query(
+            "INSERT INTO asks (task_id, kind, body, options, nonce_sha256, deadline_at) \
+             VALUES ($1, 'plan_approval', 'second', '[]'::jsonb, 'one-pending-nonce-hash-2', \
+                     now() + interval '1 hour')",
+        )
+        .bind(task_id)
+        .execute(&pool)
+        .await;
+        let err = second.expect_err(
+            "a second PENDING ask on the same task must be rejected by asks_one_pending_per_task",
+        );
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("asks_one_pending_per_task") || msg.contains("duplicate key"),
+            "unexpected error (expected a unique-violation on asks_one_pending_per_task): {msg}",
+        );
+
+        // Exactly one row exists — the rejected INSERT wrote nothing.
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM asks WHERE task_id = $1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    });
+}
+
+// ---------------------------------------------------------------------
+// FIX 6 (task-9 fix wave): all `asks_e2e` tests above run as the cluster
+// superuser via `connect_admin_pool`. The daemon runs every `asks`
+// statement as `kastellan_runtime` — this pins the grants 0023 actually
+// declares, mirroring `postgres_e2e.rs`'s
+// `runtime_role_audit_log_revoke_is_enforced`.
+// ---------------------------------------------------------------------
+
+#[test]
+fn asks_table_grants_match_the_runtime_role_contract() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let bin_dir = match pg_bin_dir_or_skip() {
+        Some(d) => d,
+        None => return,
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "askg-d",
+        "askg-l",
+        &format!("kastellan-supervisor-test-pg-askg-{suffix}"),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        use kastellan_db::tasks;
+        use kastellan_db::tasks::Lane;
+
+        // Probe applies all migrations (incl. 0023) and creates the
+        // kastellan_runtime role + its asks grants.
+        kastellan_db::probe::run(
+            &cluster.conn_spec, "core", "startup",
+            serde_json::json!({"version": "test", "purpose": "asks-grants-e2e"}),
+        ).await.expect("probe run");
+
+        let pool = kastellan_db::pool::connect_admin_pool(&cluster.conn_spec)
+            .await.expect("admin pool");
+
+        // Seed a task as the (superuser) admin pool before dropping
+        // privilege — `asks.task_id` has a FK to `tasks`, and INSERT into
+        // `tasks` is not what this test is checking.
+        let task_id = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "grants probe"}),
+        ).await.unwrap();
+
+        // ---------- SET ROLE on a held connection ----------
+        let mut held = pool.acquire().await.expect("acquire connection");
+        sqlx::query(sqlx::AssertSqlSafe(kastellan_db::conn::set_role_runtime_statement()))
+            .execute(&mut *held)
+            .await
+            .expect("SET ROLE kastellan_runtime");
+
+        // ---------- positive path: INSERT/SELECT/UPDATE succeed ----------
+        let inserted: (i64,) = sqlx::query_as(
+            "INSERT INTO asks (task_id, kind, body, options, nonce_sha256, deadline_at) \
+             VALUES ($1, 'plan_approval', 'b', '[]'::jsonb, 'grants-probe-nonce-hash', \
+                     now() + interval '1 hour') \
+             RETURNING id",
+        )
+        .bind(task_id)
+        .fetch_one(&mut *held)
+        .await
+        .expect("INSERT asks under runtime role");
+        let ask_id = inserted.0;
+
+        let (state,): (String,) = sqlx::query_as("SELECT state FROM asks WHERE id = $1")
+            .bind(ask_id)
+            .fetch_one(&mut *held)
+            .await
+            .expect("SELECT asks under runtime role");
+        assert_eq!(state, "pending");
+
+        sqlx::query("UPDATE asks SET state = 'cancelled' WHERE id = $1")
+            .bind(ask_id)
+            .execute(&mut *held)
+            .await
+            .expect("UPDATE asks under runtime role");
+
+        // ---------- negative path: DELETE denied ----------
+        let del_err = sqlx::query("DELETE FROM asks WHERE id = $1")
+            .bind(ask_id)
+            .execute(&mut *held)
+            .await
+            .expect_err("DELETE asks must be rejected under runtime role");
+        let del_msg = del_err.to_string().to_lowercase();
+        assert!(
+            del_msg.contains("permission denied"),
+            "expected 'permission denied' in error, got: {del_msg}"
+        );
+    });
+}

@@ -17,14 +17,19 @@
 //! * **`tasks` writes go through [`crate::tasks`].** That module owns all
 //!   `tasks` SQL; this one calls its executor-generic helpers inside its
 //!   own transactions rather than writing `UPDATE tasks` here.
-//! * **Resolution happens exactly once.** [`resolve`] guards on
-//!   `state = 'pending'` and reports rows-affected, so the first responder
-//!   wins and every later one is told it lost — no lock, same idiom as
-//!   `memories::set_embedding`.
+//! * **Resolution happens exactly once.** [`resolve`] and
+//!   [`resolve_with_nonce`] both guard on `state = 'pending'` and report
+//!   rows-affected, so the first responder wins and every later one is
+//!   told it lost — no lock, same idiom as `memories::set_embedding`.
+//! * **An untrusted-transport caller resolves by nonce, never by id.**
+//!   [`resolve`] is keyed by row id — a guessable small integer — and is
+//!   safe only because its caller is the local operator CLI.
+//!   [`resolve_with_nonce`] is the form a channel/transport caller must
+//!   use; see its doc for why (spec D3).
 //! * **The nonce is never readable.** Only its hash is stored, and
-//!   [`Ask`] deliberately has no nonce field. Slice 2 matches an inbound
-//!   nonce with a `WHERE nonce_sha256 = $1` predicate, never by reading
-//!   the stored value out and comparing in Rust.
+//!   [`Ask`] deliberately has no nonce field. [`resolve_with_nonce`]
+//!   matches an inbound nonce with a `WHERE nonce_sha256 = $1` predicate,
+//!   never by reading the stored value out and comparing in Rust.
 
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgRow;
@@ -66,10 +71,28 @@ pub struct Ask {
 /// plaintext, exactly once**. Nothing persists the plaintext — if the
 /// caller drops it, the ask can never be resolved through a nonce-bearing
 /// transport again and must be expired or cancelled.
-#[derive(Clone, Debug)]
+///
+/// [`Debug`] is hand-written to **redact `nonce`**: it is a live approval
+/// token — the very thing [`Ask`] deliberately has no field for, one
+/// screen above this struct — and nothing debug-formats it today, but the
+/// whole point of a `Debug` impl is that someone eventually will. A
+/// `tracing::debug!(?raised, …)` added in a later slice would otherwise
+/// write the plaintext straight into `~/.local/state/kastellan/*.out`.
+/// Mirrors `core::channel::PeerEvidence`, which redacts
+/// `presented_token` for the identical reason.
+#[derive(Clone)]
 pub struct RaisedAsk {
     pub ask_id: i64,
     pub nonce: String,
+}
+
+impl std::fmt::Debug for RaisedAsk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RaisedAsk")
+            .field("ask_id", &self.ask_id)
+            .field("nonce", &"<redacted>")
+            .finish()
+    }
 }
 
 /// One row [`expire_due`] retired, for the caller's audit emission.
@@ -209,7 +232,20 @@ pub async fn raise(
     Ok(RaisedAsk { ask_id, nonce })
 }
 
-/// Resolve a pending ask and return its task to the queue.
+/// Resolve a pending ask found by row **id**, and return its task to the
+/// queue.
+///
+/// **Operator-CLI path only.** An `id` is a small sequential integer with
+/// no unforgeability property — anyone who can guess or enumerate it can
+/// resolve someone else's ask. That is safe here only because this
+/// function's caller is local and already trusted (the operator's own
+/// `kastellan-cli`). **A caller reachable from an untrusted transport — a
+/// channel/Matrix handler parsing `resolve 41 approve` out of a room
+/// message, for instance — MUST use [`resolve_with_nonce`] instead.**
+/// Resolving by id from such a caller is exactly the openworker weakness
+/// spec D3 exists to avoid: it embeds a plain item id and is safe only
+/// because *its* transport is a single-user desktop app, which a Matrix
+/// room is not.
 ///
 /// Returns `true` iff **this** call resolved it. `false` means the ask was
 /// not `pending` — already resolved by someone else, expired, cancelled,
@@ -242,7 +278,7 @@ pub async fn resolve(
              resolved_by = $2, \
              resolution = $3 \
          WHERE id = $1 AND state = 'pending' \
-         RETURNING task_id",
+         RETURNING id, task_id",
     )
     .bind(ask_id)
     .bind(resolved_by)
@@ -256,10 +292,88 @@ pub async fn resolve(
         // was written either way.
         return Ok(false);
     };
+    let (resolved_ask_id, task_id) = decode_resolved_ids(&row)?;
+
+    finish_resolve(tx, resolved_ask_id, task_id).await
+}
+
+/// Resolve a pending ask found by its correlation **nonce**, and return its
+/// task to the queue.
+///
+/// **This is the path a channel/transport caller must use.** Callers pass
+/// the plaintext nonce (whatever the peer presented); it is hashed here
+/// with [`sha256_hex`] and matched against the stored `nonce_sha256` —
+/// never the other way around, so a DB read still cannot recover a live
+/// token. Guarded `WHERE nonce_sha256 = $1 AND state = 'pending'`, so a
+/// peer who does not hold the nonce [`raise`] handed out cannot resolve
+/// (or even discover) anyone else's ask. See [`resolve`]'s doc for why the
+/// by-id form is not safe for this caller.
+///
+/// Same semantics as [`resolve`] otherwise: one transaction, exactly-once,
+/// first-responder-wins. Returns `true` iff **this** call resolved it;
+/// `false` for a wrong/unissued nonce, an already-resolved ask, or one that
+/// expired/was cancelled.
+pub async fn resolve_with_nonce(
+    pool: &PgPool,
+    nonce: &str,
+    resolved_by: &str,
+    resolution: &serde_json::Value,
+) -> Result<bool, DbError> {
+    let nonce_hash = sha256_hex(nonce);
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| DbError::Query(format!("asks resolve_with_nonce begin: {e}")))?;
+
+    let row = sqlx::query(
+        "UPDATE asks \
+         SET state = 'resolved', \
+             resolved_at = now(), \
+             resolved_by = $2, \
+             resolution = $3 \
+         WHERE nonce_sha256 = $1 AND state = 'pending' \
+         RETURNING id, task_id",
+    )
+    .bind(&nonce_hash)
+    .bind(resolved_by)
+    .bind(resolution)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| DbError::Query(format!("asks resolve_with_nonce: {e}")))?;
+
+    let Some(row) = row else {
+        // Wrong/unissued nonce, or lost the race. Dropping `tx` rolls back;
+        // nothing was written either way.
+        return Ok(false);
+    };
+    let (resolved_ask_id, task_id) = decode_resolved_ids(&row)?;
+
+    finish_resolve(tx, resolved_ask_id, task_id).await
+}
+
+/// Decode the `(id, task_id)` pair both resolvers' guarded UPDATE returns.
+fn decode_resolved_ids(row: &PgRow) -> Result<(i64, i64), DbError> {
+    let ask_id: i64 = row
+        .try_get("id")
+        .map_err(|e| DbError::Query(format!("decode asks.id: {e}")))?;
     let task_id: i64 = row
         .try_get("task_id")
         .map_err(|e| DbError::Query(format!("decode asks.task_id: {e}")))?;
+    Ok((ask_id, task_id))
+}
 
+/// Shared tail of [`resolve`] and [`resolve_with_nonce`]: given a
+/// transaction whose guarded `UPDATE asks … WHERE state = 'pending'` has
+/// already found and locked exactly one row, resume that row's task and
+/// commit. Both callers differ only in the `WHERE` predicate (and the bind
+/// type it takes) — everything after "we found the row" is identical, and
+/// lives here exactly once so the two resolvers cannot drift apart.
+async fn finish_resolve(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    ask_id: i64,
+    task_id: i64,
+) -> Result<bool, DbError> {
     if !tasks::resume_from_ask(&mut *tx, task_id).await? {
         // A pending ask whose task is NOT awaiting_operator is an invariant
         // violation: `cancel_for_task` cancels the ask with the task, and
@@ -343,12 +457,17 @@ pub async fn expire_due(pool: &PgPool) -> Result<Vec<ExpiredAsk>, DbError> {
 ///
 /// Called from [`crate::tasks::mark_cancelled`] inside its transaction —
 /// see the note there for why it lives inside the cancel path rather than
-/// in a separate cancel-both helper.
+/// in a separate cancel-both helper. **Sole intended caller:**
+/// `tasks::mark_cancelled`.
+///
+/// `pub(crate)`, not `pub`: called from anywhere else, this cancels an ask
+/// out from under a task that was never actually cancelled, and nothing
+/// reconciles the two afterwards.
 ///
 /// Executor-generic, and takes a `task_id` rather than an ask id: the
 /// caller is cancelling a *task* and does not know or care how many asks
 /// it has.
-pub async fn cancel_for_task<'e, E>(executor: E, task_id: i64) -> Result<u64, DbError>
+pub(crate) async fn cancel_for_task<'e, E>(executor: E, task_id: i64) -> Result<u64, DbError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
@@ -366,13 +485,17 @@ where
 
 /// Every ask still awaiting a human, oldest first — the operator inbox
 /// read. Capped at `limit`; `created_at ASC` because the oldest question
-/// is the one holding a task up longest.
+/// is the one holding a task up longest, with `id ASC` as a tiebreaker —
+/// `created_at` defaults to `transaction_timestamp()`, so two asks raised
+/// in the same transaction (or just landing in the same clock tick) can
+/// tie, and without a tiebreaker the inbox order for that pair is
+/// nondeterministic across calls.
 pub async fn list_pending(pool: &PgPool, limit: i64) -> Result<Vec<Ask>, DbError> {
     let limit = limit.max(0); // LIMIT -1 is a PG error
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {ASK_COLUMNS} FROM asks \
          WHERE state = 'pending' \
-         ORDER BY created_at ASC \
+         ORDER BY created_at ASC, id ASC \
          LIMIT $1"
     )))
     .bind(limit)
@@ -397,4 +520,37 @@ pub async fn get(pool: &PgPool, ask_id: i64) -> Result<Option<Ask>, DbError> {
         .await
         .map_err(|e| DbError::Query(format!("asks get: {e}")))?;
     row.as_ref().map(decode_ask_row).transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RaisedAsk`'s `Debug` must never render the plaintext nonce — it is
+    /// a live approval token, the very thing [`Ask`] deliberately has no
+    /// field for. Asserted here rather than trusted, mirroring
+    /// `core::channel::peer_evidence_debug_redacts_the_presented_token`:
+    /// the failure mode is silent, and a `tracing::debug!(?raised, …)`
+    /// added anywhere on the resolve path would otherwise write the token
+    /// straight into the daemon log.
+    #[test]
+    fn raised_ask_debug_redacts_the_nonce() {
+        let raised = RaisedAsk { ask_id: 41, nonce: "S3CRET-NONCE-VALUE".to_string() };
+        let rendered = format!("{raised:?}");
+        assert!(!rendered.contains("S3CRET-NONCE-VALUE"), "nonce leaked into Debug: {rendered}");
+        assert!(rendered.contains("redacted"), "must say it was redacted: {rendered}");
+        // The ask id is not a secret and stays legible for diagnosis.
+        assert!(rendered.contains("41"), "ask_id must stay visible: {rendered}");
+    }
+
+    /// Redacting `Debug` must not have cost the derived `Clone` the rest of
+    /// the code relies on (`raise` returns an owned `RaisedAsk`; callers
+    /// may need to hold onto a copy of the id/nonce pair).
+    #[test]
+    fn raised_ask_still_clones() {
+        let raised = RaisedAsk { ask_id: 7, nonce: "abc123".to_string() };
+        let cloned = raised.clone();
+        assert_eq!(cloned.ask_id, raised.ask_id);
+        assert_eq!(cloned.nonce, raised.nonce);
+    }
 }
