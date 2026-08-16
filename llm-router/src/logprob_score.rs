@@ -51,13 +51,20 @@
 
 use crate::messages::{ChatResponse, TopLogProb};
 
-/// Conventional spellings of the affirmative verdict token, after
-/// [`normalize_token`]. Callers may pass their own.
-pub const YES_FORMS: &[&str] = &["yes", "true", "unsafe"];
+/// The affirmative verdict spelling, after [`normalize_token`].
+///
+/// Deliberately just `yes` — the one form actually measured coming back
+/// from the guard model, rather than a speculative set like
+/// `yes|true|unsafe`. A wider set is not free: it raises the chance of
+/// matching a token that belongs to a *different* question framing, and
+/// since one match on each side is all it takes to produce a number, a
+/// false match here does not degrade a score, it fabricates one. Callers
+/// with a model that answers differently pass their own set.
+pub const YES_FORMS: &[&str] = &["yes"];
 
-/// Conventional spellings of the negative verdict token, after
-/// [`normalize_token`].
-pub const NO_FORMS: &[&str] = &["no", "false", "safe"];
+/// The negative verdict spelling, after [`normalize_token`]. Narrow for
+/// the same reason as [`YES_FORMS`].
+pub const NO_FORMS: &[&str] = &["no"];
 
 /// The token's text, preferring the wire's raw `bytes` over the display
 /// form.
