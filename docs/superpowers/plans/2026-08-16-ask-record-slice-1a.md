@@ -464,7 +464,7 @@ export CARGO_TARGET_DIR=$HOME/.cargo-target-kastellan-gate
 cargo test -p kastellan-core --lib plan_digest:: 2>&1 | tail -20
 ```
 
-Expected: PASS, 19 tests. If `refused` or another `Plan` field is missing from `base_plan()`, the compile error names it — add it as `None` rather than changing the digest.
+Expected: PASS, 24 tests (19 as listed, plus the five per-field tests added in fix round 1). If `refused` or another `Plan` field is missing from `base_plan()`, the compile error names it — add it as `None` rather than changing the digest.
 
 - [ ] **Step 5: Clippy, then commit**
 
@@ -2175,7 +2175,7 @@ If any mutation does NOT fail its test, the test is not pinning what it claims �
 
 - [ ] **Step 2: Predict the test-count delta, then gate the Mac**
 
-Count the new `#[test]` functions in the diff: 19 in `plan_digest` + 6 in `asks_e2e` = **25**. Predict `Mac baseline + 25` and reconcile the actual exactly — an unexplained delta means a test is not being compiled, which is the failure the platform split produces.
+Count the new `#[test]` functions in the diff: 24 in `plan_digest` + 6 in `asks_e2e` = **30**. Predict `Mac baseline + 30` and reconcile the actual exactly — an unexplained delta means a test is not being compiled, which is the failure the platform split produces.
 
 ```sh
 source "$HOME/.cargo/env"
@@ -2204,7 +2204,7 @@ ssh dgx 'grep -c "^==== MARKER" ~/gate-564.log; tail -5 ~/gate-564.log; grep -c 
 Confirm, and record each in the handover table:
 - one marker pair in the log (two runs appended to one log give two different wrong totals)
 - `TEST_EXIT=0`
-- the total is the DGX baseline **3268 + 25 = 3293**, reconciled exactly
+- the total is the DGX baseline **3268 + 30 = 3298**, reconciled exactly
 - **all 6 `asks_e2e` tests actually RAN** — they are the only evidence for this whole slice, and a skip-as-pass is indistinguishable from a pass in the count:
   ```sh
   ssh dgx 'grep "asks_e2e" -A 12 ~/gate-564.log | head -20'

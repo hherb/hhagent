@@ -54,8 +54,16 @@ approved plan, in which case the task escalates twice and the operator sees a ne
 
 `plan_digest(&Plan) -> String` is SHA-256 over a canonical serialization of the plan with exactly
 four fields removed: plan-level `context` and `rationale`, and per-step `returns` and `done_when`.
-Everything else counts — `decision`, `result`, `data_ceiling`, `refused`, `floor_request`, and per
-step `tool`, `method`, `parameters`, `classification`.
+Everything else counts. `Plan` has **twelve** fields, so that is: `decision`, `result`,
+`data_ceiling`, `refused`, `floor_request`, `l1_insight`, `l3_skill`, `invoke_skill`,
+`python_skill`, and per step `tool`, `method`, `parameters`, `classification`.
+
+The last four earn their place and are not merely swept in by the rule. `invoke_skill` drives L3
+expansion at `inner_loop` step 1b, which stamps every expanded step's classification — it is as
+executable as `steps` itself. `l3_skill` and `python_skill` crystallise **persistent, reusable
+artifacts** (the latter carries `code`), so an approval carrying across a change in them would
+approve one thing and crystallise another. `l1_insight` is written to memory by
+`write_l1_promoted_row`. All four are effects, not narration.
 
 **The rule is stated as an exclusion list on purpose, and that is load-bearing.** An earlier
 formulation named the included fields instead, and it had already silently dropped `floor_request`
