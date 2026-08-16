@@ -339,6 +339,31 @@ pub async fn expire_due(pool: &PgPool) -> Result<Vec<ExpiredAsk>, DbError> {
     Ok(out)
 }
 
+/// Cancel every pending ask belonging to a task. Returns how many moved.
+///
+/// Called from [`crate::tasks::mark_cancelled`] inside its transaction —
+/// see the note there for why it lives inside the cancel path rather than
+/// in a separate cancel-both helper.
+///
+/// Executor-generic, and takes a `task_id` rather than an ask id: the
+/// caller is cancelling a *task* and does not know or care how many asks
+/// it has.
+pub async fn cancel_for_task<'e, E>(executor: E, task_id: i64) -> Result<u64, DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let r = sqlx::query(
+        "UPDATE asks \
+         SET state = 'cancelled' \
+         WHERE task_id = $1 AND state = 'pending'",
+    )
+    .bind(task_id)
+    .execute(executor)
+    .await
+    .map_err(|e| DbError::Query(format!("asks cancel_for_task: {e}")))?;
+    Ok(r.rows_affected())
+}
+
 /// Fetch one ask by id, in any state.
 pub async fn get(pool: &PgPool, ask_id: i64) -> Result<Option<Ask>, DbError> {
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(

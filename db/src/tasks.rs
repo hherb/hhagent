@@ -232,8 +232,8 @@ pub async fn observe_state(pool: &PgPool, task_id: i64) -> Result<String, DbErro
 }
 
 /// Producer-side cancellation. Sets `state = 'cancelled'` only if the
-/// task is still in `pending` or `running`; the trigger fires the
-/// `tasks_cancelled` NOTIFY.
+/// task is still in `pending`, `running` or `awaiting_operator`; the
+/// trigger fires the `tasks_cancelled` NOTIFY.
 ///
 /// Returns the post-update row via `RETURNING` so the caller can emit
 /// one producer-side audit row (e.g. `actor='cli' action='task.cancelled'`)
@@ -243,21 +243,53 @@ pub async fn observe_state(pool: &PgPool, task_id: i64) -> Result<String, DbErro
 /// Mirrors the shape [`sweep_crashed`] took on 2026-05-12 for the same
 /// reason: an audit emitter downstream needs the row's `lane` and
 /// `plan_count` to build the canonical lifecycle payload.
+///
+/// # Why this also cancels the task's asks (#564)
+///
+/// `awaiting_operator` was added so a task can suspend on a human
+/// decision. Cancelling such a task while leaving its ask `pending` would
+/// leave a live question attached to a dead task: still resolvable, and
+/// resolving it would try to re-enqueue something already cancelled.
+///
+/// The ask write lives **inside** this function, in the same transaction,
+/// rather than in a separate cancel-both helper — which is why `db::tasks`
+/// depends on `db::asks`. With a separate helper, any caller reaching for
+/// plain `mark_cancelled` (and the CLI cancel path is one) would silently
+/// strand the ask. One cancel path that cannot be bypassed is worth the
+/// coupling; same argument `AllowlistDecl` made in #545 for making the
+/// half-declared state unrepresentable.
 pub async fn mark_cancelled(pool: &PgPool, task_id: i64) -> Result<Option<Task>, DbError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| DbError::Query(format!("tasks mark_cancelled begin: {e}")))?;
+
     let row = sqlx::query(
         "UPDATE tasks \
          SET state = 'cancelled', \
              finished_at = now(), \
              updated_at = now() \
-         WHERE id = $1 AND state IN ('pending', 'running') \
+         WHERE id = $1 AND state IN ('pending', 'running', 'awaiting_operator') \
          RETURNING id, state, lane, created_at, updated_at, started_at, \
                    finished_at, lease_expires_at, plan_count, payload, result",
     )
     .bind(task_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| DbError::Query(format!("tasks mark_cancelled: {e}")))?;
-    row.as_ref().map(decode_task_row).transpose()
+
+    let Some(row) = row else {
+        // Not cancellable. Dropping `tx` rolls back; nothing was written.
+        return Ok(None);
+    };
+    let task = decode_task_row(&row)?;
+
+    crate::asks::cancel_for_task(&mut *tx, task_id).await?;
+
+    tx.commit()
+        .await
+        .map_err(|e| DbError::Query(format!("tasks mark_cancelled commit: {e}")))?;
+    Ok(Some(task))
 }
 
 /// Cancel a task **only if it is still `pending`** (never claimed).

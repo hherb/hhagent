@@ -426,3 +426,75 @@ fn expire_due_fails_the_task_closed_and_leaves_others_alone() {
         // untested. Do not assume it is exercised here.
     });
 }
+
+#[test]
+fn cancelling_a_suspended_task_cancels_its_ask() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let bin_dir = match pg_bin_dir_or_skip() {
+        Some(d) => d,
+        None => return,
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "askc-d",
+        "askc-l",
+        &format!("kastellan-supervisor-test-pg-askc-{suffix}"),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        use kastellan_db::{asks, tasks};
+        use kastellan_db::tasks::Lane;
+
+        kastellan_db::probe::run(
+            &cluster.conn_spec, "core", "startup",
+            serde_json::json!({"version": "test", "purpose": "asks-cancel-e2e"}),
+        ).await.expect("probe run");
+        let pool = kastellan_db::pool::connect_admin_pool(&cluster.conn_spec)
+            .await.expect("admin pool");
+
+        let task_id = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "cancel probe"}),
+        ).await.unwrap();
+        tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            &pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve"]), None,
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        ).await.unwrap();
+
+        // Without the widening, awaiting_operator would be a state from
+        // which a task cannot be cancelled at all — a wedge this slice
+        // would have introduced.
+        let cancelled = tasks::mark_cancelled(&pool, task_id).await.unwrap();
+        assert!(cancelled.is_some(), "an awaiting_operator task must be cancellable");
+        assert_eq!(cancelled.unwrap().state, "cancelled");
+
+        // The ask goes with it. A pending ask on a dead task stays
+        // resolvable, and resolving it would try to re-enqueue a cancelled
+        // task — which `resolve` now refuses, loudly, for nothing.
+        let got = asks::get(&pool, raised.ask_id).await.unwrap().unwrap();
+        assert_eq!(got.state, "cancelled");
+        assert!(!asks::resolve(
+            &pool, raised.ask_id, "operator/cli", &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap(), "a cancelled ask must not be resolvable");
+
+        // A cancelled ask is not expiry's business either.
+        assert!(asks::expire_due(&pool).await.unwrap().is_empty());
+
+        // Unchanged behaviour for the pre-existing states.
+        let plain = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "plain"}),
+        ).await.unwrap();
+        assert!(tasks::mark_cancelled(&pool, plain).await.unwrap().is_some());
+        // Already terminal → idempotent no-op.
+        assert!(tasks::mark_cancelled(&pool, plain).await.unwrap().is_none());
+    });
+}
