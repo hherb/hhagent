@@ -505,8 +505,14 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   second endpoint is needed only while oMLX lacks logprobs", but with llama.cpp pinned on *both* hosts the guard
   never shares the planner's endpoint, so the seam lands with the wiring slice rather than being avoided.
   First slice is the injection-guard `Review` tier (escalate-up only), *not* a plan-review
-  stage. **Owed before it:** the DGX llama.cpp leg (not installed there, so "one τ across hosts" is an argument
-  from identical bits, not yet a measurement) and measurement 3's ≥100-example calibration set. The posture below is unchanged and carries over verbatim; note especially that a "skip the expensive
+  stage. **The DGX leg RAN 2026-08-16 and the cross-host claim is now measured, not argued:** llama.cpp built
+  from source there with CUDA (GB10/aarch64), same harness, same Q8 pair verified identical by **SHA-256 on
+  both hosts** — **14/14, margin +0.8216, p50 30 ms**, with a **maximum per-case divergence of 0.0044** against
+  the Mac across two different accelerator stacks. The drift is directionally *safe* (attacks score marginally
+  higher on the DGX, benigns marginally lower, so the margin widens), and a 0.45/0.70 band has ~2 orders of
+  magnitude more headroom than that noise. Latency is the one figure that does not transfer: 30 ms vs 43 ms.
+  **Owed before slice 1:** measurement 3's ≥100-example calibration set — τ=0.5 is still Mistral's default
+  rather than a fitted threshold, and the OOD false-negative rate is still unmeasured. The posture below is unchanged and carries over verbatim; note especially that a "skip the expensive
   review" gate is **fail-open** and stays ruled out (and is blocked on Stage 3 existing regardless).
   The Guardian write-up is kept below as the comparison baseline:
 - [ ] **(baseline) Model-based CASSANDRA guard tier — IBM Granite Guardian 4.1 (defense-in-depth, advisory only)** —

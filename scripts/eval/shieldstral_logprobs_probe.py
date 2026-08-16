@@ -45,6 +45,7 @@ Usage:
 import argparse
 import json
 import math
+import platform
 import statistics
 import sys
 import time
@@ -468,7 +469,11 @@ def main() -> int:
 
     ls = sorted(r[5] for r in measured)
     if ls:
-        print(f"\nlatency over {len(ls)} measured calls (measurement 5, quiet Mac):")
+        # Name the host the numbers came from rather than hardcoding "Mac":
+        # measurement 5 is now run on both, and a latency table that misreports
+        # which machine produced it is worse than one with no label at all.
+        host = f"{platform.system()} {platform.machine()}"
+        print(f"\nlatency over {len(ls)} measured calls (measurement 5, quiet {host}):")
         print(f"  p50={statistics.median(ls)*1000:.0f} ms  "
               f"p90={ls[int(len(ls)*0.9)]*1000:.0f} ms  max={ls[-1]*1000:.0f} ms")
 
