@@ -413,6 +413,38 @@ where
     Ok(r.rows_affected() == 1)
 }
 
+/// Return a suspended task to the queue after its ask resolved (#564).
+///
+/// Guarded on `awaiting_operator` so it cannot resurrect a task that was
+/// cancelled or expired while the ask was outstanding. Returns `true` iff
+/// a row moved.
+///
+/// The `tasks_notify_resumed` trigger fires `pg_notify('tasks_resumed', id)`
+/// on this transition, which is what wakes the lane runner immediately
+/// rather than at its next 30 s heartbeat.
+///
+/// `started_at` and `plan_count` are deliberately left alone: the resumed
+/// run is a continuation of the same task, and `plan_count` is the
+/// plans-so-far counter the CLI shows.
+///
+/// Executor-generic so `asks::resolve` can call it inside its transaction.
+pub async fn resume_from_ask<'e, E>(executor: E, task_id: i64) -> Result<bool, DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let r = sqlx::query(
+        "UPDATE tasks \
+         SET state = 'pending', \
+             updated_at = now() \
+         WHERE id = $1 AND state = 'awaiting_operator'",
+    )
+    .bind(task_id)
+    .execute(executor)
+    .await
+    .map_err(|e| DbError::Query(format!("tasks resume_from_ask: {e}")))?;
+    Ok(r.rows_affected() == 1)
+}
+
 /// Fetch one task by id (any state). Used by CLI status subcommand
 /// and by the synthetic-load harness.
 pub async fn get(pool: &PgPool, task_id: i64) -> Result<Option<Task>, DbError> {

@@ -209,6 +209,76 @@ pub async fn raise(
     Ok(RaisedAsk { ask_id, nonce })
 }
 
+/// Resolve a pending ask and return its task to the queue.
+///
+/// Returns `true` iff **this** call resolved it. `false` means the ask was
+/// not `pending` — already resolved by someone else, expired, cancelled,
+/// or absent — and nothing was written.
+///
+/// The guard is `WHERE id = $1 AND state = 'pending'` with rows-affected as
+/// the answer: the same race-safe idiom `memories::set_embedding` uses.
+/// That is what makes resolution exactly-once and first-responder-wins
+/// across surfaces (a Matrix reply and a CLI resolve racing each other)
+/// with no lock and no read-then-write window.
+///
+/// `resolution` is a closed set — `{"choice": …}` indexing into the ask's
+/// `options`, optionally with `free_text` for the audit row. Free text is
+/// stored and shown, never fed back into a plan.
+pub async fn resolve(
+    pool: &PgPool,
+    ask_id: i64,
+    resolved_by: &str,
+    resolution: &serde_json::Value,
+) -> Result<bool, DbError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| DbError::Query(format!("asks resolve begin: {e}")))?;
+
+    let row = sqlx::query(
+        "UPDATE asks \
+         SET state = 'resolved', \
+             resolved_at = now(), \
+             resolved_by = $2, \
+             resolution = $3 \
+         WHERE id = $1 AND state = 'pending' \
+         RETURNING task_id",
+    )
+    .bind(ask_id)
+    .bind(resolved_by)
+    .bind(resolution)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| DbError::Query(format!("asks resolve: {e}")))?;
+
+    let Some(row) = row else {
+        // Lost the race, or no such ask. Dropping `tx` rolls back; nothing
+        // was written either way.
+        return Ok(false);
+    };
+    let task_id: i64 = row
+        .try_get("task_id")
+        .map_err(|e| DbError::Query(format!("decode asks.task_id: {e}")))?;
+
+    if !tasks::resume_from_ask(&mut *tx, task_id).await? {
+        // A pending ask whose task is NOT awaiting_operator is an invariant
+        // violation: `cancel_for_task` cancels the ask with the task, and
+        // `expire_due` expires it with the timeout, so no other path should
+        // be able to separate them. Fail closed and loudly — the rollback
+        // leaves the ask `pending`, which is recoverable, where committing
+        // would leave it resolved with no task to resume.
+        return Err(DbError::Other(format!(
+            "asks resolve: ask {ask_id} was pending but task {task_id} is not \
+             awaiting_operator — refusing to resolve an ask whose task cannot resume"
+        )));
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| DbError::Query(format!("asks resolve commit: {e}")))?;
+    Ok(true)
+}
+
 /// Fetch one ask by id, in any state.
 pub async fn get(pool: &PgPool, ask_id: i64) -> Result<Option<Ask>, DbError> {
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(

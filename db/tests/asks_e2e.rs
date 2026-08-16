@@ -200,3 +200,88 @@ fn raise_suspends_the_task_and_releases_the_lease() {
         assert_eq!(tasks::observe_state(&pool, task_id).await.unwrap(), "awaiting_operator");
     });
 }
+
+#[test]
+fn resolve_is_exactly_once_and_re_enqueues_the_task() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let bin_dir = match pg_bin_dir_or_skip() {
+        Some(d) => d,
+        None => return,
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "askv-d",
+        "askv-l",
+        &format!("kastellan-supervisor-test-pg-askv-{suffix}"),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        use kastellan_db::{asks, tasks};
+        use kastellan_db::tasks::Lane;
+
+        kastellan_db::probe::run(
+            &cluster.conn_spec, "core", "startup",
+            serde_json::json!({"version": "test", "purpose": "asks-resolve-e2e"}),
+        ).await.expect("probe run");
+        let pool = kastellan_db::pool::connect_admin_pool(&cluster.conn_spec)
+            .await.expect("admin pool");
+
+        let task_id = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "resolve probe"}),
+        ).await.unwrap();
+        tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            &pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve", "deny"]), Some("digest1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        ).await.unwrap();
+
+        // First responder wins.
+        let won = asks::resolve(
+            &pool, raised.ask_id, "matrix/@horst:kastellan.dev",
+            &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap();
+        assert!(won, "the first resolve must win");
+
+        // The task is back in the queue, claimable again.
+        assert_eq!(tasks::observe_state(&pool, task_id).await.unwrap(), "pending");
+        let reclaimed = tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap();
+        assert_eq!(reclaimed.map(|t| t.id), Some(task_id));
+
+        // The ask carries who decided and what they chose.
+        let got = asks::get(&pool, raised.ask_id).await.unwrap().unwrap();
+        assert_eq!(got.state, "resolved");
+        assert_eq!(got.resolved_by.as_deref(), Some("matrix/@horst:kastellan.dev"));
+        assert_eq!(got.resolution, Some(serde_json::json!({"choice": "approve"})));
+        assert!(got.resolved_at.is_some());
+
+        // THE property: a second resolve loses, and changes nothing. Without
+        // the `AND state='pending'` guard this would overwrite the first
+        // decision and re-enqueue a task that is already running.
+        let lost = asks::resolve(
+            &pool, raised.ask_id, "matrix/@someone-else:evil.example",
+            &serde_json::json!({"choice": "deny"}),
+        ).await.unwrap();
+        assert!(!lost, "the second resolve must lose");
+
+        let after = asks::get(&pool, raised.ask_id).await.unwrap().unwrap();
+        assert_eq!(after.resolved_by.as_deref(), Some("matrix/@horst:kastellan.dev"),
+            "a losing resolve must not overwrite the winner");
+        assert_eq!(after.resolution, Some(serde_json::json!({"choice": "approve"})));
+        assert_eq!(tasks::observe_state(&pool, task_id).await.unwrap(), "running",
+            "a losing resolve must not re-enqueue the already-reclaimed task");
+
+        // An unknown ask id is a loss, not an error.
+        assert!(!asks::resolve(
+            &pool, 999_999, "operator/cli", &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap());
+    });
+}
