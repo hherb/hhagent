@@ -456,19 +456,14 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   question supplied at inference time**, returning a calibrated score from a single forward pass, so one set of
   weights serves every hook point below with no fine-tune each. Verdict is ADOPT-**CONDITIONALLY**: five
   measurements gate it, and measurement 1 is a hard go/no-go — the score needs token logprobs, and the macOS
-  leg is the single point of failure for the whole design. **Measurement 1 half-answered 2026-08-15, and the
-  answer changed the plan:** macOS moved to **oMLX** as the default backend, and oMLX **returns no logprobs**
-  (absent from `/v1/chat/completions`; `top_logprobs` is declared on `/v1/responses` but accepted and ignored,
-  with no response schema emitting them anywhere in its OpenAPI document — measured against the live server).
-  Shieldstral *runs* correctly on oMLX but yields a bare `yes`/`no`, i.e. exactly the unmovable τ=0.5 the study
-  warned about. **Resolution: the guard model targets llama.cpp on macOS** — the designated fallback runtime,
-  reported to serve logprobs *and* Shieldstral's multimodal half (which the previously-planned Ollama route
-  would not have), so the confidence-band design stays cross-platform and no Linux-only security behaviour is
-  introduced. **Measurement 1 RUN the same day — PASS, the go/no-go is cleared.** llama.cpp (build 9910) with
-  `Shieldstral-1.0-3B` Q4_K_M + `mmproj-F16` returns 20 logprob alternatives with both `yes` and `no` present
-  on every call, scores **14/14** on a labelled smoke set at τ=0.5 with a **+0.796 margin** and 14 distinct
-  scores (so banding is mechanically possible), at **p50 40 ms** on a quiet Mac; multimodal confirmed
-  (injection rendered into a PNG → 0.997). Harness `scripts/eval/run-shieldstral-llamacpp.sh`.
+  leg is the single point of failure for the whole design. **Measurement 1 RUN 2026-08-15 — PASS, go/no-go
+  cleared.** Checking that leg first is what paid: macOS had just moved to **oMLX**, which **returns no
+  logprobs** (absent from `/v1/chat/completions`; `top_logprobs` declared on `/v1/responses` but accepted and
+  ignored, no response schema emitting them anywhere — measured live), so Shieldstral runs there but yields a
+  bare `yes`/`no`, the unmovable τ=0.5 that collapses the design. **llama.cpp** serves both logprobs and the
+  multimodal half, keeping the banded design cross-platform with no Linux-only security behaviour: Q4_K_M +
+  `mmproj-F16` scored **14/14** at τ=0.5 with a **+0.796 margin**, 14 distinct scores, **p50 40 ms**,
+  multimodal confirmed. Harness `scripts/eval/run-shieldstral-llamacpp.sh`.
   **The load-bearing finding is not the pass — it is that the policy prompt decides the outcome.** Identical
   weights and documents scored 11/14 with a *negative* margin (a textbook indirect injection at 0.0038,
   confidently safe) until `<Instruct>` named the candidate classes as the model card instructs. Read wrong,
@@ -476,22 +471,48 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   **tuned artefact under version control with its measurements**, and measurement 3 must re-run whenever it
   changes. Numbers are Q4_K_M and do not transfer to a DGX BF16 leg; ≥100-example calibration (measurement 3)
   and the OOD false-negative rate remain open.
-  **The harness itself was fail-open and has been fixed — read before trusting any re-run.** As first written it
-  scored an *unmeasurable* call (neither `yes` nor `no` among the alternatives ⇒ both logits on the `-10.0`
-  floor ⇒ softmax exactly 0.5 ⇒ `0.5 > 0.5` false) as **`safe`**, folded those rows into the accuracy figure,
-  and returned 0 from `main` regardless of the outcome — so a backend whose tokenizer emits `Ġyes` (the planned
-  BF16/vLLM leg is a different tokenizer) would have put every case on the floor and still printed a table and
-  exited 0. Unmeasurable calls are now `UNMEASURED`, excluded from accuracy/separation/latency, and **the exit
-  status is the verdict**. The `<Instruct>` block carries a `POLICY_DIGEST` checksum so the "re-run measurement 3
-  whenever it changes" rule is enforced rather than remembered, and the wrapper's chat-template preflight —
-  which could never fail, because a pipeline's status is `head`'s — now aborts. Measurement 3 must run against
-  the FIXED harness; the numbers above predate it and were re-read as sound (all 14 calls had both forms
+  **The harness was fail-open in four ways and has been fixed — read before trusting any re-run.** An
+  *unmeasurable* call (neither spelling among the alternatives ⇒ both logits on the `-10.0` floor ⇒ softmax
+  exactly 0.5 ⇒ `0.5 > 0.5` false) scored as **`safe`** and counted toward accuracy; `main` returned 0
+  regardless of outcome; the chat-template preflight could never fail (a pipeline takes `head`'s always-zero
+  status); and a missing `mmproj` silently dropped the multimodal half. `.strip()` does not remove byte-BPE
+  markers, so a different tokenizer could floor every case at once and still print a table. Unmeasurable calls
+  are now `UNMEASURED` and **the exit status is the verdict**; `<Instruct>` carries a `POLICY_DIGEST` so the
+  "re-run measurement 3 when it changes" rule is enforced rather than remembered. Measurement 3 must run
+  against the FIXED harness; the Q4 numbers predate it and were re-read as sound (all 14 calls had both forms
   present, so none was a floor artefact).
-  **Explicitly deferred:** do not add a
-  `guard_url`/`guard_model` seam to `RouterConfig` yet — a second endpoint is needed only while oMLX lacks
-  logprobs, and the seam becomes dead code in the sole core-side LLM egress the moment it gains them.
+  **Runtime + quantisation PINNED 2026-08-16: llama.cpp + `Shieldstral-1.0-3B-Q8_0` + `mmproj-BF16` on BOTH
+  hosts** — same bits, same template, so one fitted τ transfers instead of needing a per-host story. Both
+  alternatives were measured and rejected: **vLLM** is not arch-blocked (the model declares
+  `Mistral3ForConditionalGeneration`, present in the DGX container's registry) but that container ships
+  **0.15.1** against a card asking **≥ 0.26.0**, and vLLM's GGUF path is an experimental single-file out-of-tree
+  plugin, so it would serve **BF16 safetensors** — different weights, hence no shared threshold; **Ollama**
+  *is* capable (0.22.0 returns `logprobs`/`top_logprobs`, newly measured) but needs a hand-rolled Modelfile,
+  which is the Agents-A1 broken-stub-template hazard, and two packagings means two calibrations.
+  **Q8 re-run: PASS, 14/14, margin +0.8151 (Q4 was +0.796), p50 43 ms**, leetspeak — the weakest attack in both
+  runs — improving most (0.8596 → 0.9036); `<Instruct>` unchanged, so the runs are comparable.
+  **Measurement 2 DONE 2026-08-16:** `llm-router` gained `logprobs`/`top_logprobs` (additive, absent on the wire
+  unless asked) plus the pure `logprob_score` module, whose `Option<f32>` makes "unmeasured" unrepresentable as
+  "safe". `disable_thinking` is **measured safe** against Shieldstral's template — identical 26-token prompt,
+  `cached_tokens: 25`, i.e. the rendered prompt was byte-identical, not merely un-rejected.
+  **Three more harness defects found and fixed, all "a check that cannot fail":** the readiness loop died on
+  iteration 1 (`curl` exits 7 on a refused connection; `set -eu` propagates that through `code=$(…)`), so it
+  could only ever succeed against a server someone else had started — meaning the wrapper had never run end to
+  end and the Q4 numbers were produced by hand; an already-occupied port silently measured **unknown weights**
+  (now exit 8); and the chat-template preflight grepped build-dependent log wording, so a miss and a
+  template-less GGUF were one output — it now asks `/props`.
+  **The `guard_url`/`guard_model` deferral no longer holds on its original grounds** — that reasoning was "a
+  second endpoint is needed only while oMLX lacks logprobs", but with llama.cpp pinned on *both* hosts the guard
+  never shares the planner's endpoint, so the seam lands with the wiring slice rather than being avoided.
   First slice is the injection-guard `Review` tier (escalate-up only), *not* a plan-review
-  stage. The posture below is unchanged and carries over verbatim; note especially that a "skip the expensive
+  stage. **The DGX leg RAN 2026-08-16 and the cross-host claim is now measured, not argued:** llama.cpp built
+  from source there with CUDA (GB10/aarch64), same harness, same Q8 pair verified identical by **SHA-256 on
+  both hosts** — **14/14, margin +0.8216, p50 30 ms**, with a **maximum per-case divergence of 0.0044** against
+  the Mac across two different accelerator stacks. The drift is directionally *safe* (attacks score marginally
+  higher on the DGX, benigns marginally lower, so the margin widens), and a 0.45/0.70 band has ~2 orders of
+  magnitude more headroom than that noise. Latency is the one figure that does not transfer: 30 ms vs 43 ms.
+  **Owed before slice 1:** measurement 3's ≥100-example calibration set — τ=0.5 is still Mistral's default
+  rather than a fitted threshold, and the OOD false-negative rate is still unmeasured. The posture below is unchanged and carries over verbatim; note especially that a "skip the expensive
   review" gate is **fail-open** and stays ruled out (and is blocked on Stage 3 existing regardless).
   The Guardian write-up is kept below as the comparison baseline:
 - [ ] **(baseline) Model-based CASSANDRA guard tier — IBM Granite Guardian 4.1 (defense-in-depth, advisory only)** —

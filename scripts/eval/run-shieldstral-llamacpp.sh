@@ -17,6 +17,11 @@
 #   sh scripts/eval/run-shieldstral-llamacpp.sh
 #
 # Set ALLOW_TEXT_ONLY=1 to run deliberately without the vision projector.
+#
+# Exit status is the MEASUREMENT's verdict (see above), except for these
+# setup refusals: 2 missing model, 3 server died, 4 server never ready,
+# 5 chat-template preflight failed, 6 missing curl/llama-server,
+# 7 missing vision projector, 8 port already occupied by another server.
 set -eu
 
 MODEL="${MODEL:-$HOME/models/shieldstral/Shieldstral-1.0-3B-Q4_K_M.gguf}"
@@ -52,6 +57,24 @@ else
   exit 7
 fi
 
+# Refuse to measure against a server this script did not start.
+#
+# If the port is already occupied, our llama-server cannot bind and dies, while
+# the readiness probe below cheerfully takes its 200 from the STRANGER — and the
+# run then reports a clean pass over unknown weights: the wrong quantisation, or
+# a different model entirely. There is no way to tell from the output, because
+# --alias makes every Shieldstral server answer to the same name. Silent-wrong
+# is the worst outcome available to a measurement, so this fails loudly instead.
+occupied=$(curl -s -m 2 -o /dev/null -w '%{http_code}' \
+           "http://127.0.0.1:$PORT/health" 2>/dev/null || true)
+if [ "$occupied" != "000" ]; then
+  echo "port $PORT is already answering (HTTP $occupied)."
+  echo "  Refusing to measure against a server this script did not start —"
+  echo "  the weights would be whatever that server loaded, not \$MODEL."
+  echo "  Stop it, or re-run with PORT=<other>."
+  exit 8
+fi
+
 echo "starting llama-server on :$PORT"
 # --alias so the API model name is stable; jinja is on by default so the
 # GGUF's own chat template is applied -- which is the thing to verify below,
@@ -76,10 +99,20 @@ trap 'kill $SRV 2>/dev/null || true; exit 130' INT TERM
 # surfaces as a bogus "cannot reach backend" failure of the measurement.
 ready=""
 for _ in $(seq 1 300); do
-  # curl already prints 000 on a connection failure, so no `|| echo 000`
-  # fallback — that appended a SECOND 000 and made the variable read `000000`.
+  # Two separate things about curl on a refused connection, and getting only
+  # the first one right is what made this loop unable to wait:
+  #  - stdout: it already prints 000, so no `|| echo 000` fallback — that
+  #    appended a SECOND 000 and made the variable read `000000`.
+  #  - exit status: it EXITS 7 ("failed to connect"), and under `set -e` a
+  #    command substitution's status becomes the assignment's, so the script
+  #    died on iteration 1 with curl's own 7 — before the model had finished
+  #    loading, every time. The loop could therefore only ever succeed against
+  #    a server someone else had already started, which is precisely the state
+  #    that hid this: the measurement it wraps was run by hand.
+  # `|| true` guards the status; the 000 on stdout is what the check below
+  # reads, so the not-yet-listening case stays a normal loop iteration.
   code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' \
-         "http://127.0.0.1:$PORT/health" 2>/dev/null)
+         "http://127.0.0.1:$PORT/health" 2>/dev/null || true)
   [ "$code" = "200" ] && { ready=1; break; }
   kill -0 $SRV 2>/dev/null || { echo "server died:"; tail -20 "$LOG"; exit 3; }
   sleep 1
@@ -88,18 +121,41 @@ done
 
 echo
 echo "=== chat template preflight (a broken stub template silently ruins the score) ==="
-# Capture first, THEN test. `grep ... | head -5 || echo` can never reach the
-# fallback: a pipeline's status is the LAST command's, and head always exits 0
-# (verified) — so the negative case printed nothing at all and the section
-# rendered as a bare header. The check that guards a known silent-corruption
-# hazard must be able to fail.
-tmpl=$(grep -iE "chat template|chat_template|tmpl" "$LOG" | head -5 || true)
-if [ -n "$tmpl" ]; then
-  printf '%s\n' "$tmpl"
+# Ask the SERVER which template it will apply, instead of grepping its startup
+# log for one.
+#
+# The log-grep version of this check was unsound in a way that only shows up on
+# another build: llama.cpp's startup wording is build-dependent, and the build
+# measured here prints no chat-template line at all, at any verbosity. So a grep
+# miss was indistinguishable from "this GGUF carries no template" — collapsing
+# a clean model and the exact silent-corruption hazard being guarded into one
+# output, in the abort direction. (Its predecessor was worse still: `grep | head
+# || echo` could never reach the fallback at all, since a pipeline takes head's
+# always-zero status.)
+#
+# /props reports the template actually in force, which is the claim the check
+# wants to make. Two failure shapes are rejected:
+#   - absent/empty          -> nothing was loaded
+#   - present but not Mistral's -> llama.cpp substituted its built-in fallback
+#     (chatml), which parses fine and silently reframes every <Instruct> block
+tmpl_len=$(curl -s -m 10 "http://127.0.0.1:$PORT/props" 2>/dev/null \
+  | python3 -c '
+import json, sys
+try:
+    t = json.load(sys.stdin).get("chat_template") or ""
+except Exception:
+    t = ""
+# The marker is Mistral-specific and measured present in both the noctrex Q4_K_M
+# and Abiray Q8_0 GGUFs; a chatml fallback carries neither it nor [INST].
+print(len(t) if ("[SYSTEM_PROMPT]" in t or "[INST]" in t) else 0)
+' 2>/dev/null || echo 0)
+if [ "${tmpl_len:-0}" -gt 0 ]; then
+  echo "  OK: server reports a Mistral chat template, ${tmpl_len} chars"
 else
-  echo "  FAIL: no chat-template line in $LOG — cannot confirm the GGUF's own"
-  echo "  template was applied. A stub template silently corrupts every score,"
-  echo "  so this aborts rather than measure garbage."
+  echo "  FAIL: /props reports no Mistral chat template on :$PORT — either none"
+  echo "  was embedded in $MODEL, or llama.cpp fell back to its built-in chatml."
+  echo "  Both silently corrupt every score, so this aborts rather than measure"
+  echo "  garbage. Inspect: curl -s http://127.0.0.1:$PORT/props"
   exit 5
 fi
 

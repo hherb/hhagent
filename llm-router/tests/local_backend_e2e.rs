@@ -23,6 +23,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use kastellan_llm_router::logprob_score::{
+    binary_token_probability, first_position_alternatives, NO_FORMS, YES_FORMS,
+};
 use kastellan_llm_router::{
     ChatMessage, ChatRequest, ChatRole, Router, RouterConfig, RouterError,
 };
@@ -268,6 +271,64 @@ async fn happy_path_round_trips_request_and_response() {
         "expected the local leg to suppress thinking: {}",
         served.body
     );
+}
+
+/// A classifier call end-to-end: the request carries the logprobs pair
+/// on the wire, and the response's distribution comes back far enough to
+/// be scored.
+///
+/// This exists on top of the pure unit tests for the reason #566
+/// established — pure-function tests alone cannot catch a *reverted
+/// wiring*. `binary_token_probability` can be perfect while
+/// `with_logprobs` never reaches the socket, and every test in
+/// `logprob_score` would still pass.
+///
+/// The canned body is the shape measured against DGX Ollama 0.22.0 on
+/// 2026-08-16, trimmed to two alternatives.
+#[tokio::test]
+async fn logprobs_round_trip_and_score() {
+    let canned_body = serde_json::json!({
+        "id": "chatcmpl-mock-lp",
+        "model": "guard-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "yes"},
+            "finish_reason": "length",
+            "logprobs": {"content": [{
+                "token": "yes",
+                "logprob": -0.1,
+                "bytes": [121, 101, 115],
+                "top_logprobs": [
+                    {"token": "yes", "logprob": -0.1,  "bytes": [121, 101, 115]},
+                    {"token": "no",  "logprob": -2.3,  "bytes": [110, 111]}
+                ]
+            }]}
+        }]
+    })
+    .to_string();
+    let (base_url, served_rx) =
+        spawn_one_shot_mock(CannedResponse::ok_json(canned_body)).await;
+
+    let router = router_pointing_at(&base_url);
+    let req = ChatRequest::new("guard-model", vec![ChatMessage::user("<Query>: unsafe?")])
+        .with_logprobs(20);
+    let resp = router.send(&req).await.expect("send succeeds");
+
+    // Request side: both fields reached the socket, as the pair vLLM needs.
+    let served = served_rx.await.expect("mock served the request");
+    let parsed: ChatRequest =
+        serde_json::from_str(&served.body).expect("body decodes as ChatRequest");
+    assert_eq!(parsed.logprobs, Some(true), "wire body: {}", served.body);
+    assert_eq!(parsed.top_logprobs, Some(20), "wire body: {}", served.body);
+
+    // Response side: the distribution survived decoding and scores.
+    let alternatives =
+        first_position_alternatives(&resp).expect("alternatives decoded");
+    assert_eq!(alternatives.len(), 2);
+    let score = binary_token_probability(alternatives, YES_FORMS, NO_FORMS)
+        .expect("both verdict spellings present");
+    // sigmoid(-0.1 - -2.3) = sigmoid(2.2)
+    assert!((score - 0.9002_f32).abs() < 1e-3, "unexpected score {score}");
 }
 
 /// The switch is what decides, not the call site: with it off the
