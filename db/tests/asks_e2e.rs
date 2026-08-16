@@ -263,14 +263,38 @@ fn resolve_is_exactly_once_and_re_enqueues_the_task() {
         assert_eq!(got.resolution, Some(serde_json::json!({"choice": "approve"})));
         assert!(got.resolved_at.is_some());
 
-        // THE property: a second resolve loses, and changes nothing. Without
-        // the `AND state='pending'` guard this would overwrite the first
-        // decision and re-enqueue a task that is already running.
-        let lost = asks::resolve(
+        // THE property: a second resolve loses CLEANLY, and changes nothing.
+        //
+        // `resolve` commits the `asks` UPDATE and `resume_from_ask` in ONE
+        // transaction, so by the time the first `resolve` above returned,
+        // the task had already left `awaiting_operator` atomically in that
+        // same commit. That makes a second resolve overwriting the winner's
+        // decision structurally impossible, with or without the outer
+        // `state = 'pending'` guard on the `asks` row — data safety comes
+        // from the transaction plus `resume_from_ask`'s inner
+        // `awaiting_operator` guard, which a losing call can never satisfy.
+        //
+        // What the outer guard on `asks` actually buys is the CONTRACT, not
+        // that safety: it is what lets a legitimate race return a clean
+        // `Ok(false)` instead of falling through to `resume_from_ask`'s
+        // guard and surfacing the invariant-violation `Err` meant for a
+        // genuinely corrupt row. Remove the outer guard and this exact call
+        // routes into that `Err` branch instead of `Ok(false)` — confirmed
+        // by mutation-testing it away (see task-4-report.md's "Fix round
+        // 1/5" section for the observed failure). So there are two layers
+        // here, doing two different jobs: lose the outer guard and a
+        // legitimate loser gets an error instead of a clean "you lost";
+        // lose the inner guard (or the transaction) and data safety itself
+        // is gone. Neither one substitutes for the other.
+        let second = asks::resolve(
             &pool, raised.ask_id, "matrix/@someone-else:evil.example",
             &serde_json::json!({"choice": "deny"}),
-        ).await.unwrap();
-        assert!(!lost, "the second resolve must lose");
+        ).await;
+        assert!(
+            matches!(second, Ok(false)),
+            "the second resolve must lose CLEANLY (Ok(false)), not error or \
+             win — got {second:?}",
+        );
 
         let after = asks::get(&pool, raised.ask_id).await.unwrap().unwrap();
         assert_eq!(after.resolved_by.as_deref(), Some("matrix/@horst:kastellan.dev"),
