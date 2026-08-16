@@ -17,6 +17,7 @@ pub mod constitutional;
 pub mod data_ceiling;
 pub mod deterministic;
 pub mod injection_guard;
+pub mod plan_digest;
 pub mod review;
 pub mod types;
 
