@@ -343,13 +343,27 @@ fn expire_due_fails_the_task_closed_and_leaves_others_alone() {
         let pool = kastellan_db::pool::connect_admin_pool(&cluster.conn_spec)
             .await.expect("admin pool");
 
-        // (a) an ask already past its deadline
+        // (a) two asks already past their deadline, on two DIFFERENT tasks.
+        // Two, not one: `expired.len() == 1` would pass just as well for a
+        // sweep that processes only the first due row and stops, which is a
+        // real bug class (a `for` loop replaced by an early `return`/`break`)
+        // and was previously untested.
         let stale_task = tasks::insert_pending(
             &pool, Lane::Fast, serde_json::json!({"instruction": "stale"}),
         ).await.unwrap();
         tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
         let stale = asks::raise(
             &pool, stale_task, "plan_approval", "approve?",
+            &serde_json::json!(["approve"]), None,
+            time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
+        ).await.unwrap();
+
+        let stale_task2 = tasks::insert_pending(
+            &pool, Lane::Fast, serde_json::json!({"instruction": "stale2"}),
+        ).await.unwrap();
+        tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let stale2 = asks::raise(
+            &pool, stale_task2, "plan_approval", "approve?",
             &serde_json::json!(["approve"]), None,
             time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
         ).await.unwrap();
@@ -365,22 +379,30 @@ fn expire_due_fails_the_task_closed_and_leaves_others_alone() {
             time::OffsetDateTime::now_utc() + time::Duration::seconds(3600),
         ).await.unwrap();
 
-        let expired = asks::expire_due(&pool).await.unwrap();
-        assert_eq!(expired.len(), 1, "only the past-deadline ask expires: {expired:?}");
-        assert_eq!(expired[0].ask_id, stale.ask_id);
-        assert_eq!(expired[0].task_id, stale_task);
+        let mut expired = asks::expire_due(&pool).await.unwrap();
+        assert_eq!(expired.len(), 2, "both past-deadline asks expire: {expired:?}");
+        expired.sort_by_key(|e| e.ask_id); // RETURNING order is not guaranteed
+        let mut want = [
+            asks::ExpiredAsk { ask_id: stale.ask_id, task_id: stale_task },
+            asks::ExpiredAsk { ask_id: stale2.ask_id, task_id: stale_task2 },
+        ];
+        want.sort_by_key(|e| e.ask_id);
+        assert_eq!(expired, want, "the sweep must name both stale asks and both their tasks");
 
-        // The stale ask is expired and its task failed CLOSED with a
-        // distinguishable detail.
-        assert_eq!(asks::get(&pool, stale.ask_id).await.unwrap().unwrap().state, "expired");
-        let t = tasks::get(&pool, stale_task).await.unwrap().unwrap();
-        assert_eq!(t.state, "failed");
-        assert!(t.finished_at.is_some(), "a failed task must be stamped finished");
-        assert_eq!(
-            t.result.as_ref().and_then(|r| r.get("detail")).and_then(|d| d.as_str()),
-            Some("ask_timeout"),
-            "the failure must name the ask timeout, not read as a generic error: {:?}", t.result,
-        );
+        // Both stale asks are expired and BOTH their tasks failed CLOSED
+        // with a distinguishable detail — not just the first one the sweep
+        // touched.
+        for (ask, task_id) in [(&stale, stale_task), (&stale2, stale_task2)] {
+            assert_eq!(asks::get(&pool, ask.ask_id).await.unwrap().unwrap().state, "expired");
+            let t = tasks::get(&pool, task_id).await.unwrap().unwrap();
+            assert_eq!(t.state, "failed");
+            assert!(t.finished_at.is_some(), "a failed task must be stamped finished");
+            assert_eq!(
+                t.result.as_ref().and_then(|r| r.get("detail")).and_then(|d| d.as_str()),
+                Some("ask_timeout"),
+                "the failure must name the ask timeout, not read as a generic error: {:?}", t.result,
+            );
+        }
 
         // The fresh one is untouched.
         assert_eq!(asks::get(&pool, fresh.ask_id).await.unwrap().unwrap().state, "pending");
@@ -393,5 +415,14 @@ fn expire_due_fails_the_task_closed_and_leaves_others_alone() {
         assert!(!asks::resolve(
             &pool, stale.ask_id, "operator/cli", &serde_json::json!({"choice": "approve"}),
         ).await.unwrap());
+
+        // Coverage note: this pins that the sweep processes EVERY due row
+        // (a loop that stopped after the first would fail the
+        // `expired.len() == 2` assertion above). It does NOT cover
+        // atomicity under a mid-loop DB error — that `?` only fires on a
+        // genuine database failure, and there is no fault-injection seam in
+        // `tests-common` to force one, so that path stays correct by
+        // construction (one transaction, `?` returns before `commit`) but
+        // untested. Do not assume it is exercised here.
     });
 }
