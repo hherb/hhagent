@@ -157,8 +157,12 @@ fn canonical_form(plan: &Plan) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cassandra::types::{DataClass, Plan, PlannedStep};
+    use crate::cassandra::types::{
+        DataClass, InvokeDirective, L3Param, L3SkillCandidate, L3TemplateStep, Plan,
+        PlannedStep, PythonSkillCandidate, RefusedReason,
+    };
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     /// A two-step plan used as the baseline across these tests.
     fn base_plan() -> Plan {
@@ -302,6 +306,77 @@ mod tests {
         let before = plan_digest(&base_plan());
         let mut p = base_plan();
         p.floor_request = Some(DataClass::ClinicalConfidential);
+        assert_ne!(plan_digest(&p), before);
+    }
+
+    #[test]
+    fn changing_the_refusal_changes_the_digest() {
+        let before = plan_digest(&base_plan());
+        let mut p = base_plan();
+        p.refused = Some(RefusedReason {
+            principle: 3,
+            reason: "would_disclose_clinical_data_without_consent".into(),
+        });
+        assert_ne!(plan_digest(&p), before);
+    }
+
+    #[test]
+    fn changing_the_l1_insight_changes_the_digest() {
+        let before = plan_digest(&base_plan());
+        let mut p = base_plan();
+        p.l1_insight = Some("the user always books outbound flights before return legs".into());
+        assert_ne!(plan_digest(&p), before);
+    }
+
+    #[test]
+    fn changing_the_l3_skill_candidate_changes_the_digest() {
+        // l3_skill crystallises a new reusable tool-call template into the
+        // skill layer. An approval must not carry to a replan that
+        // proposes a DIFFERENT template than the one the operator saw —
+        // that would mean approving one skill and storing another.
+        let before = plan_digest(&base_plan());
+        let mut p = base_plan();
+        p.l3_skill = Some(L3SkillCandidate {
+            name: "flight_confirmation_lookup_skill".into(),
+            description: "look up a flight confirmation email and read it".into(),
+            parameters: vec![L3Param {
+                name: "airline_name".into(),
+                description: "which airline to search mail for".into(),
+            }],
+            steps: vec![L3TemplateStep {
+                tool: "calendar".into(),
+                method: "calendar.search".into(),
+                parameters: json!({"query": "{{airline_name}}"}),
+            }],
+        });
+        assert_ne!(plan_digest(&p), before);
+    }
+
+    #[test]
+    fn changing_the_invoke_directive_changes_the_digest() {
+        let before = plan_digest(&base_plan());
+        let mut p = base_plan();
+        p.invoke_skill = Some(InvokeDirective {
+            name: "flight_confirmation_invoke_directive".into(),
+            args: BTreeMap::from([("carrier".to_string(), "Emirates".to_string())]),
+            params: serde_json::Value::Null,
+        });
+        assert_ne!(plan_digest(&p), before);
+    }
+
+    #[test]
+    fn changing_the_python_skill_candidate_changes_the_digest() {
+        // python_skill is stored and later executed byte-for-byte
+        // unchanged, so an approval must not carry to a replan that
+        // crystallises DIFFERENT code than what the operator reviewed.
+        let before = plan_digest(&base_plan());
+        let mut p = base_plan();
+        p.python_skill = Some(PythonSkillCandidate {
+            name: "flight_confirmation_python_skill".into(),
+            description: "python snippet that finds and prints the newest flight confirmation"
+                .into(),
+            code: "print('newest flight confirmation')".into(),
+        });
         assert_ne!(plan_digest(&p), before);
     }
 
