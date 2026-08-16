@@ -486,8 +486,25 @@ fn cancelling_a_suspended_task_cancels_its_ask() {
             &pool, raised.ask_id, "operator/cli", &serde_json::json!({"choice": "approve"}),
         ).await.unwrap(), "a cancelled ask must not be resolvable");
 
-        // A cancelled ask is not expiry's business either.
+        // A cancelled ask is not expiry's business either — even when it is
+        // ALSO past its deadline. Force the deadline into the past (raw SQL:
+        // deliberately reaching past the API to construct a state the API
+        // will not itself produce) so the sweep's `deadline_at < now()`
+        // predicate would take this row too, if it were still `pending`.
+        // The only thing left to skip it is `cancel_for_task` having moved
+        // it out of `pending` — which is what this asserts, and what makes
+        // the assertion falsifiable: with the ask still `pending`, the sweep
+        // would take it and fail the task.
+        sqlx::query("UPDATE asks SET deadline_at = now() - interval '1 hour' WHERE id = $1")
+            .bind(raised.ask_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         assert!(asks::expire_due(&pool).await.unwrap().is_empty());
+        assert_eq!(
+            tasks::observe_state(&pool, task_id).await.unwrap(), "cancelled",
+            "the sweep must not overwrite a cancelled task with failed",
+        );
 
         // Unchanged behaviour for the pre-existing states.
         let plain = tasks::insert_pending(
