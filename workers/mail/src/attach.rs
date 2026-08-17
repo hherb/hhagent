@@ -653,8 +653,8 @@ mod tests {
     /// Two attachments of one message sharing a prefix: refused, not guessed.
     #[test]
     fn a_sha_prefix_matching_two_attachments_is_refused() {
-        let shared = format!("{}ffffffffffffffff", &"a".repeat(48));
-        let other = format!("{}0000000000000000", &"a".repeat(48));
+        let shared = format!("{}ffffffffffffffff", "a".repeat(48));
+        let other = format!("{}0000000000000000", "a".repeat(48));
         let atts = [att("one.pdf", &shared), att("two.pdf", &other)];
         let e = pick(&atts, None, Some(&"a".repeat(20)), id(37413)).unwrap_err();
         assert!(!e.is_empty(), "an ambiguous prefix must refuse");
