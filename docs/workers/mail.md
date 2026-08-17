@@ -51,6 +51,10 @@ So:
   ambiguous name is refused with the candidates listed, never guessed.
 - `{sha256}` still works, and is right when the hash is copied verbatim from a
   previous step's output in the same task.
+- `{message_id, sha256}` together is **not** an error. The hash selects — it is
+  exact — but is first checked against that message's attachments, so a wrong
+  one is caught by the message rather than by localmail's ambiguous 404, and
+  the file still gets the archive's own name.
 
 `mail.get_attachment` (the deliver-a-file tool) takes the **same two forms**.
 Its `filename` does double duty, and the two jobs do not conflict:

@@ -39,7 +39,16 @@ pub enum Selector {
     Sha(String),
     /// A message plus (optionally) a filename within it. The sha256 is
     /// resolved from the message itself, so it cannot be mistyped.
-    InMessage { message_id: LocalmailId, filename: Option<String> },
+    ///
+    /// `expect_sha` carries a hash the planner supplied *alongside* the
+    /// message. It selects (a hash is exact), but is checked against that
+    /// message's attachments first, so a hallucinated one is caught by the
+    /// message rather than by localmail's ambiguous 404.
+    InMessage {
+        message_id: LocalmailId,
+        filename: Option<String>,
+        expect_sha: Option<String>,
+    },
 }
 
 /// Longest filename this module will quote back. Filenames in the live archive
@@ -102,16 +111,26 @@ pub fn is_sha256(s: &str) -> bool {
 /// takes a `filename` meaning something else entirely (the output name), so a
 /// planner carrying it across from that tool is confused about the parameter,
 /// not about which file it wants.
+///
+/// A `sha256` **with** a `message_id` used to be refused outright, on the
+/// argument that the two could disagree. Live task 4 (Mac, 2026-08-17) showed
+/// what that costs when they *agree*: the planner sent both, was refused, spent
+/// an iteration, retried with the bare hash — and the file landed on disk as
+/// `71aac4580932_attachment`, because the sha form has no archive name to save
+/// under. Refusing a pair that is merely redundant is friction, not safety. The
+/// message form is taken instead and the hash *verified* against that message's
+/// attachments, which is strictly stronger than either alone: a hallucinated
+/// hash is caught by the message it does not belong to, and the file still gets
+/// the archive's own name.
 pub fn choose(
     sha256: Option<String>,
     message_id: Option<LocalmailId>,
     filename: Option<String>,
 ) -> Result<Selector, String> {
     match (sha256, message_id) {
-        (Some(_), Some(_)) => Err(
-            "Pass EITHER `message_id` (+ optional `filename`) OR `sha256` — not both.".to_string(),
-        ),
-        (None, Some(message_id)) => Ok(Selector::InMessage { message_id, filename }),
+        (expect_sha, Some(message_id)) => {
+            Ok(Selector::InMessage { message_id, filename, expect_sha })
+        }
         (Some(sha256), None) => Ok(Selector::Sha(sha256)),
         (None, None) if filename.is_some() => Err(
             "`filename` alone cannot address an attachment — add the `message_id` of the \
@@ -153,6 +172,7 @@ pub fn choose(
 pub fn pick(
     attachments: &[serde_json::Value],
     filename: Option<&str>,
+    expect_sha: Option<&str>,
     message_id: LocalmailId,
 ) -> Result<Picked, String> {
     // An entry is usable only if it carries a sha256 of the right shape. A
@@ -174,6 +194,22 @@ pub fn pick(
             "message {message_id} has no attachment this tool can read — re-check the \
              mail.get_message output for one with a sha256."
         ));
+    }
+
+    // A hash the planner supplied beside the message selects exactly, once the
+    // message has vouched for it. Checked before `filename`, which in this form
+    // is at most a second opinion.
+    if let Some(want_sha) = expect_sha {
+        return match usable.iter().find(|(_, sha)| *sha == want_sha) {
+            Some((name, sha)) => Ok(Picked::new(sha, name)),
+            None => Err(with_names(
+                &format!(
+                    "that `sha256` is not an attachment of message {message_id} — drop it and \
+                     name one of these in `filename`:"
+                ),
+                &usable,
+            )),
+        };
     }
 
     let Some(want) = filename else {
@@ -331,7 +367,7 @@ mod tests {
         let got = choose(None, Some(id(37413)), Some(LIVE_NAME.into())).unwrap();
         assert_eq!(
             got,
-            Selector::InMessage { message_id: id(37413), filename: Some(LIVE_NAME.into()) }
+            Selector::InMessage { message_id: id(37413), filename: Some(LIVE_NAME.into()), expect_sha: None }
         );
     }
 
@@ -340,7 +376,7 @@ mod tests {
         // The single-attachment case — which is what the live failure was — needs
         // no filename at all.
         let got = choose(None, Some(id(37413)), None).unwrap();
-        assert_eq!(got, Selector::InMessage { message_id: id(37413), filename: None });
+        assert_eq!(got, Selector::InMessage { message_id: id(37413), filename: None, expect_sha: None });
     }
 
     #[test]
@@ -365,13 +401,47 @@ mod tests {
         assert_survives_the_clamp(&e, &["message_id", "filename", "sha256"]);
     }
 
+    /// Both together is redundant, not contradictory — so it is taken as the
+    /// message form carrying a hash to verify, rather than refused. Live task 4
+    /// paid an iteration and a badly-named file for the old refusal.
     #[test]
-    fn naming_both_forms_is_refused_rather_than_silently_preferring_one() {
-        // Preferring one would make the *other* argument a lie the planner never
-        // learns about: if they disagree, the answer is text from a document it
-        // did not ask for, which is worse than an error it can repair.
-        let e = choose(Some(SHA_A.into()), Some(id(37413)), None).unwrap_err();
-        assert_survives_the_clamp(&e, &["sha256", "message_id"]);
+    fn a_sha_beside_a_message_id_becomes_a_hash_to_verify_against_that_message() {
+        let got = choose(Some(SHA_A.into()), Some(id(37413)), None).unwrap();
+        assert_eq!(
+            got,
+            Selector::InMessage {
+                message_id: id(37413),
+                filename: None,
+                expect_sha: Some(SHA_A.into())
+            }
+        );
+    }
+
+    #[test]
+    fn a_verified_sha_selects_its_attachment_and_yields_the_archive_name() {
+        let atts = [att("boarding-pass.pdf", SHA_B), att(LIVE_NAME, SHA_A)];
+        let picked = pick(&atts, None, Some(SHA_A), id(37413)).unwrap();
+        assert_eq!(picked.sha256, SHA_A);
+        assert_eq!(picked.filename, LIVE_NAME, "the archive name, for saving");
+    }
+
+    /// The point of verifying rather than trusting: a hash that belongs to no
+    /// attachment of this message is caught here, by the message, instead of
+    /// reaching localmail and coming back as its ambiguous 404.
+    #[test]
+    fn a_sha_absent_from_the_message_is_refused_and_lists_the_real_attachments() {
+        let atts = [att(LIVE_NAME, SHA_A)];
+        let e = pick(&atts, None, Some(SHA_B), id(37413)).unwrap_err();
+        assert_survives_the_clamp(&e, &["sha256", LIVE_NAME]);
+    }
+
+    /// The hash wins over a filename that would have chosen differently — it is
+    /// the exact identifier, and the message has already vouched for it.
+    #[test]
+    fn a_verified_sha_outranks_a_filename_that_names_another_attachment() {
+        let atts = [att("boarding-pass.pdf", SHA_B), att(LIVE_NAME, SHA_A)];
+        let picked = pick(&atts, Some("boarding-pass.pdf"), Some(SHA_A), id(37413)).unwrap();
+        assert_eq!(picked.sha256, SHA_A);
     }
 
     #[test]
@@ -387,19 +457,19 @@ mod tests {
     #[test]
     fn a_lone_attachment_needs_no_filename() {
         let atts = [att(LIVE_NAME, SHA_A)];
-        assert_eq!(pick(&atts, None, id(37413)).unwrap().sha256, SHA_A);
+        assert_eq!(pick(&atts, None, None, id(37413)).unwrap().sha256, SHA_A);
     }
 
     #[test]
     fn an_exact_filename_picks_its_attachment() {
         let atts = [att("other.pdf", SHA_B), att(LIVE_NAME, SHA_A)];
-        assert_eq!(pick(&atts, Some(LIVE_NAME), id(37413)).unwrap().sha256, SHA_A);
+        assert_eq!(pick(&atts, Some(LIVE_NAME), None, id(37413)).unwrap().sha256, SHA_A);
     }
 
     #[test]
     fn filename_matching_ignores_case() {
         let atts = [att(LIVE_NAME, SHA_A)];
-        assert_eq!(pick(&atts, Some(&LIVE_NAME.to_lowercase()), id(37413)).unwrap().sha256, SHA_A);
+        assert_eq!(pick(&atts, Some(&LIVE_NAME.to_lowercase()), None, id(37413)).unwrap().sha256, SHA_A);
     }
 
     #[test]
@@ -409,7 +479,7 @@ mod tests {
         // prefix is naming the right file, and refusing it would spend an
         // iteration on a repair that adds no information.
         let atts = [att("boarding-pass.pdf", SHA_B), att(LIVE_NAME, SHA_A)];
-        assert_eq!(pick(&atts, Some("e-ticket-DQXK68.pdf"), id(37413)).unwrap().sha256, SHA_A);
+        assert_eq!(pick(&atts, Some("e-ticket-DQXK68.pdf"), None, id(37413)).unwrap().sha256, SHA_A);
     }
 
     #[test]
@@ -418,7 +488,7 @@ mod tests {
         // that ran substring first would have two candidates and refuse a request
         // that names one of them exactly.
         let atts = [att("flight-receipt.pdf", SHA_B), att("receipt.pdf", SHA_A)];
-        assert_eq!(pick(&atts, Some("receipt.pdf"), id(37413)).unwrap().sha256, SHA_A);
+        assert_eq!(pick(&atts, Some("receipt.pdf"), None, id(37413)).unwrap().sha256, SHA_A);
     }
 
     /// Two parts of one message really can share a filename (`image001.png` is
@@ -427,7 +497,7 @@ mod tests {
     #[test]
     fn two_attachments_sharing_a_filename_are_refused_rather_than_guessed() {
         let atts = [att("image001.png", SHA_A), att("image001.png", SHA_B)];
-        let e = pick(&atts, Some("image001.png"), id(37413)).unwrap_err();
+        let e = pick(&atts, Some("image001.png"), None, id(37413)).unwrap_err();
         assert_survives_the_clamp(&e, &["image001.png"]);
     }
 
@@ -442,7 +512,7 @@ mod tests {
             att("receipt-feb.pdf", SHA_B),
             att("itinerary.pdf", &"c".repeat(64)),
         ];
-        let e = pick(&atts, Some("receipt"), id(37413)).unwrap_err();
+        let e = pick(&atts, Some("receipt"), None, id(37413)).unwrap_err();
         assert_survives_the_clamp(&e, &["receipt-jan.pdf", "receipt-feb.pdf"]);
         assert!(
             !e.contains("itinerary.pdf"),
@@ -453,20 +523,20 @@ mod tests {
     #[test]
     fn several_attachments_and_no_filename_lists_what_to_choose_from() {
         let atts = [att("a.pdf", SHA_A), att("b.pdf", SHA_B)];
-        let e = pick(&atts, None, id(37413)).unwrap_err();
+        let e = pick(&atts, None, None, id(37413)).unwrap_err();
         assert_survives_the_clamp(&e, &["filename", "a.pdf", "b.pdf"]);
     }
 
     #[test]
     fn a_filename_that_matches_nothing_lists_what_is_there() {
         let atts = [att("a.pdf", SHA_A)];
-        let e = pick(&atts, Some("nope.pdf"), id(37413)).unwrap_err();
+        let e = pick(&atts, Some("nope.pdf"), None, id(37413)).unwrap_err();
         assert_survives_the_clamp(&e, &["a.pdf"]);
     }
 
     #[test]
     fn a_message_with_no_attachments_says_so_rather_than_listing_nothing() {
-        let e = pick(&[], Some("a.pdf"), id(37413)).unwrap_err();
+        let e = pick(&[], Some("a.pdf"), None, id(37413)).unwrap_err();
         assert_survives_the_clamp(&e, &["37413"]);
         assert!(e.contains("no attachment"), "got: {e}");
     }
@@ -478,7 +548,7 @@ mod tests {
         // `/v1/attachments/null/text`; skipping it means the lone *usable*
         // attachment is still found without a filename.
         let atts = [json!({ "filename": "ghost.pdf", "sha256": null }), att("real.pdf", SHA_A)];
-        assert_eq!(pick(&atts, None, id(37413)).unwrap().sha256, SHA_A);
+        assert_eq!(pick(&atts, None, None, id(37413)).unwrap().sha256, SHA_A);
     }
 
     #[test]
@@ -487,7 +557,7 @@ mod tests {
         // caller. Filtering here keeps that guard structural rather than relying
         // on the caller to re-validate what a trusted service sent.
         let atts = [json!({ "filename": "evil.pdf", "sha256": "../../etc/passwd" })];
-        let e = pick(&atts, None, id(37413)).unwrap_err();
+        let e = pick(&atts, None, None, id(37413)).unwrap_err();
         assert!(!e.contains("etc/passwd"), "must not echo the rejected path: {e}");
     }
 
@@ -525,15 +595,17 @@ mod tests {
 
         let mut messages = vec![
             choose(None, None, None).unwrap_err(),
-            choose(Some(SHA_A.into()), Some(id(37413)), None).unwrap_err(),
             choose(None, None, Some(long.clone())).unwrap_err(),
-            pick(&many, None, id(37413)).unwrap_err(),
-            pick(&many, Some(&long), id(37413)).unwrap_err(),
-            pick(&[], None, id(37413)).unwrap_err(),
+            // The new variable-length arm: a hash the message does not carry,
+            // whose repair lists that message's (here, very long) filenames.
+            pick(&many, None, Some(SHA_B), id(37413)).unwrap_err(),
+            pick(&many, None, None, id(37413)).unwrap_err(),
+            pick(&many, Some(&long), None, id(37413)).unwrap_err(),
+            pick(&[], None, None, id(37413)).unwrap_err(),
             missing_text_advice(SHA_A, true),
             missing_text_advice(SHA_A, false),
         ];
-        messages.push(pick(&many[..2], Some("x"), id(37413)).unwrap_err());
+        messages.push(pick(&many[..2], Some("x"), None, id(37413)).unwrap_err());
 
         for m in &messages {
             assert!(

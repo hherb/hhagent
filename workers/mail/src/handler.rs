@@ -148,7 +148,7 @@ impl MailHandler {
                 // so there is nothing authoritative to save it under.
                 Ok(attach::Picked { sha256, filename: String::new() })
             }
-            attach::Selector::InMessage { message_id, filename } => {
+            attach::Selector::InMessage { message_id, filename, expect_sha } => {
                 // Compact headers: only `attachments` is read here, and full
                 // headers would multiply the response for nothing.
                 let msg = self
@@ -159,7 +159,7 @@ impl MailHandler {
                     .get("attachments")
                     .and_then(serde_json::Value::as_array)
                     .map_or(&[], Vec::as_slice);
-                attach::pick(attachments, filename.as_deref(), message_id)
+                attach::pick(attachments, filename.as_deref(), expect_sha.as_deref(), message_id)
                     .map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))
             }
         }
