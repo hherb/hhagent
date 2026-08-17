@@ -179,6 +179,17 @@ pub struct ToolEntry {
 #[derive(Default, Debug)]
 pub struct ToolRegistry {
     entries: HashMap<String, ToolEntry>,
+    /// Per-tool advertised JSON-RPC method names, exactly as `tool_docs()`
+    /// declares them and as the planner prompt renders them.
+    ///
+    /// Kept beside `entries` rather than inside [`ToolEntry`] on purpose: every
+    /// manifest constructs a `ToolEntry` by struct literal, so a new field
+    /// there is a compile error in fifteen unrelated files for a fact none of
+    /// them owns — the *manifest* owns its docs, and `assemble_registry`
+    /// already has both halves in hand. A tool with no recorded methods (every
+    /// hand-built registry in the test suite) simply qualifies nothing, which
+    /// is the pre-existing behaviour.
+    methods: HashMap<String, Vec<&'static str>>,
 }
 
 impl ToolRegistry {
@@ -188,6 +199,18 @@ impl ToolRegistry {
 
     pub fn insert(&mut self, name: impl Into<String>, entry: ToolEntry) {
         self.entries.insert(name.into(), entry);
+    }
+
+    /// Record the methods `name` advertises, for namespace completion at
+    /// dispatch (see [`method_qualify`]).
+    pub fn set_methods(&mut self, name: impl Into<String>, methods: Vec<&'static str>) {
+        self.methods.insert(name.into(), methods);
+    }
+
+    /// Methods `name` advertises; empty when the tool is unknown or its
+    /// manifest recorded none.
+    pub fn methods_for(&self, name: &str) -> &[&'static str] {
+        self.methods.get(name).map_or(&[], Vec::as_slice)
     }
 
     pub fn lookup(&self, name: &str) -> Option<&ToolEntry> {
@@ -235,6 +258,9 @@ pub use result_mapping::{map_dispatch_result, rpc_code_name};
 
 mod fetch_screen;
 use fetch_screen::screen_fetched_data;
+
+mod method_qualify;
+use method_qualify::qualified_method;
 
 // Re-export of the canonical actor string for scheduler-emitted audit
 // rows. The dispatcher's short-circuit rows (`step.unknown_tool`,
@@ -558,12 +584,28 @@ impl StepDispatcher for ToolHostStepDispatcher {
             }
         };
 
+        // Complete an omitted namespace (`get_attachment_text` →
+        // `mail.get_attachment_text`) before the call. Deliberately AFTER the
+        // registry lookup, which is what supplies the tool's advertised
+        // methods, and before `dispatch`, so the audit row written at the
+        // chokepoint records the method actually put on the wire. The plan's
+        // own wording is preserved separately in its `plan.formulate` row, so
+        // the trail still shows both halves.
+        let qualified = qualified_method(&step.method, self.registry.methods_for(&step.tool));
+        if let Some(m) = &qualified {
+            tracing::info!(
+                tool = %step.tool, requested = %step.method, dispatched = %m,
+                "ToolHostStepDispatcher: completed an omitted method namespace"
+            );
+        }
+        let method = qualified.as_deref().unwrap_or(&step.method);
+
         let result = dispatch(
             &self.pool,
             &self.vault,             // NEW — Item 31
             handle.worker_mut(),
             &step.tool,
-            &step.method,
+            method,
             step.parameters.clone(),
         )
         .await;
