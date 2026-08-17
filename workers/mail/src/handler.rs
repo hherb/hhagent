@@ -11,6 +11,7 @@ use crate::attach;
 use crate::client::{MailClient, MailError};
 use crate::ids::{self, LocalmailId};
 use crate::problem;
+use crate::search_params;
 use crate::sort;
 
 pub struct MailHandler {
@@ -34,6 +35,14 @@ impl MailHandler {
             query: String,
             #[serde(default)]
             filters: Option<serde_json::Value>,
+            // Accepted at the top level as well as inside `filters`, because
+            // `mail.list_messages` takes them there and the planner carried the
+            // shape across (twice, in one live task). `search_params` folds them
+            // inward and fixes their type.
+            #[serde(default, deserialize_with = "ids::account_ids")]
+            account_ids: Option<Vec<LocalmailId>>,
+            #[serde(default, deserialize_with = "ids::folder_ids")]
+            folder_ids: Option<Vec<LocalmailId>>,
             #[serde(default)]
             sort: Option<String>,
             #[serde(default)]
@@ -43,7 +52,9 @@ impl MailHandler {
         }
         let p: P = parse_params(params)?;
         let mut body = serde_json::json!({ "query": p.query });
-        if let Some(f) = p.filters {
+        let filters = search_params::normalize_filters(p.filters, p.account_ids, p.folder_ids)
+            .map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))?;
+        if let Some(f) = filters {
             body["filters"] = f;
         }
         // The ordering is the one property the response gets annotated with, so
@@ -129,11 +140,13 @@ impl MailHandler {
     /// change is for: the hash comes out of localmail's own response rather than
     /// out of the planner's transcription of a 64-char string it saw once,
     /// unlabelled, in a key-stripped prompt head.
-    fn resolve_attachment(&self, selector: attach::Selector) -> Result<String, RpcError> {
+    fn resolve_attachment(&self, selector: attach::Selector) -> Result<attach::Picked, RpcError> {
         match selector {
             attach::Selector::Sha(sha256) => {
                 validate_sha256(&sha256).map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))?;
-                Ok(sha256)
+                // No archive filename: the planner named a hash, not a message,
+                // so there is nothing authoritative to save it under.
+                Ok(attach::Picked { sha256, filename: String::new() })
             }
             attach::Selector::InMessage { message_id, filename } => {
                 // Compact headers: only `attachments` is read here, and full
@@ -146,7 +159,7 @@ impl MailHandler {
                     .get("attachments")
                     .and_then(serde_json::Value::as_array)
                     .map_or(&[], Vec::as_slice);
-                attach::pick_sha(attachments, filename.as_deref(), message_id)
+                attach::pick(attachments, filename.as_deref(), message_id)
                     .map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))
             }
         }
@@ -169,7 +182,7 @@ impl MailHandler {
         // Whether the planner typed the hash decides which repair a 404 gets;
         // read it before `resolve_attachment` consumes the selector.
         let planner_supplied = matches!(selector, attach::Selector::Sha(_));
-        let sha256 = self.resolve_attachment(selector)?;
+        let sha256 = self.resolve_attachment(selector)?.sha256;
         // `get_bytes` (the higher attachment cap, not the JSON cap) — extracted
         // text of a large document can exceed the JSON-response ceiling.
         let (_ct, bytes) = self
@@ -202,12 +215,23 @@ impl MailHandler {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct P {
-            sha256: String,
+            #[serde(default)]
+            sha256: Option<String>,
+            #[serde(default, deserialize_with = "ids::opt_message_id")]
+            message_id: Option<LocalmailId>,
             #[serde(default)]
             filename: Option<String>,
         }
         let p: P = parse_params(params)?;
-        validate_sha256(&p.sha256).map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))?;
+        // `filename` does double duty here, and the two jobs do not conflict:
+        // with `message_id` it *selects* the attachment, and the file is then
+        // saved under the name the archive actually has for it; with `sha256`
+        // (which already selects one) it names the output, exactly as before.
+        // Kept before `choose` consumes it, because the sha form needs it.
+        let requested_name = p.filename.clone();
+        let selector = attach::choose(p.sha256, p.message_id, p.filename)
+            .map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))?;
+        let picked = self.resolve_attachment(selector)?;
         let out_dir = std::env::var("KASTELLAN_WORKER_OUT").map_err(|_| {
             RpcError::new(
                 codes::OPERATION_FAILED,
@@ -217,9 +241,17 @@ impl MailHandler {
         })?;
         let (content_type, bytes) = self
             .client
-            .get_bytes(&format!("/v1/attachments/{}", p.sha256))
+            .get_bytes(&format!("/v1/attachments/{}", picked.sha256))
             .map_err(mail_err_to_rpc)?;
-        let name = safe_attachment_name(p.filename.as_deref(), &p.sha256);
+        // The archive's own name wins over the planner's: a substring match may
+        // have selected `Download 470989752-e-ticket-DQXK68.pdf` for a request
+        // that said `e-ticket-DQXK68.pdf`, and the file on disk should carry the
+        // name the archive uses. Falls back to what was asked for (the sha form,
+        // where there is no archive name), then to a sha-derived stem.
+        let name = safe_attachment_name(
+            picked.save_name().or(requested_name.as_deref()),
+            &picked.sha256,
+        );
         let dir = Path::new(&out_dir);
         let dest = dir.join(&name);
         // Per-process-unique .partial so an interrupted write or two concurrent
@@ -237,7 +269,7 @@ impl MailHandler {
             RpcError::new(codes::OPERATION_FAILED, format!("finalize attachment: {e}"))
         })?;
         Ok(serde_json::json!({
-            "sha256": p.sha256,
+            "sha256": picked.sha256,
             "filename": name,
             "content_type": content_type,
             "size": bytes.len(),
@@ -947,6 +979,27 @@ mod tests {
         assert!(err.message.contains("NO template substitution"), "got: {}", err.message);
     }
 
+    /// Serialises the tests that drive `mail.get_attachment`.
+    ///
+    /// `KASTELLAN_WORKER_OUT` is process-global while Rust runs tests in
+    /// parallel threads, so a second test's `remove_var` lands between the
+    /// first's `set_var` and its `call` — which is exactly how this crate's
+    /// full-workspace run failed with "no task output dir" while the same
+    /// tests passed run alone. The guard, not the ordering, is what makes them
+    /// deterministic; a poisoned lock is recovered rather than cascading, since
+    /// one failing test should not turn the others into failures of their own.
+    fn with_out_dir<T>(tag: &str, body: impl FnOnce(&std::path::Path) -> T) -> T {
+        static OUT_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = OUT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("KASTELLAN_WORKER_OUT", &dir);
+        let out = body(&dir);
+        std::env::remove_var("KASTELLAN_WORKER_OUT");
+        std::fs::remove_dir_all(&dir).ok();
+        out
+    }
+
     // --- get_attachment writes original bytes to out/ safely ---
     struct PdfFake;
     impl HttpGet for PdfFake {
@@ -959,23 +1012,114 @@ mod tests {
 
     #[test]
     fn get_attachment_writes_to_out_dir_safely() {
-        let out = std::env::temp_dir().join(format!("mailout-{}", std::process::id()));
-        std::fs::create_dir_all(&out).unwrap();
-        std::env::set_var("KASTELLAN_WORKER_OUT", &out);
+        with_out_dir("mailout", |out| {
         let mut h = MailHandler::with_client(client_with(Box::new(PdfFake)));
         let sha = "a".repeat(64);
         let out_json = h
             .call("mail.get_attachment", serde_json::json!({"sha256": sha, "filename": "../evil/booking.pdf"}))
             .unwrap();
-        std::env::remove_var("KASTELLAN_WORKER_OUT");
         let path = std::path::PathBuf::from(out_json["path"].as_str().unwrap());
-        assert!(path.starts_with(&out), "must stay within out dir: {path:?}");
+        assert!(path.starts_with(out), "must stay within out dir: {path:?}");
         assert!(path.exists(), "file written");
         assert_eq!(std::fs::read(&path).unwrap(), b"%PDF-1.7 body");
         assert_eq!(out_json["size"], 13);
         assert!(out_json.get("data_base64").is_none(), "no bytes in the result");
         assert!(!path.to_string_lossy().contains(".."), "no traversal in name");
-        std::fs::remove_dir_all(&out).ok();
+        });
+    }
+
+    /// `get_attachment` carries the same hallucinated-hash exposure as
+    /// `get_attachment_text`, so it takes the same message form.
+    #[test]
+    fn get_attachment_resolves_a_message_and_filename() {
+        with_out_dir("mailsel", |_dir| {
+        let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::ok())));
+        let out = h
+            .call(
+                "mail.get_attachment",
+                serde_json::json!({"message_id": 37413, "filename": "e-ticket-DQXK68.pdf"}),
+            )
+            .unwrap();
+        assert_eq!(out["sha256"], LIVE_SHA, "the decoy must not be saved");
+        // Saved under the ARCHIVE's name, not the substring that selected it.
+        let name = out["filename"].as_str().unwrap();
+        assert!(name.contains("e-ticket-DQXK68.pdf"), "got {name}");
+        assert!(name.starts_with(&LIVE_SHA[..12]), "sha-prefixed: {name}");
+        assert!(name.contains("Download") || name.contains("470989752"), "archive name: {name}");
+        });
+    }
+
+    /// The pre-existing contract, unchanged: with a `sha256` the `filename`
+    /// still means the *output* name.
+    #[test]
+    fn get_attachment_by_sha_still_treats_filename_as_the_output_name() {
+        with_out_dir("mailsha", |_dir| {
+        let mut h = MailHandler::with_client(client_with(Box::new(PdfFake)));
+        let sha = "a".repeat(64);
+        let out = h
+            .call("mail.get_attachment", serde_json::json!({"sha256": sha, "filename": "chosen.pdf"}))
+            .unwrap();
+        assert_eq!(out["filename"], "aaaaaaaaaaaa_chosen.pdf");
+        });
+    }
+
+    #[test]
+    fn get_attachment_without_any_selector_is_invalid_params() {
+        let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::ok())));
+        let err = h.call("mail.get_attachment", serde_json::json!({})).unwrap_err();
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+        assert!(err.message.contains("message_id"), "got: {}", err.message);
+    }
+
+    // --- mail.search: the id filters the planner actually writes ---
+
+    /// Echoes the whole POST body back so a test can read what was sent.
+    struct BodyEchoFake;
+    impl HttpGet for BodyEchoFake {
+        fn get(&self, _: &Url) -> Result<RawResponse, String> { unreachable!() }
+        fn transport_kind(&self) -> &'static str { "fake" }
+        fn post_authed(&self, _: &Url, _: &str, _: &str, body: &[u8], _m: usize) -> Result<RawResponse, String> {
+            let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
+            Ok(json_resp(
+                serde_json::to_vec(&serde_json::json!({"results": [], "sent": sent}))
+                    .unwrap()
+                    .as_slice(),
+            ))
+        }
+    }
+
+    /// Live task 161 wrote this twice and was refused twice: `account_ids` where
+    /// `mail.list_messages` takes it. It is now folded into `filters`, as the
+    /// strings localmail's model requires.
+    #[test]
+    fn search_accepts_top_level_account_ids_and_sends_them_as_filter_strings() {
+        let mut h = MailHandler::with_client(client_with(Box::new(BodyEchoFake)));
+        let out = h
+            .call("mail.search", serde_json::json!({"query": "flight", "account_ids": [1]}))
+            .unwrap();
+        assert_eq!(out["sent"]["filters"]["account_ids"], serde_json::json!(["1"]));
+    }
+
+    /// The other half of task 161: nested, but numeric — which localmail
+    /// answered with a raw 422 validation envelope.
+    #[test]
+    fn search_coerces_numeric_ids_inside_filters_to_strings() {
+        let mut h = MailHandler::with_client(client_with(Box::new(BodyEchoFake)));
+        let out = h
+            .call(
+                "mail.search",
+                serde_json::json!({"query": "flight", "filters": {"account_ids": [1], "has_attachment": true}}),
+            )
+            .unwrap();
+        assert_eq!(out["sent"]["filters"]["account_ids"], serde_json::json!(["1"]));
+        assert_eq!(out["sent"]["filters"]["has_attachment"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn search_without_id_filters_sends_no_filters_key() {
+        let mut h = MailHandler::with_client(client_with(Box::new(BodyEchoFake)));
+        let out = h.call("mail.search", serde_json::json!({"query": "flight"})).unwrap();
+        assert!(out["sent"].get("filters").is_none(), "sent: {}", out["sent"]);
     }
 
     #[test]

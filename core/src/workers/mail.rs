@@ -118,6 +118,17 @@ impl WorkerManifest for MailManifest {
                 params: &[
                     ToolParam { name: "query", description: "free-text search query", required: true },
                     ToolParam {
+                        name: "account_ids",
+                        description: "restrict to these account ids, e.g. [1] — same place as on \
+                                      mail.list_messages. May also go inside filters, but not both.",
+                        required: false,
+                    },
+                    ToolParam {
+                        name: "folder_ids",
+                        description: "restrict to these folder ids. Same rule as account_ids.",
+                        required: false,
+                    },
+                    ToolParam {
                         name: "filters",
                         description: "object: date_from, date_to, from, to, subject, has_attachment, account_ids, folder_ids, lang",
                         required: false,
@@ -203,10 +214,31 @@ impl WorkerManifest for MailManifest {
                 name: TOOL_NAME,
                 method: "mail.get_attachment",
                 summary: "Save an attachment in its ORIGINAL format (PDF, etc.) to the task \
-                          output dir; returns its path, size and content_type. Use to DELIVER a file.",
+                          output dir; returns its path, size and content_type. Use to DELIVER \
+                          a file. Named the same way as mail.get_attachment_text: by message_id \
+                          (+ filename); do NOT retype a sha256.",
                 params: &[
-                    ToolParam { name: "sha256", description: "attachment sha256 from get_message", required: true },
-                    ToolParam { name: "filename", description: "suggested filename (sanitized)", required: false },
+                    ToolParam {
+                        name: "message_id",
+                        description: "message_id of the mail.get_message step that listed the \
+                                      attachment, e.g. 37413. Prefer this: the sha256 is then \
+                                      looked up for you and cannot be mistyped.",
+                        required: false,
+                    },
+                    ToolParam {
+                        name: "filename",
+                        description: "with message_id, which attachment to save (a distinctive \
+                                      part of the name is enough) — it is then saved under the \
+                                      archive's own name. With sha256, the name to save it as.",
+                        required: false,
+                    },
+                    ToolParam {
+                        name: "sha256",
+                        description: "alternative to message_id: the attachment's exact 64-char \
+                                      hash, only ever copied verbatim from a previous step's \
+                                      output — never reconstructed from memory.",
+                        required: false,
+                    },
                 ],
             },
         ]
@@ -379,6 +411,47 @@ mod tests {
             sha.description.contains("message_id"),
             "a planner reaching for the hash must learn there is another way: {:?}",
             sha.description
+        );
+    }
+
+    /// `mail.get_attachment` carries the same hallucinated-hash exposure as its
+    /// sibling, so it advertises the same message form — and its `filename`
+    /// description has to say that the parameter now does two jobs, because with
+    /// `sha256` it still means the output name.
+    #[test]
+    fn get_attachment_offers_the_message_form_and_explains_the_double_duty_filename() {
+        let docs = MailManifest.tool_docs();
+        let d = docs
+            .iter()
+            .find(|d| d.method == "mail.get_attachment")
+            .expect("mail.get_attachment must be advertised");
+        let names: Vec<&str> = d.params.iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["message_id", "filename", "sha256"]);
+        assert!(d.params.iter().all(|p| !p.required), "either form suffices");
+        let fname = d.params.iter().find(|p| p.name == "filename").expect("filename");
+        assert!(
+            fname.description.contains("message_id") && fname.description.contains("sha256"),
+            "must distinguish the two meanings: {:?}",
+            fname.description
+        );
+    }
+
+    /// Live task 161 spent its whole budget writing `account_ids` where
+    /// `mail.list_messages` takes it. The worker now accepts it there, and the
+    /// schema has to say so or the planner has no way to learn it.
+    #[test]
+    fn search_advertises_the_top_level_id_filters_the_planner_actually_writes() {
+        let docs = MailManifest.tool_docs();
+        let d = docs.iter().find(|d| d.method == "mail.search").expect("mail.search");
+        let names: Vec<&str> = d.params.iter().map(|p| p.name).collect();
+        for want in ["account_ids", "folder_ids"] {
+            assert!(names.contains(&want), "mail.search must advertise {want}: {names:?}");
+        }
+        let acct = d.params.iter().find(|p| p.name == "account_ids").expect("account_ids");
+        assert!(
+            acct.description.contains("filters"),
+            "must say the nested form exists and that both is an error: {:?}",
+            acct.description
         );
     }
 

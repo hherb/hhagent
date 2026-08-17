@@ -52,12 +52,25 @@ So:
 - `{sha256}` still works, and is right when the hash is copied verbatim from a
   previous step's output in the same task.
 
-`mail.get_attachment` (the deliver-a-file tool) still takes `{sha256}` only, and
-is therefore still exposed to the same mistyped-hash failure. It was left out of
-this change for scope, not because the conflict is unresolvable: its `filename`
-parameter currently means the *output* name, but the output name is already
-derived from the attachment's real filename, so one `{message_id, filename}`
-could select the attachment and name the saved file in a single step.
+`mail.get_attachment` (the deliver-a-file tool) takes the **same two forms**.
+Its `filename` does double duty, and the two jobs do not conflict:
+
+- with `message_id`, it *selects* the attachment, and the file is saved under
+  the name the archive actually has for it — not the substring that matched, so
+  asking for `e-ticket-DQXK68.pdf` still writes
+  `<sha12>_Download_470989752-e-ticket-DQXK68.pdf`;
+- with `sha256`, it names the output, exactly as it always did.
+
+### Naming the accounts to search
+
+`mail.search` accepts `account_ids` / `folder_ids` **either** at the top level
+(where `mail.list_messages` takes them) **or** inside `filters` — but not both,
+which is refused rather than resolved by precedence. Ids may be written as
+numbers or digit-strings either way; the worker sends localmail the strings its
+`SearchFiltersModel` requires. Before this, a top-level `account_ids` was
+rejected as an unknown field and a numeric one inside `filters` came back as a
+raw FastAPI 422 that no planner could act on — between them they cost one live
+task its entire iteration budget.
 
 ## One-time operator setup
 

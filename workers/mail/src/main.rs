@@ -8,6 +8,7 @@ mod client;
 mod handler;
 mod ids;
 mod problem;
+mod search_params;
 mod sort;
 
 use kastellan_worker_prelude::serve_stdio;

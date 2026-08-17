@@ -19,7 +19,7 @@
 //!
 //! So the tool now accepts either form, and this module owns the pure half:
 //! which form was named ([`choose`]), which attachment a filename picks
-//! ([`pick_sha`]), and what to tell the planner when the answer is none of them.
+//! ([`pick`]), and what to tell the planner when the answer is none of them.
 //!
 //! Every string here is planner-facing. `core` clamps a failed step's detail to
 //! [`kastellan_protocol::STEP_ERR_DETAIL_MAX`] chars before the planner sees it
@@ -53,10 +53,39 @@ const NAME_HEAD: usize = 44;
 /// exists and that more values are available via `mail.get_message`.
 const MAX_LISTED: usize = 3;
 
+/// One attachment, as localmail itself names it.
+///
+/// The filename comes back beside the hash because `mail.get_attachment` writes
+/// the file to disk and needs a name for it — and the *requested* filename is
+/// not that name: substring matching means the planner may have asked for
+/// `e-ticket-DQXK68.pdf` and been given
+/// `Download 470989752-e-ticket-DQXK68.pdf`. Saving under what was typed rather
+/// than what was found would put a file on disk under a name the archive does
+/// not use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picked {
+    pub sha256: String,
+    /// localmail's own filename for the blob; empty when the entry carried none.
+    pub filename: String,
+}
+
+impl Picked {
+    fn new(sha256: &str, filename: &str) -> Self {
+        Self { sha256: sha256.to_string(), filename: filename.to_string() }
+    }
+
+    /// The filename to save under, or `None` when the archive had no name for
+    /// it (so the caller falls back to what the planner asked for, then to a
+    /// sha-derived stem).
+    pub fn save_name(&self) -> Option<&str> {
+        (!self.filename.is_empty()).then_some(self.filename.as_str())
+    }
+}
+
 /// Is this a sha256 this worker will interpolate into a URL path?
 ///
 /// The single rule, shared by `handler::validate_sha256` (which turns a `false`
-/// into the planner's repair text) and by [`pick_sha`] (which merely skips an
+/// into the planner's repair text) and by [`pick`] (which merely skips an
 /// entry). Two copies of a traversal guard is one copy too many.
 pub fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -121,11 +150,11 @@ pub fn choose(
 ///
 /// `message_id` is quoted in the repair text only — the planner has to be able
 /// to match the advice to the step it wrote.
-pub fn pick_sha(
+pub fn pick(
     attachments: &[serde_json::Value],
     filename: Option<&str>,
     message_id: LocalmailId,
-) -> Result<String, String> {
+) -> Result<Picked, String> {
     // An entry is usable only if it carries a sha256 of the right shape. A
     // missing one is real (localmail emits `"sha256": null` for a part whose
     // blob was never stored); a malformed one would reach a URL path.
@@ -148,8 +177,8 @@ pub fn pick_sha(
     }
 
     let Some(want) = filename else {
-        if let [(_, sha)] = usable[..] {
-            return Ok(sha.to_string());
+        if let [(name, sha)] = usable[..] {
+            return Ok(Picked::new(sha, name));
         }
         return Err(with_names(
             &format!(
@@ -165,8 +194,8 @@ pub fn pick_sha(
     let ci: Vec<_> = usable.iter().filter(|(n, _)| n.to_lowercase() == lower).collect();
     let sub: Vec<_> = usable.iter().filter(|(n, _)| n.to_lowercase().contains(&lower)).collect();
     for tier in [&exact, &ci, &sub] {
-        if let [(_, sha)] = tier[..] {
-            return Ok(sha.to_string());
+        if let [(name, sha)] = tier[..] {
+            return Ok(Picked::new(sha, name));
         }
     }
     if sub.len() > 1 {
@@ -307,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_id_alone_is_accepted_and_defers_the_choice_to_pick_sha() {
+    fn a_message_id_alone_is_accepted_and_defers_the_choice_to_pick() {
         // The single-attachment case — which is what the live failure was — needs
         // no filename at all.
         let got = choose(None, Some(id(37413)), None).unwrap();
@@ -353,24 +382,24 @@ mod tests {
         assert_survives_the_clamp(&e, &["message_id"]);
     }
 
-    // --- pick_sha: which attachment a filename names ---
+    // --- pick: which attachment a filename names ---
 
     #[test]
     fn a_lone_attachment_needs_no_filename() {
         let atts = [att(LIVE_NAME, SHA_A)];
-        assert_eq!(pick_sha(&atts, None, id(37413)).unwrap(), SHA_A);
+        assert_eq!(pick(&atts, None, id(37413)).unwrap().sha256, SHA_A);
     }
 
     #[test]
     fn an_exact_filename_picks_its_attachment() {
         let atts = [att("other.pdf", SHA_B), att(LIVE_NAME, SHA_A)];
-        assert_eq!(pick_sha(&atts, Some(LIVE_NAME), id(37413)).unwrap(), SHA_A);
+        assert_eq!(pick(&atts, Some(LIVE_NAME), id(37413)).unwrap().sha256, SHA_A);
     }
 
     #[test]
     fn filename_matching_ignores_case() {
         let atts = [att(LIVE_NAME, SHA_A)];
-        assert_eq!(pick_sha(&atts, Some(&LIVE_NAME.to_lowercase()), id(37413)).unwrap(), SHA_A);
+        assert_eq!(pick(&atts, Some(&LIVE_NAME.to_lowercase()), id(37413)).unwrap().sha256, SHA_A);
     }
 
     #[test]
@@ -380,7 +409,7 @@ mod tests {
         // prefix is naming the right file, and refusing it would spend an
         // iteration on a repair that adds no information.
         let atts = [att("boarding-pass.pdf", SHA_B), att(LIVE_NAME, SHA_A)];
-        assert_eq!(pick_sha(&atts, Some("e-ticket-DQXK68.pdf"), id(37413)).unwrap(), SHA_A);
+        assert_eq!(pick(&atts, Some("e-ticket-DQXK68.pdf"), id(37413)).unwrap().sha256, SHA_A);
     }
 
     #[test]
@@ -389,7 +418,7 @@ mod tests {
         // that ran substring first would have two candidates and refuse a request
         // that names one of them exactly.
         let atts = [att("flight-receipt.pdf", SHA_B), att("receipt.pdf", SHA_A)];
-        assert_eq!(pick_sha(&atts, Some("receipt.pdf"), id(37413)).unwrap(), SHA_A);
+        assert_eq!(pick(&atts, Some("receipt.pdf"), id(37413)).unwrap().sha256, SHA_A);
     }
 
     /// Two parts of one message really can share a filename (`image001.png` is
@@ -398,7 +427,7 @@ mod tests {
     #[test]
     fn two_attachments_sharing_a_filename_are_refused_rather_than_guessed() {
         let atts = [att("image001.png", SHA_A), att("image001.png", SHA_B)];
-        let e = pick_sha(&atts, Some("image001.png"), id(37413)).unwrap_err();
+        let e = pick(&atts, Some("image001.png"), id(37413)).unwrap_err();
         assert_survives_the_clamp(&e, &["image001.png"]);
     }
 
@@ -413,7 +442,7 @@ mod tests {
             att("receipt-feb.pdf", SHA_B),
             att("itinerary.pdf", &"c".repeat(64)),
         ];
-        let e = pick_sha(&atts, Some("receipt"), id(37413)).unwrap_err();
+        let e = pick(&atts, Some("receipt"), id(37413)).unwrap_err();
         assert_survives_the_clamp(&e, &["receipt-jan.pdf", "receipt-feb.pdf"]);
         assert!(
             !e.contains("itinerary.pdf"),
@@ -424,20 +453,20 @@ mod tests {
     #[test]
     fn several_attachments_and_no_filename_lists_what_to_choose_from() {
         let atts = [att("a.pdf", SHA_A), att("b.pdf", SHA_B)];
-        let e = pick_sha(&atts, None, id(37413)).unwrap_err();
+        let e = pick(&atts, None, id(37413)).unwrap_err();
         assert_survives_the_clamp(&e, &["filename", "a.pdf", "b.pdf"]);
     }
 
     #[test]
     fn a_filename_that_matches_nothing_lists_what_is_there() {
         let atts = [att("a.pdf", SHA_A)];
-        let e = pick_sha(&atts, Some("nope.pdf"), id(37413)).unwrap_err();
+        let e = pick(&atts, Some("nope.pdf"), id(37413)).unwrap_err();
         assert_survives_the_clamp(&e, &["a.pdf"]);
     }
 
     #[test]
     fn a_message_with_no_attachments_says_so_rather_than_listing_nothing() {
-        let e = pick_sha(&[], Some("a.pdf"), id(37413)).unwrap_err();
+        let e = pick(&[], Some("a.pdf"), id(37413)).unwrap_err();
         assert_survives_the_clamp(&e, &["37413"]);
         assert!(e.contains("no attachment"), "got: {e}");
     }
@@ -449,16 +478,16 @@ mod tests {
         // `/v1/attachments/null/text`; skipping it means the lone *usable*
         // attachment is still found without a filename.
         let atts = [json!({ "filename": "ghost.pdf", "sha256": null }), att("real.pdf", SHA_A)];
-        assert_eq!(pick_sha(&atts, None, id(37413)).unwrap(), SHA_A);
+        assert_eq!(pick(&atts, None, id(37413)).unwrap().sha256, SHA_A);
     }
 
     #[test]
     fn an_entry_whose_sha256_is_not_a_hash_is_not_selected() {
-        // The sha reaching `pick_sha` is interpolated into a URL path by the
+        // The sha reaching `pick` is interpolated into a URL path by the
         // caller. Filtering here keeps that guard structural rather than relying
         // on the caller to re-validate what a trusted service sent.
         let atts = [json!({ "filename": "evil.pdf", "sha256": "../../etc/passwd" })];
-        let e = pick_sha(&atts, None, id(37413)).unwrap_err();
+        let e = pick(&atts, None, id(37413)).unwrap_err();
         assert!(!e.contains("etc/passwd"), "must not echo the rejected path: {e}");
     }
 
@@ -498,13 +527,13 @@ mod tests {
             choose(None, None, None).unwrap_err(),
             choose(Some(SHA_A.into()), Some(id(37413)), None).unwrap_err(),
             choose(None, None, Some(long.clone())).unwrap_err(),
-            pick_sha(&many, None, id(37413)).unwrap_err(),
-            pick_sha(&many, Some(&long), id(37413)).unwrap_err(),
-            pick_sha(&[], None, id(37413)).unwrap_err(),
+            pick(&many, None, id(37413)).unwrap_err(),
+            pick(&many, Some(&long), id(37413)).unwrap_err(),
+            pick(&[], None, id(37413)).unwrap_err(),
             missing_text_advice(SHA_A, true),
             missing_text_advice(SHA_A, false),
         ];
-        messages.push(pick_sha(&many[..2], Some("x"), id(37413)).unwrap_err());
+        messages.push(pick(&many[..2], Some("x"), id(37413)).unwrap_err());
 
         for m in &messages {
             assert!(

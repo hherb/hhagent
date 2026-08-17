@@ -148,6 +148,35 @@ pub fn folder_ids<'de, D: serde::Deserializer<'de>>(
     id_list(d, IdField::FolderIds)
 }
 
+/// Validate a JSON array of ids into their canonical digit-string form.
+///
+/// For `mail.search`'s `filters` object, whose `account_ids`/`folder_ids`
+/// localmail types as `list[str]` — an integer there returns a raw FastAPI 422
+/// the planner cannot act on. `key` is the parameter name as the tool schema
+/// advertises it, so a rejection blames the argument the planner actually wrote
+/// (the #536 lesson); an unrecognised key is blamed generically rather than
+/// mis-attributed to `message_id`.
+pub fn id_strings(key: &str, v: &serde_json::Value) -> Result<Vec<String>, String> {
+    let field = match key {
+        "account_ids" => IdField::AccountIds,
+        "folder_ids" => IdField::FolderIds,
+        other => return Err(format!("`{other}` is not an id filter.")),
+    };
+    let Some(items) = v.as_array() else {
+        return Err(format!(
+            "`{key}` must be a list of ids, e.g. [\"1\"]. {} Got: {}",
+            field.want(),
+            head(&v.to_string())
+        ));
+    };
+    if items.is_empty() {
+        return Err(format!(
+            "`{key}` must not be an empty list — omit it entirely to search them all."
+        ));
+    }
+    items.iter().map(|item| parse_id(field, item).map(|i| i.to_string())).collect()
+}
+
 /// An optional list of ids, every element validated and blamed on `field`.
 ///
 /// An explicitly *empty* list is refused rather than passed on: `join_ids` would
