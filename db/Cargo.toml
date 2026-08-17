@@ -43,6 +43,12 @@ aes-gcm = { workspace = true }
 # panic-unwind cannot leave material behind.
 zeroize = { workspace = true }
 
+# `OsRng` for ask correlation nonces (`asks::raise`). The nonce is a
+# security token matched against an untrusted inbound message, so it uses
+# the OS CSPRNG directly — same choice `core::secrets::vault` makes for
+# secret refs.
+rand = { workspace = true }
+
 # Per-OS keyring backends for `OsKeyringProvider` (the production
 # wrapping-key store). See workspace `Cargo.toml` for the rationale
 # behind the per-target split. Tests use `MapKeyProvider`; CI never

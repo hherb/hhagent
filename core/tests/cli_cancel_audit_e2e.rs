@@ -27,9 +27,19 @@
 //!    `task.cancelled` producer row — NOT a producer `task.finalize`.
 //!    The scheduler's inner-loop `observe_state` poll will write its own
 //!    `actor='scheduler' action='task.finalize'` row later; a producer
-//!    finalize would double-count the finalize stream. The discriminator
-//!    is `task.started_at.is_none()` — true iff the task was never
-//!    claimed (set by `claim_one` only).
+//!    finalize would double-count the finalize stream.
+//!
+//! 4. [`kastellan_core::cli_audit::cancel_and_audit`] on an
+//!    `awaiting_operator` task (#564, suspended on an operator ask) writes
+//!    BOTH producer rows plus an `ask.cancelled` row. It has `started_at`
+//!    set, like a running task, but no live inner loop — so nobody else
+//!    finalizes it.
+//!
+//! The discriminator is the task's state **before** the cancel, carried on
+//! `tasks::Cancellation::previous_state`: only `running` has a scheduler-side
+//! observer. It used to be `task.started_at.is_none()`, which cannot
+//! distinguish cases 3 and 4 — both have `started_at` set — and so silently
+//! dropped case 4's finalize row entirely.
 //!
 //! ## Why the test exists
 //!
@@ -401,10 +411,11 @@ fn cancel_already_terminal_task_writes_no_audit_row() {
 /// producer finalize would double-count the finalize stream.
 ///
 /// The discriminator inside [`kastellan_core::cli_audit::cancel_and_audit`]
-/// is `task.started_at.is_none()` — true iff the task was never claimed
-/// (set by `claim_one` only). This test plants a running task by calling
-/// `claim_one` directly (no real scheduler needed; the discriminator is
-/// purely DB-state-driven) and asserts exactly ONE new audit row results.
+/// is the task's state **before** the cancel (`previous_state == "running"`),
+/// not `started_at` — see the sibling `awaiting_operator` test for the case
+/// that distinction exists to get right. This test plants a running task by
+/// calling `claim_one` directly (no real scheduler needed; the discriminator
+/// is purely DB-state-driven) and asserts exactly ONE new audit row results.
 #[test]
 fn cancel_running_task_does_not_write_producer_finalize() {
     if skip_if_no_supervisor() {
@@ -444,7 +455,7 @@ fn cancel_running_task_does_not_write_producer_finalize() {
             .expect("connect runtime pool");
 
         // Insert a pending task and claim it ourselves (no real scheduler
-        // needed — the discriminator is just `tasks.started_at IS NOT NULL`).
+        // needed — the discriminator is just the pre-cancel `tasks.state`).
         let id = insert_pending(
             &pool,
             Lane::Fast,
@@ -517,6 +528,162 @@ fn cancel_running_task_does_not_write_producer_finalize() {
         .await
         .expect("count cli/task.cancelled rows");
         assert_eq!(lifecycle_count, 1, "exactly one cli/task.cancelled row");
+
+        pool.close().await;
+    });
+}
+
+/// A task cancelled out of `awaiting_operator` (#564) MUST get a producer
+/// `task.finalize` row — and before the #570 fix wave it got none from
+/// anyone.
+///
+/// The old discriminator was `task.started_at.is_none()`, whose stated
+/// premise is "the scheduler observed this task, so its inner-loop
+/// `observe_state` poll will write the finalize row itself." That premise is
+/// false for a suspended task: `claim_one` stamped `started_at`, but the
+/// lane released the task when the ask was raised and `run_one` has already
+/// returned, so there is no poll left to notice the cancel. The producer
+/// skipped the row and the scheduler never wrote one, so observation-phase
+/// SQL grouping on `action='task.finalize'` undercounted by exactly the
+/// cancelled-while-suspended population — the identical undercount the
+/// producer row exists to close for never-claimed tasks.
+///
+/// Mutation that must fail this test: `scheduler_will_emit_finalize`
+/// returning `previous_state != "pending"` (the old `started_at`-shaped
+/// test).
+#[test]
+fn cancel_awaiting_operator_task_writes_producer_finalize_and_ask_row() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let bin_dir = match pg_bin_dir_or_skip() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "ccaw-d",
+        "ccaw-l",
+        &format!("kastellan-supervisor-test-pg-ccaw-{suffix}"),
+    );
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("build multi-thread tokio runtime");
+
+    rt.block_on(async {
+        kastellan_db::probe::run(
+            &cluster.conn_spec,
+            "core",
+            "startup",
+            serde_json::json!({"version": "test", "purpose": "cli-cancel-audit-awaiting"}),
+        )
+        .await
+        .expect("probe run");
+
+        let pool = kastellan_db::pool::connect_runtime_pool(&cluster.conn_spec)
+            .await
+            .expect("connect runtime pool");
+
+        let id = insert_pending(
+            &pool,
+            Lane::Fast,
+            serde_json::json!({"instruction": "suspended-then-cancelled"}),
+        )
+        .await
+        .expect("insert_pending");
+        let claimed = kastellan_db::tasks::claim_one(&pool, Lane::Fast, 60)
+            .await
+            .expect("claim_one")
+            .expect("claimed task");
+        assert!(claimed.started_at.is_some(), "claim_one must set started_at");
+
+        // Suspend it on an ask, exactly as slice 1b's Escalate arm will.
+        let raised = kastellan_db::asks::raise(
+            &pool,
+            id,
+            "plan_approval",
+            "approve this plan?",
+            &serde_json::json!(["approve", "deny"]),
+            Some("digest-abc"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        )
+        .await
+        .expect("raise");
+        assert_eq!(
+            kastellan_db::tasks::observe_state(&pool, id).await.unwrap(),
+            "awaiting_operator",
+        );
+
+        let outcome = cancel_and_audit(&pool, id).await.expect("cancel suspended");
+        let task = match outcome {
+            CancelOutcome::Cancelled(t) => t,
+            CancelOutcome::NotCancellable => panic!("a suspended task must be cancellable"),
+        };
+        assert_eq!(task.state, "cancelled");
+        // The property that makes this case indistinguishable from a running
+        // cancel by the OLD discriminator, and why it needed the pre-cancel
+        // state instead.
+        assert!(
+            task.started_at.is_some(),
+            "a suspended task carries started_at, just like a running one — which is \
+             exactly why `started_at.is_none()` could not tell them apart",
+        );
+
+        // THE assertion: the producer finalize row exists. Under the old
+        // discriminator this count was 0 and no scheduler row ever arrived.
+        let finalize_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE actor = 'cli' AND action = 'task.finalize'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count cli/finalize rows");
+        assert_eq!(
+            finalize_count, 1,
+            "a task cancelled out of awaiting_operator has NO live inner loop, so the \
+             producer must write the finalize row or nobody does",
+        );
+
+        let lifecycle_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE actor = 'cli' AND action = 'task.cancelled'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count cli/task.cancelled rows");
+        assert_eq!(lifecycle_count, 1, "exactly one cli/task.cancelled row");
+
+        // And the destroyed question leaves a trace. Without this row a
+        // pending ask vanishes from `list_pending` with nothing in the audit
+        // log saying a human was ever asked.
+        let ask_rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT action, payload FROM audit_log \
+             WHERE actor = 'cli' AND action = 'ask.cancelled'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch ask.cancelled rows");
+        assert_eq!(ask_rows.len(), 1, "one ask.cancelled row");
+        assert_eq!(ask_rows[0].1.get("asks_cancelled").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            ask_rows[0].1.get("task_state_before_cancel").and_then(|v| v.as_str()),
+            Some("awaiting_operator"),
+        );
+
+        // The ask really is cancelled, not merely reported as such.
+        assert_eq!(
+            kastellan_db::asks::get(&pool, raised.ask_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "cancelled",
+        );
 
         pool.close().await;
     });

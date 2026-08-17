@@ -2291,6 +2291,7 @@ dependencies = [
  "kastellan-supervisor",
  "kastellan-tests-common",
  "keyring",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -120,6 +120,29 @@ async fn lane_loop(
         eprintln!("scheduler[{}]: LISTEN tasks_cancelled failed: {e}", lane.as_sql());
         return;
     }
+    // A task resumed from `awaiting_operator` (#564) is an UPDATE, which
+    // the INSERT-only `tasks_inserted` trigger cannot see — without this
+    // the resumed task waits out a full HEARTBEAT. Its own channel rather
+    // than overloading `tasks_inserted`, whose name would then no longer
+    // describe what it carries.
+    //
+    // NOT fatal, unlike the two LISTENs above, and the asymmetry is
+    // deliberate: `tasks_inserted` / `tasks_cancelled` are how this lane
+    // learns about work and about withdrawal, so losing them is losing the
+    // lane's purpose. `tasks_resumed` is a **latency optimisation over the
+    // 30 s heartbeat** — `drain_lane` runs unconditionally on the timer, so
+    // a resumed task is picked up either way. Killing the whole lane
+    // (`return` ends the tokio task, nothing supervises it, and every
+    // systemd unit still reports `active`) over a subscription whose
+    // absence costs at most one heartbeat inverts the severity.
+    if let Err(e) = listener.listen("tasks_resumed").await {
+        tracing::error!(
+            lane = lane.as_sql(),
+            error = %e,
+            "LISTEN tasks_resumed failed; resumed tasks will wait up to one HEARTBEAT (30 s) \
+             instead of waking immediately",
+        );
+    }
 
     // Initial drain: a task inserted *before* the LISTEN above does
     // not produce a NOTIFY visible to this listener (PG does not queue
