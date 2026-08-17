@@ -137,6 +137,46 @@ mod tests {
         PythonExecHandler::with_python(PathBuf::from("/nonexistent/python3"))
     }
 
+    /// Run `body` with [`exec::WORKER_SCRATCH_ENV`] pointed at a private dir.
+    ///
+    /// **Required by any test that falls through validation into `run_code`.**
+    /// `run_code` resolves the scratch dir from the *real* environment and
+    /// wipes it before it spawns — so with the variable unset it resolves to
+    /// [`exec::SCRATCH_DIR`], `/tmp`, and the test deletes the developer's
+    /// `/tmp`. It also raced the sibling `exec::tests` wipe fixtures, which
+    /// live under `/tmp`, and turned that suite intermittently red in CI
+    /// (issue #574: `left: 1, right: 3`).
+    ///
+    /// The production default is *correct* and deliberately unchanged: inside
+    /// the sandbox `/tmp` **is** the worker's own scratch tmpfs, so wiping it
+    /// is the intended pristine-scratch reset. It is only wrong for a unit
+    /// test, which runs outside the jail against the host's real `/tmp`.
+    ///
+    /// `KASTELLAN_WORKER_SCRATCH` is process-global while Rust runs tests in
+    /// parallel threads, so the mutex — not the ordering — is what makes this
+    /// deterministic. Cleanup runs from `Drop` so a failing assertion cannot
+    /// leak the variable into whatever runs next. Same shape as the mail
+    /// worker's `with_out_dir`, for the same reason.
+    fn with_scratch_dir<T>(tag: &str, body: impl FnOnce() -> T) -> T {
+        static SCRATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var(exec::WORKER_SCRATCH_ENV);
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+
+        let _guard = SCRATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("pyexec-scratch-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var(exec::WORKER_SCRATCH_ENV, &dir);
+        let _restore = Restore(dir.clone());
+        body()
+    }
+
     #[test]
     fn unknown_method_is_method_not_found() {
         let err = handler()
@@ -171,10 +211,13 @@ mod tests {
 
     #[test]
     fn unspawnable_interpreter_is_operation_failed() {
-        let err = handler()
-            .call("python.exec", serde_json::json!({"code": "print(1)"}))
-            .unwrap_err();
-        assert_eq!(err.code, codes::OPERATION_FAILED);
+        // Reaches `run_code`, so it must not be pointed at the real `/tmp`.
+        with_scratch_dir("unspawnable", || {
+            let err = handler()
+                .call("python.exec", serde_json::json!({"code": "print(1)"}))
+                .unwrap_err();
+            assert_eq!(err.code, codes::OPERATION_FAILED);
+        });
     }
 
     #[test]
@@ -207,10 +250,15 @@ mod tests {
         // No `params` key: validation passes, so we fall through to the spawn,
         // which fails on the dummy interpreter → OPERATION_FAILED (not
         // INVALID_PARAMS). Proves absent params is the `{}` default, not a reject.
-        let err = handler()
-            .call("python.exec", serde_json::json!({"code": "print(1)"}))
-            .unwrap_err();
-        assert_eq!(err.code, codes::OPERATION_FAILED);
+        //
+        // "Reaches spawn" is exactly what makes the scratch guard mandatory
+        // here: everything past validation runs `run_code`'s wipe first.
+        with_scratch_dir("absent-params", || {
+            let err = handler()
+                .call("python.exec", serde_json::json!({"code": "print(1)"}))
+                .unwrap_err();
+            assert_eq!(err.code, codes::OPERATION_FAILED);
+        });
     }
 
     fn outcome(end: ChildEnd) -> ExecOutcome {
