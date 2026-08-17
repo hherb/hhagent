@@ -142,23 +142,50 @@ impl MailHandler {
     /// unlabelled, in a key-stripped prompt head.
     fn resolve_attachment(&self, selector: attach::Selector) -> Result<attach::Picked, RpcError> {
         match selector {
-            attach::Selector::Sha(sha256) => {
-                validate_sha256(&sha256).map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))?;
-                // No archive filename: the planner named a hash, not a message,
-                // so there is nothing authoritative to save it under.
-                Ok(attach::Picked { sha256, filename: String::new() })
-            }
+            // Fallible construction is the whole guard: `from_planner_sha` is
+            // the only way into `Picked` from here, so the traversal check on
+            // the `{sha256}` URL segment cannot be forgotten at a call site.
+            attach::Selector::Sha(sha256) => attach::Picked::from_planner_sha(&sha256)
+                .map_err(|m| RpcError::new(codes::INVALID_PARAMS, m)),
             attach::Selector::InMessage { message_id, filename, expect_sha } => {
                 // Compact headers: only `attachments` is read here, and full
                 // headers would multiply the response for nothing.
                 let msg = self
                     .client
                     .get_json(&detail_path(message_id, false))
-                    .map_err(mail_err_to_rpc)?;
-                let attachments: &[serde_json::Value] = msg
-                    .get("attachments")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(&[], Vec::as_slice);
+                    // localmail returns the same 404 for "no such message" and
+                    // "your ACL excludes it" (a deliberate choice — permission
+                    // state must not be enumerable). Forwarding its sentence
+                    // makes the agent tell the user the mail does not exist.
+                    .map_err(|e| match e {
+                        MailError::Upstream { status: 404, .. } => RpcError::new(
+                            codes::INVALID_PARAMS,
+                            format!(
+                                "message {message_id} is not readable — either no such \
+                                 message_id, or this agent's mail ACL excludes it. Copy a \
+                                 message_id from a mail.search or mail.list_messages hit."
+                            ),
+                        ),
+                        other => mail_err_to_rpc(other),
+                    })?;
+                // A message detail always carries an `attachments` array
+                // (localmail emits `[]` for none). Absent-or-not-an-array is a
+                // contract violation, and reporting it as "this message has no
+                // attachments" would state something about the archive that we
+                // did not learn from the archive.
+                let attachments: &[serde_json::Value] = match msg.get("attachments") {
+                    Some(serde_json::Value::Array(a)) => a.as_slice(),
+                    None | Some(serde_json::Value::Null) => &[],
+                    Some(_) => {
+                        return Err(RpcError::new(
+                            codes::OPERATION_FAILED,
+                            format!(
+                                "localmail returned message {message_id} with a non-array \
+                                 `attachments` — this is a service fault, not an empty message."
+                            ),
+                        ))
+                    }
+                };
                 attach::pick(attachments, filename.as_deref(), expect_sha.as_deref(), message_id)
                     .map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))
             }
@@ -182,7 +209,7 @@ impl MailHandler {
         // Whether the planner typed the hash decides which repair a 404 gets;
         // read it before `resolve_attachment` consumes the selector.
         let planner_supplied = matches!(selector, attach::Selector::Sha(_));
-        let sha256 = self.resolve_attachment(selector)?.sha256;
+        let sha256 = self.resolve_attachment(selector)?.sha256().to_string();
         // `get_bytes` (the higher attachment cap, not the JSON cap) — extracted
         // text of a large document can exceed the JSON-response ceiling.
         let (_ct, bytes) = self
@@ -231,6 +258,10 @@ impl MailHandler {
         let requested_name = p.filename.clone();
         let selector = attach::choose(p.sha256, p.message_id, p.filename)
             .map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))?;
+        // Same rule as `get_attachment_text`: a hash this worker resolved out of
+        // a message is right by construction, so a 404 on it must not send the
+        // planner to re-copy it.
+        let planner_supplied = matches!(selector, attach::Selector::Sha(_));
         let picked = self.resolve_attachment(selector)?;
         let out_dir = std::env::var("KASTELLAN_WORKER_OUT").map_err(|_| {
             RpcError::new(
@@ -241,17 +272,26 @@ impl MailHandler {
         })?;
         let (content_type, bytes) = self
             .client
-            .get_bytes(&format!("/v1/attachments/{}", picked.sha256))
-            .map_err(mail_err_to_rpc)?;
+            .get_bytes(&format!("/v1/attachments/{}", picked.sha256()))
+            // localmail answers 404 here for "no such blob" *and* for an ACL
+            // denial, exactly as it does for extracted text. This tool used to
+            // forward that sentence verbatim — the ambiguous upstream 404 the
+            // sibling tool was fixed for, still live in the tool that sibling's
+            // own advice recommends as the fallback.
+            .map_err(|e| match e {
+                MailError::Upstream { status: 404, .. } => RpcError::new(
+                    codes::OPERATION_FAILED,
+                    attach::missing_blob_advice(picked.sha256(), planner_supplied),
+                ),
+                other => mail_err_to_rpc(other),
+            })?;
         // The archive's own name wins over the planner's: a substring match may
         // have selected `Download 470989752-e-ticket-DQXK68.pdf` for a request
         // that said `e-ticket-DQXK68.pdf`, and the file on disk should carry the
         // name the archive uses. Falls back to what was asked for (the sha form,
         // where there is no archive name), then to a sha-derived stem.
-        let name = safe_attachment_name(
-            picked.save_name().or(requested_name.as_deref()),
-            &picked.sha256,
-        );
+        let name =
+            safe_attachment_name(picked.save_name().or(requested_name.as_deref()), picked.sha256());
         let dir = Path::new(&out_dir);
         let dest = dir.join(&name);
         // Per-process-unique .partial so an interrupted write or two concurrent
@@ -269,7 +309,7 @@ impl MailHandler {
             RpcError::new(codes::OPERATION_FAILED, format!("finalize attachment: {e}"))
         })?;
         Ok(serde_json::json!({
-            "sha256": picked.sha256,
+            "sha256": picked.sha256(),
             "filename": name,
             "content_type": content_type,
             "size": bytes.len(),
@@ -324,20 +364,6 @@ fn mail_err_to_rpc(e: MailError) -> RpcError {
         MailError::Transport(m) => {
             RpcError::new(codes::OPERATION_FAILED, format!("transport: {m}"))
         }
-    }
-}
-
-/// Require exactly 64 lowercase hex chars — prevents any path traversal or
-/// injection through the `{sha256}` URL segment.
-///
-/// The rule itself lives in [`attach::is_sha256`], shared with the resolver that
-/// skips a malformed entry rather than explaining it; this wrapper adds only the
-/// planner-facing text.
-fn validate_sha256(s: &str) -> Result<(), String> {
-    if attach::is_sha256(s) {
-        Ok(())
-    } else {
-        Err(format!("sha256 must be 64 lowercase hex chars, got {:?}", s.chars().take(8).collect::<String>()))
     }
 }
 
@@ -818,12 +844,27 @@ mod tests {
     /// no `unwrap_err` can inspect and no `Err` arm can distinguish.
     struct ArchiveFake {
         text_status: u16,
+        /// Status for the *blob* route (`/v1/attachments/{sha}`), which is a
+        /// different 404 from the text route's and needs its own advice.
+        blob_status: u16,
+        /// Status for the message-detail route. localmail returns 404 both for
+        /// "no such message" and for an ACL denial.
+        message_status: u16,
+        /// Serve a message detail whose `attachments` is not an array — a
+        /// contract violation that must not be reported as "no attachments".
+        attachments_malformed: bool,
         /// `(filename, sha256)` pairs the message carries.
         attachments: Vec<(String, String)>,
     }
     impl ArchiveFake {
         fn new(text_status: u16, attachments: Vec<(String, String)>) -> Self {
-            Self { text_status, attachments }
+            Self {
+                text_status,
+                blob_status: 200,
+                message_status: 200,
+                attachments_malformed: false,
+                attachments,
+            }
         }
         /// Two attachments, so a filename has work to do.
         fn ok() -> Self {
@@ -843,26 +884,61 @@ mod tests {
         fn single_without_text() -> Self {
             Self::new(404, vec![(LIVE_NAME.to_string(), LIVE_SHA.to_string())])
         }
+        /// One attachment listed on the message whose *blob* localmail cannot
+        /// serve — the second step of `missing_text_advice`'s advice chain.
+        fn single_missing_blob() -> Self {
+            Self { blob_status: 404, ..Self::single() }
+        }
+        /// The message itself is unreadable: absent, or outside the ACL.
+        fn no_such_message() -> Self {
+            Self { message_status: 404, ..Self::single() }
+        }
+        fn attachments_not_an_array() -> Self {
+            Self { attachments_malformed: true, ..Self::single() }
+        }
+        fn not_found(detail: &str) -> RawResponse {
+            RawResponse {
+                status: 404,
+                location: None,
+                content_type: "application/problem+json".into(),
+                body: format!(r#"{{"detail": "{detail}"}}"#).into_bytes(),
+            }
+        }
     }
     impl HttpGet for ArchiveFake {
         fn get(&self, _: &Url) -> Result<RawResponse, String> { unreachable!() }
         fn transport_kind(&self) -> &'static str { "fake" }
         fn get_authed(&self, url: &Url, _b: &str, _m: usize) -> Result<RawResponse, String> {
-            if let Some(sha) = url
-                .path()
-                .strip_prefix("/v1/attachments/")
-                .and_then(|p| p.strip_suffix("/text"))
-            {
-                if self.text_status == 404 {
-                    return Ok(RawResponse {
-                        status: 404,
+            let path = url.path().to_string();
+            if let Some(rest) = path.strip_prefix("/v1/attachments/") {
+                // Text route and blob route are distinct upstream 404s needing
+                // opposite repairs, so the fake has to tell them apart too.
+                return Ok(match rest.strip_suffix("/text") {
+                    Some(_) if self.text_status == 404 => {
+                        Self::not_found("no extracted text for attachment")
+                    }
+                    Some(sha) => {
+                        let text = if sha == LIVE_SHA { E_TICKET_TEXT } else { DECOY_TEXT };
+                        json_resp(format!(r#"{{"text":"{text}"}}"#).as_bytes())
+                    }
+                    None if self.blob_status == 404 => {
+                        Self::not_found(&format!("attachment {rest} not found"))
+                    }
+                    None => RawResponse {
+                        status: 200,
                         location: None,
-                        content_type: "application/problem+json".into(),
-                        body: br#"{"detail": "no extracted text for attachment"}"#.to_vec(),
-                    });
-                }
-                let text = if sha == LIVE_SHA { E_TICKET_TEXT } else { DECOY_TEXT };
-                return Ok(json_resp(format!(r#"{{"text":"{text}"}}"#).as_bytes()));
+                        content_type: "application/pdf".into(),
+                        body: b"%PDF-1.7 body".to_vec(),
+                    },
+                });
+            }
+            if self.message_status == 404 {
+                return Ok(Self::not_found("message not found"));
+            }
+            if self.attachments_malformed {
+                return Ok(json_resp(
+                    br#"{"id":"37413","subject":"E-Ticket","attachments":"none"}"#,
+                ));
             }
             let entries: Vec<String> = self
                 .attachments
@@ -988,16 +1064,29 @@ mod tests {
     /// tests passed run alone. The guard, not the ordering, is what makes them
     /// deterministic; a poisoned lock is recovered rather than cascading, since
     /// one failing test should not turn the others into failures of their own.
+    ///
+    /// Cleanup runs from `Drop`, not from the tail of this function: `body` is
+    /// an assertion-bearing closure, so any failing test in here unwinds, and a
+    /// tail-position `remove_var` would leave the variable set process-wide for
+    /// whatever ran next — turning one real failure into a run whose other
+    /// results cannot be trusted.
     fn with_out_dir<T>(tag: &str, body: impl FnOnce(&std::path::Path) -> T) -> T {
         static OUT_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var("KASTELLAN_WORKER_OUT");
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+
         let _guard = OUT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("KASTELLAN_WORKER_OUT", &dir);
-        let out = body(&dir);
-        std::env::remove_var("KASTELLAN_WORKER_OUT");
-        std::fs::remove_dir_all(&dir).ok();
-        out
+        let _restore = Restore(dir.clone());
+        body(&dir)
     }
 
     // --- get_attachment writes original bytes to out/ safely ---
@@ -1013,18 +1102,21 @@ mod tests {
     #[test]
     fn get_attachment_writes_to_out_dir_safely() {
         with_out_dir("mailout", |out| {
-        let mut h = MailHandler::with_client(client_with(Box::new(PdfFake)));
-        let sha = "a".repeat(64);
-        let out_json = h
-            .call("mail.get_attachment", serde_json::json!({"sha256": sha, "filename": "../evil/booking.pdf"}))
-            .unwrap();
-        let path = std::path::PathBuf::from(out_json["path"].as_str().unwrap());
-        assert!(path.starts_with(out), "must stay within out dir: {path:?}");
-        assert!(path.exists(), "file written");
-        assert_eq!(std::fs::read(&path).unwrap(), b"%PDF-1.7 body");
-        assert_eq!(out_json["size"], 13);
-        assert!(out_json.get("data_base64").is_none(), "no bytes in the result");
-        assert!(!path.to_string_lossy().contains(".."), "no traversal in name");
+            let mut h = MailHandler::with_client(client_with(Box::new(PdfFake)));
+            let sha = "a".repeat(64);
+            let out_json = h
+                .call(
+                    "mail.get_attachment",
+                    serde_json::json!({"sha256": sha, "filename": "../evil/booking.pdf"}),
+                )
+                .unwrap();
+            let path = std::path::PathBuf::from(out_json["path"].as_str().unwrap());
+            assert!(path.starts_with(out), "must stay within out dir: {path:?}");
+            assert!(path.exists(), "file written");
+            assert_eq!(std::fs::read(&path).unwrap(), b"%PDF-1.7 body");
+            assert_eq!(out_json["size"], 13);
+            assert!(out_json.get("data_base64").is_none(), "no bytes in the result");
+            assert!(!path.to_string_lossy().contains(".."), "no traversal in name");
         });
     }
 
@@ -1033,19 +1125,44 @@ mod tests {
     #[test]
     fn get_attachment_resolves_a_message_and_filename() {
         with_out_dir("mailsel", |_dir| {
-        let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::ok())));
-        let out = h
-            .call(
-                "mail.get_attachment",
-                serde_json::json!({"message_id": 37413, "filename": "e-ticket-DQXK68.pdf"}),
-            )
-            .unwrap();
-        assert_eq!(out["sha256"], LIVE_SHA, "the decoy must not be saved");
-        // Saved under the ARCHIVE's name, not the substring that selected it.
-        let name = out["filename"].as_str().unwrap();
-        assert!(name.contains("e-ticket-DQXK68.pdf"), "got {name}");
-        assert!(name.starts_with(&LIVE_SHA[..12]), "sha-prefixed: {name}");
-        assert!(name.contains("Download") || name.contains("470989752"), "archive name: {name}");
+            let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::ok())));
+            let out = h
+                .call(
+                    "mail.get_attachment",
+                    serde_json::json!({"message_id": 37413, "filename": "e-ticket-DQXK68.pdf"}),
+                )
+                .unwrap();
+            assert_eq!(out["sha256"], LIVE_SHA, "the decoy must not be saved");
+            // Saved under the ARCHIVE's name, not the substring that selected it.
+            let name = out["filename"].as_str().unwrap();
+            assert!(name.contains("e-ticket-DQXK68.pdf"), "got {name}");
+            assert!(name.starts_with(&LIVE_SHA[..12]), "sha-prefixed: {name}");
+            assert!(
+                name.contains("Download") || name.contains("470989752"),
+                "archive name: {name}"
+            );
+        });
+    }
+
+    /// Live task 4 (Mac): the planner sent `message_id` *and* the hash, was
+    /// refused, retried with the bare hash, and the file landed as
+    /// `71aac4580932_attachment` — the sha form has no archive name to save
+    /// under. The pair is now taken as the message form, so the file keeps the
+    /// archive's own name. Covered end-to-end because that filename is the
+    /// user-visible half.
+    #[test]
+    fn get_attachment_by_message_and_sha_saves_under_the_archive_name() {
+        with_out_dir("mailboth", |_dir| {
+            let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::ok())));
+            let out = h
+                .call(
+                    "mail.get_attachment",
+                    serde_json::json!({"message_id": 37413, "sha256": LIVE_SHA}),
+                )
+                .unwrap();
+            assert_eq!(out["sha256"], LIVE_SHA);
+            let name = out["filename"].as_str().unwrap();
+            assert!(name.contains("e-ticket-DQXK68.pdf"), "archive name, not `_attachment`: {name}");
         });
     }
 
@@ -1054,12 +1171,15 @@ mod tests {
     #[test]
     fn get_attachment_by_sha_still_treats_filename_as_the_output_name() {
         with_out_dir("mailsha", |_dir| {
-        let mut h = MailHandler::with_client(client_with(Box::new(PdfFake)));
-        let sha = "a".repeat(64);
-        let out = h
-            .call("mail.get_attachment", serde_json::json!({"sha256": sha, "filename": "chosen.pdf"}))
-            .unwrap();
-        assert_eq!(out["filename"], "aaaaaaaaaaaa_chosen.pdf");
+            let mut h = MailHandler::with_client(client_with(Box::new(PdfFake)));
+            let sha = "a".repeat(64);
+            let out = h
+                .call(
+                    "mail.get_attachment",
+                    serde_json::json!({"sha256": sha, "filename": "chosen.pdf"}),
+                )
+                .unwrap();
+            assert_eq!(out["filename"], "aaaaaaaaaaaa_chosen.pdf");
         });
     }
 
@@ -1069,6 +1189,90 @@ mod tests {
         let err = h.call("mail.get_attachment", serde_json::json!({})).unwrap_err();
         assert_eq!(err.code, codes::INVALID_PARAMS);
         assert!(err.message.contains("message_id"), "got: {}", err.message);
+    }
+
+    /// `get_attachment_text`'s resolved-hash advice ends with "use
+    /// mail.get_attachment instead", so this tool is the second step of an
+    /// advice chain. It used to forward localmail's bare `404: attachment
+    /// <sha> not found` — the ambiguous upstream sentence the sibling tool was
+    /// fixed for, reached by a planner that did exactly what it was told.
+    #[test]
+    fn a_404_from_get_attachment_carries_repair_advice_not_the_upstream_sentence() {
+        with_out_dir("mail404", |_dir| {
+            let mut h =
+                MailHandler::with_client(client_with(Box::new(ArchiveFake::single_missing_blob())));
+            let err = h
+                .call("mail.get_attachment", serde_json::json!({"message_id": 37413}))
+                .unwrap_err();
+            assert!(!err.message.contains("localmail 404"), "raw upstream: {}", err.message);
+            assert!(err.message.contains("not stored"), "got: {}", err.message);
+            // Resolved hash: the planner is not sent to re-copy what it never typed.
+            assert!(!err.message.contains("mistyped"), "got: {}", err.message);
+        });
+    }
+
+    /// The planner-supplied arm of the same 404.
+    #[test]
+    fn a_404_from_get_attachment_on_a_typed_hash_points_at_the_hash() {
+        with_out_dir("mail404b", |_dir| {
+            let mut h =
+                MailHandler::with_client(client_with(Box::new(ArchiveFake::single_missing_blob())));
+            let err = h
+                .call("mail.get_attachment", serde_json::json!({"sha256": LIVE_SHA}))
+                .unwrap_err();
+            assert!(err.message.contains("mistyped"), "got: {}", err.message);
+            assert!(err.message.contains("message_id"), "got: {}", err.message);
+        });
+    }
+
+    /// localmail answers the same 404 for "no such message" and "your ACL
+    /// excludes it" — deliberately, so permission state is not enumerable. The
+    /// worker used to forward it, so the agent told the user the mail did not
+    /// exist.
+    #[test]
+    fn an_unreadable_message_id_is_repairable_not_a_bare_upstream_404() {
+        let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::no_such_message())));
+        let err = h
+            .call("mail.get_attachment_text", serde_json::json!({"message_id": 99999}))
+            .unwrap_err();
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+        assert!(err.message.contains("99999"), "name the id that failed: {}", err.message);
+        assert!(err.message.contains("ACL"), "both causes, not just one: {}", err.message);
+        assert!(!err.message.contains("localmail 404"), "raw upstream: {}", err.message);
+    }
+
+    /// A 200 that is not a message detail must not be reported as a fact about
+    /// the archive ("this message has no attachments").
+    #[test]
+    fn a_non_array_attachments_field_is_a_service_fault_not_an_empty_message() {
+        let mut h =
+            MailHandler::with_client(client_with(Box::new(ArchiveFake::attachments_not_an_array())));
+        let err = h
+            .call("mail.get_attachment_text", serde_json::json!({"message_id": 37413}))
+            .unwrap_err();
+        assert_eq!(err.code, codes::OPERATION_FAILED);
+        assert!(err.message.contains("service fault"), "got: {}", err.message);
+    }
+
+    /// The params structs gained three optional fields each, so the
+    /// misspelling guard needs pinning on the widened surface too: without
+    /// `deny_unknown_fields`, `acount_ids` is silently dropped and the search
+    /// runs unfiltered.
+    #[test]
+    fn a_misspelled_parameter_on_a_widened_schema_is_still_refused() {
+        let mut h = MailHandler::with_client(client_with(Box::new(BodyEchoFake)));
+        let err = h
+            .call("mail.search", serde_json::json!({"query": "x", "acount_ids": [1]}))
+            .unwrap_err();
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+
+        let mut h2 = MailHandler::with_client(client_with(Box::new(ArchiveFake::ok())));
+        for method in ["mail.get_attachment_text", "mail.get_attachment"] {
+            let err = h2
+                .call(method, serde_json::json!({"message_id": 37413, "filenam": "x.pdf"}))
+                .unwrap_err();
+            assert_eq!(err.code, codes::INVALID_PARAMS, "{method} accepted a typo'd field");
+        }
     }
 
     // --- mail.search: the id filters the planner actually writes ---
