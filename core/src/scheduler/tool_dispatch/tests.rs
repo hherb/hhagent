@@ -278,10 +278,88 @@ fn shell_exec_entry_declares_single_use_lifecycle() {
 }
 
 // The unknown-tool branch of `ToolHostStepDispatcher::dispatch_step`
-// is covered end-to-end in `core/tests/scheduler_step_dispatch_e2e.rs`
-// (the dispatcher needs a real `PgPool` to construct, so a pure unit
-// test would be tautological). `tool_registry_starts_empty` above
-// pins the underlying registry-miss contract.
+// is covered end-to-end in `core/tests/scheduler_step_dispatch_e2e.rs`.
+// `tool_registry_starts_empty` above pins the underlying registry-miss
+// contract.
+//
+// This block used to say a unit test needed a real `PgPool` and would
+// therefore be tautological. That is not so — `connect_lazy` parses a URL
+// without connecting, which is how `core/tests/handoff_dispatch_e2e.rs`
+// has built this dispatcher hermetically all along — and the belief cost
+// real coverage: the registry→`qualify_method` wiring below had no test,
+// so reverting it left the whole workspace suite green while restoring a
+// live `-32601 unknown method` failure.
+
+// ----- namespace completion is wired to the registry -----
+
+/// A lazily-connected pool. Never dialled: `qualify_method` is pure and
+/// touches neither Postgres nor a worker. Still needs a Tokio context —
+/// `connect_lazy` spawns the pool's reaper — hence `#[tokio::test]` below.
+fn dead_pool() -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(250))
+        .connect_lazy("postgres://127.0.0.1:1/tool_dispatch_qualify_test")
+        .expect("lazy pool parses the URL without connecting")
+}
+
+/// Lifecycle fake that must never be acquired — `qualify_method` resolves
+/// against the registry alone, so reaching the worker layer is the bug.
+struct NeverAcquire;
+
+#[async_trait::async_trait]
+impl crate::worker_lifecycle::WorkerLifecycleManager for NeverAcquire {
+    async fn acquire(
+        &self,
+        _tool: &str,
+        _entry: &ToolEntry,
+    ) -> Result<crate::worker_lifecycle::WorkerHandle, ToolHostError> {
+        panic!("qualify_method must not reach the worker-acquire path");
+    }
+}
+
+fn dispatcher_with_registry(reg: ToolRegistry) -> ToolHostStepDispatcher {
+    ToolHostStepDispatcher::new(
+        dead_pool(),
+        std::sync::Arc::new(crate::secrets::Vault::new()),
+        std::sync::Arc::new(NeverAcquire),
+        std::sync::Arc::new(reg),
+        std::sync::Arc::new(crate::handoff::HandoffCache::new()),
+    )
+}
+
+/// The join between the two halves of the namespace fix: `assemble_registry`
+/// records a tool's advertised methods, and the dispatcher has to look them up
+/// **under that tool's own name** and hand back the completion.
+///
+/// Each half had a test and the join had none, so three separate regressions
+/// — dropping the substitution, keying `methods_for` on `step.method`, or
+/// qualifying only for the log line — all left the suite green.
+#[tokio::test]
+async fn qualify_method_completes_a_bare_name_against_the_tools_own_registry_entry() {
+    let mut reg = ToolRegistry::new();
+    reg.insert("mail", shell_exec_entry(PathBuf::from("/x"), &[]));
+    reg.set_methods("mail", vec!["mail.search", "mail.get_attachment_text"]);
+    // A second tool, so keying the lookup on the wrong field is observable:
+    // `methods_for("get_attachment_text")` returns nothing and qualifies nothing.
+    reg.insert("web-search", shell_exec_entry(PathBuf::from("/y"), &[]));
+    reg.set_methods("web-search", vec!["web.search"]);
+    let d = dispatcher_with_registry(reg);
+
+    assert_eq!(
+        d.qualify_method("mail", "get_attachment_text").as_deref(),
+        Some("mail.get_attachment_text"),
+        "the live failure: a bare method must be completed from the registry"
+    );
+    // Scoped to the named tool — `web.search` is not reachable via `mail`.
+    assert_eq!(d.qualify_method("mail", "search").as_deref(), Some("mail.search"));
+    assert_eq!(d.qualify_method("web-search", "search").as_deref(), Some("web.search"));
+    // Already qualified, unknown, and unregistered all pass through untouched,
+    // so re-running the completion over an already-normalised plan is a no-op.
+    assert_eq!(d.qualify_method("mail", "mail.search"), None);
+    assert_eq!(d.qualify_method("mail", "nope"), None);
+    assert_eq!(d.qualify_method("no-such-tool", "search"), None);
+}
 
 // ----- build_scheduler_step_failure_payload -----
 
