@@ -725,15 +725,26 @@ async fn tasks_lifecycle_e2e() {
     assert!(task.finished_at.is_some(), "finished_at must be set after finalize");
 
     // ── 4. mark_cancelled on a separate row ──────────────────────────
-    // Widened 2026-05-13 to return Option<Task> via RETURNING so producer-
-    // side callers can build an audit-row payload without a follow-up
-    // SELECT. Some(task) = a row was flipped to cancelled; None = the
-    // row was already terminal or did not exist.
+    // Widened 2026-05-13 to return the row via RETURNING so producer-side
+    // callers can build an audit-row payload without a follow-up SELECT,
+    // and again in #564 to a `Cancellation` carrying the pre-cancel state
+    // and the ask count. Some(_) = a row was flipped to cancelled;
+    // None = the row was already terminal or did not exist.
     let id2 = insert_pending(&pool, Lane::Long, serde_json::json!({"instruction": "x"}))
         .await
         .expect("insert_pending id2");
     let cancelled = mark_cancelled(&pool, id2).await.expect("mark_cancelled");
-    let task2 = cancelled.expect("mark_cancelled must return Some(task) for a pending row");
+    let cancellation =
+        cancelled.expect("mark_cancelled must return Some(_) for a pending row");
+    assert_eq!(
+        cancellation.previous_state, "pending",
+        "the pre-cancel state decides whether a producer finalize row is owed"
+    );
+    assert_eq!(
+        cancellation.asks_cancelled, 0,
+        "a never-claimed task cannot have an ask"
+    );
+    let task2 = cancellation.task;
     assert_eq!(task2.id, id2, "RETURNING shape pins row identity");
     assert_eq!(task2.state, "cancelled", "post-update state is 'cancelled'");
     assert_eq!(task2.lane, Lane::Long, "RETURNING shape pins lane round-trip");

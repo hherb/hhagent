@@ -235,10 +235,17 @@ pub async fn observe_state(pool: &PgPool, task_id: i64) -> Result<String, DbErro
 /// task is still in `pending`, `running` or `awaiting_operator`; the
 /// trigger fires the `tasks_cancelled` NOTIFY.
 ///
-/// Returns the post-update row via `RETURNING` so the caller can emit
-/// one producer-side audit row (e.g. `actor='cli' action='task.cancelled'`)
-/// without a follow-up SELECT. `None` means the row was not in a
-/// cancellable state (already terminal, or does not exist) — idempotent.
+/// Returns a [`Cancellation`] — the post-update row via `RETURNING` so the
+/// caller can emit one producer-side audit row (e.g. `actor='cli'
+/// action='task.cancelled'`) without a follow-up SELECT, plus the state the
+/// task was in **before** the cancel and how many asks went with it.
+/// `None` means the row was not in a cancellable state (already terminal,
+/// or does not exist) — idempotent.
+///
+/// `previous_state` exists because the audit emitter downstream has to
+/// decide whether the scheduler will *also* write a `task.finalize` row for
+/// this task, and after the UPDATE every cancelled row looks alike. See
+/// [`Cancellation::previous_state`].
 ///
 /// Mirrors the shape [`sweep_crashed`] took on 2026-05-12 for the same
 /// reason: an audit emitter downstream needs the row's `lane` and
@@ -265,28 +272,78 @@ pub async fn observe_state(pool: &PgPool, task_id: i64) -> Result<String, DbErro
 /// `tasks` UPDATE — asks locked first, tasks second. That matches
 /// `asks::resolve`, `asks::resolve_with_nonce`, and `asks::expire_due`,
 /// which all write `asks` then `tasks` inside one transaction. Locking
-/// tasks first (the order this function used before this comment was
-/// added) inverts that order relative to the other three, and PG detects
-/// the resulting lock cycle between a concurrent `mark_cancelled(T)` and
-/// `resolve(A)` on the same (task, ask) pair as a deadlock (SQLSTATE
-/// 40P01) and aborts one side — surfacing as a database error on either
-/// the operator's cancel or their approval, for no reason but acquisition
-/// order. **If you are tempted to swap this back so the "primary" tasks
+/// tasks first inverts that order relative to the other three, and PG
+/// detects the resulting lock cycle between a concurrent
+/// `mark_cancelled(T)` and `resolve(A)` on the same (task, ask) pair as a
+/// deadlock (SQLSTATE 40P01) and aborts one side — surfacing as a database
+/// error on either the operator's cancel or their approval, for no reason
+/// but acquisition order. Reproduced against a live PG 18 before this was
+/// written. **If you are tempted to swap this back so the "primary" tasks
 /// UPDATE runs first: don't — it silently reintroduces that deadlock.**
 ///
-/// Cancelling the ask before the tasks UPDATE succeeds is still correct
+/// `asks::raise` is the one writer of both tables that takes them the
+/// other way round (`suspend_for_ask`, then INSERT). It cannot participate
+/// in that cycle: it requires `state = 'running'`, and a task with a
+/// pending ask is `awaiting_operator`, so the only transaction it can
+/// contend with on the ask side is another `raise` for the same task —
+/// which serializes on the `tasks` row first. What it *can* do is race
+/// this function, which is what the re-sweep below is for.
+///
+/// # Why the ask cancel runs TWICE
+///
+/// The asks-first order opens a window the tasks-first order did not have,
+/// and it is not theoretical — it was reproduced on a live PG 18:
+///
+/// 1. `raise(T)` locks task `T` (`running` → `awaiting_operator`).
+/// 2. `mark_cancelled(T)` sweeps `asks` — **0 rows**; under READ COMMITTED
+///    the ask `raise` is about to insert is invisible, and there is no row
+///    version to block on.
+/// 3. `raise(T)` inserts ask `A` and commits.
+/// 4. `mark_cancelled(T)`'s tasks UPDATE unblocks, re-checks against the
+///    committed row, finds `awaiting_operator` in the widened `IN` list,
+///    and cancels.
+///
+/// Result: task `cancelled`, ask `A` still `pending` — precisely the
+/// stranded live-question-on-a-dead-task this function's coupling exists
+/// to prevent. The second sweep runs *after* the tasks row lock is held,
+/// so it sees anything committed in that window. It cannot deadlock: by
+/// the time we hold the tasks lock, no `raise` for this task can be
+/// mid-flight holding an ask row (it takes the tasks lock first), and any
+/// ask that existed at step 2 is already locked by us.
+///
+/// Cancelling the asks before the tasks UPDATE succeeds is still correct
 /// when the task turns out NOT to be cancellable: the function returns
-/// `Ok(None)` without committing, and dropping `tx` rolls the ask cancel
-/// back along with it. The ask cancel here is therefore provisional on the
-/// task actually being cancelled, exactly as before — only the lock
-/// acquisition order changed, not the outcome.
-pub async fn mark_cancelled(pool: &PgPool, task_id: i64) -> Result<Option<Task>, DbError> {
+/// `Ok(None)` without committing, and dropping `tx` rolls both sweeps back
+/// along with it. The ask cancel is provisional on the task actually being
+/// cancelled.
+pub async fn mark_cancelled(
+    pool: &PgPool,
+    task_id: i64,
+) -> Result<Option<Cancellation>, DbError> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| DbError::Query(format!("tasks mark_cancelled begin: {e}")))?;
 
-    crate::asks::cancel_for_task(&mut *tx, task_id).await?;
+    // First sweep: establishes the asks → tasks acquisition order.
+    let mut asks_cancelled = crate::asks::cancel_for_task(&mut tx, task_id).await?;
+
+    // Read the pre-cancel state. `RETURNING` yields the NEW row, so this is
+    // the only place the old state is still observable.
+    //
+    // `FOR UPDATE`, and that is load-bearing rather than incidental. A plain
+    // SELECT is a snapshot read: in the raise-racing-cancel interleaving
+    // described above it returns the *stale* `running`, because the raiser's
+    // `awaiting_operator` is not committed yet. `previous_state` would then
+    // say `running`, the audit emitter would conclude a scheduler-side
+    // inner loop is going to write the `task.finalize` row, and none would
+    // ever be written — the exact undercount this field exists to prevent,
+    // reintroduced under the exact race the second sweep exists to handle.
+    // Locking the row makes the read wait for that writer and report what
+    // the UPDATE below will actually see. It also takes the `tasks` lock
+    // here rather than at the UPDATE, which is still *after* the asks
+    // sweep, so the acquisition order is unchanged.
+    let previous_state = state_locked_in_tx(&mut tx, task_id).await?;
 
     let row = sqlx::query(
         "UPDATE tasks \
@@ -310,10 +367,101 @@ pub async fn mark_cancelled(pool: &PgPool, task_id: i64) -> Result<Option<Task>,
     };
     let task = decode_task_row(&row)?;
 
+    // Second sweep — see "Why the ask cancel runs TWICE" above. Now that
+    // the tasks row lock is held, an ask committed by a `raise` racing
+    // step 1 is visible and gets cancelled with its task.
+    asks_cancelled += crate::asks::cancel_for_task(&mut tx, task_id).await?;
+
     tx.commit()
         .await
         .map_err(|e| DbError::Query(format!("tasks mark_cancelled commit: {e}")))?;
-    Ok(Some(task))
+    Ok(Some(Cancellation {
+        task,
+        previous_state: previous_state.unwrap_or_default(),
+        asks_cancelled,
+    }))
+}
+
+/// What [`mark_cancelled`] returns when it actually cancelled something.
+#[derive(Debug, Clone)]
+pub struct Cancellation {
+    /// The post-update row, `state = 'cancelled'`.
+    pub task: Task,
+    /// The state the task was in **immediately before** the cancel, read
+    /// inside the same transaction.
+    ///
+    /// Load-bearing, not diagnostic. The producer-side audit emitter has to
+    /// decide whether the scheduler's inner loop will *also* write a
+    /// `task.finalize` row for this task, and after the UPDATE a task
+    /// cancelled out of `running` and one cancelled out of
+    /// `awaiting_operator` are indistinguishable — both have `started_at`
+    /// set. Only the first has a live inner loop to emit that row. See
+    /// `core::cli_audit::task::scheduler_will_emit_finalize`.
+    pub previous_state: String,
+    /// How many of the task's `pending` asks were cancelled with it.
+    ///
+    /// Surfaced rather than discarded so the audit trail can record that a
+    /// human's outstanding question was destroyed. Without it, a pending
+    /// ask vanishes from `asks::list_pending` with nothing in `audit_log`
+    /// saying it ever existed.
+    pub asks_cancelled: u64,
+}
+
+/// Read a task's current state inside a caller's transaction, **without**
+/// locking the row.
+///
+/// For diagnostics only — `asks::raise` uses it to name the state it found
+/// when the task was not suspendable. A snapshot read is right there: the
+/// caller is already on an error path, is about to roll back, and must not
+/// block behind whichever writer moved the task out from under it.
+/// Somewhere a concurrent commit lands between the guard and this read, the
+/// message names the slightly-stale state, which is a strictly better
+/// message than the fixed three-way list it replaced.
+///
+/// Distinct from [`observe_state`], which takes a pool and errors on a
+/// missing row: this one returns `None` for "no such task" because its
+/// caller is already handling a failure and must not have it masked by a
+/// second one. Takes `&mut PgConnection` for the same reason the write
+/// helpers do — see [`suspend_for_ask`].
+pub(crate) async fn state_in_tx(
+    conn: &mut sqlx::PgConnection,
+    task_id: i64,
+) -> Result<Option<String>, DbError> {
+    decode_state_row(
+        sqlx::query("SELECT state FROM tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(conn)
+            .await
+            .map_err(|e| DbError::Query(format!("tasks state_in_tx: {e}")))?,
+    )
+}
+
+/// Read a task's current state inside a caller's transaction and **hold the
+/// row lock**, so the value is what a subsequent guarded UPDATE in the same
+/// transaction will see.
+///
+/// Used by [`mark_cancelled`], where a stale answer is not cosmetic: see the
+/// `FOR UPDATE` note at its call site.
+async fn state_locked_in_tx(
+    conn: &mut sqlx::PgConnection,
+    task_id: i64,
+) -> Result<Option<String>, DbError> {
+    decode_state_row(
+        sqlx::query("SELECT state FROM tasks WHERE id = $1 FOR UPDATE")
+            .bind(task_id)
+            .fetch_optional(conn)
+            .await
+            .map_err(|e| DbError::Query(format!("tasks state_locked_in_tx: {e}")))?,
+    )
+}
+
+fn decode_state_row(row: Option<PgRow>) -> Result<Option<String>, DbError> {
+    row.as_ref()
+        .map(|r| {
+            r.try_get::<String, _>("state")
+                .map_err(|e| DbError::Query(format!("decode tasks.state: {e}")))
+        })
+        .transpose()
 }
 
 /// Cancel a task **only if it is still `pending`** (never claimed).
@@ -441,26 +589,35 @@ pub async fn increment_plan_count(
 /// never claimed — and the caller must treat that as a refusal to
 /// suspend, not as success.
 ///
-/// Releasing the lease is load-bearing, not tidiness. `any_live_worker`
-/// counts `running` rows with an unexpired lease as evidence a daemon is
-/// alive and consuming a lane; a suspended task that kept its lease would
-/// make a completely idle daemon look busy to `memory l3 run`'s
-/// busy-vs-absent discrimination. (The crash sweep is a separate story
-/// and needs no help here: `sweep_crashed` filters `state = 'running'`,
-/// so a suspended task is already outside it.)
+/// Releasing the lease is **hygiene, not a load-bearing invariant**, and
+/// the distinction matters because slice 1b must not cite it as one. Every
+/// consumer of `lease_expires_at` also filters on `state = 'running'` —
+/// `any_live_worker` (`state = 'running' AND lease_expires_at > now()`)
+/// and `sweep_crashed` (`state = 'running' AND lease_expires_at < now()`)
+/// both — and `claim_one` overwrites the column unconditionally on the way
+/// back to `running`. So a suspended task that kept its lease would not in
+/// fact look busy to anything; it would just be a confusing artifact for
+/// an operator reading the table. (An earlier version of this comment
+/// claimed the `any_live_worker` consequence. It was wrong in the same way
+/// the e2e assertion beside it was — that helper's `state` predicate
+/// excludes a suspended task before the lease is ever consulted.)
 ///
-/// Executor-generic so `asks::raise` can call it inside its transaction —
-/// the ask INSERT and this UPDATE must commit together. **Sole intended
-/// caller:** `asks::raise`.
+/// Takes `&mut PgConnection` so `asks::raise` can call it inside its
+/// transaction — the ask INSERT and this UPDATE must commit together — and
+/// so that a `&PgPool` (which `E: Executor` would have accepted) cannot
+/// run it standalone and suspend a task whose ask never gets written.
+/// **Sole intended caller:** `asks::raise`.
 ///
 /// `pub(crate)`, not `pub`: called from anywhere else, this parks a task
-/// in `awaiting_operator` with no ask backing it — `claim_one`,
-/// `sweep_crashed`, and `expire_due` all skip that state, so the task
+/// in `awaiting_operator` with no ask backing it. `claim_one`
+/// (`state = 'pending'`) and `sweep_crashed` (`state = 'running'`) both
+/// skip that state, and `asks::expire_due` can only reach a task *through*
+/// an ask row — so a task parked with no ask is invisible to all three and
 /// wedges permanently until a manual cancel.
-pub(crate) async fn suspend_for_ask<'e, E>(executor: E, task_id: i64) -> Result<bool, DbError>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
+pub(crate) async fn suspend_for_ask(
+    conn: &mut sqlx::PgConnection,
+    task_id: i64,
+) -> Result<bool, DbError> {
     let r = sqlx::query(
         "UPDATE tasks \
          SET state = 'awaiting_operator', \
@@ -469,7 +626,7 @@ where
          WHERE id = $1 AND state = 'running'",
     )
     .bind(task_id)
-    .execute(executor)
+    .execute(conn)
     .await
     .map_err(|e| DbError::Query(format!("tasks suspend_for_ask: {e}")))?;
     Ok(r.rows_affected() == 1)
@@ -489,7 +646,7 @@ where
 /// UPDATE** — it does not reset either to a fresh-task value.
 ///
 /// That is true of the SQL and false of the observed outcome, and slice
-/// 1b must not read this comment as "the plan budget carries forward."
+/// 1b must not read it as "the plan budget carries forward."
 /// `core::scheduler::runner::task_exec::run_one` rebuilds the resumed
 /// task's `TaskContext` with `plan_count: 0` regardless of what this
 /// column holds, and `inner_loop` writes that absolute value straight
@@ -498,20 +655,21 @@ where
 /// resumes with a **fresh full budget** — the CLI's plans-so-far column
 /// reads 4 → 1, not 4 → 4. Whether that reset is fine (a resumed task
 /// deserves a full retry budget) or wrong (the operator approved a
-/// continuation, not a new attempt) is slice 1b's call, not made here;
-/// this comment previously implied the count survives, which it does not.
+/// continuation, not a new attempt) is slice 1b's call, not made here.
 ///
-/// Executor-generic so `asks::resolve` and `asks::resolve_with_nonce` can
-/// call it inside their transactions. **Sole intended caller:**
-/// `asks::resolve` / `asks::resolve_with_nonce`.
+/// Takes `&mut PgConnection` so `asks::resolve` and
+/// `asks::resolve_with_nonce` can call it inside their transactions, and
+/// so a `&PgPool` cannot re-enqueue a task standalone while the ask's
+/// resolution rolls back. **Sole intended caller:** `asks::resolve` /
+/// `asks::resolve_with_nonce`.
 ///
 /// `pub(crate)`, not `pub`: called from anywhere else, this resurrects a
 /// task from `awaiting_operator` with no resolved ask behind it, silently
 /// bypassing the human decision the state exists to wait on.
-pub(crate) async fn resume_from_ask<'e, E>(executor: E, task_id: i64) -> Result<bool, DbError>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
+pub(crate) async fn resume_from_ask(
+    conn: &mut sqlx::PgConnection,
+    task_id: i64,
+) -> Result<bool, DbError> {
     let r = sqlx::query(
         "UPDATE tasks \
          SET state = 'pending', \
@@ -519,7 +677,7 @@ where
          WHERE id = $1 AND state = 'awaiting_operator'",
     )
     .bind(task_id)
-    .execute(executor)
+    .execute(conn)
     .await
     .map_err(|e| DbError::Query(format!("tasks resume_from_ask: {e}")))?;
     Ok(r.rows_affected() == 1)
@@ -540,19 +698,18 @@ where
 /// and conflating the two would make lane-latency queries count tasks that
 /// spent their time waiting on a human.
 ///
-/// **Sole intended caller:** `asks::expire_due`. `pub(crate)`, not `pub`:
-/// called from anywhere else, this terminalises a task that may still have
-/// a `pending` ask attached, leaving a resolvable ask pointing at a dead
+/// **Sole intended caller:** `asks::expire_due`. Takes
+/// `&mut PgConnection` so it runs inside that sweep's transaction and
+/// cannot be handed a `&PgPool`. `pub(crate)`, not `pub`: called from
+/// anywhere else, this terminalises a task that may still have a
+/// `pending` ask attached, leaving a resolvable ask pointing at a dead
 /// task — the same wedge `mark_cancelled`'s coupled ask-cancel exists to
 /// prevent, reintroduced from a different call site.
-pub(crate) async fn fail_awaiting_operator<'e, E>(
-    executor: E,
+pub(crate) async fn fail_awaiting_operator(
+    conn: &mut sqlx::PgConnection,
     task_id: i64,
     detail: &str,
-) -> Result<bool, DbError>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
+) -> Result<bool, DbError> {
     let r = sqlx::query(
         "UPDATE tasks \
          SET state = 'failed', \
@@ -563,7 +720,7 @@ where
     )
     .bind(task_id)
     .bind(serde_json::json!({"kind": "error", "detail": detail}))
-    .execute(executor)
+    .execute(conn)
     .await
     .map_err(|e| DbError::Query(format!("tasks fail_awaiting_operator: {e}")))?;
     Ok(r.rows_affected() == 1)

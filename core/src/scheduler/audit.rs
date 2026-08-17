@@ -156,6 +156,23 @@ pub const FINALIZE_PROVENANCE_CRASH_RECOVERY: &str = "crash_recovery";
 /// always JSON `null`.
 pub const FINALIZE_PROVENANCE_PRODUCER_CANCEL_PENDING: &str = "producer_cancel_pending";
 
+/// Value of the `provenance` field in a `task.finalize` payload emitted
+/// when a producer (`kastellan-cli`) cancels a task suspended in
+/// `awaiting_operator` on an operator ask (#564).
+///
+/// **A distinct value from [`FINALIZE_PROVENANCE_PRODUCER_CANCEL_PENDING`],
+/// because every hardcoded field of that payload is false here.** A
+/// suspended task WAS claimed (`started_at` is set), it DID run plan
+/// iterations and step dispatches before escalating, and its duration is
+/// not zero. Reusing the pending shape would have emitted a row asserting
+/// "never claimed, zero work, no start time" about a task that had done
+/// real work — a fabricated record in the one log whose job is to be
+/// trustworthy. Counters are JSON `null` for the same reason
+/// [`FINALIZE_PROVENANCE_CRASH_RECOVERY`] uses null: the inner loop's
+/// in-memory counters went away with the loop, and the producer cannot
+/// recover them.
+pub const FINALIZE_PROVENANCE_PRODUCER_CANCEL_SUSPENDED: &str = "producer_cancel_suspended";
+
 /// Build the `action` string for a terminal-state lifecycle row.
 /// Centralises the `"task." + state` format so a future rename can't
 /// drift between the writer and any reader. Example: `"failed"` →
@@ -321,6 +338,41 @@ pub fn build_producer_cancel_finalize_payload(
         "started_at":           Value::Null,
         "finished_at":          format_rfc3339(finished_at),
         "provenance":           FINALIZE_PROVENANCE_PRODUCER_CANCEL_PENDING,
+    })
+}
+
+/// Build the `task.finalize` payload for a producer cancel of a task
+/// suspended in `awaiting_operator` on an operator ask (#564).
+///
+/// Same 10-key shape as the others. Unlike
+/// [`build_producer_cancel_finalize_payload`] **nothing here is hardcoded
+/// to a never-claimed task's values**: `started_at` is the real claim
+/// timestamp, `plan_count` is what the task actually burned before
+/// escalating, and `total_duration_ms` is measured from the claim. The two
+/// call counters are JSON `null` — genuinely unrecoverable, exactly as in
+/// [`build_crashed_finalize_payload`] — because the lane runner released
+/// this task when the ask was raised and its in-memory counters went with
+/// it. `provenance` is [`FINALIZE_PROVENANCE_PRODUCER_CANCEL_SUSPENDED`],
+/// so an observation query never has to infer the path.
+pub fn build_producer_cancel_suspended_finalize_payload(
+    task_id: i64,
+    lane: Lane,
+    plan_count: i32,
+    started_at: Option<OffsetDateTime>,
+    finished_at: OffsetDateTime,
+) -> Value {
+    let duration_ms: Option<u64> = started_at.map(|s| compute_duration_ms(Some(s), finished_at));
+    json!({
+        "task_id":              task_id,
+        "lane":                 lane.as_sql(),
+        "state":                "cancelled",
+        "plan_count":           plan_count,
+        "total_llm_calls":      Value::Null,
+        "total_dispatch_calls": Value::Null,
+        "total_duration_ms":    duration_ms,
+        "started_at":           started_at.map(format_rfc3339),
+        "finished_at":          format_rfc3339(finished_at),
+        "provenance":           FINALIZE_PROVENANCE_PRODUCER_CANCEL_SUSPENDED,
     })
 }
 

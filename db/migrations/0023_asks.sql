@@ -6,10 +6,11 @@
 --
 -- Design: docs/superpowers/specs/2026-08-16-ask-record-slice-1a-design.md
 --
--- Three parts:
---   1. the `asks` table + its two indexes
+-- Four parts:
+--   1. the `asks` table + its four indexes
 --   2. `tasks_state_check` widened with 'awaiting_operator'
 --   3. the `tasks_resumed` NOTIFY trigger (awaiting_operator -> pending)
+--   4. the `kastellan_runtime` grants
 --
 -- `notify_task_completed` (0005, last replaced in 0012) is deliberately
 -- NOT touched. 'awaiting_operator' is not terminal, so it must not appear
@@ -32,36 +33,81 @@ BEGIN;
 -- optional free_text kept for the audit row and shown to the operator.
 -- Free text is never interpolated into a plan — otherwise the ask channel
 -- becomes an injection funnel aimed at the reviewer's own decision.
+--
+-- Every one of the four CHECKs below exists because the property it pins
+-- was, in review, asserted only in prose. A comment saying "closed set"
+-- over a bare JSONB column is a contract on a caller that does not exist
+-- yet (slice 1b/2), and the caller that eventually arrives reads the
+-- column, not the comment.
 CREATE TABLE asks (
     id            BIGSERIAL   PRIMARY KEY,
     task_id       BIGINT      NOT NULL REFERENCES tasks(id),
-    kind          TEXT        NOT NULL,
+    -- Closed set, like `state`. A new ask kind is a migration, deliberately:
+    -- `kind` selects slice 1b's dispatch, so an unrecognised value there is
+    -- a silent no-op on a question a human was asked to answer.
+    kind          TEXT        NOT NULL
+                  CHECK (kind IN ('plan_approval')),
     body          TEXT        NOT NULL,
-    options       JSONB       NOT NULL,
+    -- A non-empty JSON array. An ask whose `options` is `[]`, `null`, or a
+    -- scalar renders as a question with no answers: unanswerable, so the
+    -- task waits out the full deadline for a reply that cannot be given.
+    options       JSONB       NOT NULL
+                  CHECK (jsonb_typeof(options) = 'array'
+                         AND jsonb_array_length(options) > 0),
     plan_digest   TEXT,
     nonce_sha256  TEXT        NOT NULL,
     state         TEXT        NOT NULL DEFAULT 'pending'
                   CHECK (state IN ('pending','resolved','expired','cancelled')),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Compared against PG's `now()` by `expire_due`, so it is pinned
+    -- against PG's own clock here rather than against the caller's:
+    -- `created_at` defaults to `transaction_timestamp()`, and a daemon
+    -- whose clock trails the database's would otherwise mint an ask that
+    -- is already expirable. A past deadline is always a caller bug.
     deadline_at   TIMESTAMPTZ NOT NULL,
     resolved_at   TIMESTAMPTZ,
     resolved_by   TEXT,
-    resolution    JSONB
+    resolution    JSONB,
+
+    CONSTRAINT asks_deadline_after_created CHECK (deadline_at > created_at),
+
+    -- `resolved` is all-or-nothing. Without this a half-resolved row is
+    -- representable — and `kastellan_runtime` holds blanket UPDATE, so
+    -- "only the Rust path writes all four together" is a property of
+    -- today's callers, not of the table.
+    CONSTRAINT asks_resolved_is_complete CHECK (
+        (state = 'resolved') = (resolved_at IS NOT NULL
+                                AND resolved_by IS NOT NULL
+                                AND resolution  IS NOT NULL)
+    )
 );
 
 -- Partial index: the expiry sweep only ever scans pending rows. Mirrors
 -- `pairing_codes_claimable` from 0018.
 CREATE INDEX asks_pending_deadline ON asks (deadline_at) WHERE state = 'pending';
--- Every read from the task side ("does this task have an open ask?").
+-- A task's ask HISTORY, which accumulates: a task may escalate more than
+-- once over its life (approved on plan 2, escalating again on plan 4), and
+-- every ask it ever raised stays on the table because there is no DELETE
+-- grant. Serves the operator-facing "show me this task's questions" read
+-- and `cancel_for_task`'s task-scoped sweep.
 CREATE INDEX asks_task ON asks (task_id);
 
--- One pending ask per task, enforced by the database rather than only by
--- `raise`'s application-level guard (`UPDATE tasks … WHERE state =
--- 'running'`, which only stops a SECOND raise against the same task from
--- the same process — it is not a substitute for a constraint). This is
--- exactly the invariant `asks::resolve`'s loud `Err` branch exists to
--- detect a violation of; making it a UNIQUE index turns "detect after the
--- fact" into "cannot happen".
+-- One **pending** ask per task — partial, and the partiality is the point:
+-- a task that resolved one ask must be able to raise the next. A plain
+-- UNIQUE (task_id) would let the first escalation succeed and every
+-- subsequent one fail forever, which is a mainline slice-1b flow.
+--
+-- The database rather than only `raise`'s application-level guard
+-- (`UPDATE tasks … WHERE state = 'running'`). That guard is a row-
+-- conditional UPDATE and so IS cross-process — two concurrent `raise(T)`
+-- calls serialize on the tasks row lock and the loser re-evaluates against
+-- the committed `awaiting_operator` and matches nothing. What it does not
+-- cover is a writer that reaches `asks` without going through `raise` at
+-- all: direct SQL, a future call site, or a task returned to `running`
+-- with a stale pending ask still attached. This is exactly the invariant
+-- `asks::resolve`'s loud `Err` branch exists to detect a violation of;
+-- making it a UNIQUE index turns "detect after the fact" into "cannot
+-- happen".
 CREATE UNIQUE INDEX asks_one_pending_per_task ON asks (task_id) WHERE state = 'pending';
 
 -- The nonce lookup `asks::resolve_with_nonce` (#564 fix wave) performs
@@ -81,9 +127,11 @@ ALTER TABLE tasks
 -- (3) Resume wake-up. `tasks_inserted` fires AFTER INSERT only, so an
 -- awaiting_operator -> pending UPDATE wakes nobody and the resumed task
 -- waits out the lane runner's 30 s HEARTBEAT. A dedicated channel rather
--- than overloading `tasks_inserted`: a channel name that no longer
--- describes what it carries is the trap that broke upgrade_from_git.sh's
--- own post-deploy check in the #516 arc.
+-- than overloading `tasks_inserted`, whose name would then no longer
+-- describe what it carries — the same class of trap as the renamed LOG
+-- LINE in the #516 arc, which broke `upgrade_from_git.sh`'s post-deploy
+-- grep. (That was a log line, not a NOTIFY channel; the lesson transfers,
+-- the mechanism does not.)
 CREATE OR REPLACE FUNCTION notify_task_resumed()
 RETURNS trigger
 LANGUAGE plpgsql

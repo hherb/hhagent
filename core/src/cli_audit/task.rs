@@ -15,7 +15,7 @@ use time::OffsetDateTime;
 use crate::cli_audit::CLI_AUDIT_ACTOR;
 use crate::scheduler::audit::{
     action_task_terminal, build_lifecycle_payload, build_producer_cancel_finalize_payload,
-    ACTION_TASK_FINALIZE, ACTION_TASK_SUBMITTED,
+    build_producer_cancel_suspended_finalize_payload, ACTION_TASK_FINALIZE, ACTION_TASK_SUBMITTED,
 };
 
 /// Outcome of [`cancel_and_audit`].
@@ -50,35 +50,44 @@ pub enum CancelOutcome {
 ///    `task.<state>` rows so observation-phase SQL on
 ///    `action LIKE 'task.%'` captures both producer intent and
 ///    scheduler observation.
-/// 2. **Only when the task was never claimed** (`task.started_at.is_none()`):
+/// 2. **Only when no scheduler-side observer will finalize the task**:
 ///    one `actor='cli' action='task.finalize'` summary row with
 ///    `state='cancelled'`, `started_at: null`, and zero counters /
-///    duration. Rationale: the scheduler will never observe this task
-///    (it never claimed it), so without this row observation-phase SQL
+///    duration. Rationale: without this row observation-phase SQL
 ///    grouping on `action='task.finalize'` would silently undercount by
-///    exactly the producer-cancelled-pending population. The counters
+///    exactly the population no observer covers. The counters
 ///    are **known** zeros (the task ran zero plan iterations and zero
 ///    step dispatches) — distinct from the crashed-task finalize where
 ///    they are JSON `null` because the dead daemon's counters were
 ///    unrecoverable.
+/// 3. **When the cancel destroyed pending asks**: one `actor='cli'
+///    action='ask.cancelled'` row (#564), so a withdrawn human question
+///    leaves a trace.
 ///
-/// When the task was already `running` (`started_at.is_some()`) the
-/// scheduler's inner-loop `observe_state` poll will later write its own
-/// `actor='scheduler' action='task.finalize'` row; emitting a producer
-/// finalize here would double-count the finalize stream, so we skip it.
-/// The discriminator is purely DB-state-driven (`started_at IS NOT NULL`
-/// after the UPDATE), which is exactly the predicate that distinguishes
-/// "scheduler ever touched this task" from "scheduler never saw it."
+/// The discriminator for (2) is the task's state **before** the cancel,
+/// carried on [`kastellan_db::tasks::Cancellation::previous_state`] — see
+/// [`scheduler_will_emit_finalize`]. Only a task cancelled out of
+/// `running` has a live inner loop whose `observe_state` poll will write
+/// the scheduler's own finalize row; emitting a producer finalize for it
+/// too would double-count. A task cancelled out of `pending` was never
+/// claimed, and one cancelled out of `awaiting_operator` was claimed but
+/// has no live loop — both need the producer row.
 ///
 /// Both audit inserts are best-effort (chokepoint posture); DB errors
 /// there are logged via `tracing::warn!` and swallowed so a transient
 /// audit failure cannot mask the successful SQL UPDATE.
 pub async fn cancel_and_audit(pool: &PgPool, task_id: i64) -> Result<CancelOutcome, DbError> {
-    let Some(task) = mark_cancelled(pool, task_id).await? else {
+    let Some(cancellation) = mark_cancelled(pool, task_id).await? else {
         return Ok(CancelOutcome::NotCancellable);
     };
-    emit_cancel_audit_rows(pool, &task).await;
-    Ok(CancelOutcome::Cancelled(task))
+    emit_cancel_audit_rows(
+        pool,
+        &cancellation.task,
+        &cancellation.previous_state,
+        cancellation.asks_cancelled,
+    )
+    .await;
+    Ok(CancelOutcome::Cancelled(cancellation.task))
 }
 
 /// Like [`cancel_and_audit`], but cancels **only if the task is still
@@ -100,25 +109,61 @@ pub async fn cancel_if_pending_and_audit(
     let Some(task) = mark_cancelled_if_pending(pool, task_id).await? else {
         return Ok(CancelOutcome::NotCancellable);
     };
-    emit_cancel_audit_rows(pool, &task).await;
+    // Pending-only by construction, so the pre-cancel state is `pending`
+    // and there can be no ask: `raise` only ever suspends a `running`
+    // task, so a never-claimed task has none.
+    emit_cancel_audit_rows(pool, &task, "pending", 0).await;
     Ok(CancelOutcome::Cancelled(task))
+}
+
+/// Does the scheduler's inner loop have a live observer that will write
+/// its own `actor='scheduler' action='task.finalize'` row for a task
+/// cancelled out of `previous_state`?
+///
+/// **`running` is the only state for which the answer is yes**, and that is
+/// narrower than the `started_at.is_some()` test this used to be. A task
+/// cancelled out of `awaiting_operator` (#564) also has `started_at` set —
+/// `claim_one` stamped it before the ask suspended the task — but its lane
+/// released it when the ask was raised, so `run_one` has already returned
+/// and there is no `observe_state` poll left to notice the cancel. Under
+/// the old test such a task got **no** `task.finalize` row from anyone, and
+/// observation-phase SQL grouping on `action='task.finalize'` undercounted
+/// by exactly the cancelled-while-suspended population — the identical
+/// undercount the producer row was introduced to close for never-claimed
+/// tasks.
+///
+/// Keyed on the pre-cancel state rather than on post-cancel column values
+/// because after the UPDATE the two cases are indistinguishable. (They can
+/// be told apart by `lease_expires_at`, which `suspend_for_ask` nulls — but
+/// that is an implicit coupling to a column another function clears for
+/// unrelated reasons, and it would break silently.)
+fn scheduler_will_emit_finalize(previous_state: &str) -> bool {
+    previous_state == "running"
 }
 
 /// Emit the producer audit rows for a cancelled task. Shared by
 /// [`cancel_and_audit`] and [`cancel_if_pending_and_audit`]; the `task`
-/// passed in is the already-cancelled row returned by the `mark_*` UPDATE.
+/// passed in is the already-cancelled row returned by the `mark_*` UPDATE,
+/// and `previous_state` is the state it held immediately before.
 ///
 /// 1. **Always** one `actor='cli' action='task.cancelled'` lifecycle row.
-/// 2. **Only when the task was never claimed** (`started_at.is_none()`) one
-///    producer `task.finalize` summary row — the scheduler emits its own
-///    `task.finalize` for any task it observed (the inner-loop
-///    `observe_state` poll catches the cancel of a running task), so
-///    emitting one here too would inflate the finalize stream.
+/// 2. **When no scheduler-side observer will finalize this task** (see
+///    [`scheduler_will_emit_finalize`]) one producer `task.finalize`
+///    summary row, so the finalize stream neither under- nor over-counts.
+/// 3. **When the cancel destroyed one or more pending asks**, one
+///    `actor='cli' action='ask.cancelled'` row. A human had an outstanding
+///    question; without this it disappears from `asks::list_pending` with
+///    nothing in `audit_log` recording that it was ever asked.
 ///
-/// Both inserts are best-effort (chokepoint posture): a DB error is logged
+/// All inserts are best-effort (chokepoint posture): a DB error is logged
 /// via `tracing::warn!` and swallowed so a transient audit failure cannot
 /// mask the successful SQL UPDATE.
-async fn emit_cancel_audit_rows(pool: &PgPool, task: &Task) {
+async fn emit_cancel_audit_rows(
+    pool: &PgPool,
+    task: &Task,
+    previous_state: &str,
+    asks_cancelled: u64,
+) {
     let action = action_task_terminal("cancelled");
     let payload = build_lifecycle_payload(task.id, task.lane, task.plan_count);
     if let Err(e) = audit::insert(pool, CLI_AUDIT_ACTOR, &action, payload).await {
@@ -128,10 +173,34 @@ async fn emit_cancel_audit_rows(pool: &PgPool, task: &Task) {
             "cli_audit::emit_cancel_audit_rows: lifecycle audit insert failed (cancel itself succeeded)",
         );
     }
-    if task.started_at.is_none() {
-        emit_producer_cancel_finalize(pool, task).await;
+    if !scheduler_will_emit_finalize(previous_state) {
+        emit_producer_cancel_finalize(pool, task, previous_state).await;
+    }
+    if asks_cancelled > 0 {
+        let ask_payload = serde_json::json!({
+            "task_id": task.id,
+            "asks_cancelled": asks_cancelled,
+            "task_state_before_cancel": previous_state,
+        });
+        if let Err(e) =
+            audit::insert(pool, CLI_AUDIT_ACTOR, ACTION_ASK_CANCELLED, ask_payload).await
+        {
+            tracing::warn!(
+                task_id = task.id,
+                asks_cancelled,
+                error = %e,
+                "cli_audit::emit_cancel_audit_rows: ask.cancelled audit insert failed \
+                 (cancel itself succeeded)",
+            );
+        }
     }
 }
+
+/// `action` for the row recording that cancelling a task destroyed the
+/// human's outstanding question(s). A `const` so the observation-phase
+/// query and the writer cannot drift onto two spellings of one event —
+/// same reason `asks::ASK_TIMEOUT_DETAIL` is one.
+pub const ACTION_ASK_CANCELLED: &str = "ask.cancelled";
 
 /// Insert one `actor='cli' action='task.finalize'` row for a
 /// producer-cancelled `pending` task. Best-effort, same posture as the
@@ -157,7 +226,7 @@ async fn emit_cancel_audit_rows(pool: &PgPool, task: &Task) {
 /// Wire shape: [`build_producer_cancel_finalize_payload`], including the
 /// `provenance="producer_cancel_pending"` discriminator added in issue
 /// #50 schema-v2.
-async fn emit_producer_cancel_finalize(pool: &PgPool, task: &Task) {
+async fn emit_producer_cancel_finalize(pool: &PgPool, task: &Task, previous_state: &str) {
     let finished_at = task.finished_at.unwrap_or_else(|| {
         tracing::error!(
             task_id = task.id,
@@ -167,12 +236,22 @@ async fn emit_producer_cancel_finalize(pool: &PgPool, task: &Task) {
         );
         OffsetDateTime::now_utc()
     });
-    let payload = build_producer_cancel_finalize_payload(
-        task.id,
-        task.lane,
-        task.plan_count,
-        finished_at,
-    );
+    // Two shapes, because the never-claimed payload's hardcoded fields are
+    // FALSE for a suspended task: it was claimed (`started_at` is set), it
+    // burned plan iterations before escalating, and its duration is not
+    // zero. Emitting the pending shape for it would fabricate a record in
+    // the one log whose whole job is to be trustworthy.
+    let payload = if previous_state == "awaiting_operator" {
+        build_producer_cancel_suspended_finalize_payload(
+            task.id,
+            task.lane,
+            task.plan_count,
+            task.started_at,
+            finished_at,
+        )
+    } else {
+        build_producer_cancel_finalize_payload(task.id, task.lane, task.plan_count, finished_at)
+    };
     if let Err(e) =
         audit::insert(pool, CLI_AUDIT_ACTOR, ACTION_TASK_FINALIZE, payload).await
     {
