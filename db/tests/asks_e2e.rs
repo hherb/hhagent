@@ -1787,3 +1787,150 @@ fn a_cancel_racing_a_raise_does_not_strand_the_ask() {
         );
     });
 }
+
+/// `finish_resolve`'s fail-closed `Err` arm — a pending ask whose task is
+/// NOT `awaiting_operator` — is never reached by any other test, so
+/// replacing its guard with `let _ = resume_from_ask(...)` changed no
+/// outcome anywhere.
+///
+/// The arm is defensive and, since `asks_one_pending_per_task`, close to
+/// unreachable through the API. Testing it rather than deleting it is the
+/// better call: it also pins that the rollback leaves the ask **pending**
+/// (recoverable) rather than resolved-with-no-task-to-resume, which is the
+/// half that actually matters if the invariant ever does break.
+#[test]
+fn resolving_an_ask_whose_task_cannot_resume_fails_closed_and_rolls_back() {
+    let Some(h) = harness("askfc") else {
+        return;
+    };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-fail-closed-e2e").await;
+        let pool = &pool;
+        use kastellan_db::tasks::Lane;
+        use kastellan_db::{asks, tasks};
+
+        let task_id = tasks::insert_pending(
+            pool, Lane::Fast, serde_json::json!({"instruction": "fail-closed probe"}),
+        ).await.unwrap();
+        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve"]), None,
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        ).await.unwrap();
+
+        // Separate the pair behind the API's back: the ask stays `pending`
+        // while its task leaves `awaiting_operator`. No supported path can
+        // produce this — `cancel_for_task` and `expire_due` both move the
+        // ask with the task — which is exactly why it needs raw SQL.
+        sqlx::query("UPDATE tasks SET state = 'running' WHERE id = $1")
+            .bind(task_id).execute(pool).await.unwrap();
+
+        let err = asks::resolve_with_nonce(
+            pool, &raised.nonce, "operator/cli", &serde_json::json!({"choice": "approve"}),
+        ).await.expect_err(
+            "a pending ask whose task cannot resume must fail LOUDLY, not return Ok(false) — \
+             Ok(false) reads as 'you lost a race' and would hide a corrupt pair",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&raised.ask_id.to_string()), "error must name the ask: {msg}");
+        assert!(msg.contains(&task_id.to_string()), "error must name the task: {msg}");
+
+        // THE other half: the rollback left the ask recoverable. Committing
+        // instead would have left it `resolved` with no task to resume.
+        let after = asks::get(pool, raised.ask_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.state, "pending",
+            "the rollback must leave the ask pending (recoverable), not resolved",
+        );
+        assert!(after.resolved_by.is_none());
+        assert!(after.resolution.is_none());
+        assert_eq!(tasks::observe_state(pool, task_id).await.unwrap(), "running");
+    });
+}
+
+/// `raise` must persist the `body` and `options` it was given.
+///
+/// Neither field was ever read back: the decode assertions covered
+/// `task_id`/`kind`/`state`/`plan_digest`/`resolved_at` only, so binding
+/// `kind` twice (making `body` the literal `"plan_approval"`) or a constant
+/// `options` survived the whole suite. `options` is the set the operator's
+/// `choice` indexes into and which `resolve` now validates against, so a
+/// constant there would show the operator the wrong question AND silently
+/// change which answers are accepted.
+#[test]
+fn raise_persists_the_body_and_options_it_was_given() {
+    let Some(h) = harness("askbo") else {
+        return;
+    };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-body-options-e2e").await;
+        let pool = &pool;
+        use kastellan_db::tasks::Lane;
+        use kastellan_db::{asks, tasks};
+
+        let task_id = tasks::insert_pending(
+            pool, Lane::Fast, serde_json::json!({"instruction": "body probe"}),
+        ).await.unwrap();
+        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
+
+        let body = "CASSANDRA escalated: send 2 clinical PDFs to an off-allowlist address?";
+        let options = serde_json::json!(["approve", "deny", "approve_without_attachments"]);
+        let raised = asks::raise(
+            pool, task_id, "plan_approval", body, &options, Some("digest-xyz"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        ).await.unwrap();
+
+        let got = asks::get(pool, raised.ask_id).await.unwrap().unwrap();
+        assert_eq!(got.body, body, "the operator must be shown the question that was asked");
+        assert_eq!(got.options, options, "verbatim, in order");
+        assert_eq!(got.kind, "plan_approval");
+        assert_eq!(got.plan_digest.as_deref(), Some("digest-xyz"));
+        assert!(got.created_at <= got.deadline_at);
+
+        // The third option is genuinely accepted — proving `options` reached
+        // the resolver's validation, not just the row.
+        assert!(asks::resolve_with_nonce(
+            pool, &raised.nonce, "operator/cli",
+            &serde_json::json!({"choice": "approve_without_attachments"}),
+        ).await.unwrap());
+    });
+}
+
+/// A `plan_digest` of `None` must round-trip as SQL `NULL`, not `""`.
+///
+/// `raised2` in the raise test is created with `None` and never read back,
+/// so `.bind(plan_digest.unwrap_or_default())` — storing the empty string —
+/// survived. Migration 0023 makes the nullability an explicit design point
+/// for future non-plan ask kinds, and `""` would compare equal to no digest
+/// at all in slice 1b's match.
+#[test]
+fn a_none_plan_digest_round_trips_as_sql_null() {
+    let Some(h) = harness("asknd") else {
+        return;
+    };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-null-digest-e2e").await;
+        let pool = &pool;
+        use kastellan_db::tasks::Lane;
+        use kastellan_db::{asks, tasks};
+
+        let task_id = tasks::insert_pending(
+            pool, Lane::Fast, serde_json::json!({"instruction": "null digest probe"}),
+        ).await.unwrap();
+        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve"]), None,
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        ).await.unwrap();
+
+        assert!(asks::get(pool, raised.ask_id).await.unwrap().unwrap().plan_digest.is_none());
+        // Asserted at the SQL level too: `Option<String>` decoding cannot
+        // tell `NULL` from `''` once it is in Rust.
+        let is_null: bool = sqlx::query_scalar(
+            "SELECT plan_digest IS NULL FROM asks WHERE id = $1",
+        ).bind(raised.ask_id).fetch_one(pool).await.unwrap();
+        assert!(is_null, "an absent digest must be SQL NULL, never the empty string");
+    });
+}
