@@ -3,10 +3,12 @@
 //! text or as original-format files written to the task workspace out/ dir.
 //! Design: docs/superpowers/specs/2026-07-22-localmail-mail-worker-integration-design.md
 
+mod attach;
 mod client;
 mod handler;
 mod ids;
 mod problem;
+mod search_params;
 mod sort;
 
 use kastellan_worker_prelude::serve_stdio;

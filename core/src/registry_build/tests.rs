@@ -484,6 +484,47 @@ fn assemble_collects_docs_only_for_registered_tools() {
     );
 }
 
+/// A registered tool's advertised methods reach the registry, because the
+/// dispatcher completes an omitted namespace against exactly this set — and a
+/// registry that recorded none would silently qualify nothing, restoring the
+/// live `-32601 unknown method get_attachment_text` failure with every unit
+/// test still green (`method_qualify`'s own tests pass a literal array).
+///
+/// Pinned against a *disabled* tool as well: recording methods for a worker
+/// that never registered would let the dispatcher rewrite a method into a tool
+/// the planner cannot dispatch.
+#[test]
+fn assemble_records_advertised_methods_for_registered_tools_only() {
+    let exe_dir = PathBuf::from("/install/bin");
+    let sibling = shell_exec_sibling(&exe_dir);
+    let get_env = |_k: &str| None;
+    let exists = {
+        let s = sibling.clone();
+        move |p: &Path| p == s.as_path()
+    };
+    let allowlist = |_t: &str| Vec::new();
+    let ctx = ResolveCtx {
+        get_env: &get_env,
+        exists: &exists,
+        is_dir: &|_p: &Path| false,
+        exe_dir: Some(exe_dir.as_path()),
+        canonicalize: &|_p| None,
+        allowlist: &allowlist,
+    };
+    let (reg, _loaded, _docs) = assemble_registry(WORKER_MANIFESTS, &ctx);
+
+    let shell = reg.methods_for("shell-exec");
+    assert!(
+        shell.contains(&"shell.exec"),
+        "shell-exec's advertised methods must reach the registry; got {shell:?}"
+    );
+    assert!(
+        reg.methods_for("web-search").is_empty(),
+        "a disabled tool must record no methods"
+    );
+    assert!(reg.methods_for("no-such-tool").is_empty(), "unknown tool → empty, not a panic");
+}
+
 #[test]
 fn allowlist_kind_for_tool_maps_argv0_and_domain_tools() {
     assert_eq!(allowlist_kind_for_tool("shell-exec"), Some(EntryKind::Argv0));

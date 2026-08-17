@@ -459,6 +459,12 @@ pub fn assemble_registry(
                     advertisement_warnings(name, &live);
                     Advertisement::Described(decl.kind, live)
                 });
+                // Record what this tool advertises, so the dispatcher can
+                // complete a method whose namespace the planner omitted. Taken
+                // from the same `tool_docs()` the prompt is built from, so the
+                // set the planner is shown and the set it may name are the same
+                // set by construction.
+                reg.set_methods(name, m.tool_docs().iter().map(|d| d.method).collect());
                 for doc in m.tool_docs() {
                     docs.push(match &declared {
                         Some(Advertisement::Described(kind, entries)) => {

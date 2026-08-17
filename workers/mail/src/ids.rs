@@ -112,6 +112,28 @@ pub fn message_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<LocalmailId,
         .map_err(serde::de::Error::custom)
 }
 
+/// `#[serde(deserialize_with)]` for an **optional** `message_id`.
+///
+/// `mail.get_attachment_text` addresses an attachment either by message or by
+/// hash, so its `message_id` is optional — and an optional field is precisely
+/// where a validator degrades quietly. Plain `Option::<LocalmailId>` would be
+/// fine, but reaching for `Option<i64>` or swallowing the error into `None`
+/// would make a *malformed* id indistinguishable from an *absent* one, and the
+/// tool would then answer "name the attachment" for a value the planner did
+/// name. Explicit `null` is absence; anything else is validated exactly as the
+/// required form, [`explain`]'s repair advice included.
+pub fn opt_message_id<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<LocalmailId>, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Null => Ok(None),
+        v => parse_id(IdField::MessageId, &v)
+            .map(LocalmailId)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 /// `#[serde(deserialize_with)]` for `mail.list_messages`' optional `account_ids`.
 pub fn account_ids<'de, D: serde::Deserializer<'de>>(
     d: D,
@@ -124,6 +146,35 @@ pub fn folder_ids<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<Vec<LocalmailId>>, D::Error> {
     id_list(d, IdField::FolderIds)
+}
+
+/// Validate a JSON array of ids into their canonical digit-string form.
+///
+/// For `mail.search`'s `filters` object, whose `account_ids`/`folder_ids`
+/// localmail types as `list[str]` — an integer there returns a raw FastAPI 422
+/// the planner cannot act on. `key` is the parameter name as the tool schema
+/// advertises it, so a rejection blames the argument the planner actually wrote
+/// (the #536 lesson); an unrecognised key is blamed generically rather than
+/// mis-attributed to `message_id`.
+pub fn id_strings(key: &str, v: &serde_json::Value) -> Result<Vec<String>, String> {
+    let field = match key {
+        "account_ids" => IdField::AccountIds,
+        "folder_ids" => IdField::FolderIds,
+        other => return Err(format!("`{other}` is not an id filter.")),
+    };
+    let Some(items) = v.as_array() else {
+        return Err(format!(
+            "`{key}` must be a list of ids, e.g. [\"1\"]. {} Got: {}",
+            field.want(),
+            head(&v.to_string())
+        ));
+    };
+    if items.is_empty() {
+        return Err(format!(
+            "`{key}` must not be an empty list — omit it entirely to search them all."
+        ));
+    }
+    items.iter().map(|item| parse_id(field, item).map(|i| i.to_string())).collect()
 }
 
 /// An optional list of ids, every element validated and blamed on `field`.
@@ -479,6 +530,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The optional form must be optional about *presence*, not about validity.
+    #[test]
+    fn an_optional_message_id_is_absent_or_validated_never_silently_dropped() {
+        #[derive(Debug, Deserialize)]
+        struct P {
+            #[serde(default, deserialize_with = "opt_message_id")]
+            message_id: Option<LocalmailId>,
+        }
+        let absent: P = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.message_id.is_none(), "an absent field is None");
+        let null: P = serde_json::from_value(json!({"message_id": null})).unwrap();
+        assert!(null.message_id.is_none(), "an explicit null is absence");
+        let good: P = serde_json::from_value(json!({"message_id": "37413"})).unwrap();
+        assert_eq!(good.message_id.unwrap().to_string(), "37413");
+
+        // The half that a `None`-swallowing implementation would get wrong: a
+        // bad value must still be refused, with the same advice as the required
+        // form, rather than read as "the planner named no message".
+        let e = serde_json::from_value::<P>(json!({"message_id": "{{message_id}}"})).unwrap_err();
+        assert!(e.to_string().contains("NO template substitution"), "got: {e}");
     }
 
     #[test]

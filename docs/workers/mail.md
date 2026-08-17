@@ -15,7 +15,7 @@ attachments delivered as extracted text **or** as original-format files.
 | `mail.get_message` | One message: headers, plaintext body, attachment list `[{filename, sha256, content_type, size}]`. |
 | `mail.list_messages` | Browse newest-first; `account_ids`/`folder_ids` filters; `cursor`. |
 | `mail.list_accounts` | Accounts this agent may read. |
-| `mail.get_attachment_text` | Server-extracted text of an attachment (`{sha256}`). Use to **read** it. |
+| `mail.get_attachment_text` | Server-extracted text of an attachment. Use to **read** it. Address it by `{message_id, filename}` — or by `{sha256}`, but see *Addressing an attachment* below. |
 | `mail.get_attachment` | Save an attachment in its **original format** (PDF, etc.) to the task output dir; returns `{path, size, content_type, filename}`. Use to **deliver** a file. |
 
 The agent does the reasoning (e.g. extracting flight-booking fields into a CSV);
@@ -25,6 +25,56 @@ are written **directly and durably** into the per-task output dir
 — the path the tool returns is where the file actually is, and it survives the
 task. An empty per-task dir (a task that saved no files) is pruned automatically;
 retention/cleanup of delivered files is an operator concern.
+
+### Addressing an attachment
+
+`mail.get_attachment_text` takes **either** `{message_id, filename}` **or**
+`{sha256}`, and the first form is the one to prefer.
+
+A planner reaches a successful step's output through `extract_scannable_text`:
+string values only, **keys discarded**, capped at 4 KiB
+(`core::scheduler::inner_loop::summary`). A sha256 therefore arrives as an
+unlabelled 64-character hex blob that the model must identify by shape and then
+transcribe exactly — and on 2026-08-17 (task 160) it did not. The correct hash
+was the 6th string in that head, at roughly byte 120; the planner emitted a
+different 64 hex chars, localmail answered its `404 no extracted text for
+attachment <hash>`, and the agent reported to the user that PDF extraction had
+failed while the extracted text — 28 594 characters, including the figure the
+user had asked for — sat in the database.
+
+So:
+
+- `{message_id}` alone is enough when the message has one attachment.
+- `{message_id, filename}` picks one of several. Matching is exact, then
+  case-insensitive, then a *unique* case-insensitive substring, so
+  `e-ticket-DQXK68.pdf` finds `Download 470989752-e-ticket-DQXK68.pdf`. An
+  ambiguous name is refused with the candidates listed, never guessed.
+- `{sha256}` still works, and is right when the hash is copied verbatim from a
+  previous step's output in the same task.
+- `{message_id, sha256}` together is **not** an error. The hash selects — it is
+  exact — but is first checked against that message's attachments, so a wrong
+  one is caught by the message rather than by localmail's ambiguous 404, and
+  the file still gets the archive's own name.
+
+`mail.get_attachment` (the deliver-a-file tool) takes the **same two forms**.
+Its `filename` does double duty, and the two jobs do not conflict:
+
+- with `message_id`, it *selects* the attachment, and the file is saved under
+  the name the archive actually has for it — not the substring that matched, so
+  asking for `e-ticket-DQXK68.pdf` still writes
+  `<sha12>_Download_470989752-e-ticket-DQXK68.pdf`;
+- with `sha256`, it names the output, exactly as it always did.
+
+### Naming the accounts to search
+
+`mail.search` accepts `account_ids` / `folder_ids` **either** at the top level
+(where `mail.list_messages` takes them) **or** inside `filters` — but not both,
+which is refused rather than resolved by precedence. Ids may be written as
+numbers or digit-strings either way; the worker sends localmail the strings its
+`SearchFiltersModel` requires. Before this, a top-level `account_ids` was
+rejected as an unknown field and a numeric one inside `filters` came back as a
+raw FastAPI 422 that no planner could act on — between them they cost one live
+task its entire iteration budget.
 
 ## One-time operator setup
 
