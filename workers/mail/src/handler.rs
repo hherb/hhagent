@@ -7,6 +7,7 @@ use std::path::Path;
 
 use kastellan_protocol::{codes, server::Handler, RpcError};
 
+use crate::attach;
 use crate::client::{MailClient, MailError};
 use crate::ids::{self, LocalmailId};
 use crate::problem;
@@ -122,20 +123,69 @@ impl MailHandler {
         self.client.get_json("/v1/accounts").map_err(mail_err_to_rpc)
     }
 
+    /// Turn a [`attach::Selector`] into a sha256 that is safe to interpolate.
+    ///
+    /// The `InMessage` arm costs one extra GET, and buys the property the whole
+    /// change is for: the hash comes out of localmail's own response rather than
+    /// out of the planner's transcription of a 64-char string it saw once,
+    /// unlabelled, in a key-stripped prompt head.
+    fn resolve_attachment(&self, selector: attach::Selector) -> Result<String, RpcError> {
+        match selector {
+            attach::Selector::Sha(sha256) => {
+                validate_sha256(&sha256).map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))?;
+                Ok(sha256)
+            }
+            attach::Selector::InMessage { message_id, filename } => {
+                // Compact headers: only `attachments` is read here, and full
+                // headers would multiply the response for nothing.
+                let msg = self
+                    .client
+                    .get_json(&detail_path(message_id, false))
+                    .map_err(mail_err_to_rpc)?;
+                let attachments: &[serde_json::Value] = msg
+                    .get("attachments")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(&[], Vec::as_slice);
+                attach::pick_sha(attachments, filename.as_deref(), message_id)
+                    .map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))
+            }
+        }
+    }
+
     fn get_attachment_text(&self, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct P {
-            sha256: String,
+            #[serde(default)]
+            sha256: Option<String>,
+            #[serde(default, deserialize_with = "ids::opt_message_id")]
+            message_id: Option<LocalmailId>,
+            #[serde(default)]
+            filename: Option<String>,
         }
         let p: P = parse_params(params)?;
-        validate_sha256(&p.sha256).map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))?;
+        let selector = attach::choose(p.sha256, p.message_id, p.filename)
+            .map_err(|m| RpcError::new(codes::INVALID_PARAMS, m))?;
+        // Whether the planner typed the hash decides which repair a 404 gets;
+        // read it before `resolve_attachment` consumes the selector.
+        let planner_supplied = matches!(selector, attach::Selector::Sha(_));
+        let sha256 = self.resolve_attachment(selector)?;
         // `get_bytes` (the higher attachment cap, not the JSON cap) — extracted
         // text of a large document can exceed the JSON-response ceiling.
         let (_ct, bytes) = self
             .client
-            .get_bytes(&format!("/v1/attachments/{}/text", p.sha256))
-            .map_err(mail_err_to_rpc)?;
+            .get_bytes(&format!("/v1/attachments/{sha256}/text"))
+            // localmail answers 404 both for a blob it has never seen and for
+            // one whose text is not extracted yet, and the two need opposite
+            // repairs. Forwarding its sentence verbatim is what told the live
+            // agent that extraction had failed when the hash was simply wrong.
+            .map_err(|e| match e {
+                MailError::Upstream { status: 404, .. } => RpcError::new(
+                    codes::OPERATION_FAILED,
+                    attach::missing_text_advice(&sha256, planner_supplied),
+                ),
+                other => mail_err_to_rpc(other),
+            })?;
         // localmail returns `application/json {"text": "..."}`; surface the inner
         // text so the agent gets the extracted content, not a JSON envelope
         // double-encoded as a string. Fall back to the raw body for a non-JSON
@@ -145,7 +195,7 @@ impl MailHandler {
             .ok()
             .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_owned))
             .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-        Ok(serde_json::json!({ "sha256": p.sha256, "text": text }))
+        Ok(serde_json::json!({ "sha256": sha256, "text": text }))
     }
 
     fn get_attachment(&self, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
@@ -247,8 +297,12 @@ fn mail_err_to_rpc(e: MailError) -> RpcError {
 
 /// Require exactly 64 lowercase hex chars — prevents any path traversal or
 /// injection through the `{sha256}` URL segment.
+///
+/// The rule itself lives in [`attach::is_sha256`], shared with the resolver that
+/// skips a malformed entry rather than explaining it; this wrapper adds only the
+/// planner-facing text.
 fn validate_sha256(s: &str) -> Result<(), String> {
-    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if attach::is_sha256(s) {
         Ok(())
     } else {
         Err(format!("sha256 must be 64 lowercase hex chars, got {:?}", s.chars().take(8).collect::<String>()))
@@ -703,6 +757,194 @@ mod tests {
         let mut h = MailHandler::with_client(client_with(Box::new(TextFake)));
         let err = h.call("mail.get_attachment_text", serde_json::json!({"sha256": "../etc/passwd"})).unwrap_err();
         assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    // --- get_attachment_text addressed by message rather than by hash ---
+
+    /// The sha256 that message 37413 really carries in the live archive.
+    const LIVE_SHA: &str = "71aac4580932cffe7649dda9c4cc10e2997de81d80105eafd448a64763f4a73b";
+    /// Its filename there, download prefix and all.
+    const LIVE_NAME: &str = "Download 470989752-e-ticket-DQXK68.pdf";
+    /// A second attachment, so that `filename` is load-bearing rather than
+    /// decorative: with only one attachment in the message every filename — and
+    /// none at all — resolves to the same sha, and a test written against that
+    /// fixture passes whether or not the worker reads the parameter.
+    const DECOY_NAME: &str = "boarding-pass.pdf";
+    const DECOY_SHA: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    /// Distinguishable bodies, so a test can tell *which* attachment was read.
+    const E_TICKET_TEXT: &str = "GST Paid 146.81 AUD";
+    const DECOY_TEXT: &str = "boarding pass only";
+
+    /// Serves message detail *and* extracted text, with a **different body per
+    /// sha**.
+    ///
+    /// That is what makes the selection observable: the test reads which
+    /// document came back, so "the filename picked the wrong attachment" is a
+    /// failed assertion on the text rather than a silent pass. An in-fake
+    /// `assert!` on the URL would instead abort the test through a panic, which
+    /// no `unwrap_err` can inspect and no `Err` arm can distinguish.
+    struct ArchiveFake {
+        text_status: u16,
+        /// `(filename, sha256)` pairs the message carries.
+        attachments: Vec<(String, String)>,
+    }
+    impl ArchiveFake {
+        fn new(text_status: u16, attachments: Vec<(String, String)>) -> Self {
+            Self { text_status, attachments }
+        }
+        /// Two attachments, so a filename has work to do.
+        fn ok() -> Self {
+            Self::new(
+                200,
+                vec![
+                    (DECOY_NAME.to_string(), DECOY_SHA.to_string()),
+                    (LIVE_NAME.to_string(), LIVE_SHA.to_string()),
+                ],
+            )
+        }
+        /// One attachment — message 37413's real shape.
+        fn single() -> Self {
+            Self::new(200, vec![(LIVE_NAME.to_string(), LIVE_SHA.to_string())])
+        }
+        /// One attachment whose text localmail does not have.
+        fn single_without_text() -> Self {
+            Self::new(404, vec![(LIVE_NAME.to_string(), LIVE_SHA.to_string())])
+        }
+    }
+    impl HttpGet for ArchiveFake {
+        fn get(&self, _: &Url) -> Result<RawResponse, String> { unreachable!() }
+        fn transport_kind(&self) -> &'static str { "fake" }
+        fn get_authed(&self, url: &Url, _b: &str, _m: usize) -> Result<RawResponse, String> {
+            if let Some(sha) = url
+                .path()
+                .strip_prefix("/v1/attachments/")
+                .and_then(|p| p.strip_suffix("/text"))
+            {
+                if self.text_status == 404 {
+                    return Ok(RawResponse {
+                        status: 404,
+                        location: None,
+                        content_type: "application/problem+json".into(),
+                        body: br#"{"detail": "no extracted text for attachment"}"#.to_vec(),
+                    });
+                }
+                let text = if sha == LIVE_SHA { E_TICKET_TEXT } else { DECOY_TEXT };
+                return Ok(json_resp(format!(r#"{{"text":"{text}"}}"#).as_bytes()));
+            }
+            let entries: Vec<String> = self
+                .attachments
+                .iter()
+                .map(|(name, sha)| {
+                    format!(
+                        r#"{{"filename":"{name}","sha256":"{sha}","content_type":"application/pdf","size":56112}}"#
+                    )
+                })
+                .collect();
+            let body = format!(
+                r#"{{"id":"37413","subject":"E-Ticket","attachments":[{}]}}"#,
+                entries.join(",")
+            );
+            Ok(json_resp(body.as_bytes()))
+        }
+    }
+
+    /// The live failure this whole change exists for (task 160, 2026-08-17): the
+    /// planner had the message and a filename, and had to retype a 64-char hash
+    /// to read the attachment. It got the hash wrong, localmail 404'd, and the
+    /// agent told the user PDF extraction had failed.
+    #[test]
+    fn get_attachment_text_resolves_the_sha_from_a_message_and_filename() {
+        // Two attachments, so the filename decides which one — a fixture with
+        // one would pass even if the parameter were never read.
+        let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::ok())));
+        let out = h
+            .call(
+                "mail.get_attachment_text",
+                serde_json::json!({"message_id": 37413, "filename": "e-ticket-DQXK68.pdf"}),
+            )
+            .unwrap();
+        assert_eq!(out["text"], E_TICKET_TEXT);
+        assert_eq!(out["sha256"], LIVE_SHA, "the resolved sha is reported back");
+    }
+
+    /// The other half of the same property: naming the *other* attachment reads
+    /// the other document. Without this, the test above is consistent with a
+    /// worker that always picks `attachments[1]`.
+    #[test]
+    fn a_different_filename_in_the_same_message_selects_the_other_attachment() {
+        let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::ok())));
+        let out = h
+            .call(
+                "mail.get_attachment_text",
+                serde_json::json!({"message_id": 37413, "filename": DECOY_NAME}),
+            )
+            .unwrap();
+        assert_eq!(out["text"], DECOY_TEXT);
+        assert_eq!(out["sha256"], DECOY_SHA);
+    }
+
+    /// The single-attachment case — which is what the live failure was — needs
+    /// no filename at all, so the planner copies exactly one short integer.
+    #[test]
+    fn get_attachment_text_needs_no_filename_when_the_message_has_one_attachment() {
+        let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::single())));
+        let out = h
+            .call("mail.get_attachment_text", serde_json::json!({"message_id": 37413}))
+            .unwrap();
+        assert_eq!(out["text"], E_TICKET_TEXT);
+    }
+
+    /// Params naming no attachment at all must be repairable, not a bare
+    /// deserialization complaint about a missing required field.
+    #[test]
+    fn get_attachment_text_without_any_selector_is_invalid_params() {
+        let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::ok())));
+        let err = h.call("mail.get_attachment_text", serde_json::json!({})).unwrap_err();
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+        assert!(err.message.contains("message_id"), "got: {}", err.message);
+    }
+
+    /// A 404 on a hash the *planner* supplied is most often a mistyped hash, and
+    /// the advice says so — the live failure's agent instead concluded that
+    /// server-side extraction was broken and reported that to the user.
+    #[test]
+    fn a_404_on_a_planner_supplied_sha_points_at_the_addressing_not_at_extraction() {
+        let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::single_without_text())));
+        let err = h
+            .call("mail.get_attachment_text", serde_json::json!({"sha256": LIVE_SHA}))
+            .unwrap_err();
+        assert!(err.message.contains("message_id"), "got: {}", err.message);
+        assert!(err.message.contains("filename"), "got: {}", err.message);
+    }
+
+    /// The mirror: a hash this worker resolved is right by construction, so the
+    /// planner must not be sent to re-copy a parameter it never supplied (#536).
+    #[test]
+    fn a_404_on_a_resolved_sha_does_not_send_the_planner_to_re_copy_a_hash() {
+        let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::single_without_text())));
+        let err = h
+            .call("mail.get_attachment_text", serde_json::json!({"message_id": 37413}))
+            .unwrap_err();
+        assert!(
+            !err.message.contains("message_id"),
+            "the message was already named correctly: {}",
+            err.message
+        );
+        assert!(err.message.contains("mail.get_attachment"), "got: {}", err.message);
+    }
+
+    /// A message_id that is not an id gets `ids::explain`'s repair text, exactly
+    /// as `mail.get_message`'s does — the optional form must not quietly degrade
+    /// to "expected i64" or, worse, to `None`.
+    #[test]
+    fn a_bad_message_id_here_gets_the_same_repair_advice_as_get_message() {
+        let mut h = MailHandler::with_client(client_with(Box::new(ArchiveFake::ok())));
+        let err = h
+            .call("mail.get_attachment_text", serde_json::json!({"message_id": "{{message_id}}"}))
+            .unwrap_err();
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+        assert!(err.message.contains("NO template substitution"), "got: {}", err.message);
     }
 
     // --- get_attachment writes original bytes to out/ safely ---

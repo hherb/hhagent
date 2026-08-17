@@ -172,8 +172,32 @@ impl WorkerManifest for MailManifest {
                 name: TOOL_NAME,
                 method: "mail.get_attachment_text",
                 summary: "Extracted text of an attachment (server-side PDF/office extraction). \
-                          Use to READ an attachment's contents.",
-                params: &[ToolParam { name: "sha256", description: "attachment sha256 from get_message", required: true }],
+                          Use to READ an attachment's contents. Name it by message_id \
+                          (+ filename when the message has more than one attachment); \
+                          do NOT retype a sha256.",
+                params: &[
+                    ToolParam {
+                        name: "message_id",
+                        description: "message_id of the mail.get_message step that listed the \
+                                      attachment, e.g. 37413. Prefer this: the sha256 is then \
+                                      looked up for you and cannot be mistyped.",
+                        required: false,
+                    },
+                    ToolParam {
+                        name: "filename",
+                        description: "which attachment in that message, e.g. \
+                                      e-ticket-DQXK68.pdf. Omit it when the message has only \
+                                      one; a distinctive part of the name is enough.",
+                        required: false,
+                    },
+                    ToolParam {
+                        name: "sha256",
+                        description: "alternative to message_id: the attachment's exact 64-char \
+                                      hash, only ever copied verbatim from a previous step's \
+                                      output — never reconstructed from memory.",
+                        required: false,
+                    },
+                ],
             },
             ToolDoc {
                 name: TOOL_NAME,
@@ -316,6 +340,45 @@ mod tests {
                 "mail.get_attachment_text",
                 "mail.get_attachment",
             ]
+        );
+    }
+
+    /// The live defect this parameter set exists to end (task 160, 2026-08-17):
+    /// the tool took exactly one parameter — a 64-char sha256 — and the planner,
+    /// which had the right hash in its prompt head, supplied a different one.
+    /// localmail 404'd, and the agent told the user that PDF extraction had
+    /// failed while the extracted text sat in the database.
+    ///
+    /// The schema is where a planner learns there is a form that needs no hash,
+    /// and `assemble` renders params in **declaration order**, so the order is a
+    /// commitment rather than a formatting preference.
+    #[test]
+    fn get_attachment_text_offers_the_message_form_first_and_demands_no_hash() {
+        let docs = MailManifest.tool_docs();
+        let d = docs
+            .iter()
+            .find(|d| d.method == "mail.get_attachment_text")
+            .expect("mail.get_attachment_text must be advertised");
+        let names: Vec<&str> = d.params.iter().map(|p| p.name).collect();
+        assert_eq!(
+            names,
+            vec!["message_id", "filename", "sha256"],
+            "the form that needs no hash must be read first"
+        );
+        assert!(
+            d.params.iter().all(|p| !p.required),
+            "either form suffices, so marking any one parameter required would be a lie"
+        );
+        assert!(
+            d.summary.contains("message_id"),
+            "the summary is read before the params: {:?}",
+            d.summary
+        );
+        let sha = d.params.iter().find(|p| p.name == "sha256").expect("sha256 still accepted");
+        assert!(
+            sha.description.contains("message_id"),
+            "a planner reaching for the hash must learn there is another way: {:?}",
+            sha.description
         );
     }
 

@@ -112,6 +112,28 @@ pub fn message_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<LocalmailId,
         .map_err(serde::de::Error::custom)
 }
 
+/// `#[serde(deserialize_with)]` for an **optional** `message_id`.
+///
+/// `mail.get_attachment_text` addresses an attachment either by message or by
+/// hash, so its `message_id` is optional — and an optional field is precisely
+/// where a validator degrades quietly. Plain `Option::<LocalmailId>` would be
+/// fine, but reaching for `Option<i64>` or swallowing the error into `None`
+/// would make a *malformed* id indistinguishable from an *absent* one, and the
+/// tool would then answer "name the attachment" for a value the planner did
+/// name. Explicit `null` is absence; anything else is validated exactly as the
+/// required form, [`explain`]'s repair advice included.
+pub fn opt_message_id<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<LocalmailId>, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Null => Ok(None),
+        v => parse_id(IdField::MessageId, &v)
+            .map(LocalmailId)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 /// `#[serde(deserialize_with)]` for `mail.list_messages`' optional `account_ids`.
 pub fn account_ids<'de, D: serde::Deserializer<'de>>(
     d: D,
@@ -479,6 +501,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The optional form must be optional about *presence*, not about validity.
+    #[test]
+    fn an_optional_message_id_is_absent_or_validated_never_silently_dropped() {
+        #[derive(Debug, Deserialize)]
+        struct P {
+            #[serde(default, deserialize_with = "opt_message_id")]
+            message_id: Option<LocalmailId>,
+        }
+        let absent: P = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.message_id.is_none(), "an absent field is None");
+        let null: P = serde_json::from_value(json!({"message_id": null})).unwrap();
+        assert!(null.message_id.is_none(), "an explicit null is absence");
+        let good: P = serde_json::from_value(json!({"message_id": "37413"})).unwrap();
+        assert_eq!(good.message_id.unwrap().to_string(), "37413");
+
+        // The half that a `None`-swallowing implementation would get wrong: a
+        // bad value must still be refused, with the same advice as the required
+        // form, rather than read as "the planner named no message".
+        let e = serde_json::from_value::<P>(json!({"message_id": "{{message_id}}"})).unwrap_err();
+        assert!(e.to_string().contains("NO template substitution"), "got: {e}");
     }
 
     #[test]
