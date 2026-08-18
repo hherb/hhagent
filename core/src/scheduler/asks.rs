@@ -321,6 +321,20 @@ mod tests {
     }
 
     #[test]
+    fn an_offered_choice_this_module_does_not_understand_is_refused() {
+        // "defer" is one of this ask's own `options`, so it clears the
+        // `offered` guard and reaches the final match arm — unlike
+        // "maybe" above, which never offered and is rejected earlier.
+        // That arm must land on `None`, never on an unpinned `Approve`,
+        // since `options` is free-form JSONB and a future ask kind is
+        // exactly the case that would offer a third choice string.
+        let mut a = ask(Some(serde_json::json!({"choice": "defer"})), Some("digest-a"));
+        a.options = serde_json::json!(["approve", "deny", "defer"]);
+        assert_eq!(resolution_choice(&a), None);
+        assert_eq!(decide(&a, "digest-a"), AskDecision::NotForThisPlan);
+    }
+
+    #[test]
     fn decide_approves_only_the_digest_that_was_approved() {
         let a = ask(Some(serde_json::json!({"choice": "approve"})), Some("digest-a"));
         assert_eq!(decide(&a, "digest-a"), AskDecision::Approved);
