@@ -15,6 +15,13 @@
 //! * `tasks list|status|cancel|fail|tail` — inspect and manage
 //!   tasks in the scheduler DB.
 //!
+//! * `inbox list|show|resolve` — the operator's answer surface for
+//!   asks the daemon raised (#564 slice 1b). Named `inbox`, not
+//!   `asks`, so it cannot be confused with `ask`, which submits a
+//!   task. `resolve` writes one `actor='cli' action='ask.resolved'`
+//!   audit row on success; a lost race (already resolved) or an
+//!   unoffered choice writes nothing and exits non-zero.
+//!
 //! * `tools allowlist add|remove|list` — manage the per-tool argv0
 //!   allowlist stored in `tool_allowlists`. Add/remove emit one
 //!   `actor='cli' action='tools.allowlist.{add,remove}'` audit row
@@ -80,6 +87,9 @@
 //! kastellan-cli tasks cancel <id>
 //! kastellan-cli tasks fail   <id>
 //! kastellan-cli tasks tail   <id>
+//! kastellan-cli inbox list                 [-n N]
+//! kastellan-cli inbox show    <ask-id>
+//! kastellan-cli inbox resolve <ask-id> approve|deny [--note "<text>"]
 //! kastellan-cli tools allowlist add    <tool> <argv0>
 //! kastellan-cli tools allowlist remove <tool> <argv0>
 //! kastellan-cli tools allowlist list   [--tool <name>]
@@ -146,6 +156,7 @@ mod audit_tail;
 mod entities;
 mod entities_kinds;
 mod entities_reembed;
+mod inbox;
 mod install;
 mod matrix;
 mod memory_l1;
@@ -175,6 +186,7 @@ fn main() -> ExitCode {
         },
         "ask"         => ask::run_ask(&args[2..]),
         "tasks"       => tasks::run_tasks(&args[2..]),
+        "inbox"       => inbox::run_inbox(&args[2..]),
         "tools"       => tools_allowlist::run_tools(&args[2..]),
         "memory"      => memory_l1::run_memory(&args[2..]),
         "entities"    => entities::run_entities(&args[2..]),
@@ -206,6 +218,9 @@ usage:
     kastellan-cli tasks cancel <id>
     kastellan-cli tasks fail   <id>
     kastellan-cli tasks tail   <id>
+    kastellan-cli inbox list                 [-n N]
+    kastellan-cli inbox show    <ask-id>
+    kastellan-cli inbox resolve <ask-id> approve|deny [--note \"<text>\"]
     kastellan-cli tools allowlist add    <tool> <argv0>
     kastellan-cli tools allowlist remove <tool> <argv0>
     kastellan-cli tools allowlist list   [--tool <name>]
