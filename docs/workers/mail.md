@@ -54,7 +54,23 @@ So:
 - `{message_id, sha256}` together is **not** an error. The hash selects — it is
   exact — but is first checked against that message's attachments, so a wrong
   one is caught by the message rather than by localmail's ambiguous 404, and
-  the file still gets the archive's own name.
+  the file still gets the archive's own name. A **unique 12-char prefix** is
+  accepted here, which is what makes the refusal messages below actionable.
+  Naming *both* a `sha256` and a `filename` that resolve to **different**
+  attachments is refused rather than silently resolved by precedence.
+
+Not every message can be addressed by filename. Two parts of one message may
+share a name (`image001.png` is the usual case) or carry none at all, and there
+a repair that said "copy one exactly" would list two identical strings — advice
+the planner cannot act on, so it re-sends the same value until the iteration
+cap. In those messages the refusal lists **12-char sha prefixes** instead and
+asks for `sha256`, because that is the key that actually discriminates.
+
+Three upstream states are also kept distinct, because they need opposite
+repairs and localmail returns the same 404 for several of them: a message with
+no attachments at all; attachments that are listed but whose content was never
+stored (localmail emits `"sha256": null`); and a `message_id` that is either
+absent or outside this agent's mail ACL.
 
 `mail.get_attachment` (the deliver-a-file tool) takes the **same two forms**.
 Its `filename` does double duty, and the two jobs do not conflict:
@@ -64,6 +80,11 @@ Its `filename` does double duty, and the two jobs do not conflict:
   asking for `e-ticket-DQXK68.pdf` still writes
   `<sha12>_Download_470989752-e-ticket-DQXK68.pdf`;
 - with `sha256`, it names the output, exactly as it always did.
+
+Both attachment tools translate localmail's 404 into advice whose wording
+depends on **where the hash came from**: one the planner typed is most often
+mistyped, while one this worker resolved out of a message is right by
+construction and must not send the planner to re-copy it.
 
 ### Naming the accounts to search
 
@@ -75,6 +96,11 @@ numbers or digit-strings either way; the worker sends localmail the strings its
 rejected as an unknown field and a numeric one inside `filters` came back as a
 raw FastAPI 422 that no planner could act on — between them they cost one live
 task its entire iteration budget.
+
+An explicit `null` (`{"filters": {"account_ids": null}}`) means *absent*, the
+same as omitting it — matching how an optional `message_id` is read — and never
+reaches localmail as a filter value. An explicitly **empty list** is refused,
+because it asks localmail to filter by nothing.
 
 ## One-time operator setup
 

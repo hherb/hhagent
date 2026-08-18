@@ -557,6 +557,19 @@ mod inner_loop_test_stubs {
         }
     }
 
+    /// Stands in for the registry: completes a bare method for `mail` only.
+    pub struct QualifyingDispatcher;
+
+    #[async_trait::async_trait]
+    impl StepDispatcher for QualifyingDispatcher {
+        async fn dispatch_step(&self, _task_id: i64, _step: &PlannedStep) -> StepOutcome {
+            StepOutcome::Ok(serde_json::json!("ok"))
+        }
+        fn qualify_method(&self, tool: &str, method: &str) -> Option<String> {
+            (tool == "mail" && !method.contains('.')).then(|| format!("mail.{method}"))
+        }
+    }
+
     /// A non-terminal plan that dispatches one step (increments dispatch_count).
     pub fn one_step_plan() -> Plan {
         Plan {
@@ -979,4 +992,64 @@ async fn forced_synthesis_at_cap_answers_from_gathered_observations() {
         "a forced-synthesis answer must not seed a reusable skill, got {:?}",
         result.terminal_python_skill
     );
+}
+
+// ----- namespace completion is applied to the plan, not just at dispatch -----
+
+/// The plan itself carries the completed method, because more than the
+/// dispatch call reads it.
+///
+/// `summary::ok_summary_cap` keys the per-step output cap on
+/// `plan.steps[i].method`; with the completion applied only at the dispatch
+/// site, a plan step written as a bare `search_batch` newly *succeeded* (it
+/// used to fail `-32601`) while its result head was capped at the flat 4 KiB
+/// instead of the batch-scaled 24 KiB — a silent 6× cut in what the planner
+/// then reasons from, on a path this feature created. The audit payloads and
+/// the plan digest read the same field.
+#[tokio::test]
+async fn qualify_plan_methods_rewrites_the_step_the_summary_and_audit_will_read() {
+    use inner_loop_test_stubs::QualifyingDispatcher;
+
+    let mut steps = vec![
+        PlannedStep {
+            tool: "mail".into(),
+            method: "get_attachment_text".into(),
+            parameters: serde_json::json!({}),
+            returns: "text".into(),
+            done_when: "text".into(),
+            classification: DataClass::Public,
+        },
+        // Already qualified — must be left exactly as written.
+        PlannedStep {
+            tool: "mail".into(),
+            method: "mail.search".into(),
+            parameters: serde_json::json!({}),
+            returns: "hits".into(),
+            done_when: "hits".into(),
+            classification: DataClass::Public,
+        },
+        // A tool the dispatcher cannot complete for — untouched, and the
+        // worker's own METHOD_NOT_FOUND stays the honest answer.
+        PlannedStep {
+            tool: "web-search".into(),
+            method: "search".into(),
+            parameters: serde_json::json!({}),
+            returns: "hits".into(),
+            done_when: "hits".into(),
+            classification: DataClass::Public,
+        },
+    ];
+
+    qualify_plan_methods(&QualifyingDispatcher, 1, &mut steps);
+
+    assert_eq!(steps[0].method, "mail.get_attachment_text", "the live failure");
+    assert_eq!(steps[1].method, "mail.search", "already qualified — unchanged");
+    assert_eq!(steps[2].method, "search", "not this tool's to complete");
+
+    // Idempotent: the dispatcher re-checks at the chokepoint, so a second pass
+    // over an already-normalised plan must change nothing.
+    let before: Vec<String> = steps.iter().map(|s| s.method.clone()).collect();
+    qualify_plan_methods(&QualifyingDispatcher, 1, &mut steps);
+    let after: Vec<String> = steps.iter().map(|s| s.method.clone()).collect();
+    assert_eq!(before, after, "completion must be idempotent");
 }

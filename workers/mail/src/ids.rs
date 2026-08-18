@@ -53,8 +53,13 @@ impl fmt::Display for LocalmailId {
 /// ["abc"]}` was answered with *"re-read the hit's message_id … Expected the
 /// numeric message_id"*, sending the planner to repair a parameter that was
 /// never wrong while it re-sent the one that was.
+///
+/// `pub` so [`id_strings`] can take one instead of re-deriving it from a
+/// string: a closed set of parameters is what this is, and passing the name as
+/// `&str` bought an unreachable "not an id filter" arm whose message blamed the
+/// *planner* for what could only ever be a worker-side typo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdField {
+pub enum IdField {
     MessageId,
     AccountIds,
     FolderIds,
@@ -63,7 +68,7 @@ enum IdField {
 impl IdField {
     /// The parameter name exactly as `core`'s tool schema advertises it, so the
     /// planner can match the advice to the argument it wrote.
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::MessageId => "message_id",
             Self::AccountIds => "account_ids",
@@ -152,16 +157,15 @@ pub fn folder_ids<'de, D: serde::Deserializer<'de>>(
 ///
 /// For `mail.search`'s `filters` object, whose `account_ids`/`folder_ids`
 /// localmail types as `list[str]` — an integer there returns a raw FastAPI 422
-/// the planner cannot act on. `key` is the parameter name as the tool schema
-/// advertises it, so a rejection blames the argument the planner actually wrote
-/// (the #536 lesson); an unrecognised key is blamed generically rather than
-/// mis-attributed to `message_id`.
-pub fn id_strings(key: &str, v: &serde_json::Value) -> Result<Vec<String>, String> {
-    let field = match key {
-        "account_ids" => IdField::AccountIds,
-        "folder_ids" => IdField::FolderIds,
-        other => return Err(format!("`{other}` is not an id filter.")),
-    };
+/// the planner cannot act on. `field` names the parameter exactly as the tool
+/// schema advertises it, so a rejection blames the argument the planner
+/// actually wrote (the #536 lesson).
+///
+/// Returns validated [`LocalmailId`]s rather than bare strings: this does the
+/// same work as [`id_list`], and discarding the type at the boundary would
+/// leave "these were validated" recorded only in the function's name.
+pub fn id_strings(field: IdField, v: &serde_json::Value) -> Result<Vec<LocalmailId>, String> {
+    let key = field.name();
     let Some(items) = v.as_array() else {
         return Err(format!(
             "`{key}` must be a list of ids, e.g. [\"1\"]. {} Got: {}",
@@ -174,7 +178,7 @@ pub fn id_strings(key: &str, v: &serde_json::Value) -> Result<Vec<String>, Strin
             "`{key}` must not be an empty list — omit it entirely to search them all."
         ));
     }
-    items.iter().map(|item| parse_id(field, item).map(|i| i.to_string())).collect()
+    items.iter().map(|item| parse_id(field, item).map(LocalmailId)).collect()
 }
 
 /// An optional list of ids, every element validated and blamed on `field`.
@@ -552,6 +556,30 @@ mod tests {
         // form, rather than read as "the planner named no message".
         let e = serde_json::from_value::<P>(json!({"message_id": "{{message_id}}"})).unwrap_err();
         assert!(e.to_string().contains("NO template substitution"), "got: {e}");
+    }
+
+    /// `id_strings` is `mail.search`'s validator for ids nested in `filters`,
+    /// and it had no direct test at all — its empty-list guard could be deleted
+    /// without failing anything, which would send localmail a filter matching
+    /// nothing and answer a question that had answers with zero results.
+    #[test]
+    fn id_strings_validates_coerces_and_refuses_the_empty_list() {
+        let got = id_strings(IdField::AccountIds, &json!([1, "2"])).unwrap();
+        assert_eq!(got.iter().map(ToString::to_string).collect::<Vec<_>>(), ["1", "2"]);
+
+        let empty = id_strings(IdField::AccountIds, &json!([])).unwrap_err();
+        assert!(empty.contains("account_ids"), "{empty}");
+        assert!(empty.contains("omit it"), "must say what to do instead: {empty}");
+
+        let not_a_list = id_strings(IdField::FolderIds, &json!("1")).unwrap_err();
+        assert!(not_a_list.contains("folder_ids"), "blame the right parameter: {not_a_list}");
+        assert!(not_a_list.contains("list of ids"), "{not_a_list}");
+
+        // A bad element is blamed on the field it was written under, not on
+        // `message_id` — the #536 rule.
+        let bad = id_strings(IdField::FolderIds, &json!(["{{folder_id}}"])).unwrap_err();
+        assert!(bad.contains("folder_ids"), "{bad}");
+        assert!(!bad.contains("message_id"), "must not mis-attribute: {bad}");
     }
 
     #[test]

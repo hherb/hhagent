@@ -8,7 +8,9 @@
 use std::path::PathBuf;
 
 use kastellan_protocol::server::Handler;
-use kastellan_worker_python_exec::exec::{MAX_CAPTURE_BYTES, PARAMS_FILE_MAX_DEFAULT};
+use kastellan_worker_python_exec::exec::{
+    MAX_CAPTURE_BYTES, PARAMS_FILE_MAX_DEFAULT, WORKER_SCRATCH_ENV,
+};
 use kastellan_worker_python_exec::handler::PythonExecHandler;
 
 /// First existing interpreter from the manifest's per-OS candidate
@@ -38,10 +40,49 @@ fn find_python() -> Option<PathBuf> {
     None
 }
 
+/// Run one `python.exec` call against a **private** scratch dir.
+///
+/// `run_code` reads [`WORKER_SCRATCH_ENV`] from the process environment and
+/// **wipes that directory** before every spawn. Unset, it resolves to the
+/// worker's production default, `/tmp`. Inside the sandbox that is right —
+/// `/tmp` *is* the worker's own scratch tmpfs, and wiping it is the intended
+/// pristine-scratch reset — but these tests deliberately run **unjailed**, so
+/// unset here means every call deletes the contents of the host's real `/tmp`
+/// (issue #574). These calls drive a real interpreter, so they were also
+/// writing `params.json` into it.
+///
+/// The mutex is load-bearing for correctness, not tidiness: the variable is
+/// process-global, the wipe happens per call, and Rust runs these tests in
+/// parallel — so two concurrent calls sharing the dir would delete each
+/// other's `params.json` mid-flight. Reusing one dir across serialised calls
+/// is also the closest match to production warm reuse, which is what the wipe
+/// exists for. Cleanup is a `Drop` so a failing assertion cannot leak the
+/// variable into the next test.
+fn in_private_scratch<T>(f: impl FnOnce() -> T) -> T {
+    static SCRATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            std::env::remove_var(WORKER_SCRATCH_ENV);
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    let _guard = SCRATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("pyexec-it-scratch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    std::env::set_var(WORKER_SCRATCH_ENV, &dir);
+    let _restore = Restore(dir.clone());
+    f()
+}
+
 fn call(python: PathBuf, code: &str) -> serde_json::Value {
-    let mut h = PythonExecHandler::with_python(python);
-    h.call("python.exec", serde_json::json!({ "code": code }))
-        .expect("python.exec should return a result, not an RPC error")
+    in_private_scratch(|| {
+        let mut h = PythonExecHandler::with_python(python);
+        h.call("python.exec", serde_json::json!({ "code": code }))
+            .expect("python.exec should return a result, not an RPC error")
+    })
 }
 
 /// Like [`call`] but also sends a `params` object and returns the raw
@@ -51,8 +92,10 @@ fn call_params(
     code: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, kastellan_protocol::RpcError> {
-    let mut h = PythonExecHandler::with_python(python);
-    h.call("python.exec", serde_json::json!({ "code": code, "params": params }))
+    in_private_scratch(|| {
+        let mut h = PythonExecHandler::with_python(python);
+        h.call("python.exec", serde_json::json!({ "code": code, "params": params }))
+    })
 }
 
 #[test]

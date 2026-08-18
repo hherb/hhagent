@@ -185,6 +185,21 @@ pub trait StepDispatcher: Send + Sync {
         std::collections::BTreeSet::new()
     }
 
+    /// The method to dispatch in place of `method`, or `None` to leave it
+    /// unchanged — namespace completion against `tool`'s advertised methods
+    /// (see `tool_dispatch::method_qualify`).
+    ///
+    /// On the trait rather than only inside the dispatcher because the plan is
+    /// normalised *once*, up here, where `plan.steps` is still owned: the
+    /// method is read by more than the dispatch call (the per-step output cap
+    /// in `summary::ok_summary_cap`, the plan digest, the audit payloads), and
+    /// qualifying only at the dispatch site left every one of those reading a
+    /// name that was never on the wire. Default: `None` — only the production
+    /// dispatcher holds a registry.
+    fn qualify_method(&self, _tool: &str, _method: &str) -> Option<String> {
+        None
+    }
+
     /// Drop any per-task state this dispatcher holds (e.g. the handoff
     /// cache) once the task reaches a terminal state. Default no-op; the
     /// production dispatcher overrides it. Called once per task by the lane
@@ -196,6 +211,30 @@ pub trait StepDispatcher: Send + Sync {
     /// lane runner before dispatching, when a `Workspace` was constructed.
     /// Default no-op; only the production dispatcher holds workspace state.
     fn set_task_out_dir(&self, _task_id: i64, _out_dir: std::path::PathBuf) {}
+}
+
+/// Rewrite each step's `method` in place to the namespace-completed form the
+/// dispatcher will actually put on the wire.
+///
+/// Extracted from the loop body so the substitution has a test that does not
+/// need Postgres: the pure completion rule and the registry lookup each had
+/// one, and the line joining them to the plan did not — which is how a live
+/// `-32601 unknown method` regression could survive a green suite.
+///
+/// Idempotent: an already-qualified method is never rewritten, so running this
+/// and the dispatcher's own chokepoint check over the same plan is a no-op the
+/// second time.
+fn qualify_plan_methods(dispatcher: &dyn StepDispatcher, task_id: i64, steps: &mut [PlannedStep]) {
+    for step in steps {
+        if let Some(qualified) = dispatcher.qualify_method(&step.tool, &step.method) {
+            tracing::info!(
+                task_id, tool = %step.tool,
+                requested = %step.method, dispatched = %qualified,
+                "inner_loop: completed an omitted method namespace"
+            );
+            step.method = qualified;
+        }
+    }
 }
 
 /// Run the inner loop until terminal. Returns an [`InnerLoopResult`]
@@ -380,6 +419,21 @@ pub async fn run_to_terminal(
                 }
             }
         }
+
+        // 1c. Complete an omitted method namespace (`get_attachment_text` →
+        // `mail.get_attachment_text`) on the plan itself, once.
+        //
+        // Placed after invoke expansion so expanded steps are covered too, and
+        // before review so CASSANDRA, the plan digest, the per-step output cap
+        // and both audit payloads all see the method that will actually be put
+        // on the wire. The planner's own wording is not lost: `plan.formulate`
+        // was already written above, from the plan as it arrived.
+        //
+        // The dispatcher re-checks at the chokepoint, which is a no-op once a
+        // name is qualified (an exactly-advertised method is never rewritten) —
+        // kept because the chokepoint, not this loop, is what every dispatch
+        // path goes through.
+        qualify_plan_methods(dispatcher.as_ref(), ctx.task_id, &mut plan.steps);
 
         // 2. CASSANDRA review
         let rctx = ReviewStageContext {

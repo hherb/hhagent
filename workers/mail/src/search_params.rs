@@ -23,7 +23,7 @@
 //! refused with [`crate::ids`]'s repair text, so widening the accepted shape
 //! does not widen what can reach localmail.
 
-use crate::ids::LocalmailId;
+use crate::ids::{IdField, LocalmailId};
 
 /// Fold the top-level id filters into `filters`, and normalise any already
 /// nested there, returning the object to send as `filters` (or `None`).
@@ -47,8 +47,14 @@ pub fn normalize_filters(
         }
     };
 
-    for (key, top) in [("account_ids", account_ids), ("folder_ids", folder_ids)] {
-        let nested = obj.get(key);
+    for (field, top) in [(IdField::AccountIds, account_ids), (IdField::FolderIds, folder_ids)] {
+        let key = field.name();
+        // An explicit `null` is absence, matching `ids::opt_message_id` — the
+        // convention this crate sets one module over. Treating it as a shape
+        // error would refuse `{"account_ids": null}`, which localmail itself
+        // accepts as "no filter", and would make the two optional-parameter
+        // spellings disagree for no reason the planner could infer.
+        let nested = obj.get(key).filter(|v| !v.is_null());
         match (top, nested) {
             (Some(_), Some(_)) => {
                 return Err(format!(
@@ -64,12 +70,15 @@ pub fn normalize_filters(
             (None, Some(v)) => {
                 // Already nested, but possibly as numbers — which localmail
                 // answers with a 422 the planner cannot act on.
-                let coerced = crate::ids::id_strings(key, v)?;
+                let coerced = crate::ids::id_strings(field, v)?;
                 let as_values: Vec<serde_json::Value> =
-                    coerced.into_iter().map(serde_json::Value::String).collect();
+                    coerced.into_iter().map(|i| serde_json::Value::String(i.to_string())).collect();
                 obj.insert(key.to_string(), serde_json::Value::Array(as_values));
             }
-            (None, None) => {}
+            // A `null` placeholder must not reach localmail as a filter value.
+            (None, None) => {
+                obj.remove(key);
+            }
         }
     }
 
@@ -189,13 +198,66 @@ mod tests {
         assert!(as_the_planner_sees_it(&e2).contains("folder_ids"), "got: {e2}");
     }
 
-    /// A nested id filter that is not even a list is a shape error, not a panic.
+    /// A nested id filter that is not even a list is a shape error, not a panic
+    /// — and the message names the parameter and shows the shape, like every
+    /// other planner-facing string here. Asserting only `!e.is_empty()` pinned
+    /// Err-vs-Ok and nothing else.
     #[test]
-    fn a_nested_id_filter_that_is_not_a_list_is_refused() {
+    fn a_nested_id_filter_that_is_not_a_list_is_refused_with_the_shape() {
         let e = normalize_filters(Some(json!({"account_ids": "1"})), None, None).unwrap_err();
-        assert!(!e.is_empty());
-        let e2 = normalize_filters(Some(json!({"account_ids": null})), None, None).unwrap_err();
-        assert!(!e2.is_empty());
+        let seen = as_the_planner_sees_it(&e);
+        assert!(seen.contains("account_ids"), "must name the parameter: {seen}");
+        assert!(seen.contains("list of ids"), "must show the shape: {seen}");
+    }
+
+    /// An explicit `null` is absence, exactly as `ids::opt_message_id` treats
+    /// it — and it must not survive into the body as a filter value localmail
+    /// would then have to interpret.
+    #[test]
+    fn an_explicit_null_id_filter_is_absence_not_a_shape_error() {
+        assert!(normalize_filters(Some(json!({"account_ids": null})), None, None)
+            .unwrap()
+            .is_none());
+        let out = normalize_filters(Some(json!({"account_ids": null, "subject": "flight"})), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out["subject"], json!("flight"));
+        assert!(out.get("account_ids").is_none(), "no null on the wire: {out}");
+    }
+
+    /// A `null` beside a top-level value is absence, not a doubled parameter —
+    /// otherwise the planner is refused for writing the placeholder it was
+    /// allowed to write.
+    #[test]
+    fn a_null_nested_filter_does_not_collide_with_the_top_level_form() {
+        let out = normalize_filters(Some(json!({"account_ids": null})), Some(ids(&[2])), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out["account_ids"], json!(["2"]));
+    }
+
+    /// An empty list asks localmail to filter by nothing. `id_list` refuses the
+    /// same shape for `mail.list_messages`; the twin inherited the rule and not
+    /// the test, so deleting the check survived a mutation run.
+    #[test]
+    fn an_empty_nested_id_list_is_refused_rather_than_filtering_by_nothing() {
+        let e = normalize_filters(Some(json!({"account_ids": []})), None, None).unwrap_err();
+        let seen = as_the_planner_sees_it(&e);
+        assert!(seen.contains("account_ids"), "{seen}");
+        assert!(seen.contains("omit it"), "must say what to do instead: {seen}");
+    }
+
+    /// The doubled-parameter message interpolates `{key}`. Only `account_ids`
+    /// was ever tested, so hardcoding that name survived — and `folder_ids`
+    /// doubling would then be blamed on the wrong parameter, which is the exact
+    /// #536 mis-attribution this module is written against.
+    #[test]
+    fn a_doubled_folder_ids_is_blamed_on_folder_ids() {
+        let e = normalize_filters(Some(json!({"folder_ids": ["1"]})), None, Some(ids(&[2])))
+            .unwrap_err();
+        let seen = as_the_planner_sees_it(&e);
+        assert!(seen.contains("folder_ids"), "must name the doubled parameter: {seen}");
+        assert!(!seen.contains("account_ids"), "must not blame the sibling: {seen}");
     }
 
     #[test]

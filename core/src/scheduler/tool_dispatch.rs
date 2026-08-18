@@ -414,6 +414,10 @@ impl StepDispatcher for ToolHostStepDispatcher {
         self.registry.tool_names()
     }
 
+    fn qualify_method(&self, tool: &str, method: &str) -> Option<String> {
+        qualified_method(method, self.registry.methods_for(tool))
+    }
+
     fn purge_task(&self, task_id: i64) {
         self.handoff.purge_task(task_id);
         self.task_out_dirs
@@ -588,9 +592,16 @@ impl StepDispatcher for ToolHostStepDispatcher {
         // `mail.get_attachment_text`) before the call. Deliberately AFTER the
         // registry lookup, which is what supplies the tool's advertised
         // methods, and before `dispatch`, so the audit row written at the
-        // chokepoint records the method actually put on the wire. The plan's
-        // own wording is preserved separately in its `plan.formulate` row, so
-        // the trail still shows both halves.
+        // chokepoint records the method actually put on the wire.
+        //
+        // The inner loop normalises `plan.steps` up front (see
+        // `inner_loop::qualify_plan_methods`), so in the supervised path this
+        // is a no-op — an already-advertised method is never rewritten. It
+        // stays because the chokepoint, not the loop, is what every dispatch
+        // path passes through, and a caller that skips the loop should not
+        // silently lose the completion. The plan's own wording is preserved in
+        // its `plan.formulate` row, written before normalisation, so the trail
+        // still shows both halves.
         let qualified = qualified_method(&step.method, self.registry.methods_for(&step.tool));
         if let Some(m) = &qualified {
             tracing::info!(

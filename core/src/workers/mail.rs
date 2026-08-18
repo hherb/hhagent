@@ -203,9 +203,11 @@ impl WorkerManifest for MailManifest {
                     },
                     ToolParam {
                         name: "sha256",
-                        description: "alternative to message_id: the attachment's exact 64-char \
+                        description: "instead of, or alongside, message_id: the attachment's \
                                       hash, only ever copied verbatim from a previous step's \
-                                      output — never reconstructed from memory.",
+                                      output — never reconstructed from memory. Beside a \
+                                      message_id it is checked against that message, and a \
+                                      12-char prefix is enough.",
                         required: false,
                     },
                 ],
@@ -234,9 +236,11 @@ impl WorkerManifest for MailManifest {
                     },
                     ToolParam {
                         name: "sha256",
-                        description: "alternative to message_id: the attachment's exact 64-char \
+                        description: "instead of, or alongside, message_id: the attachment's \
                                       hash, only ever copied verbatim from a previous step's \
-                                      output — never reconstructed from memory.",
+                                      output — never reconstructed from memory. Beside a \
+                                      message_id it is checked against that message, and a \
+                                      12-char prefix is enough.",
                         required: false,
                     },
                 ],
