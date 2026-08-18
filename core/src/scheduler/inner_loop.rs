@@ -500,9 +500,12 @@ pub async fn run_to_terminal(
 
         // Precedence (issue #23 spec §2):
         //   Verdict CB                       → Outcome::Blocked   (reviewer wins)
-        //   Verdict Escalate, no CB          → Outcome::AwaitingOperator (#564 slice 1b),
+        //   Escalate, no CB, no refusal      → Outcome::AwaitingOperator (#564 slice 1b),
         //                                      unless the operator already approved
-        //                                      this exact plan, which proceeds
+        //                                      this exact plan, which proceeds.
+        //                                      With a refusal present the row below
+        //                                      wins — Escalate does NOT suspend a
+        //                                      refusal plan (see the arm's else).
         //   plan.refused.is_some(), no CB    → Outcome::Refused   (agent's refusal stands)
         //   plan terminal, neither           → Outcome::Completed
         //   non-terminal                     → execute steps
@@ -568,6 +571,20 @@ pub async fn run_to_terminal(
                             // place to keep it. If the ask row really was
                             // cancelled underneath us, `finalize` is a no-op
                             // for it anyway.
+                            //
+                            // COVERAGE, stated plainly so nobody assumes more
+                            // than there is: the *precondition* that makes this
+                            // arm fire is pinned by
+                            // `scheduler_asks_e2e::raising_against_a_task_that_is_not_running_is_an_error`
+                            // — `raise_and_suspend` really does return `Err`
+                            // rather than orphaning an ask. **This arm itself is
+                            // not exercised end-to-end**, because reaching it
+                            // through the lane runner needs the task to stop
+                            // being `running` between the claim and the review,
+                            // which no test stages. So a regression that swapped
+                            // these two lines back to `ctx.blocks.push(...);
+                            // continue` — the exact degrade #564 slice 1b deletes
+                            // — would go green. Keep the `Failed` return.
                             Err(e) => {
                                 tracing::error!(
                                     task_id = ctx.task_id,
