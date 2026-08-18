@@ -1934,3 +1934,114 @@ fn a_none_plan_digest_round_trips_as_sql_null() {
         assert!(is_null, "an absent digest must be SQL NULL, never the empty string");
     });
 }
+
+/// Insert a pending task and claim it, so it is `running` — the state
+/// `asks::raise` requires. Shared by the `latest_resolved_for_task` tests
+/// below, each of which needs a running task before it can raise anything.
+async fn seed_running_task(pool: &sqlx::PgPool) -> i64 {
+    use kastellan_db::tasks::{self, Lane};
+
+    let task_id = tasks::insert_pending(
+        pool, Lane::Fast, serde_json::json!({"instruction": "latest_resolved_for_task probe"}),
+    ).await.expect("insert pending");
+    tasks::claim_one(pool, Lane::Fast, 60).await.expect("claim").expect("a pending task");
+    task_id
+}
+
+/// A `pending` ask is not a resolved one — `latest_resolved_for_task` must
+/// not surface a question nobody has answered yet.
+#[test]
+fn latest_resolved_for_task_returns_none_when_nothing_is_resolved() {
+    let Some(h) = harness("asklrn") else {
+        return;
+    };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-latest-none").await;
+        let pool = &pool;
+        use kastellan_db::asks;
+
+        let task_id = seed_running_task(pool).await;
+
+        // A pending ask is not a resolved ask.
+        let _ = asks::raise(
+            pool, task_id, "plan_approval", "why", &serde_json::json!(["approve", "deny"]),
+            Some("digest-a"), time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        ).await.expect("raise");
+
+        let got = asks::latest_resolved_for_task(pool, task_id).await.expect("read");
+        assert!(got.is_none(), "a pending ask must not be returned as resolved");
+    });
+}
+
+/// A task that escalates twice (first approved, then denied) must see the
+/// SECOND decision, not the first — `resolved_at DESC, id DESC` must win
+/// over insertion order.
+#[test]
+fn latest_resolved_for_task_returns_the_most_recent_resolution() {
+    let Some(h) = harness("asklrr") else {
+        return;
+    };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-latest-recent").await;
+        let pool = &pool;
+        use kastellan_db::tasks::Lane;
+        use kastellan_db::{asks, tasks};
+
+        let task_id = seed_running_task(pool).await;
+
+        // First ask: raised, approved. Resolving it returns the task to
+        // `pending`.
+        let first = asks::raise(
+            pool, task_id, "plan_approval", "first concern",
+            &serde_json::json!(["approve", "deny"]), Some("digest-a"),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        ).await.expect("raise 1");
+        assert!(asks::resolve(pool, first.ask_id, "operator",
+            &serde_json::json!({"choice": "approve"})).await.expect("resolve 1"));
+
+        // Second ask on the same task, denied. `raise` needs `running`, so
+        // re-claim the task the resolve just re-enqueued.
+        tasks::claim_one(pool, Lane::Fast, 60).await.expect("claim").expect("a task");
+        let second = asks::raise(
+            pool, task_id, "plan_approval", "second concern",
+            &serde_json::json!(["approve", "deny"]), Some("digest-b"),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        ).await.expect("raise 2");
+        assert!(asks::resolve(pool, second.ask_id, "operator",
+            &serde_json::json!({"choice": "deny"})).await.expect("resolve 2"));
+
+        let got = asks::latest_resolved_for_task(pool, task_id).await.expect("read")
+            .expect("a resolved ask");
+        assert_eq!(got.id, second.ask_id, "the LATEST resolution must win, not the first");
+        assert_eq!(got.plan_digest.as_deref(), Some("digest-b"));
+    });
+}
+
+/// An `expired` ask is a timeout, not a decision — `latest_resolved_for_task`
+/// must not let one read as an answer.
+#[test]
+fn latest_resolved_for_task_ignores_expired_and_cancelled_asks() {
+    let Some(h) = harness("asklrs") else {
+        return;
+    };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-latest-states").await;
+        let pool = &pool;
+        use kastellan_db::asks;
+
+        let task_id = seed_running_task(pool).await;
+
+        // Deadline one second out, then swept: the ask ends `expired`, not
+        // `resolved`.
+        let _ = asks::raise(
+            pool, task_id, "plan_approval", "why", &serde_json::json!(["approve", "deny"]),
+            Some("digest-a"), time::OffsetDateTime::now_utc() + time::Duration::seconds(1),
+        ).await.expect("raise");
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let expired = asks::expire_due(pool).await.expect("expire");
+        assert_eq!(expired.len(), 1, "the ask must have been swept");
+
+        let got = asks::latest_resolved_for_task(pool, task_id).await.expect("read");
+        assert!(got.is_none(), "an expired ask is not a resolution and must not be returned");
+    });
+}

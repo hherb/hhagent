@@ -711,6 +711,42 @@ pub async fn list_pending(pool: &PgPool, limit: i64) -> Result<Vec<Ask>, DbError
     Ok(out)
 }
 
+/// The task's most recently resolved ask, if it has one.
+///
+/// Slice 1b's single read: `run_one` calls it once per claimed task and
+/// both consumers work from that one value — the pre-plan deny check and
+/// the `Escalate` arm's digest comparison (spec D4).
+///
+/// **`state = 'resolved'` only.** An `expired` or `cancelled` ask is not a
+/// decision anybody made, and returning one would let a timeout read as an
+/// answer. A `pending` ask cannot be seen here either, and that is not
+/// merely filtered: a task with a pending ask is `awaiting_operator`, which
+/// `claim_one` never returns, so no caller of this function can be running
+/// one.
+///
+/// Ordered `resolved_at DESC, id DESC`. `resolved_at` is `now()` at resolve
+/// time, so two asks resolved inside one transaction tick can tie — the
+/// same tiebreaker [`list_pending`] carries, for the same reason. A task
+/// that escalates twice (P approved, then P′ denied) must see the second
+/// decision, not the first.
+pub async fn latest_resolved_for_task(
+    pool: &PgPool,
+    task_id: i64,
+) -> Result<Option<Ask>, DbError> {
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {ASK_COLUMNS} FROM asks \
+         WHERE task_id = $1 AND state = 'resolved' \
+         ORDER BY resolved_at DESC, id DESC \
+         LIMIT 1"
+    )))
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| DbError::Query(format!("asks latest_resolved_for_task: {e}")))?;
+
+    row.as_ref().map(decode_ask_row).transpose()
+}
+
 /// Fetch one ask by id, in any state.
 pub async fn get(pool: &PgPool, ask_id: i64) -> Result<Option<Ask>, DbError> {
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
