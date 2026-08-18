@@ -2027,21 +2027,119 @@ fn latest_resolved_for_task_ignores_expired_and_cancelled_asks() {
     h.rt.block_on(async {
         let pool = h.migrated_pool("asks-latest-states").await;
         let pool = &pool;
-        use kastellan_db::asks;
+        use kastellan_db::{asks, tasks};
 
-        let task_id = seed_running_task(pool).await;
-
-        // Deadline one second out, then swept: the ask ends `expired`, not
-        // `resolved`.
+        // ---- expired half: deadline one second out, then swept. `expire_due`
+        // fails the task closed (terminal), so this needs its own task —
+        // a cancelled ask cannot follow it on the same one.
+        let expired_task_id = seed_running_task(pool).await;
         let _ = asks::raise(
-            pool, task_id, "plan_approval", "why", &serde_json::json!(["approve", "deny"]),
+            pool, expired_task_id, "plan_approval", "why",
+            &serde_json::json!(["approve", "deny"]),
             Some("digest-a"), time::OffsetDateTime::now_utc() + time::Duration::seconds(1),
         ).await.expect("raise");
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         let expired = asks::expire_due(pool).await.expect("expire");
         assert_eq!(expired.len(), 1, "the ask must have been swept");
 
-        let got = asks::latest_resolved_for_task(pool, task_id).await.expect("read");
+        let got = asks::latest_resolved_for_task(pool, expired_task_id).await.expect("read");
         assert!(got.is_none(), "an expired ask is not a resolution and must not be returned");
+
+        // ---- cancelled half: reached via the real production path —
+        // `tasks::mark_cancelled` cancelling a task that has a pending ask,
+        // exactly as `asks::cancel_for_task`'s only caller does it — not a
+        // hand-crafted `state = 'cancelled'` row.
+        let cancelled_task_id = seed_running_task(pool).await;
+        let raised = asks::raise(
+            pool, cancelled_task_id, "plan_approval", "why too",
+            &serde_json::json!(["approve", "deny"]),
+            Some("digest-b"), time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        ).await.expect("raise");
+        let cancelled = tasks::mark_cancelled(pool, cancelled_task_id).await.expect("cancel")
+            .expect("an awaiting_operator task must be cancellable");
+        assert_eq!(cancelled.asks_cancelled, 1, "the pending ask must have gone with it");
+        assert_eq!(
+            asks::get(pool, raised.ask_id).await.unwrap().unwrap().state, "cancelled",
+            "the ask must actually have reached the cancelled state for this test to mean anything",
+        );
+
+        let got = asks::latest_resolved_for_task(pool, cancelled_task_id).await.expect("read");
+        assert!(got.is_none(), "a cancelled ask is not a resolution and must not be returned");
+    });
+}
+
+/// `resolved_at` is `now()` at resolve time, so two asks resolved inside one
+/// transaction tick genuinely CAN tie — the `, id DESC` half of the ORDER BY
+/// is what breaks it, not decoration. Racing the clock to produce a real tie
+/// would be flaky, so this forces one directly (per the review finding: `UPDATE
+/// asks SET resolved_at = $1 WHERE task_id = $2`) and asserts the higher-id ask
+/// wins, repeatably — a missing tiebreaker would make the result
+/// nondeterministic across calls (dependent on physical row/index order)
+/// rather than simply wrong once, so a single call would not reliably catch
+/// its absence.
+#[test]
+fn latest_resolved_for_task_breaks_a_resolved_at_tie_by_higher_id() {
+    let Some(h) = harness("asklrt") else {
+        return;
+    };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-latest-tie").await;
+        let pool = &pool;
+        use kastellan_db::tasks::Lane;
+        use kastellan_db::{asks, tasks};
+
+        let task_id = seed_running_task(pool).await;
+
+        let first = asks::raise(
+            pool, task_id, "plan_approval", "first concern",
+            &serde_json::json!(["approve", "deny"]), Some("digest-a"),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        ).await.expect("raise 1");
+        assert!(asks::resolve(pool, first.ask_id, "operator",
+            &serde_json::json!({"choice": "approve"})).await.expect("resolve 1"));
+
+        tasks::claim_one(pool, Lane::Fast, 60).await.expect("claim").expect("a task");
+        let second = asks::raise(
+            pool, task_id, "plan_approval", "second concern",
+            &serde_json::json!(["approve", "deny"]), Some("digest-b"),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        ).await.expect("raise 2");
+        assert!(asks::resolve(pool, second.ask_id, "operator",
+            &serde_json::json!({"choice": "deny"})).await.expect("resolve 2"));
+        assert!(
+            second.ask_id > first.ask_id,
+            "the second raise must get the higher id for this test to mean anything",
+        );
+
+        // Force the tie directly rather than racing the clock.
+        let tied_at = time::OffsetDateTime::now_utc();
+        sqlx::query("UPDATE asks SET resolved_at = $1 WHERE task_id = $2")
+            .bind(tied_at)
+            .bind(task_id)
+            .execute(pool)
+            .await
+            .expect("force the resolved_at tie");
+        let (a, b): (time::OffsetDateTime, time::OffsetDateTime) = sqlx::query_as(
+            "SELECT \
+             (SELECT resolved_at FROM asks WHERE id = $1), \
+             (SELECT resolved_at FROM asks WHERE id = $2)",
+        )
+        .bind(first.ask_id)
+        .bind(second.ask_id)
+        .fetch_one(pool)
+        .await
+        .expect("read back the tied resolved_at");
+        assert_eq!(a, b, "both asks must share exactly one resolved_at instant");
+
+        // The higher-id ask must win, on repeated calls — a missing
+        // `id DESC` tiebreaker is nondeterministic, not just wrong once.
+        for attempt in 0..3 {
+            let got = asks::latest_resolved_for_task(pool, task_id).await.expect("read")
+                .expect("a resolved ask");
+            assert_eq!(
+                got.id, second.ask_id,
+                "attempt {attempt}: with a tied resolved_at, the higher id must win every call",
+            );
+        }
     });
 }
