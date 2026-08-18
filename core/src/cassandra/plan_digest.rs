@@ -1,18 +1,16 @@
 //! What an operator approval binds to (#564, spec D1/D2).
 //!
-//! ⚠️ **NOT YET WIRED — this is the primitive, slice 1b is the caller.**
-//! Nothing computes a digest in production today: `Verdict::Escalate`
-//! still degrades to `Block`, nothing writes `asks.plan_digest`, and the
-//! consult-the-resolved-ask path described below does not exist yet. The
-//! rest of this doc is written in the present tense because it specifies
-//! what the digest *means*; do not read it as a description of live
-//! behaviour and go looking for the escalate path.
+//! Wired since slice 1b: the inner loop's `Verdict::Escalate` arm digests
+//! the plan it is about to escalate, `scheduler::asks::raise_and_suspend`
+//! writes that digest to `asks.plan_digest`, and `scheduler::asks::decide`
+//! is the consult-the-resolved-ask path described below.
 //!
 //! When CASSANDRA escalates a plan, the ask records a **digest** of that
 //! plan rather than the plan itself. On resume the agent replans from
-//! scratch — `run_one` rebuilds `TaskContext` from the task payload with
-//! `plan_count: 0`, so the escalated plan is gone — and goes through review
-//! again as normal. If the new plan's digest matches the approved one, the
+//! scratch — `run_one` rebuilds `TaskContext` from the task payload, so the
+//! escalated plan itself is gone (only `plan_count` carries over, see
+//! `runner::task_exec::resume_budget`) — and goes through review again as
+//! normal. If the new plan's digest matches the approved one, the
 //! `Escalate` arm consults the resolved ask instead of raising a second one.
 //! A *different* plan escalates afresh.
 //!

@@ -322,10 +322,11 @@ async fn drain_lane(
 
         // A non-terminal outcome: the task suspended on an operator ask.
         // `db::asks::raise` already moved the row to `awaiting_operator`
-        // inside its own transaction and the `ask.raised` audit row is
-        // written by `scheduler::asks::raise_and_suspend`, so there is
-        // nothing to finalize and no terminal lifecycle row to write. The
-        // L1/L3 hooks below are `Outcome::Completed`-only anyway.
+        // inside its own transaction, and the `ask.raised` audit row is
+        // written where the ask is raised (`scheduler::asks::raise_and_suspend`,
+        // called from the inner loop's `Verdict::Escalate` arm). So there is
+        // nothing to finalize and no terminal lifecycle row to write here.
+        // The L1/L3 hooks below are `Outcome::Completed`-only anyway.
         let Some(final_state) = result.outcome.final_state() else {
             // The per-task out dir is left in place: the task resumes and
             // `create_dir_all` is idempotent, so re-creating it costs

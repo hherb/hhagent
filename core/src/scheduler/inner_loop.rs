@@ -27,6 +27,7 @@ use self::summary::{render_plans_summary, PlanRecord};
 #[cfg(test)]
 pub(crate) use self::summary::{STEP_ERR_DETAIL_MAX, STEP_OK_SUMMARY_MAX};
 use super::agent::{AgentError, PlanFormulator};
+use super::asks;
 use super::inner_loop_audit::{
     write_audit_plan_formulate, write_audit_plan_outcome, write_audit_verdict,
 };
@@ -499,6 +500,9 @@ pub async fn run_to_terminal(
 
         // Precedence (issue #23 spec §2):
         //   Verdict CB                       → Outcome::Blocked   (reviewer wins)
+        //   Verdict Escalate, no CB          → Outcome::AwaitingOperator (#564 slice 1b),
+        //                                      unless the operator already approved
+        //                                      this exact plan, which proceeds
         //   plan.refused.is_some(), no CB    → Outcome::Refused   (agent's refusal stands)
         //   plan terminal, neither           → Outcome::Completed
         //   non-terminal                     → execute steps
@@ -517,27 +521,65 @@ pub async fn run_to_terminal(
             }
             Verdict::Escalate(reason, sev) => {
                 // Same rationale as Block: a refusal plan must not loop.
-                // No channel bus in this scope — for non-refusal plans,
-                // treat as Block so the agent gets a chance to revise.
-                // The audit row above already records `verdict_kind=escalate`,
-                // but the runtime degradation (escalate → block) is invisible
-                // to anyone not reading the audit log; a warn keeps it
-                // grep-able in the daemon journal.
                 //
-                // TODO(channel-bus): when the channel-bus lands, route
-                //   the Escalate verdict to the operator channel and
-                //   await a verdict from there. The site to update is
-                //   this match arm. See HANDOVER §"channel bus".
+                // For a non-refusal plan the reviewer said a human must
+                // decide, so this raises an operator ask and suspends the
+                // task — unless the operator already approved *this exact
+                // plan*, in which case it proceeds.
                 if plan.refused.is_none() {
-                    tracing::warn!(
-                        task_id = ctx.task_id,
-                        plan_count = ctx.plan_count,
-                        severity = ?sev,
-                        reason = %reason,
-                        "Verdict::Escalate degraded to Block (channel-bus not wired)"
-                    );
-                    ctx.blocks.push(format!("escalate(no-channel): {reason}"));
-                    continue;
+                    // Digest the plan as it stands — after the floor raise,
+                    // the `data_ceiling` resolution, invoke expansion and
+                    // namespace completion — because that is what would
+                    // execute, and the replan runs the same normalisations
+                    // so the two digests are comparable.
+                    let digest = crate::cassandra::plan_digest::plan_digest(&plan);
+                    let approved = ctx.resolved_ask.as_ref().is_some_and(|a| {
+                        matches!(asks::decide(a, &digest), asks::AskDecision::Approved)
+                    });
+                    if approved {
+                        tracing::info!(
+                            task_id = ctx.task_id,
+                            plan_count = ctx.plan_count,
+                            severity = ?sev,
+                            "Verdict::Escalate covered by a resolved operator approval for this \
+                             exact plan; proceeding"
+                        );
+                        // Falls through to the refusal check below and then
+                        // to the terminal check / step execution, exactly as
+                        // an `Approve` verdict does.
+                    } else {
+                        match asks::raise_and_suspend(pool, ctx.task_id, &plan, reason, *sev).await
+                        {
+                            Ok(ask_id) => {
+                                tracing::info!(
+                                    task_id = ctx.task_id,
+                                    ask_id,
+                                    plan_count = ctx.plan_count,
+                                    severity = ?sev,
+                                    reason = %reason,
+                                    "Verdict::Escalate raised an operator ask; task suspended"
+                                );
+                                return finish!(Outcome::AwaitingOperator { ask_id });
+                            }
+                            // Fail the task; do NOT fall back to Block.
+                            // Degrading silently is the behaviour this slice
+                            // deletes, and doing it on the one path where the
+                            // reviewer said a human must decide is the worst
+                            // place to keep it. If the ask row really was
+                            // cancelled underneath us, `finalize` is a no-op
+                            // for it anyway.
+                            Err(e) => {
+                                tracing::error!(
+                                    task_id = ctx.task_id,
+                                    error = %e,
+                                    "Verdict::Escalate could not raise an operator ask"
+                                );
+                                return finish!(Outcome::Failed(format!(
+                                    "escalation could not be raised: {e}"
+                                )));
+                            }
+                        }
+                    }
                 } else {
                     // Escalate on a refusal plan: refusal stands and no
                     // degradation happens (the loop terminates). Surface
