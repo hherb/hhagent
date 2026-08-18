@@ -56,6 +56,18 @@ pub struct TaskContext {
     pub blocks: Vec<String>,
     pub plan_count: u32,
     pub max_plans: u32,
+    /// The task's most recently resolved operator ask, when it has one.
+    ///
+    /// Read **once** by `runner::task_exec::run_one` before the first
+    /// formulation and threaded in here, so the `Escalate` arm compares
+    /// digests against an in-memory value rather than issuing a second
+    /// query from inside the loop — and so a test can construct the
+    /// decision without a live Postgres (spec D4).
+    ///
+    /// Never holds a denial in practice: `run_one` terminates a denied task
+    /// before building this context. `asks::decide` still handles that case
+    /// correctly rather than assuming it away.
+    pub resolved_ask: Option<kastellan_db::asks::Ask>,
 }
 
 impl TaskContext {

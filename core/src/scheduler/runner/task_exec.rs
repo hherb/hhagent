@@ -12,15 +12,73 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 
+use kastellan_db::asks::Ask;
 use kastellan_db::tasks::Task;
 
 use crate::cassandra::review::ChainReviewStage;
 use crate::cassandra::types::DataClass;
 use crate::scheduler::agent::PlanFormulator;
+use crate::scheduler::asks::{resolution_choice, Choice};
 use crate::scheduler::inner_loop::{
     run_to_terminal, ClassificationFloorSource, InnerLoopResult, Outcome, StepDispatcher,
     TaskContext,
 };
+
+/// The terminal outcome a task's already-resolved ask forces before any
+/// planning happens, or `None` to proceed.
+///
+/// Only a **denial** is terminal here. `asks::resolve` re-enqueues the task
+/// on any resolution, so a denied task returns to `pending`, is claimed,
+/// and would otherwise replan from scratch — and if denial only bound to
+/// the plan digest, the agent could replan around it: the operator denies
+/// plan P, the agent produces P′, P′ passes review, and the thing that was
+/// just refused executes. An operator saying "deny" means *do not do this*
+/// (spec D2).
+///
+/// `reason` is the ask's `body` — the concern the operator was answering.
+/// Their optional free-text note is deliberately not copied here; it lives
+/// in `asks.resolution` and the `ask.resolved` audit row (spec D10).
+///
+/// A malformed resolution proceeds rather than terminating: failing toward
+/// running costs an escalation, where failing toward refusal kills a task
+/// for a reason nobody can see in the plan trail.
+pub(crate) fn pre_plan_outcome(resolved: Option<&Ask>) -> Option<Outcome> {
+    let ask = resolved?;
+    match resolution_choice(ask) {
+        Some(Choice::Deny) => Some(Outcome::Denied {
+            ask_id: ask.id,
+            reason: ask.body.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// `(starting plan_count, max_plans)` for a claimed task, given the value
+/// its DB column holds.
+///
+/// Two separable things the old code conflated by starting every run at 0
+/// (spec D6):
+///
+/// * **the column is a historical fact.** `inner_loop` mirrors
+///   `ctx.plan_count` back with `increment_plan_count`, which writes the
+///   **absolute** value — so a task that escalated after 4 plans and
+///   resumed at 0 rewrote its own column 4 → 1. Seeding from the column
+///   keeps it monotonic and true.
+/// * **the budget is a policy.** An approved plan gets a full further
+///   allowance, because the alternative — spending from the original
+///   budget — leaves a task that escalated on its last allowed plan
+///   resuming with none, so the operator's approval buys nothing. Runaway
+///   is not the risk it looks like: each additional allowance costs one
+///   human interaction.
+///
+/// A negative column value (impossible today; `plan_count` is a signed
+/// column with a non-negative writer) clamps to 0 rather than wrapping
+/// through `as u32` to ~4 billion, which would make the cap check pass
+/// forever.
+pub(crate) fn resume_budget(db_plan_count: i32, max_plans: u32) -> (u32, u32) {
+    let carried = u32::try_from(db_plan_count).unwrap_or(0);
+    (carried, carried.saturating_add(max_plans))
+}
 
 pub(super) async fn run_one(
     pool: &PgPool,
@@ -84,6 +142,39 @@ pub(super) async fn run_one(
         .and_then(|n| u32::try_from(n).ok())
         .unwrap_or(max_plans);
 
+    // One read, two consumers (spec D4): the denial check just below, and
+    // the `Escalate` arm's digest comparison via `ctx.resolved_ask`.
+    //
+    // A read failure is NOT fatal. It means at worst that an approval is
+    // not seen and the plan escalates again — one more operator
+    // interaction — where failing the task would turn a transient DB blip
+    // into a lost task.
+    let resolved_ask = match kastellan_db::asks::latest_resolved_for_task(pool, task.id).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(
+                task_id = task.id, error = %e,
+                "could not read the task's resolved ask; proceeding as if there is none \
+                 (an approval will not be seen and the plan will escalate again)"
+            );
+            None
+        }
+    };
+
+    if let Some(outcome) = pre_plan_outcome(resolved_ask.as_ref()) {
+        tracing::info!(task_id = task.id, "operator denied this task's ask; terminating without planning");
+        return InnerLoopResult {
+            outcome,
+            plan_count: u32::try_from(task.plan_count).unwrap_or(0),
+            dispatch_count: 0,
+            terminal_l1_insight: None,
+            terminal_l3_skill: None,
+            terminal_python_skill: None,
+        };
+    }
+
+    let (start_plan_count, max_plans_for_run) = resume_budget(task.plan_count, max_plans_override);
+
     let ctx = TaskContext {
         task_id: task.id,
         lane: task.lane,
@@ -94,8 +185,9 @@ pub(super) async fn run_one(
         plans: vec![],
         advisories: vec![],
         blocks: vec![],
-        plan_count: 0,
-        max_plans: max_plans_override,
+        plan_count: start_plan_count,
+        max_plans: max_plans_for_run,
+        resolved_ask,
     };
 
     let task_id = ctx.task_id;
@@ -197,6 +289,7 @@ fn parse_classification_floor_source_from_payload(
 mod tests {
     use super::*;
     use serde_json::json;
+    use time::OffsetDateTime;
 
     #[test]
     fn absent_payload_field_parses_as_default() {
@@ -295,6 +388,76 @@ mod tests {
             err.contains("reserved") || err.contains("apply_floor_raise"),
             "error must name the contract: {err}",
         );
+    }
+
+    fn resolved_ask(choice: &str) -> Ask {
+        Ask {
+            id: 9,
+            task_id: 3,
+            kind: "plan_approval".to_string(),
+            body: "this sends mail to a stranger".to_string(),
+            options: serde_json::json!(["approve", "deny"]),
+            plan_digest: Some("digest-a".to_string()),
+            state: "resolved".to_string(),
+            created_at: OffsetDateTime::now_utc(),
+            deadline_at: OffsetDateTime::now_utc(),
+            resolved_at: Some(OffsetDateTime::now_utc()),
+            resolved_by: Some("operator".to_string()),
+            resolution: Some(serde_json::json!({"choice": choice})),
+        }
+    }
+
+    #[test]
+    fn a_denial_terminates_the_task_before_any_planning() {
+        let out = pre_plan_outcome(Some(&resolved_ask("deny"))).expect("a denial is terminal");
+        match out {
+            Outcome::Denied { ask_id, reason } => {
+                assert_eq!(ask_id, 9);
+                // The ask's body — the question the operator answered —
+                // not the operator's own note (spec D10).
+                assert_eq!(reason, "this sends mail to a stranger");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_approval_does_not_terminate_the_task() {
+        assert!(pre_plan_outcome(Some(&resolved_ask("approve"))).is_none());
+    }
+
+    #[test]
+    fn no_resolved_ask_does_not_terminate_the_task() {
+        assert!(pre_plan_outcome(None).is_none());
+    }
+
+    #[test]
+    fn a_malformed_resolution_does_not_terminate_the_task() {
+        // Fail toward running rather than toward a silent refusal: a task
+        // killed by an unparseable row is far harder to diagnose than one
+        // that escalates again.
+        let mut a = resolved_ask("deny");
+        a.resolution = Some(serde_json::json!({"choice": "maybe"}));
+        assert!(pre_plan_outcome(Some(&a)).is_none());
+    }
+
+    #[test]
+    fn resume_budget_carries_the_count_and_extends_the_allowance() {
+        // A fresh task: nothing carried, budget is the lane default.
+        assert_eq!(resume_budget(0, 5), (0, 5));
+        // A task that escalated after 4 plans and was approved: the column
+        // keeps its 4 (so `increment_plan_count`'s absolute write no longer
+        // rewinds it to 1) and the approved plan gets a full 5 more.
+        assert_eq!(resume_budget(4, 5), (4, 9));
+    }
+
+    #[test]
+    fn resume_budget_survives_impossible_column_values() {
+        // plan_count is a signed column; a negative would make `as u32`
+        // wrap to ~4 billion and the cap check pass forever.
+        assert_eq!(resume_budget(-1, 5), (0, 5));
+        // And the extension must not overflow into a tiny budget.
+        assert_eq!(resume_budget(i32::MAX, u32::MAX).1, u32::MAX);
     }
 
     #[test]

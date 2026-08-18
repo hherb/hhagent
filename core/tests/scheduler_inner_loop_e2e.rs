@@ -204,6 +204,7 @@ fn make_ctx(task_id: i64, max_plans: u32) -> TaskContext {
         blocks: vec![],
         plan_count: 0,
         max_plans,
+        resolved_ask: None,
     }
 }
 
