@@ -320,7 +320,19 @@ async fn drain_lane(
             &claimed, max_plans,
         ).await;
 
-        let final_state = result.outcome.final_state();
+        // A non-terminal outcome: the task suspended on an operator ask.
+        // `db::asks::raise` already moved the row to `awaiting_operator`
+        // inside its own transaction and the `ask.raised` audit row is
+        // written by `scheduler::asks::raise_and_suspend`, so there is
+        // nothing to finalize and no terminal lifecycle row to write. The
+        // L1/L3 hooks below are `Outcome::Completed`-only anyway.
+        let Some(final_state) = result.outcome.final_state() else {
+            // The per-task out dir is left in place: the task resumes and
+            // `create_dir_all` is idempotent, so re-creating it costs
+            // nothing and removing it could delete a deliverable a step
+            // already wrote before the escalation.
+            continue;
+        };
         let final_result_payload = result.outcome.result_payload();
 
         // Capture `finished_at` *before* `tasks::finalize` so the

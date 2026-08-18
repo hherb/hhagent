@@ -200,16 +200,47 @@ fn classification_floor_source_as_snake_str_matches_serde_wire_form() {
 
 #[test]
 fn outcome_final_state_mapping() {
-    assert_eq!(Outcome::Completed(serde_json::json!("x")).final_state(), "completed");
-    assert_eq!(Outcome::Failed("e".into()).final_state(), "failed");
-    assert_eq!(Outcome::Cancelled.final_state(), "cancelled");
-    assert_eq!(Outcome::TimedOut.final_state(), "timed_out");
-    assert_eq!(Outcome::Blocked { principle: 1, reason: "r".into() }.final_state(), "blocked");
+    assert_eq!(Outcome::Completed(serde_json::json!("x")).final_state(), Some("completed"));
+    assert_eq!(Outcome::Failed("e".into()).final_state(), Some("failed"));
+    assert_eq!(Outcome::Cancelled.final_state(), Some("cancelled"));
+    assert_eq!(Outcome::TimedOut.final_state(), Some("timed_out"));
+    assert_eq!(
+        Outcome::Blocked { principle: 1, reason: "r".into() }.final_state(),
+        Some("blocked")
+    );
     assert_eq!(
         Outcome::Refused { principle: 1, reason: "harm".into(), body: "explanation".into() }
             .final_state(),
-        "refused",
+        Some("refused"),
     );
+}
+
+#[test]
+fn awaiting_operator_is_not_a_terminal_state() {
+    // The whole reason `final_state` is an Option: a suspended task has
+    // not finished, and `tasks::finalize` matches `WHERE state='running'`
+    // so any string here would be a silent no-op UPDATE plus two audit
+    // rows asserting an end that did not happen.
+    let o = Outcome::AwaitingOperator { ask_id: 7 };
+    assert_eq!(o.final_state(), None);
+    assert_eq!(o.result_payload(), None);
+}
+
+#[test]
+fn denied_is_terminal_as_blocked_and_says_so_in_the_payload() {
+    let o = Outcome::Denied { ask_id: 7, reason: "sends mail to a stranger".into() };
+    // `blocked` because the operator is the review authority of last
+    // resort — and no fabricated `principle`, which is what reusing
+    // Outcome::Blocked would have required.
+    assert_eq!(o.final_state(), Some("blocked"));
+    let p = o.result_payload().expect("a denied task has a payload");
+    assert_eq!(p.get("kind").and_then(|v| v.as_str()), Some("denied"));
+    assert_eq!(p.get("ask_id").and_then(|v| v.as_i64()), Some(7));
+    assert_eq!(
+        p.get("reason").and_then(|v| v.as_str()),
+        Some("sends mail to a stranger")
+    );
+    assert!(p.get("principle").is_none(), "a denial violates no CASSANDRA principle");
 }
 
 #[test]

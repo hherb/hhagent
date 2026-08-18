@@ -129,17 +129,51 @@ pub enum Outcome {
     /// path). `body` carries the planner's prose `result.body` so the
     /// user-facing explanation is preserved in the audit + DB result.
     Refused { principle: u8, reason: String, body: String },
+    /// **Non-terminal.** The reviewer escalated and an operator ask was
+    /// raised; `db::asks::raise` has already moved the task to
+    /// `awaiting_operator` inside its own transaction, so the lane runner
+    /// must NOT finalize. Resolution re-enqueues the task through the
+    /// `tasks_resumed` NOTIFY and it runs again from the top.
+    AwaitingOperator { ask_id: i64 },
+    /// An operator answered a raised ask with `deny`. Terminal.
+    ///
+    /// `reason` is the ask's own `body` — the reviewer's escalation
+    /// concern, i.e. the question the operator was answering. The
+    /// operator's optional free-text note deliberately does NOT travel
+    /// here; it lives in `asks.resolution` and the `ask.resolved` audit
+    /// row (spec D10).
+    Denied { ask_id: i64, reason: String },
 }
 
 impl Outcome {
-    pub fn final_state(&self) -> &'static str {
+    /// The `tasks.state` this outcome finalizes to, or `None` when the
+    /// task has not finished.
+    ///
+    /// **An `Option` rather than a pseudo-terminal string, and that is
+    /// load-bearing.** `AwaitingOperator` is the first non-terminal
+    /// outcome the loop can return. Answering `"awaiting_operator"` here
+    /// would send it to `tasks::finalize`, which matches
+    /// `WHERE state = 'running'` — the row is already `awaiting_operator`,
+    /// so the UPDATE silently no-ops — and would then write a terminal
+    /// lifecycle row and a `task.finalize` row asserting an end that did
+    /// not happen. `Option` makes every call site say what it does with an
+    /// unfinished task, and the compiler finds them all.
+    pub fn final_state(&self) -> Option<&'static str> {
         match self {
-            Outcome::Completed(_) => "completed",
-            Outcome::Failed(_)    => "failed",
-            Outcome::Cancelled    => "cancelled",
-            Outcome::TimedOut     => "timed_out",
-            Outcome::Blocked { .. } => "blocked",
-            Outcome::Refused { .. } => "refused",
+            Outcome::Completed(_) => Some("completed"),
+            Outcome::Failed(_)    => Some("failed"),
+            Outcome::Cancelled    => Some("cancelled"),
+            Outcome::TimedOut     => Some("timed_out"),
+            Outcome::Blocked { .. } => Some("blocked"),
+            Outcome::Refused { .. } => Some("refused"),
+            // `blocked` is shared with the reviewer-detected path on
+            // purpose: a third terminal state would need a migration to
+            // widen `tasks_state_check` and would partition every existing
+            // observation query grouping on terminal states. The
+            // `ask.resolved` audit row's `choice` is what separates the two
+            // populations.
+            Outcome::Denied { .. } => Some("blocked"),
+            Outcome::AwaitingOperator { .. } => None,
         }
     }
 
@@ -154,6 +188,11 @@ impl Outcome {
                 "principle": principle,
                 "reason": reason,
                 "body": body,
+            })),
+            Outcome::Denied { ask_id, reason } => Some(serde_json::json!({
+                "kind": "denied",
+                "ask_id": ask_id,
+                "reason": reason,
             })),
             _ => None,
         }
