@@ -127,6 +127,28 @@ pub const ACTION_TASK_FINALIZE: &str = "task.finalize";
 /// included for shape parity so consumers don't need a special case.
 pub const ACTION_TASK_SUBMITTED: &str = "task.submitted";
 
+/// `action` written when the reviewer escalated a plan and an operator ask
+/// was raised for it (#564 slice 1b). `actor='scheduler'`. Payload:
+/// `{ask_id, task_id, kind, plan_digest, severity, deadline_at}`.
+///
+/// The plaintext correlation nonce is deliberately NOT in the payload:
+/// `audit_log` is readable by every role that can read the audit trail, and
+/// the nonce is a live approval token.
+pub const ACTION_ASK_RAISED: &str = "ask.raised";
+
+/// `action` written when an operator answered a raised ask (#564 slice 1b).
+/// `actor='cli'` from `kastellan-cli inbox resolve`; a future channel
+/// resolver writes the same action under its own actor. Payload:
+/// `{ask_id, task_id, choice, resolved_by, free_text}`.
+///
+/// `choice` is what separates an operator denial from a CASSANDRA block:
+/// both land in `tasks.state='blocked'` (see `Outcome::final_state`).
+pub const ACTION_ASK_RESOLVED: &str = "ask.resolved";
+
+/// `action` written for each ask the deadline sweep retired (#564 slice
+/// 1b). `actor='scheduler'`. Payload: `{ask_id, task_id}`.
+pub const ACTION_ASK_EXPIRED: &str = "ask.expired";
+
 /// `prefix` of the per-terminal-state lifecycle row's `action`.
 /// Full action is built via [`action_task_terminal`] so the writer
 /// and any reader can't drift on the separator/format.
