@@ -77,6 +77,16 @@ pub struct Ask {
     pub resolved_at: Option<OffsetDateTime>,
     pub resolved_by: Option<String>,
     pub resolution: Option<serde_json::Value>,
+    /// The suspended run's plan history and reviewer feedback, as written
+    /// by the scheduler at suspend time (#564 slice 1b, D11). `None` for an
+    /// ask that carries no run state — an ask raised before migration 0024,
+    /// or a future kind that binds to no run.
+    ///
+    /// Opaque here on purpose: this crate stores and returns the value and
+    /// never interprets it. Its shape is `core::scheduler::asks`'s
+    /// business, and that module restores an empty history from anything it
+    /// does not recognise rather than failing the task.
+    pub resume_state: Option<serde_json::Value>,
 }
 
 /// A correlation nonce in plaintext: the unforgeable capability to
@@ -218,11 +228,14 @@ fn decode_ask_row(row: &PgRow) -> Result<Ask, DbError> {
             .map_err(|e| DbError::Query(format!("decode asks.resolved_by: {e}")))?,
         resolution: row.try_get("resolution")
             .map_err(|e| DbError::Query(format!("decode asks.resolution: {e}")))?,
+        resume_state: row.try_get("resume_state")
+            .map_err(|e| DbError::Query(format!("decode asks.resume_state: {e}")))?,
     })
 }
 
 const ASK_COLUMNS: &str = "id, task_id, kind, body, options, plan_digest, state, \
-                           created_at, deadline_at, resolved_at, resolved_by, resolution";
+                           created_at, deadline_at, resolved_at, resolved_by, resolution, \
+                           resume_state";
 
 /// Raise an ask against a **running** task and suspend that task.
 ///
@@ -253,6 +266,17 @@ const ASK_COLUMNS: &str = "id, task_id, kind, body, options, plan_digest, state,
 ///
 /// `plan_digest` is `Some` for kinds that bind to a plan and `None`
 /// otherwise; see `core::cassandra::plan_digest` for what the value means.
+///
+/// `resume_state` is the caller's opaque record of the run being suspended
+/// (#564 slice 1b, D11) — stored verbatim, never interpreted here. Pass
+/// `None` when there is no run state to carry; the resume then restores an
+/// empty history, which is what every ask raised before migration 0024
+/// does.
+// One argument per column this INSERT writes. A params struct would move
+// the same fields behind a name without making any call site clearer, and
+// would put a second place to keep in sync with the table. Same posture as
+// `core::scheduler::runner`'s spawn helpers.
+#[allow(clippy::too_many_arguments)]
 pub async fn raise(
     pool: &PgPool,
     task_id: i64,
@@ -261,6 +285,7 @@ pub async fn raise(
     options: &serde_json::Value,
     plan_digest: Option<&str>,
     deadline_at: OffsetDateTime,
+    resume_state: Option<&serde_json::Value>,
 ) -> Result<RaisedAsk, DbError> {
     let nonce = generate_nonce();
     let nonce_hash = sha256_hex(&nonce);
@@ -289,8 +314,9 @@ pub async fn raise(
     }
 
     let row = sqlx::query(
-        "INSERT INTO asks (task_id, kind, body, options, plan_digest, nonce_sha256, deadline_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+        "INSERT INTO asks \
+           (task_id, kind, body, options, plan_digest, nonce_sha256, deadline_at, resume_state) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          RETURNING id",
     )
     .bind(task_id)
@@ -300,6 +326,7 @@ pub async fn raise(
     .bind(plan_digest)
     .bind(&nonce_hash)
     .bind(deadline_at)
+    .bind(resume_state)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| DbError::Query(format!("asks raise insert: {e}")))?;
@@ -703,6 +730,57 @@ pub async fn list_pending(pool: &PgPool, limit: i64) -> Result<Vec<Ask>, DbError
     .fetch_all(pool)
     .await
     .map_err(|e| DbError::Query(format!("asks list_pending: {e}")))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(decode_ask_row(row)?);
+    }
+    Ok(out)
+}
+
+/// **Every** decision an operator has already made about this task,
+/// newest first. Empty when nobody has answered anything yet.
+///
+/// Slice 1b's single read: `run_one` calls it once per claimed task and
+/// both consumers work from that one list — the pre-plan deny check and
+/// the `Escalate` arm's digest comparison (spec D4).
+///
+/// **All of them, not just the newest, and that is the whole point.** An
+/// approval binds to a *plan digest*, so the caller has to answer "did the
+/// operator approve THIS plan", which is a lookup by digest and not by
+/// recency. A task that escalates at two different plans holds two
+/// approvals at once; returning only the newest made the older one
+/// invisible, so the earlier plan re-asked a question that had already been
+/// answered — and approving *that* made the newer approval the stale one.
+/// The two alternate forever, and `resume_budget` hands out a fresh plan
+/// allowance on every resume, so nothing but the ask deadline ends it. A
+/// task raises one ask per escalation, so this list is small and bounded by
+/// how many times a human chose to answer.
+///
+/// **`state = 'resolved'` only.** An `expired` or `cancelled` ask is not a
+/// decision anybody made, and returning one would let a timeout read as an
+/// answer. A `pending` ask cannot be seen here either, and that is not
+/// merely filtered: a task with a pending ask is `awaiting_operator`, which
+/// `claim_one` never returns, so no caller of this function can be running
+/// one.
+///
+/// Ordered `resolved_at DESC, id DESC`. `resolved_at` is `now()` at resolve
+/// time, so two asks resolved inside one transaction tick can tie — the
+/// same tiebreaker [`list_pending`] carries, for the same reason. The order
+/// is no longer load-bearing for *which* decision applies (the caller
+/// matches on digest), but it stays deterministic so a caller that does
+/// look at `first()` — an operator display, a log line — sees the same row
+/// on every call rather than whatever physical row order the planner picked.
+pub async fn resolved_for_task(pool: &PgPool, task_id: i64) -> Result<Vec<Ask>, DbError> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {ASK_COLUMNS} FROM asks \
+         WHERE task_id = $1 AND state = 'resolved' \
+         ORDER BY resolved_at DESC, id DESC"
+    )))
+    .bind(task_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| DbError::Query(format!("asks resolved_for_task: {e}")))?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {

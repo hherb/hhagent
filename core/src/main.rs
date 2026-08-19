@@ -123,6 +123,18 @@ async fn main() -> Result<()> {
         Err(e) => tracing::warn!(error = %e, "crash_recovery::sweep_and_audit failed (non-fatal)"),
     }
 
+    // Overdue operator asks from a previous daemon life (#564 slice 1b).
+    // The periodic sweep inside `spawn_scheduler` covers the running
+    // daemon; this one covers the gap across a restart, so a task does not
+    // wait a full interval to learn its ask timed out days ago.
+    // Non-fatal for the same reason the crash sweep above is: a degraded
+    // audit story is better than refusing to start.
+    match kastellan_core::scheduler::asks::sweep_expired_and_audit(&pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(count = n, "expired overdue operator asks at startup"),
+        Err(e) => tracing::warn!(error = %e, "asks::sweep_expired_and_audit failed (non-fatal)"),
+    }
+
     // LLM router (existing skeleton).
     let router_cfg = kastellan_llm_router::RouterConfig::from_env()
         .map_err(|e| anyhow!("RouterConfig::from_env: {e}"))?;

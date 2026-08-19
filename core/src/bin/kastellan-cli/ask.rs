@@ -1,10 +1,22 @@
 //! `ask "<instruction>" [--fast|--long] [--classification-floor <DataClass>]`
 //! — submit a task to the scheduler, LISTEN for the completion NOTIFY,
 //! then print the result. Ctrl-C cancels the pending/running task.
+//!
+//! A task can also stop short of any terminal state: CASSANDRA escalates
+//! its plan, an operator ask is raised, and the task parks in
+//! `awaiting_operator` until somebody answers (#564 slice 1b). No NOTIFY
+//! fires for that, so the wait loop polls for it and tells the operator
+//! where their own question is waiting — see the comment on the loop.
 
 use std::process::ExitCode;
 
 use crate::common::{parse_classification_floor, resolve_connect_spec, with_runtime};
+
+/// How often the wait loop checks whether the task suspended itself on an
+/// operator ask. Short enough that the operator is told within a few
+/// seconds of the escalation; long enough that a task running for minutes
+/// costs a trivial number of one-row reads.
+const SUSPEND_POLL_SECS: u64 = 3;
 
 pub(crate) fn run_ask(args: &[String]) -> ExitCode {
     let mut lane = kastellan_db::tasks::Lane::Fast;
@@ -182,10 +194,27 @@ async fn ask_async(
 
     eprintln!("ask: submitted task {id} (lane={}); waiting for completion…", lane.as_sql());
 
-    // Wait for a terminal-state NOTIFY for our id, OR ctrl-C.
+    // Wait for a terminal-state NOTIFY for our id, OR ctrl-C, OR the task
+    // suspending on an operator ask.
+    //
+    // That third case needs a poll, and the reason is structural: a task
+    // CASSANDRA escalates moves `running -> awaiting_operator`, which fires
+    // neither `tasks_completed` (not a terminal state) nor `tasks_resumed`
+    // (that trigger is `awaiting_operator -> pending`, i.e. the way back
+    // OUT). There is no NOTIFY for going in, so nothing can be listened for
+    // — adding one would be a migration plus a third channel, for a
+    // condition a single-row `SELECT state` answers exactly. A tick every
+    // few seconds against a local socket costs nothing next to a command
+    // whose alternative is sitting silent for the full 24 h ask deadline.
     tokio::pin! {
         let sigint = tokio::signal::ctrl_c();
     }
+    let mut suspend_poll =
+        tokio::time::interval(std::time::Duration::from_secs(SUSPEND_POLL_SECS));
+    // The first tick completes immediately; burn it so the very first check
+    // happens one interval in, by which time the scheduler has had a chance
+    // to claim the task at all.
+    suspend_poll.tick().await;
     loop {
         tokio::select! {
             n = listener.recv() => match n {
@@ -194,6 +223,28 @@ async fn ask_async(
                 }
                 Err(e) => { eprintln!("ask: listener.recv: {e}"); return ExitCode::from(1); }
             },
+            _ = suspend_poll.tick() => {
+                // A read failure here is not the command's business: the
+                // task is still running and the NOTIFY is still coming.
+                // Keep waiting rather than reporting a state we did not see.
+                if let Ok("awaiting_operator") =
+                    kastellan_db::tasks::observe_state(&pool, id).await.as_deref()
+                {
+                    // NOT a failure, and deliberately exit 0: the task is
+                    // alive and suspended on a question the operator — the
+                    // very person at this terminal — has to answer. Exiting
+                    // non-zero would tell a script the submission failed,
+                    // which is untrue and would send it into a retry loop
+                    // against a task that is merely waiting for its author.
+                    eprintln!(
+                        "ask: task {id} is waiting for an operator decision. \
+                         Run `kastellan-cli inbox list` to see the question, then \
+                         `kastellan-cli inbox resolve <id> approve|deny` to answer it. \
+                         Re-run `kastellan-cli tasks status {id}` afterwards for the result."
+                    );
+                    return ExitCode::from(0);
+                }
+            }
             result = &mut sigint => {
                 if result.is_ok() {
                     // Best-effort: even if the UPDATE or audit insert

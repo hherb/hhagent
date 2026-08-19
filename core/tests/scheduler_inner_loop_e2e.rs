@@ -204,6 +204,7 @@ fn make_ctx(task_id: i64, max_plans: u32) -> TaskContext {
         blocks: vec![],
         plan_count: 0,
         max_plans,
+        resolved_asks: Vec::new(),
     }
 }
 
@@ -600,7 +601,7 @@ async fn refusal_plan_terminates_with_state_refused() {
     }
 
     // final_state contract
-    assert_eq!(result.outcome.final_state(), "refused");
+    assert_eq!(result.outcome.final_state(), Some("refused"));
 
     // result_payload contract — 4-key shape
     let payload = result.outcome.result_payload().expect("Refused carries a payload");
@@ -724,7 +725,7 @@ async fn reviewer_constitutional_block_wins_over_agent_refusal() {
         }
         other => panic!("expected Outcome::Blocked (reviewer wins), got {other:?}"),
     }
-    assert_eq!(result.outcome.final_state(), "blocked");
+    assert_eq!(result.outcome.final_state(), Some("blocked"));
 }
 
 /// (g) Agent emits a refusal plan AND the reviewer returns a non-CB
@@ -793,7 +794,7 @@ async fn verdict_block_on_refusal_plan_does_not_loop() {
         }
         other => panic!("expected Outcome::Refused, got {other:?}"),
     }
-    assert_eq!(result.outcome.final_state(), "refused");
+    assert_eq!(result.outcome.final_state(), Some("refused"));
 
     // Pin no-loop: exactly one plan formulated, zero steps dispatched.
     assert_eq!(result.plan_count, 1, "refusal+Block must not loop the agent");

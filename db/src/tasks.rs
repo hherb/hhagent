@@ -645,17 +645,15 @@ pub(crate) async fn suspend_for_ask(
 /// `started_at` and `plan_count` are deliberately left alone **by this
 /// UPDATE** — it does not reset either to a fresh-task value.
 ///
-/// That is true of the SQL and false of the observed outcome, and slice
-/// 1b must not read it as "the plan budget carries forward."
-/// `core::scheduler::runner::task_exec::run_one` rebuilds the resumed
-/// task's `TaskContext` with `plan_count: 0` regardless of what this
-/// column holds, and `inner_loop` writes that absolute value straight
-/// back via `increment_plan_count` on the next `formulate_plan`. So a task
-/// that burned 4 of its 5-plan budget, escalated, and got approved
-/// resumes with a **fresh full budget** — the CLI's plans-so-far column
-/// reads 4 → 1, not 4 → 4. Whether that reset is fine (a resumed task
-/// deserves a full retry budget) or wrong (the operator approved a
-/// continuation, not a new attempt) is slice 1b's call, not made here.
+/// That is now true of the observed outcome too: nothing downstream
+/// resets `plan_count`, so it genuinely carries forward across a resume.
+///
+/// **Slice 1b made that call** (`runner::task_exec::resume_budget`): the
+/// context is seeded from this column, so it is monotonic and no longer
+/// rewinds, and `max_plans` is *extended* by the carried count rather than
+/// the budget being either reset or spent-from. Spending from the original
+/// budget would leave a task that escalated on its last allowed plan
+/// resuming with none, making the operator's approval buy nothing.
 ///
 /// Takes `&mut PgConnection` so `asks::resolve` and
 /// `asks::resolve_with_nonce` can call it inside their transactions, and

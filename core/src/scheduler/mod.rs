@@ -11,10 +11,12 @@
 //!   - `inner_loop_audit`  — pure builder + async writers for the inner loop's audit rows (issue #81 split)
 //!   - `runner`            — per-lane runner loop
 //!   - `tool_dispatch`     — production `StepDispatcher` wiring to `tool_host::dispatch`
+//!   - `asks`              — the operator-ask path: pure resolution reading + raise/expire wiring (#564 slice 1b)
 //!   - `audit`             — pure helpers for scheduler-emitted audit rows (spec §7)
 //!   - `crash_recovery`    — startup sweep + `task.crashed` audit row emission (spec §7)
 
 pub mod agent;
+pub mod asks;
 pub mod audit;
 pub mod crash_recovery;
 pub mod inner_loop;

@@ -20,13 +20,20 @@ use crate::scheduler::audit::{
 use self::floor::apply_floor_raise;
 pub use self::floor::ClassificationFloorSource;
 use self::invoke_expand::{expand_invoke_skill, InvokeExpansion};
-use self::summary::{render_plans_summary, PlanRecord};
+use self::summary::render_plans_summary;
+// `pub use` rather than a private import: `TaskContext::plans` is a public
+// field of this type, and the suspend/restore path
+// (`scheduler::asks::resume_state_from` / `restore_resume_state`) names it
+// directly. Without a public path it would be reachable only through the
+// leaked-type loophole.
+pub use self::summary::PlanRecord;
 // Re-exported only so the `#[cfg(test)] mod tests` below can reach these
 // `summary`-owned bounds via `use super::*`; no non-test code in this module
 // references them, hence the `cfg(test)` gate (else they read as unused).
 #[cfg(test)]
 pub(crate) use self::summary::{STEP_ERR_DETAIL_MAX, STEP_OK_SUMMARY_MAX};
 use super::agent::{AgentError, PlanFormulator};
+use super::asks;
 use super::inner_loop_audit::{
     write_audit_plan_formulate, write_audit_plan_outcome, write_audit_verdict,
 };
@@ -56,6 +63,27 @@ pub struct TaskContext {
     pub blocks: Vec<String>,
     pub plan_count: u32,
     pub max_plans: u32,
+    /// Every operator ask this task has already had answered, newest first.
+    /// Empty for a task nobody has been asked about.
+    ///
+    /// Read **once** by `runner::task_exec::run_one` before the first
+    /// formulation and threaded in here, so the `Escalate` arm compares
+    /// digests against in-memory values rather than issuing a second query
+    /// from inside the loop — and so a test can construct the decisions
+    /// without a live Postgres (spec D4).
+    ///
+    /// **A `Vec`, not an `Option`, because approvals bind to plan digests
+    /// and a task can hold several at once.** One live approval was enough
+    /// only for a task that escalates once. A task that escalates at two
+    /// different plans needs both: with only the newest kept, the earlier
+    /// plan re-asks a question the operator already answered, approving that
+    /// makes the other one stale, and the pair alternates until the ask
+    /// deadline. See `db::asks::resolved_for_task`.
+    ///
+    /// Never holds a denial in practice: `run_one` terminates a denied task
+    /// before building this context. `asks::decide` still handles that case
+    /// correctly rather than assuming it away.
+    pub resolved_asks: Vec<kastellan_db::asks::Ask>,
 }
 
 impl TaskContext {
@@ -129,17 +157,51 @@ pub enum Outcome {
     /// path). `body` carries the planner's prose `result.body` so the
     /// user-facing explanation is preserved in the audit + DB result.
     Refused { principle: u8, reason: String, body: String },
+    /// **Non-terminal.** The reviewer escalated and an operator ask was
+    /// raised; `db::asks::raise` has already moved the task to
+    /// `awaiting_operator` inside its own transaction, so the lane runner
+    /// must NOT finalize. Resolution re-enqueues the task through the
+    /// `tasks_resumed` NOTIFY and it runs again from the top.
+    AwaitingOperator { ask_id: i64 },
+    /// An operator answered a raised ask with `deny`. Terminal.
+    ///
+    /// `reason` is the ask's own `body` — the reviewer's escalation
+    /// concern, i.e. the question the operator was answering. The
+    /// operator's optional free-text note deliberately does NOT travel
+    /// here; it lives in `asks.resolution` and the `ask.resolved` audit
+    /// row (spec D10).
+    Denied { ask_id: i64, reason: String },
 }
 
 impl Outcome {
-    pub fn final_state(&self) -> &'static str {
+    /// The `tasks.state` this outcome finalizes to, or `None` when the
+    /// task has not finished.
+    ///
+    /// **An `Option` rather than a pseudo-terminal string, and that is
+    /// load-bearing.** `AwaitingOperator` is the first non-terminal
+    /// outcome the loop can return. Answering `"awaiting_operator"` here
+    /// would send it to `tasks::finalize`, which matches
+    /// `WHERE state = 'running'` — the row is already `awaiting_operator`,
+    /// so the UPDATE silently no-ops — and would then write a terminal
+    /// lifecycle row and a `task.finalize` row asserting an end that did
+    /// not happen. `Option` makes every call site say what it does with an
+    /// unfinished task, and the compiler finds them all.
+    pub fn final_state(&self) -> Option<&'static str> {
         match self {
-            Outcome::Completed(_) => "completed",
-            Outcome::Failed(_)    => "failed",
-            Outcome::Cancelled    => "cancelled",
-            Outcome::TimedOut     => "timed_out",
-            Outcome::Blocked { .. } => "blocked",
-            Outcome::Refused { .. } => "refused",
+            Outcome::Completed(_) => Some("completed"),
+            Outcome::Failed(_)    => Some("failed"),
+            Outcome::Cancelled    => Some("cancelled"),
+            Outcome::TimedOut     => Some("timed_out"),
+            Outcome::Blocked { .. } => Some("blocked"),
+            Outcome::Refused { .. } => Some("refused"),
+            // `blocked` is shared with the reviewer-detected path on
+            // purpose: a third terminal state would need a migration to
+            // widen `tasks_state_check` and would partition every existing
+            // observation query grouping on terminal states. The
+            // `ask.resolved` audit row's `choice` is what separates the two
+            // populations.
+            Outcome::Denied { .. } => Some("blocked"),
+            Outcome::AwaitingOperator { .. } => None,
         }
     }
 
@@ -154,6 +216,11 @@ impl Outcome {
                 "principle": principle,
                 "reason": reason,
                 "body": body,
+            })),
+            Outcome::Denied { ask_id, reason } => Some(serde_json::json!({
+                "kind": "denied",
+                "ask_id": ask_id,
+                "reason": reason,
             })),
             _ => None,
         }
@@ -448,6 +515,12 @@ pub async fn run_to_terminal(
 
         // Precedence (issue #23 spec §2):
         //   Verdict CB                       → Outcome::Blocked   (reviewer wins)
+        //   Escalate, no CB, no refusal      → Outcome::AwaitingOperator (#564 slice 1b),
+        //                                      unless the operator already approved
+        //                                      this exact plan, which proceeds.
+        //                                      With a refusal present the row below
+        //                                      wins — Escalate does NOT suspend a
+        //                                      refusal plan (see the arm's else).
         //   plan.refused.is_some(), no CB    → Outcome::Refused   (agent's refusal stands)
         //   plan terminal, neither           → Outcome::Completed
         //   non-terminal                     → execute steps
@@ -466,27 +539,107 @@ pub async fn run_to_terminal(
             }
             Verdict::Escalate(reason, sev) => {
                 // Same rationale as Block: a refusal plan must not loop.
-                // No channel bus in this scope — for non-refusal plans,
-                // treat as Block so the agent gets a chance to revise.
-                // The audit row above already records `verdict_kind=escalate`,
-                // but the runtime degradation (escalate → block) is invisible
-                // to anyone not reading the audit log; a warn keeps it
-                // grep-able in the daemon journal.
                 //
-                // TODO(channel-bus): when the channel-bus lands, route
-                //   the Escalate verdict to the operator channel and
-                //   await a verdict from there. The site to update is
-                //   this match arm. See HANDOVER §"channel bus".
+                // For a non-refusal plan the reviewer said a human must
+                // decide, so this raises an operator ask and suspends the
+                // task — unless the operator already approved *this exact
+                // plan*, in which case it proceeds.
                 if plan.refused.is_none() {
-                    tracing::warn!(
-                        task_id = ctx.task_id,
-                        plan_count = ctx.plan_count,
-                        severity = ?sev,
-                        reason = %reason,
-                        "Verdict::Escalate degraded to Block (channel-bus not wired)"
-                    );
-                    ctx.blocks.push(format!("escalate(no-channel): {reason}"));
-                    continue;
+                    // Digest the plan as it stands — after the floor raise,
+                    // the `data_ceiling` resolution, invoke expansion and
+                    // namespace completion — because that is what would
+                    // execute, and the replan runs the same normalisations
+                    // so the two digests are comparable.
+                    let digest = crate::cassandra::plan_digest::plan_digest(&plan);
+                    // ANY resolved ask may carry the approval, not just the
+                    // newest: a task that escalated at an earlier plan and
+                    // then at a later one holds two approvals, and this plan
+                    // is covered by whichever one names its digest.
+                    let approved = ctx.resolved_asks.iter().find(|a| {
+                        matches!(asks::decide(a, &digest), asks::AskDecision::Approved)
+                    });
+                    if let Some(approval) = approved {
+                        tracing::info!(
+                            task_id = ctx.task_id,
+                            ask_id = approval.id,
+                            plan_count = ctx.plan_count,
+                            severity = ?sev,
+                            "Verdict::Escalate covered by a resolved operator approval for this \
+                             exact plan; proceeding"
+                        );
+                        // The audit trail otherwise reads
+                        // `cassandra.verdict{kind=escalate}` → step dispatch
+                        // with nothing in between, and the digest of the plan
+                        // that RAN appears only in the much earlier
+                        // `ask.raised` row. This row is what lets a reader
+                        // show that the plan which executed is the plan that
+                        // was approved — the single property the digest
+                        // binding exists to provide.
+                        asks::emit_approval_applied(
+                            pool, approval.id, ctx.task_id, &digest,
+                        ).await;
+                        // Falls through to the refusal check below and then
+                        // to the terminal check / step execution, exactly as
+                        // an `Approve` verdict does.
+                    } else {
+                        // The run's history travels with the suspension
+                        // (spec D11). Without it the resumed task rebuilds
+                        // an EMPTY context and re-formulates every
+                        // iteration it already ran — re-executing their
+                        // steps, so an escalation the operator APPROVED
+                        // would send the same email twice.
+                        let resume_state = asks::resume_state_from(
+                            &ctx.plans, &ctx.advisories, &ctx.blocks,
+                        );
+                        match asks::raise_and_suspend(
+                            pool, ctx.task_id, &plan, reason, *sev, Some(&resume_state),
+                        )
+                        .await
+                        {
+                            Ok(ask_id) => {
+                                tracing::info!(
+                                    task_id = ctx.task_id,
+                                    ask_id,
+                                    plan_count = ctx.plan_count,
+                                    severity = ?sev,
+                                    reason = %reason,
+                                    "Verdict::Escalate raised an operator ask; task suspended"
+                                );
+                                return finish!(Outcome::AwaitingOperator { ask_id });
+                            }
+                            // Fail the task; do NOT fall back to Block.
+                            // Degrading silently is the behaviour this slice
+                            // deletes, and doing it on the one path where the
+                            // reviewer said a human must decide is the worst
+                            // place to keep it. If the ask row really was
+                            // cancelled underneath us, `finalize` is a no-op
+                            // for it anyway.
+                            //
+                            // COVERAGE, stated plainly so nobody assumes more
+                            // than there is: the *precondition* that makes this
+                            // arm fire is pinned by
+                            // `scheduler_asks_e2e::raising_against_a_task_that_is_not_running_is_an_error`
+                            // — `raise_and_suspend` really does return `Err`
+                            // rather than orphaning an ask. **This arm itself is
+                            // not exercised end-to-end**, because reaching it
+                            // through the lane runner needs the task to stop
+                            // being `running` between the claim and the review,
+                            // which no test stages. So a regression that swapped
+                            // these two lines back to `ctx.blocks.push(...);
+                            // continue` — the exact degrade #564 slice 1b deletes
+                            // — would go green. Keep the `Failed` return.
+                            Err(e) => {
+                                tracing::error!(
+                                    task_id = ctx.task_id,
+                                    error = %e,
+                                    "Verdict::Escalate could not raise an operator ask"
+                                );
+                                return finish!(Outcome::Failed(format!(
+                                    "escalation could not be raised: {e}"
+                                )));
+                            }
+                        }
+                    }
                 } else {
                     // Escalate on a refusal plan: refusal stands and no
                     // degradation happens (the loop terminates). Surface

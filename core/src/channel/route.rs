@@ -6,7 +6,7 @@
 //! (`core/src/scheduler/inner_loop.rs`). A **completed** task's result is the
 //! agent's `plan.result` — default shape `{"kind":"text","body":"..."}` — so the
 //! reply surfaces its `body` (then a `message` alias, then compact JSON for a
-//! structured result). `error`/`blocked`/`refused` carry the fixed `kind`s
+//! structured result). `error`/`blocked`/`refused`/`denied` carry the fixed `kind`s
 //! `result_payload()` stamps and map to safe, user-facing sentences. Replies go
 //! only to the *paired* user, so error detail is acceptable to surface (the
 //! recipient is the authorized operator).
@@ -52,6 +52,16 @@ pub fn reply_body(result: Option<&Value>) -> String {
         ),
         Some("refused") => str_field(result, "body")
             .unwrap_or_else(|| "I have to decline that request.".to_string()),
+        // An operator was asked to decide and said no (#564 slice 1b).
+        // Without this arm the `{"kind":"denied", …}` payload falls into
+        // the completion arm below and the user is shown raw JSON as if it
+        // were their answer. `reason` is the escalation concern the
+        // operator was answering — never their private free-text note,
+        // which `Outcome::Denied` deliberately does not carry (spec D10).
+        Some("denied") => match str_field(result, "reason") {
+            Some(reason) => format!("An operator declined that: {reason}."),
+            None => "An operator declined that request.".to_string(),
+        },
         // Anything else is a successful completion: the agent's `plan.result`,
         // whose default shape is `{"kind":"text","body":"..."}` (a custom kind is
         // also possible). Surface the human-facing `body`, then a `message` alias,
@@ -159,5 +169,37 @@ mod tests {
         assert!(blk.contains("privacy"));
         let refused = reply_body(Some(&json!({"kind":"refused","body":"No."})));
         assert_eq!(refused, "No.");
+    }
+
+    #[test]
+    fn a_denied_task_reads_as_a_refusal_not_as_an_answer() {
+        // `Outcome::Denied` stamps {"kind":"denied","ask_id":N,"reason":…}.
+        // Before this arm existed it fell into the completion branch, so a
+        // user whose task an operator DENIED was handed raw JSON presented
+        // as their answer.
+        let body = reply_body(Some(&json!({
+            "kind": "denied",
+            "ask_id": 41,
+            "reason": "sends mail to a stranger",
+        })));
+        assert!(
+            body.contains("sends mail to a stranger"),
+            "the concern the operator answered must reach the user: {body:?}",
+        );
+        assert!(!body.contains("ask_id"), "never raw JSON: {body:?}");
+        assert!(!body.contains('{'), "never raw JSON: {body:?}");
+    }
+
+    #[test]
+    fn a_denial_without_a_reason_still_reads_as_a_refusal() {
+        // Defence in depth: `Outcome::Denied` always carries `reason`, but a
+        // missing or empty one must not fall through to the completion arm
+        // and hand the user a JSON blob.
+        for r in [json!({"kind":"denied","ask_id":41}),
+                  json!({"kind":"denied","ask_id":41,"reason":"  "})] {
+            let body = reply_body(Some(&r));
+            assert!(!body.contains('{'), "never raw JSON: {body:?}");
+            assert!(body.contains("declined"), "must read as a refusal: {body:?}");
+        }
     }
 }

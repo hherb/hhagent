@@ -122,6 +122,18 @@ struct RenderedStep {
 pub struct PlanRecord {
     /// The completed plan; its `decision` labels the summary object.
     pub plan: Plan,
+    /// The raw, unscreened outcomes this record was built from. Kept so a
+    /// suspended run can be persisted and rebuilt (#564 slice 1b, D11):
+    /// `rendered` is a pure function of `(plan, outcomes)`, so persisting
+    /// the INPUTS and calling [`PlanRecord::new`] again on restore re-applies
+    /// the screen through the same code path — rather than trusting a
+    /// serialized render that arrived from storage.
+    ///
+    /// Private, with [`PlanRecord::outcomes`] as the only way out, for the
+    /// same reason `rendered` is private: a `pub` field could be pushed to
+    /// after construction, and `rendered` would then no longer describe
+    /// `outcomes`.
+    outcomes: Vec<StepOutcome>,
     /// Screened renders of `plan`'s step outcomes, one per outcome. Private:
     /// the only consumer is [`render_plans_summary`], and the screened-once
     /// invariant depends on nothing else being able to inject an unscreened
@@ -135,6 +147,9 @@ impl PlanRecord {
     /// `plan.steps[i].tool` selects the profile; a missing step (outcomes
     /// longer than steps — not expected) falls back to the fail-closed Strict
     /// default (`for_tool("")`).
+    ///
+    /// Deterministic in `(plan, outcomes)` and free of I/O, which is what
+    /// makes it safe to call again when a suspended run is restored.
     pub fn new(plan: Plan, outcomes: Vec<StepOutcome>) -> Self {
         let rendered = outcomes
             .iter()
@@ -148,7 +163,19 @@ impl PlanRecord {
                 render_step_outcome(tool, method, o)
             })
             .collect();
-        Self { plan, rendered }
+        Self { plan, outcomes, rendered }
+    }
+
+    /// The raw outcomes this record was built from, in step order.
+    ///
+    /// The one caller is the suspend path
+    /// (`scheduler::asks::resume_state_from`), which serialises `plan` and
+    /// these outcomes so the resumed run can rebuild the record with
+    /// [`PlanRecord::new`]. **Not** for building a planner prompt: these are
+    /// unscreened, and [`render_plans_summary`] is the only thing that turns
+    /// an outcome into planner-bound text.
+    pub fn outcomes(&self) -> &[StepOutcome] {
+        &self.outcomes
     }
 }
 

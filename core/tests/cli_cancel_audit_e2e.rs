@@ -610,7 +610,7 @@ fn cancel_awaiting_operator_task_writes_producer_finalize_and_ask_row() {
             "approve this plan?",
             &serde_json::json!(["approve", "deny"]),
             Some("digest-abc"),
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         )
         .await
         .expect("raise");

@@ -47,10 +47,26 @@ use task_exec::run_one;
 /// NOTIFY was lost across a listener reconnect.
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
+/// How often the expiry sweep looks for overdue operator asks.
+///
+/// Slice 1a's spec put this at daemon startup only. On a daemon that runs
+/// for weeks that is not a deadline: an unanswered ask holds its task in
+/// `awaiting_operator` until the next restart, which is the permanent wedge
+/// the deadline exists to prevent. The security half needs no sweep —
+/// `asks::resolve` and `resolve_with_nonce` both carry
+/// `AND deadline_at > now()`, so an expired nonce is dead on time
+/// regardless — but the task side does.
+const ASK_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 pub struct SchedulerHandle {
     shutdown: watch::Sender<bool>,
     pub fast: JoinHandle<()>,
     pub long: JoinHandle<()>,
+    /// The operator-ask expiry sweep (#564 slice 1b). Lane-independent —
+    /// `asks::expire_due` is a pool-wide UPDATE — so it is its own task
+    /// rather than a call inside `drain_lane`, which is the per-lane claim
+    /// hot path.
+    pub sweep: JoinHandle<()>,
 }
 
 impl SchedulerHandle {
@@ -58,6 +74,7 @@ impl SchedulerHandle {
         let _ = self.shutdown.send(true);
         let _ = self.fast.await;
         let _ = self.long.await;
+        let _ = self.sweep.await;
     }
 }
 
@@ -78,13 +95,36 @@ pub fn spawn_scheduler(
         entity_extractor.clone(), embedder.clone(),
         Lane::Fast, DEFAULT_DEADLINE_FAST_S, DEFAULT_MAX_PLANS_FAST, rx.clone(),
     ));
+    let sweep = tokio::spawn(sweep_loop(pool.clone(), rx.clone()));
     let long = tokio::spawn(lane_loop(
         pool, formulator, review, dispatcher,
         entity_extractor, embedder,
         Lane::Long, DEFAULT_DEADLINE_LONG_S, DEFAULT_MAX_PLANS_LONG, rx,
     ));
 
-    SchedulerHandle { shutdown: tx, fast, long }
+    SchedulerHandle { shutdown: tx, fast, long, sweep }
+}
+
+/// Expire overdue operator asks on a timer until shutdown.
+///
+/// A sweep error is logged and the loop continues: the next tick retries in
+/// `ASK_SWEEP_INTERVAL`, and killing this task over a transient DB error
+/// would silently disable every ask deadline for the life of the process
+/// (nothing supervises it and every unit would still report `active` — the
+/// same asymmetry the `tasks_resumed` LISTEN comment argues).
+async fn sweep_loop(pool: PgPool, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { return; }
+            }
+            _ = sleep(ASK_SWEEP_INTERVAL) => {}
+        }
+        if *shutdown.borrow() { return; }
+        if let Err(e) = super::asks::sweep_expired_and_audit(&pool).await {
+            tracing::warn!(error = %e, "operator-ask expiry sweep failed; retrying next tick");
+        }
+    }
 }
 
 // Five of the nine params are the shared scheduler dependencies
@@ -320,7 +360,20 @@ async fn drain_lane(
             &claimed, max_plans,
         ).await;
 
-        let final_state = result.outcome.final_state();
+        // A non-terminal outcome: the task suspended on an operator ask.
+        // `db::asks::raise` already moved the row to `awaiting_operator`
+        // inside its own transaction, and the `ask.raised` audit row is
+        // written where the ask is raised (`scheduler::asks::raise_and_suspend`,
+        // called from the inner loop's `Verdict::Escalate` arm). So there is
+        // nothing to finalize and no terminal lifecycle row to write here.
+        // The L1/L3 hooks below are `Outcome::Completed`-only anyway.
+        let Some(final_state) = result.outcome.final_state() else {
+            // The per-task out dir is left in place: the task resumes and
+            // `create_dir_all` is idempotent, so re-creating it costs
+            // nothing and removing it could delete a deliverable a step
+            // already wrote before the escalation.
+            continue;
+        };
         let final_result_payload = result.outcome.result_payload();
 
         // Capture `finished_at` *before* `tasks::finalize` so the
