@@ -13,6 +13,8 @@
 
 use kastellan_db::asks::Ask;
 
+use crate::scheduler::inner_loop::{PlanRecord, StepOutcome};
+
 /// The answers a `plan_approval` ask offers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Choice {
@@ -117,6 +119,133 @@ pub fn deadline_from_env() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// The suspended run's state: serialise at suspend, restore at resume.
+//
+// Pure and I/O-free, so the round trip is unit-testable without Postgres —
+// which matters because the only other way to reach it is a PG e2e.
+// ---------------------------------------------------------------------------
+
+/// What a resumed run gets back from its ask's `resume_state`.
+///
+/// A struct rather than a `(Vec<PlanRecord>, Vec<String>, Vec<String>)`
+/// tuple: `advisories` and `blocks` have the same type, so a tuple lets a
+/// call site swap them silently — and the swap would feed the planner
+/// blocked-content notices as advice and vice versa.
+#[derive(Debug, Default)]
+pub struct RestoredRun {
+    /// The completed plans of the suspended run, oldest first — rebuilt by
+    /// calling `PlanRecord::new` on the stored inputs, so the sink screen is
+    /// re-applied here rather than trusted from storage.
+    pub plans: Vec<PlanRecord>,
+    /// Reviewer advisories accumulated before the suspension.
+    pub advisories: Vec<String>,
+    /// Reviewer block notices accumulated before the suspension.
+    pub blocks: Vec<String>,
+}
+
+/// Serialise a live run's history for storage on the ask that suspends it
+/// (#564 slice 1b, D11).
+///
+/// Shape:
+/// `{"plans": [{"plan": <Plan>, "outcomes": [<StepOutcome>]}],
+///   "advisories": [<String>], "blocks": [<String>]}`.
+///
+/// **The inputs to `PlanRecord::new`, never its renders.** A `PlanRecord`
+/// also holds the screened, planner-bound render of each outcome, and that
+/// render is a pure function of `(plan, outcomes)`. Storing the inputs and
+/// re-running the constructor on restore means the screen is applied by the
+/// same code path both times; storing the render would mean a resumed run
+/// putting text from the database straight into a planner prompt on the
+/// word of whatever wrote that row.
+///
+/// `advisories` and `blocks` travel too because they are reviewer feedback
+/// the run already earned. Dropping them would let the resumed planner
+/// repeat a mistake the reviewer had already corrected.
+pub fn resume_state_from(
+    plans: &[PlanRecord],
+    advisories: &[String],
+    blocks: &[String],
+) -> serde_json::Value {
+    let plans: Vec<serde_json::Value> = plans
+        .iter()
+        .map(|p| serde_json::json!({"plan": p.plan, "outcomes": p.outcomes()}))
+        .collect();
+    serde_json::json!({
+        "plans": plans,
+        "advisories": advisories,
+        "blocks": blocks,
+    })
+}
+
+/// Rebuild a run's history from what [`resume_state_from`] wrote.
+///
+/// **Anything unrecognised restores as empty rather than erroring**, and
+/// that asymmetry is deliberate: a lost history costs the task a replay of
+/// steps it already ran, while a failed restore would throw away the
+/// operator's decision entirely and make them answer the question again.
+/// `None` — an ask raised before migration 0024, or one that binds to no
+/// run — takes the same path.
+///
+/// `plans` is **all-or-nothing**: if any entry fails to decode, the whole
+/// list is dropped. A partial list would misrepresent the order and count
+/// of what the run did — telling the planner it went straight from plan 1
+/// to plan 3 — which is a worse input than an honest empty history.
+/// `advisories` and `blocks` are independent of it and of each other, and
+/// each keeps only the string elements of an array.
+pub fn restore_resume_state(value: Option<&serde_json::Value>) -> RestoredRun {
+    let Some(obj) = value.and_then(serde_json::Value::as_object) else {
+        return RestoredRun::default();
+    };
+
+    let plans = obj
+        .get("plans")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|e| {
+                    let plan: Plan = serde_json::from_value(e.get("plan")?.clone()).ok()?;
+                    let outcomes: Vec<StepOutcome> =
+                        serde_json::from_value(e.get("outcomes")?.clone()).ok()?;
+                    Some(PlanRecord::new(plan, outcomes))
+                })
+                // Collecting into `Option<Vec<_>>` short-circuits on the
+                // first `None`, which is the all-or-nothing rule above.
+                .collect::<Option<Vec<PlanRecord>>>()
+        })
+        .unwrap_or_default();
+
+    if plans.is_none() {
+        tracing::warn!(
+            "an ask's resume_state carried a plan history that would not decode; \
+             restoring an empty history, so the resumed task may re-run steps it \
+             already ran"
+        );
+    }
+
+    RestoredRun {
+        plans: plans.unwrap_or_default(),
+        advisories: string_list(obj.get("advisories")),
+        blocks: string_list(obj.get("blocks")),
+    }
+}
+
+/// The string elements of a JSON array; empty for anything else. Non-string
+/// elements are skipped rather than voiding the list — these are
+/// presentation-only reviewer notes, and one odd entry is not a reason to
+/// drop the rest of the feedback.
+fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // Async half: raising an ask (and suspending its task), and sweeping asks
 // past their deadline. Both are thin wiring over `db::asks` plus the
 // best-effort audit rows this slice adds.
@@ -157,12 +286,19 @@ use super::audit::{
 /// That is deliberate: the digest must cover what would execute, and the
 /// same normalisations run again on the replan, so the two digests are
 /// comparable.
+///
+/// `resume_state` is the suspended run's history, from
+/// [`resume_state_from`], stored on the ask so the resumed task does not
+/// re-formulate — and re-execute — iterations it already ran (#564 slice
+/// 1b, D11). `None` means "no history to carry", which is what a run that
+/// escalated on its very first plan honestly has.
 pub async fn raise_and_suspend(
     pool: &PgPool,
     task_id: i64,
     plan: &Plan,
     concern: &str,
     severity: Severity,
+    resume_state: Option<&serde_json::Value>,
 ) -> Result<i64, DbError> {
     let digest = plan_digest(plan);
     let deadline_at = OffsetDateTime::now_utc() + Duration::seconds(deadline_from_env());
@@ -175,6 +311,7 @@ pub async fn raise_and_suspend(
         &serde_json::json!(["approve", "deny"]),
         Some(&digest),
         deadline_at,
+        resume_state,
     )
     .await?;
 
@@ -388,7 +525,171 @@ mod tests {
             resolved_at: Some(OffsetDateTime::now_utc()),
             resolved_by: Some("operator".to_string()),
             resolution,
+            resume_state: None,
         }
+    }
+
+    /// A one-step plan whose step names `tool`, so a restored record's
+    /// screen can be shown to run under the right guard profile.
+    fn plan_with_tool(tool: &str) -> Plan {
+        Plan {
+            context: "c".to_string(),
+            decision: "act".to_string(),
+            rationale: "r".to_string(),
+            steps: vec![crate::cassandra::types::PlannedStep {
+                tool: tool.to_string(),
+                method: "m".to_string(),
+                parameters: serde_json::json!({"n": 1}),
+                returns: "x".to_string(),
+                done_when: "x".to_string(),
+                classification: crate::cassandra::types::DataClass::Public,
+            }],
+            result: None,
+            data_ceiling: Some(crate::cassandra::types::DataClass::Public),
+            refused: None,
+            floor_request: None,
+            l1_insight: None,
+            l3_skill: None,
+            invoke_skill: None,
+            python_skill: None,
+        }
+    }
+
+    #[test]
+    fn a_run_round_trips_through_its_serialized_resume_state() {
+        let plans = vec![
+            PlanRecord::new(
+                plan_with_tool("mail"),
+                vec![StepOutcome::Ok(serde_json::json!({"sent": true}))],
+            ),
+            PlanRecord::new(
+                plan_with_tool("shell"),
+                vec![StepOutcome::Err {
+                    code: "E".to_string(),
+                    detail: "boom".to_string(),
+                }],
+            ),
+        ];
+        let advisories = vec!["watch the tone".to_string()];
+        let blocks = vec!["no shell".to_string()];
+
+        let restored =
+            restore_resume_state(Some(&resume_state_from(&plans, &advisories, &blocks)));
+
+        assert_eq!(restored.plans.len(), 2, "both plans come back, in order");
+        assert_eq!(restored.plans[0].plan, plans[0].plan);
+        assert_eq!(restored.plans[1].plan, plans[1].plan);
+        assert_eq!(restored.plans[0].outcomes().len(), 1);
+        assert_eq!(restored.plans[1].outcomes().len(), 1);
+        assert!(restored.plans[1].outcomes()[0].is_err(), "the error outcome survives as one");
+        // Reviewer feedback carries: without it the resumed planner repeats
+        // mistakes the reviewer already corrected.
+        assert_eq!(restored.advisories, advisories);
+        assert_eq!(restored.blocks, blocks);
+    }
+
+    #[test]
+    fn an_empty_run_round_trips_as_an_empty_run() {
+        let restored = restore_resume_state(Some(&resume_state_from(&[], &[], &[])));
+        assert!(restored.plans.is_empty());
+        assert!(restored.advisories.is_empty());
+        assert!(restored.blocks.is_empty());
+    }
+
+    #[test]
+    fn the_serialized_shape_is_the_inputs_to_plan_record_new() {
+        // Pinned because migration 0024's comment, the spec, and any future
+        // reader of a live `asks.resume_state` all describe THIS shape. It
+        // stores `plan` + `outcomes` — the constructor's inputs — and never
+        // a screened render.
+        let v = resume_state_from(
+            &[PlanRecord::new(
+                plan_with_tool("mail"),
+                vec![StepOutcome::Ok(serde_json::json!("done"))],
+            )],
+            &["a".to_string()],
+            &["b".to_string()],
+        );
+        let entry = &v["plans"][0];
+        assert!(entry.get("plan").is_some(), "the plan itself is stored");
+        assert!(entry.get("outcomes").is_some(), "so are its raw outcomes");
+        assert!(
+            entry.get("rendered").is_none(),
+            "a screened render must never be persisted; the restore re-screens instead",
+        );
+        assert_eq!(v["advisories"], serde_json::json!(["a"]));
+        assert_eq!(v["blocks"], serde_json::json!(["b"]));
+    }
+
+    #[test]
+    fn a_missing_or_malformed_resume_state_restores_as_empty_rather_than_failing() {
+        // Absent: an ask raised before migration 0024, or one that binds to
+        // no run at all.
+        for (label, value) in [
+            ("absent", None),
+            ("not an object", Some(serde_json::json!("nope"))),
+            ("null", Some(serde_json::json!(null))),
+            ("an empty object", Some(serde_json::json!({}))),
+            ("plans is not an array", Some(serde_json::json!({"plans": 7}))),
+            (
+                "an entry missing its plan",
+                Some(serde_json::json!({"plans": [{"outcomes": []}]})),
+            ),
+            (
+                "an entry missing its outcomes",
+                Some(serde_json::json!({"plans": [{"plan": {"decision": "act"}}]})),
+            ),
+            (
+                "a plan that is not a Plan",
+                Some(serde_json::json!({"plans": [{"plan": "act", "outcomes": []}]})),
+            ),
+        ] {
+            let restored = restore_resume_state(value.as_ref());
+            assert!(
+                restored.plans.is_empty(),
+                "{label}: an unusable resume_state must restore as an empty history, never                  fail the task — a lost history costs a replay, a failed task costs the                  operator's decision",
+            );
+        }
+    }
+
+    #[test]
+    fn one_undecodable_plan_drops_the_whole_history_rather_than_reordering_it() {
+        // All-or-nothing: keeping plan 2 while dropping plan 1 would tell the
+        // planner it went straight from the first plan to the third.
+        let good = serde_json::json!({"plan": {
+            "context": "c", "decision": "act", "rationale": "r", "steps": [],
+            "result": null, "data_ceiling": "Public", "refused": null,
+            "floor_request": null, "l1_insight": null, "l3_skill": null,
+            "invoke_skill": null, "python_skill": null
+        }, "outcomes": []});
+        let v = serde_json::json!({
+            "plans": [good, {"plan": 7, "outcomes": []}],
+            "advisories": ["kept"],
+            "blocks": [],
+        });
+        let restored = restore_resume_state(Some(&v));
+        assert!(restored.plans.is_empty(), "one bad entry drops the list");
+        assert_eq!(
+            restored.advisories,
+            vec!["kept".to_string()],
+            "advisories are independent of the plan list and still carry",
+        );
+    }
+
+    #[test]
+    fn advisories_and_blocks_tolerate_junk_without_taking_each_other_down() {
+        let v = serde_json::json!({
+            "plans": [],
+            "advisories": ["ok", 7, null],
+            "blocks": "not an array",
+        });
+        let restored = restore_resume_state(Some(&v));
+        assert_eq!(
+            restored.advisories,
+            vec!["ok".to_string()],
+            "non-string entries are skipped, the strings are kept",
+        );
+        assert!(restored.blocks.is_empty(), "a non-array field yields nothing");
     }
 
     #[test]

@@ -93,6 +93,72 @@ impl ReviewStage for EscalatingReview {
     }
 }
 
+/// Plays a fixed list of verdicts, one per review, then approves forever.
+///
+/// [`EscalatingReview`] can only escalate the FIRST n plans, which cannot
+/// stage the case D11 is about: a run that COMPLETES a plan (executing its
+/// steps) and escalates on a later one. That is the only shape in which a
+/// suspension has any history to carry.
+struct ScriptedReview {
+    verdicts: Mutex<std::collections::VecDeque<Verdict>>,
+}
+
+#[async_trait]
+impl ReviewStage for ScriptedReview {
+    fn name(&self) -> &str {
+        "scripted"
+    }
+
+    async fn review(&self, _plan: &Plan, _ctx: &ReviewStageContext<'_>) -> Verdict {
+        self.verdicts.lock().unwrap().pop_front().unwrap_or(Verdict::Approve)
+    }
+}
+
+/// Records `ctx.plans.len()` on every call, and picks its plan from that
+/// same number.
+///
+/// The recorded sequence is the assertion D11 actually earns: a resumed run
+/// must formulate against the history it already had, not against an empty
+/// one. Keying the plan off `ctx.plans.len()` (rather than a call counter)
+/// also means a run that restored its history walks FORWARD from where it
+/// stopped instead of re-deriving the plans it already ran.
+struct HistoryRecordingFormulator {
+    /// One entry per `formulate_plan` call: the number of completed plans
+    /// the context carried at that moment.
+    seen: Arc<Mutex<Vec<usize>>>,
+}
+
+#[async_trait]
+impl PlanFormulator for HistoryRecordingFormulator {
+    async fn formulate_plan(
+        &self,
+        ctx: &TaskContext,
+    ) -> Result<(Plan, FormulationMeta), AgentError> {
+        let n = ctx.plans.len();
+        self.seen.lock().unwrap().push(n);
+        let plan = match n {
+            0 => one_step_plan_with_param(1),
+            1 => one_step_plan_with_param(2),
+            _ => task_complete_plan("ok"),
+        };
+        Ok((plan, test_meta()))
+    }
+}
+
+/// Records the `parameters` of every step it is asked to dispatch, so a
+/// test can see whether a step ran twice.
+struct RecordingDispatcher {
+    dispatched: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait]
+impl StepDispatcher for RecordingDispatcher {
+    async fn dispatch_step(&self, _task_id: i64, step: &PlannedStep) -> StepOutcome {
+        self.dispatched.lock().unwrap().push(step.parameters.clone());
+        StepOutcome::Ok(serde_json::json!("done"))
+    }
+}
+
 /// Returns `StepOutcome::Ok` for every step without doing anything. None
 /// of these tests reaches step execution on purpose; this exists so the
 /// scheduler can be built.
@@ -135,15 +201,19 @@ impl PlanFormulator for TestFormulator {
     }
 }
 
-/// A formulator whose plan depends on the plan's INDEX WITHIN THE CURRENT
-/// RUN — `ctx.plans.len()` — rather than on a call counter.
+/// A formulator whose plan depends on the plan's INDEX WITHIN THE RUN —
+/// `ctx.plans.len()` — rather than on a call counter.
 ///
-/// That distinction is the whole test. `run_one` starts every resumed run
-/// with `plans: vec![]`, so index 0 is plan A and index 1 is plan B on every
-/// single run, and a resumed task re-derives the *same two digests* it
-/// escalated on before. A call counter (what `TestFormulator { vary: true }`
-/// uses) instead produces a brand-new digest every time, which is the
-/// separate "a different replan re-escalates" case.
+/// That distinction is the whole test. Keying on the index makes the
+/// digests STABLE: the index-0 plan is always plan A and the index-1 plan is
+/// always plan B, so a run that resumes at index 1 re-derives exactly the
+/// plan it was suspended on — the one whose steps never ran — and its
+/// digest matches the approval. A call counter (what
+/// `TestFormulator { vary: true }` uses) instead produces a brand-new digest
+/// every time, which is the separate "a different replan re-escalates" case.
+///
+/// Since D11 a resumed run restores the plans it already completed, so it
+/// starts at the index it stopped at rather than back at 0.
 ///
 /// Index >= 2 returns a terminal plan so the task can actually finish once
 /// both escalations are covered.
@@ -301,6 +371,34 @@ fn spawn_test_scheduler_per_run_index(
     review: Arc<ChainReviewStage>,
 ) -> SchedulerHandle {
     spawn_with(pool, Arc::new(PerRunIndexFormulator), review)
+}
+
+/// Spawn with a history-recording formulator and a step-recording
+/// dispatcher, returning both records.
+#[allow(clippy::type_complexity)]
+fn spawn_test_scheduler_recording_history(
+    pool: &sqlx::PgPool,
+    review: Arc<ChainReviewStage>,
+) -> (SchedulerHandle, Arc<Mutex<Vec<usize>>>, Arc<Mutex<Vec<serde_json::Value>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let dispatched = Arc::new(Mutex::new(Vec::new()));
+    let handle = spawn_scheduler(
+        pool.clone(),
+        Arc::new(HistoryRecordingFormulator { seen: Arc::clone(&seen) }),
+        review,
+        Arc::new(RecordingDispatcher { dispatched: Arc::clone(&dispatched) }),
+        Arc::new(kastellan_core::entity_extraction::NoOpEntityExtractor::new()),
+        Arc::new(NoOpEmbedder::new()),
+    );
+    (handle, seen, dispatched)
+}
+
+/// A reviewer chain of one [`ScriptedReview`] playing `verdicts` in order,
+/// then approving.
+fn scripted(verdicts: Vec<Verdict>) -> Arc<ChainReviewStage> {
+    Arc::new(ChainReviewStage::new(vec![Arc::new(ScriptedReview {
+        verdicts: Mutex::new(verdicts.into()),
+    })]))
 }
 
 /// A reviewer chain of one [`EscalatingReview`].
@@ -490,11 +588,16 @@ async fn two_escalations_at_two_plans_both_approved_finish_the_task() {
     let task_id = seed_task(&pool).await;
 
     // Plan A, then plan B, then a terminal plan — keyed on the index within
-    // the run, so each resume replays the same two digests. The reviewer
-    // escalates the first five plans it sees, which is exactly the five
-    // non-terminal reviews across the three runs (1 + 2 + 2); the sixth,
-    // the terminal plan on the last run, is approved so the task can end.
-    let handle = spawn_test_scheduler_per_run_index(&pool, escalating(5));
+    // the run, so each run re-derives the plan it was suspended on. The
+    // reviewer escalates the first four plans it sees, which is exactly the
+    // four non-terminal reviews across the three runs (1 + 2 + 1); the
+    // fifth, the terminal plan on the last run, is approved so the task can
+    // end.
+    //
+    // The third run reviews ONE non-terminal plan rather than two because it
+    // restores the completed plan A (spec D11) and resumes at plan B instead
+    // of re-deriving plan A. Before D11 this number was 5.
+    let handle = spawn_test_scheduler_per_run_index(&pool, escalating(4));
 
     // --- first escalation: plan A.
     assert_eq!(
@@ -548,11 +651,15 @@ async fn two_escalations_at_two_plans_both_approved_finish_the_task() {
         "one ask per escalation and no more — a third means the earlier approval \
          went invisible when the later one landed",
     );
-    // Both approvals were actually consulted on the final run, not just one.
+    // Both approvals were actually consulted — each exactly once, on the run
+    // that reached its plan. (Before D11 this was 3: the third run restarted
+    // from an empty history, re-derived plan A, and re-applied plan A's
+    // approval on the way back to plan B — re-running plan A's steps with
+    // it.)
     assert_eq!(
         count_audit_rows(&pool, ACTION_ASK_APPROVAL_APPLIED, task_id).await,
-        3,
-        "plan A on the second run, then plan A and plan B on the third",
+        2,
+        "plan A on the second run, plan B on the third",
     );
 
     handle.shutdown().await;
@@ -635,6 +742,93 @@ async fn a_different_replan_raises_a_second_ask_rather_than_riding_the_first_app
         count_asks_for(&pool, task_id).await,
         2,
         "an approval binds to a digest, not to a task",
+    );
+
+    handle.shutdown().await;
+}
+
+/// The resumed run formulates against the history it had at suspend time,
+/// not against an empty one (spec D11).
+///
+/// **What this proves, exactly.** The scripted run completes plan 1 (its
+/// step is dispatched), escalates on plan 2, and suspends. Before D11 the
+/// resumed run rebuilt `TaskContext` with `plans: vec![]`, so the
+/// formulator saw zero completed plans and re-derived plan 1 — dispatching
+/// its step a second time. If plan 1 had sent an email, the operator's
+/// approval would have sent it twice.
+///
+/// The assertion is the recorded `ctx.plans.len()` sequence: `[0, 1, 1, 2]`
+/// with the restore, `[0, 1, 0, 1, 2]` without it. The third entry is the
+/// first call of the resumed run, and it is the one that matters.
+///
+/// **What this does NOT prove.** Restoring the history makes the planner
+/// *aware* of what it already did; it does not make re-execution
+/// impossible. A planner that re-emits an identical step still dispatches
+/// it. The dispatch assertion below holds because THIS formulator keys on
+/// the history — it is a consequence of the restore, not an independent
+/// idempotency guarantee, which is out of scope (spec D11, "What this does
+/// NOT claim").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_run_formulates_against_the_history_it_had_at_suspend_time() {
+    let Some((pool, _cluster)) = bring_up_pg("history").await else {
+        return; // [SKIP]
+    };
+    let task_id = seed_task(&pool).await;
+
+    // Approve plan 1 so its step actually runs, then escalate on plan 2 so
+    // the suspension has a non-empty history to carry. Everything after is
+    // approved, so the resumed run is free to walk forward.
+    let (handle, seen, dispatched) = spawn_test_scheduler_recording_history(
+        &pool,
+        scripted(vec![
+            Verdict::Approve,
+            Verdict::Escalate("needs a human".to_string(), Severity::High),
+        ]),
+    );
+
+    assert_eq!(
+        await_state(&pool, task_id, "awaiting_operator", 20).await,
+        "awaiting_operator",
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![0, 1],
+        "the pre-suspension run formulated twice: once with no history, once with plan 1          completed",
+    );
+
+    // The suspension carries that history on the ask itself.
+    let ask = kastellan_db::asks::list_pending(&pool, 10).await.expect("list")[0].clone();
+    let carried = ask.resume_state.as_ref().expect("the ask carries the run's state");
+    assert_eq!(
+        carried["plans"].as_array().map(Vec::len),
+        Some(1),
+        "one completed plan travels with the suspension, got {carried}",
+    );
+
+    assert!(kastellan_db::asks::resolve(
+        &pool,
+        ask.id,
+        "operator",
+        &serde_json::json!({"choice": "approve"}),
+    )
+    .await
+    .expect("resolve"));
+
+    assert_eq!(await_state(&pool, task_id, "completed", 30).await, "completed");
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![0, 1, 1, 2],
+        "the resumed run's FIRST formulation must see the one plan the task had already          completed; a leading 0 there means it started from an empty history and          re-formulated work it had already done",
+    );
+
+    // The consequence that makes the property worth having: plan 1's step
+    // ran once across the whole task, not once per run.
+    let params = dispatched.lock().unwrap().clone();
+    assert_eq!(
+        params.iter().filter(|p| *p == &serde_json::json!({"n": 1})).count(),
+        1,
+        "plan 1's step must not be dispatched again on the resumed run, got {params:?}",
     );
 
     handle.shutdown().await;

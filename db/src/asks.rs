@@ -77,6 +77,16 @@ pub struct Ask {
     pub resolved_at: Option<OffsetDateTime>,
     pub resolved_by: Option<String>,
     pub resolution: Option<serde_json::Value>,
+    /// The suspended run's plan history and reviewer feedback, as written
+    /// by the scheduler at suspend time (#564 slice 1b, D11). `None` for an
+    /// ask that carries no run state — an ask raised before migration 0024,
+    /// or a future kind that binds to no run.
+    ///
+    /// Opaque here on purpose: this crate stores and returns the value and
+    /// never interprets it. Its shape is `core::scheduler::asks`'s
+    /// business, and that module restores an empty history from anything it
+    /// does not recognise rather than failing the task.
+    pub resume_state: Option<serde_json::Value>,
 }
 
 /// A correlation nonce in plaintext: the unforgeable capability to
@@ -218,11 +228,14 @@ fn decode_ask_row(row: &PgRow) -> Result<Ask, DbError> {
             .map_err(|e| DbError::Query(format!("decode asks.resolved_by: {e}")))?,
         resolution: row.try_get("resolution")
             .map_err(|e| DbError::Query(format!("decode asks.resolution: {e}")))?,
+        resume_state: row.try_get("resume_state")
+            .map_err(|e| DbError::Query(format!("decode asks.resume_state: {e}")))?,
     })
 }
 
 const ASK_COLUMNS: &str = "id, task_id, kind, body, options, plan_digest, state, \
-                           created_at, deadline_at, resolved_at, resolved_by, resolution";
+                           created_at, deadline_at, resolved_at, resolved_by, resolution, \
+                           resume_state";
 
 /// Raise an ask against a **running** task and suspend that task.
 ///
@@ -253,6 +266,17 @@ const ASK_COLUMNS: &str = "id, task_id, kind, body, options, plan_digest, state,
 ///
 /// `plan_digest` is `Some` for kinds that bind to a plan and `None`
 /// otherwise; see `core::cassandra::plan_digest` for what the value means.
+///
+/// `resume_state` is the caller's opaque record of the run being suspended
+/// (#564 slice 1b, D11) — stored verbatim, never interpreted here. Pass
+/// `None` when there is no run state to carry; the resume then restores an
+/// empty history, which is what every ask raised before migration 0024
+/// does.
+// One argument per column this INSERT writes. A params struct would move
+// the same fields behind a name without making any call site clearer, and
+// would put a second place to keep in sync with the table. Same posture as
+// `core::scheduler::runner`'s spawn helpers.
+#[allow(clippy::too_many_arguments)]
 pub async fn raise(
     pool: &PgPool,
     task_id: i64,
@@ -261,6 +285,7 @@ pub async fn raise(
     options: &serde_json::Value,
     plan_digest: Option<&str>,
     deadline_at: OffsetDateTime,
+    resume_state: Option<&serde_json::Value>,
 ) -> Result<RaisedAsk, DbError> {
     let nonce = generate_nonce();
     let nonce_hash = sha256_hex(&nonce);
@@ -289,8 +314,9 @@ pub async fn raise(
     }
 
     let row = sqlx::query(
-        "INSERT INTO asks (task_id, kind, body, options, plan_digest, nonce_sha256, deadline_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+        "INSERT INTO asks \
+           (task_id, kind, body, options, plan_digest, nonce_sha256, deadline_at, resume_state) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          RETURNING id",
     )
     .bind(task_id)
@@ -300,6 +326,7 @@ pub async fn raise(
     .bind(plan_digest)
     .bind(&nonce_hash)
     .bind(deadline_at)
+    .bind(resume_state)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| DbError::Query(format!("asks raise insert: {e}")))?;

@@ -189,6 +189,34 @@ pub(super) async fn run_one(
 
     let (start_plan_count, max_plans_for_run) = resume_budget(task.plan_count, max_plans_override);
 
+    // Restore the run this task was suspended in the middle of (spec D11).
+    //
+    // The state rides on the ask that suspended it, and `resolved_asks` is
+    // newest-first, so `[0]` is the suspension the operator most recently
+    // answered — the one whose history is current. A task that never
+    // suspended has no resolved asks and restores nothing, which is the same
+    // empty context a first run has always had.
+    //
+    // Without this the resumed task re-formulates every iteration it already
+    // ran and dispatches their steps a second time: plan 1 sends an email,
+    // plan 2 escalates, the operator approves, and the email goes out again
+    // — a duplicate side effect caused *by* the human oversight step.
+    //
+    // What it does NOT do is make re-execution impossible. A planner that
+    // re-emits an identical step still dispatches it; the guarantee is that
+    // the planner has the information not to, exactly as it does between two
+    // ordinary iterations of the same run.
+    let restored = crate::scheduler::asks::restore_resume_state(
+        resolved_asks.first().and_then(|a| a.resume_state.as_ref()),
+    );
+    if !restored.plans.is_empty() {
+        tracing::info!(
+            task_id = task.id,
+            plans = restored.plans.len(),
+            "resuming a suspended task with the plan history it had at suspend time",
+        );
+    }
+
     let ctx = TaskContext {
         task_id: task.id,
         lane: task.lane,
@@ -196,9 +224,9 @@ pub(super) async fn run_one(
         classification_floor,
         classification_floor_source,
         classification_floor_signals,
-        plans: vec![],
-        advisories: vec![],
-        blocks: vec![],
+        plans: restored.plans,
+        advisories: restored.advisories,
+        blocks: restored.blocks,
         plan_count: start_plan_count,
         max_plans: max_plans_for_run,
         resolved_asks,
@@ -418,6 +446,7 @@ mod tests {
             resolved_at: Some(OffsetDateTime::now_utc()),
             resolved_by: Some("operator".to_string()),
             resolution: Some(serde_json::json!({"choice": choice})),
+            resume_state: None,
         }
     }
 

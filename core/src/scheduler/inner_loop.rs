@@ -20,7 +20,13 @@ use crate::scheduler::audit::{
 use self::floor::apply_floor_raise;
 pub use self::floor::ClassificationFloorSource;
 use self::invoke_expand::{expand_invoke_skill, InvokeExpansion};
-use self::summary::{render_plans_summary, PlanRecord};
+use self::summary::render_plans_summary;
+// `pub use` rather than a private import: `TaskContext::plans` is a public
+// field of this type, and the suspend/restore path
+// (`scheduler::asks::resume_state_from` / `restore_resume_state`) names it
+// directly. Without a public path it would be reachable only through the
+// leaked-type loophole.
+pub use self::summary::PlanRecord;
 // Re-exported only so the `#[cfg(test)] mod tests` below can reach these
 // `summary`-owned bounds via `use super::*`; no non-test code in this module
 // references them, hence the `cfg(test)` gate (else they read as unused).
@@ -576,7 +582,19 @@ pub async fn run_to_terminal(
                         // to the terminal check / step execution, exactly as
                         // an `Approve` verdict does.
                     } else {
-                        match asks::raise_and_suspend(pool, ctx.task_id, &plan, reason, *sev).await
+                        // The run's history travels with the suspension
+                        // (spec D11). Without it the resumed task rebuilds
+                        // an EMPTY context and re-formulates every
+                        // iteration it already ran — re-executing their
+                        // steps, so an escalation the operator APPROVED
+                        // would send the same email twice.
+                        let resume_state = asks::resume_state_from(
+                            &ctx.plans, &ctx.advisories, &ctx.blocks,
+                        );
+                        match asks::raise_and_suspend(
+                            pool, ctx.task_id, &plan, reason, *sev, Some(&resume_state),
+                        )
+                        .await
                         {
                             Ok(ask_id) => {
                                 tracing::info!(

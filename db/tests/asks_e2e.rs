@@ -127,7 +127,7 @@ fn raise_suspends_the_task_and_releases_the_lease() {
         let too_early = asks::raise(
             &pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve", "deny"]), Some("digest0"),
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(60),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(60), None,
         ).await;
         assert!(
             too_early.is_err(),
@@ -151,7 +151,7 @@ fn raise_suspends_the_task_and_releases_the_lease() {
         let raised = asks::raise(
             &pool, task_id, "plan_approval", "approve this plan?",
             &serde_json::json!(["approve", "deny"]), Some("digest1"),
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(60),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(60), None,
         ).await.expect("raise");
 
         // The task is suspended AND its lease is released. The lease matters:
@@ -176,9 +176,17 @@ fn raise_suspends_the_task_and_releases_the_lease() {
             &pool, Lane::Fast, serde_json::json!({"instruction": "second"}),
         ).await.unwrap();
         tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
+        // This one also carries a `resume_state` (migration 0024): the
+        // suspended run's history, stored verbatim and never interpreted by
+        // this crate.
+        let run_state = serde_json::json!({
+            "plans": [{"plan": {"decision": "act"}, "outcomes": ["ok"]}],
+            "advisories": ["mind the tone"],
+            "blocks": [],
+        });
         let raised2 = asks::raise(
             &pool, t2, "plan_approval", "b", &serde_json::json!(["approve"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(60),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(60), Some(&run_state),
         ).await.expect("raise 2");
         assert_ne!(raised.nonce.expose(), raised2.nonce.expose());
 
@@ -189,6 +197,18 @@ fn raise_suspends_the_task_and_releases_the_lease() {
         assert_eq!(got.state, "pending");
         assert_eq!(got.plan_digest.as_deref(), Some("digest1"));
         assert!(got.resolved_at.is_none());
+        assert!(
+            got.resume_state.is_none(),
+            "an ask raised with no run state reads back NULL, not an empty object —              the restore side treats both as 'no history', but only NULL says the              caller never had any",
+        );
+
+        // The JSONB round-trips byte-for-byte in VALUE terms: whatever the
+        // scheduler serialised at suspend time is what the resume reads.
+        let got2 = asks::get(&pool, raised2.ask_id).await.unwrap().unwrap();
+        assert_eq!(
+            got2.resume_state.as_ref(), Some(&run_state),
+            "resume_state must round-trip unchanged; the resume restores the run from it",
+        );
 
         // A suspended task is invisible to the lane runner and the sweep.
         assert!(
@@ -246,7 +266,7 @@ fn resolve_is_exactly_once_and_re_enqueues_the_task() {
         let raised = asks::raise(
             &pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve", "deny"]), Some("digest1"),
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         // First responder wins.
@@ -367,7 +387,7 @@ fn expire_due_fails_the_task_closed_and_leaves_others_alone() {
         let stale = asks::raise(
             &pool, stale_task, "plan_approval", "approve?",
             &serde_json::json!(["approve"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(3600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(3600), None,
         ).await.unwrap();
 
         let stale_task2 = tasks::insert_pending(
@@ -377,7 +397,7 @@ fn expire_due_fails_the_task_closed_and_leaves_others_alone() {
         let stale2 = asks::raise(
             &pool, stale_task2, "plan_approval", "approve?",
             &serde_json::json!(["approve"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(3600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(3600), None,
         ).await.unwrap();
 
         // Backdate BOTH columns: `asks_deadline_after_created` rejects a
@@ -401,7 +421,7 @@ fn expire_due_fails_the_task_closed_and_leaves_others_alone() {
         let fresh = asks::raise(
             &pool, fresh_task, "plan_approval", "approve?",
             &serde_json::json!(["approve"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(3600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(3600), None,
         ).await.unwrap();
 
         let mut expired = asks::expire_due(&pool).await.unwrap();
@@ -492,7 +512,7 @@ fn cancelling_a_suspended_task_cancels_its_ask() {
         let raised = asks::raise(
             &pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         // Without the widening, awaiting_operator would be a state from
@@ -605,7 +625,7 @@ fn resolving_fires_tasks_resumed_and_pending_asks_are_listable() {
         let raised = asks::raise(
             &pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve"]), Some("d1"),
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         // list_pending surfaces it for an operator inbox.
@@ -687,7 +707,7 @@ fn resolve_with_nonce_succeeds_and_re_enqueues_the_task() {
         let raised = asks::raise(
             &pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve", "deny"]), Some("digest1"),
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         let won = asks::resolve_with_nonce(
@@ -749,7 +769,7 @@ fn resolve_with_nonce_rejects_a_wrong_nonce_and_leaves_the_ask_pending() {
         let raised = asks::raise(
             &pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve", "deny"]), Some("digest1"),
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         // Syntactically valid — 64 lowercase hex chars, the exact shape a
@@ -826,7 +846,7 @@ fn resolve_with_nonce_on_an_already_resolved_ask_returns_false() {
         let raised = asks::raise(
             &pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve", "deny"]), Some("digest1"),
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         let first = asks::resolve_with_nonce(
@@ -1018,6 +1038,28 @@ fn asks_table_grants_match_the_runtime_role_contract() {
             .await
             .expect("UPDATE asks under runtime role");
 
+        // `resume_state` (migration 0024) is reachable under the same role
+        // WITHOUT a grant of its own. That is the property being pinned:
+        // 0023 granted SELECT/INSERT/UPDATE on the TABLE, and a table-level
+        // grant covers columns added later — where a column-level grant
+        // would have left every column added after it unwritable. A future
+        // migration that adds a column is covered by this test only because
+        // this assertion names the mechanism rather than the column.
+        sqlx::query("UPDATE asks SET resume_state = $2 WHERE id = $1")
+            .bind(ask_id)
+            .bind(serde_json::json!({"plans": [], "advisories": [], "blocks": []}))
+            .execute(&mut *held)
+            .await
+            .expect("UPDATE asks.resume_state under runtime role — a column added by a \
+                     later migration inherits the table-level grant");
+        let (rs,): (Option<serde_json::Value>,) =
+            sqlx::query_as("SELECT resume_state FROM asks WHERE id = $1")
+                .bind(ask_id)
+                .fetch_one(&mut *held)
+                .await
+                .expect("SELECT asks.resume_state under runtime role");
+        assert_eq!(rs, Some(serde_json::json!({"plans": [], "advisories": [], "blocks": []})));
+
         // ---------- negative path: DELETE denied ----------
         let del_err = sqlx::query("DELETE FROM asks WHERE id = $1")
             .bind(ask_id)
@@ -1120,7 +1162,7 @@ fn a_task_can_raise_a_second_ask_once_the_first_is_resolved() {
         let first = asks::raise(
             pool, task_id, "plan_approval", "approve plan 2?",
             &serde_json::json!(["approve", "deny"]), Some("digest-plan-2"),
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.expect("first raise");
 
         assert!(asks::resolve_with_nonce(
@@ -1132,7 +1174,7 @@ fn a_task_can_raise_a_second_ask_once_the_first_is_resolved() {
         let second = asks::raise(
             pool, task_id, "plan_approval", "approve plan 4?",
             &serde_json::json!(["approve", "deny"]), Some("digest-plan-4"),
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.expect(
             "a task whose first ask is RESOLVED must be able to raise another — \
              if this fails, asks_one_pending_per_task lost its WHERE clause",
@@ -1190,7 +1232,7 @@ fn an_uncancellable_task_rolls_its_ask_cancel_back() {
         let raised = asks::raise(
             pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         // Move the task to a terminal state behind the API's back, so
@@ -1240,7 +1282,7 @@ fn a_nonce_resolves_only_its_own_ask() {
                 let r = asks::raise(
                     &pool, tid, "plan_approval", "approve?",
                     &serde_json::json!(["approve", "deny"]), None,
-                    time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                    time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
                 ).await.unwrap();
                 (tid, r)
             }
@@ -1307,7 +1349,7 @@ fn list_pending_is_oldest_first_tie_broken_by_id_and_honours_the_limit() {
             let r = asks::raise(
                 pool, tid, "plan_approval", &format!("question {i}"),
                 &serde_json::json!(["approve"]), None,
-                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
             ).await.unwrap();
             ids.push(r.ask_id);
         }
@@ -1380,7 +1422,7 @@ fn an_ask_past_its_deadline_cannot_be_resolved_even_before_the_sweep_runs() {
         let raised = asks::raise(
             pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve", "deny"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         // Backdate ONLY the deadline. The ask stays `pending` and the task
@@ -1447,7 +1489,7 @@ fn a_choice_outside_the_asks_own_options_is_refused() {
         let raised = asks::raise(
             pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve", "deny"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         // Each of these is a DIFFERENT way to miss, and each used to be
@@ -1568,7 +1610,7 @@ fn the_asks_schema_rejects_the_states_its_checks_exist_to_forbid() {
         let raised = asks::raise(
             pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         let e = sqlx::query("UPDATE asks SET state = 'resolved' WHERE id = $1")
@@ -1614,7 +1656,7 @@ fn expiring_an_ask_fires_tasks_completed_so_the_channel_can_reply() {
         let raised = asks::raise(
             pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         // Subscribe BEFORE the transition: PG does not queue notifications
@@ -1816,7 +1858,7 @@ fn resolving_an_ask_whose_task_cannot_resume_fails_closed_and_rolls_back() {
         let raised = asks::raise(
             pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         // Separate the pair behind the API's back: the ask stays `pending`
@@ -1878,7 +1920,7 @@ fn raise_persists_the_body_and_options_it_was_given() {
         let options = serde_json::json!(["approve", "deny", "approve_without_attachments"]);
         let raised = asks::raise(
             pool, task_id, "plan_approval", body, &options, Some("digest-xyz"),
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         let got = asks::get(pool, raised.ask_id).await.unwrap().unwrap();
@@ -1922,7 +1964,7 @@ fn a_none_plan_digest_round_trips_as_sql_null() {
         let raised = asks::raise(
             pool, task_id, "plan_approval", "approve?",
             &serde_json::json!(["approve"]), None,
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
 
         assert!(asks::get(pool, raised.ask_id).await.unwrap().unwrap().plan_digest.is_none());
@@ -1965,7 +2007,7 @@ fn resolved_for_task_is_empty_when_nothing_is_resolved() {
         // A pending ask is not a resolved ask.
         let _ = asks::raise(
             pool, task_id, "plan_approval", "why", &serde_json::json!(["approve", "deny"]),
-            Some("digest-a"), time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            Some("digest-a"), time::OffsetDateTime::now_utc() + time::Duration::hours(1), None,
         ).await.expect("raise");
 
         let got = asks::resolved_for_task(pool, task_id).await.expect("read");
@@ -1997,7 +2039,7 @@ fn resolved_for_task_returns_every_resolution_newest_first() {
         let first = asks::raise(
             pool, task_id, "plan_approval", "first concern",
             &serde_json::json!(["approve", "deny"]), Some("digest-a"),
-            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1), None,
         ).await.expect("raise 1");
         assert!(asks::resolve(pool, first.ask_id, "operator",
             &serde_json::json!({"choice": "approve"})).await.expect("resolve 1"));
@@ -2008,7 +2050,7 @@ fn resolved_for_task_returns_every_resolution_newest_first() {
         let second = asks::raise(
             pool, task_id, "plan_approval", "second concern",
             &serde_json::json!(["approve", "deny"]), Some("digest-b"),
-            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1), None,
         ).await.expect("raise 2");
         assert!(asks::resolve(pool, second.ask_id, "operator",
             &serde_json::json!({"choice": "deny"})).await.expect("resolve 2"));
@@ -2045,7 +2087,7 @@ fn resolved_for_task_ignores_expired_and_cancelled_asks() {
         let _ = asks::raise(
             pool, expired_task_id, "plan_approval", "why",
             &serde_json::json!(["approve", "deny"]),
-            Some("digest-a"), time::OffsetDateTime::now_utc() + time::Duration::seconds(1),
+            Some("digest-a"), time::OffsetDateTime::now_utc() + time::Duration::seconds(1), None,
         ).await.expect("raise");
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         let expired = asks::expire_due(pool).await.expect("expire");
@@ -2062,7 +2104,7 @@ fn resolved_for_task_ignores_expired_and_cancelled_asks() {
         let raised = asks::raise(
             pool, cancelled_task_id, "plan_approval", "why too",
             &serde_json::json!(["approve", "deny"]),
-            Some("digest-b"), time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            Some("digest-b"), time::OffsetDateTime::now_utc() + time::Duration::hours(1), None,
         ).await.expect("raise");
         let cancelled = tasks::mark_cancelled(pool, cancelled_task_id).await.expect("cancel")
             .expect("an awaiting_operator task must be cancellable");
@@ -2102,7 +2144,7 @@ fn resolved_for_task_breaks_a_resolved_at_tie_by_higher_id() {
         let first = asks::raise(
             pool, task_id, "plan_approval", "first concern",
             &serde_json::json!(["approve", "deny"]), Some("digest-a"),
-            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1), None,
         ).await.expect("raise 1");
         assert!(asks::resolve(pool, first.ask_id, "operator",
             &serde_json::json!({"choice": "approve"})).await.expect("resolve 1"));
@@ -2111,7 +2153,7 @@ fn resolved_for_task_breaks_a_resolved_at_tie_by_higher_id() {
         let second = asks::raise(
             pool, task_id, "plan_approval", "second concern",
             &serde_json::json!(["approve", "deny"]), Some("digest-b"),
-            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1), None,
         ).await.expect("raise 2");
         assert!(asks::resolve(pool, second.ask_id, "operator",
             &serde_json::json!({"choice": "deny"})).await.expect("resolve 2"));

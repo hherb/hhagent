@@ -93,9 +93,17 @@ async fn raise_and_suspend_suspends_the_task_and_audits_it() {
     let Some((pool, _cluster)) = bring_up_pg("raise").await else { return };
     let task_id = seed_running_task(&pool).await;
 
+    // A non-empty `resume_state`: the run's history at suspend time, which
+    // the resume restores so the task does not re-formulate — and re-run —
+    // the iterations it already completed (spec D11).
+    let run_state = serde_json::json!({
+        "plans": [{"plan": {"decision": "act"}, "outcomes": ["ok"]}],
+        "advisories": ["watch the tone"],
+        "blocks": [],
+    });
     let ask_id = asks::raise_and_suspend(
         &pool, task_id, &plan_with_context("send the mail"),
-        "this sends mail to a stranger", Severity::High,
+        "this sends mail to a stranger", Severity::High, Some(&run_state),
     ).await.expect("raise_and_suspend");
 
     assert_eq!(
@@ -108,6 +116,11 @@ async fn raise_and_suspend_suspends_the_task_and_audits_it() {
     assert_eq!(ask.body, "this sends mail to a stranger");
     assert_eq!(ask.options, serde_json::json!(["approve", "deny"]));
     assert!(ask.plan_digest.is_some(), "a plan_approval ask must bind to a digest");
+    assert_eq!(
+        ask.resume_state.as_ref(), Some(&run_state),
+        "the suspension must carry the run's history, verbatim — `run_one` restores \
+         the resumed TaskContext from exactly this value",
+    );
 
     assert!(
         audit_actions_for(&pool, task_id).await.iter().any(|a| a == ACTION_ASK_RAISED),
@@ -120,12 +133,12 @@ async fn the_digest_recorded_is_the_digest_of_the_plan_passed_in() {
     let Some((pool, _cluster)) = bring_up_pg("digest").await else { return };
     let a = seed_running_task(&pool).await;
     let ask_a = asks::raise_and_suspend(
-        &pool, a, &plan_with_context("plan one"), "c", Severity::Medium,
+        &pool, a, &plan_with_context("plan one"), "c", Severity::Medium, None,
     ).await.expect("raise a");
 
     let b = seed_running_task(&pool).await;
     let ask_b = asks::raise_and_suspend(
-        &pool, b, &plan_with_context("plan two"), "c", Severity::Medium,
+        &pool, b, &plan_with_context("plan two"), "c", Severity::Medium, None,
     ).await.expect("raise b");
 
     let da = kastellan_db::asks::get(&pool, ask_a).await.unwrap().unwrap().plan_digest;
@@ -144,7 +157,7 @@ async fn raising_against_a_task_that_is_not_running_is_an_error() {
         .await.expect("insert");
     // Never claimed, so still `pending`.
     let err = asks::raise_and_suspend(
-        &pool, task_id, &plan_with_context("x"), "c", Severity::Low,
+        &pool, task_id, &plan_with_context("x"), "c", Severity::Low, None,
     ).await;
     assert!(err.is_err(), "raising against a non-running task must fail, not orphan an ask");
     assert_eq!(tasks::observe_state(&pool, task_id).await.expect("state"), "pending");
@@ -159,7 +172,7 @@ async fn sweep_expired_and_audit_fails_the_task_and_writes_one_row_each() {
     // the test exercises the same path production does.
     std::env::set_var(asks::ASK_DEADLINE_ENV, "1");
     let ask_id = asks::raise_and_suspend(
-        &pool, task_id, &plan_with_context("x"), "c", Severity::Low,
+        &pool, task_id, &plan_with_context("x"), "c", Severity::Low, None,
     ).await.expect("raise");
     std::env::remove_var(asks::ASK_DEADLINE_ENV);
 
