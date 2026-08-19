@@ -296,3 +296,64 @@ re-escalating on a semantically identical replan, which costs an operator intera
 safe direction. The dangerous direction — an approval carrying to a plan the operator would not
 recognise — is what the exclusion-list digest exists to make unlikely. The first real escalation on
 the DGX is the measurement; do not tune the exclusion list before it.
+
+---
+
+## Addendum (2026-08-19) — D11: the suspend carries the step history
+
+Added after the final whole-branch review. **This supersedes the original D4/D6 assumption that a
+resumed task may simply replan from an empty history.**
+
+### The defect
+
+`run_one` rebuilt `TaskContext` with `plans: vec![]`, so a resumed task started from nothing and
+re-formulated every iteration it had already run. Slice 1a's spec did say the resumed task
+"replans from scratch" — that is why an approval binds to a digest — but it never stated the
+consequence: **the steps of the earlier iterations execute again.**
+
+Concretely: plan 1 sends an email; plan 2 escalates; the operator approves; on resume plan 1 is
+re-formulated, passes review again, and the email is sent a second time. The feature whose entire
+purpose is human oversight would cause duplicate side effects *because* a human approved something.
+
+Every e2e escalated on the first plan with zero prior steps, so 34 new tests were structurally
+blind to it.
+
+### The fix
+
+The suspension carries the run's history, and the resume restores it.
+
+- **Migration 0024** adds `asks.resume_state JSONB NULL`. The state belongs to *this* suspension,
+  and there is exactly one ask per suspension, so the ask row is its natural home — not
+  `tasks.payload`, which is the producer's declared intent and must not become scheduler scratch.
+- `db::asks::raise` takes `resume_state: Option<&serde_json::Value>`; `Ask` carries the column.
+- `scheduler::asks::raise_and_suspend` serialises the live context into it.
+- `run_one` restores it from the most recent resolved ask before building `TaskContext`.
+
+### What is stored, and why it is the inputs rather than the renders
+
+`PlanRecord` holds `plan: Plan` plus a **private** `rendered: Vec<RenderedStep>`, and `RenderedStep`
+is neither public nor serde-able. That is not an obstacle to work around — it is a hint. `rendered`
+is a *pure, deterministic function* of `(plan, outcomes)` (`PlanRecord::new` screens each outcome
+under its step's own guard profile), so the honest thing to persist is the **inputs**, and to
+rebuild the record by calling the same constructor on restore.
+
+So `resume_state` is `{"plans": [{"plan": <Plan>, "outcomes": [<StepOutcome>]}], "advisories": [...],
+"blocks": [...]}`. `Plan` and `StepOutcome` both already derive `Serialize`/`Deserialize`.
+
+Two consequences worth stating:
+
+- **`PlanRecord` must retain its `outcomes`.** It currently consumes them and keeps only the
+  renders, so the raw inputs are unrecoverable at suspend time. Keeping them costs memory
+  proportional to what the dispatcher already caps, and it is what makes the screened-once
+  invariant survive a restore: the screen is re-applied by the same constructor rather than a
+  serialized render being trusted.
+- **`advisories` and `blocks` carry too.** They are accumulated reviewer feedback; dropping them
+  would make the resumed planner repeat mistakes the reviewer already corrected.
+
+### What this does NOT claim
+
+Restoring the history makes the resumed planner *aware* of what it already did; it does not make
+re-execution impossible. A planner that re-emits an identical step will still dispatch it. The
+guarantee this buys is that the planner has the information not to — the same guarantee the loop
+already relies on between ordinary iterations. A stronger property (idempotency keys per dispatched
+step) is out of scope and is not implied anywhere in this document.
