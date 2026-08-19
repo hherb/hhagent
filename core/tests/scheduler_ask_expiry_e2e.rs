@@ -32,6 +32,9 @@ use kastellan_core::cassandra::types::{DataClass, Plan, PlannedStep, Severity, V
 use kastellan_core::memory::embedder::NoOpEmbedder;
 use kastellan_core::scheduler::agent::{AgentError, FormulationMeta, PlanFormulator};
 use kastellan_core::scheduler::asks::ASK_DEADLINE_ENV;
+use kastellan_core::scheduler::audit::{
+    action_task_terminal, ACTION_TASK_FINALIZE, FINALIZE_PROVENANCE_ASK_EXPIRY,
+};
 use kastellan_core::scheduler::inner_loop::{StepDispatcher, StepOutcome, TaskContext};
 use kastellan_core::scheduler::{spawn_scheduler, SchedulerHandle};
 use kastellan_db::tasks::{self, insert_pending, Lane};
@@ -237,6 +240,56 @@ async fn an_unanswered_ask_expires_and_fails_its_task_without_a_restart() {
         Some(kastellan_db::asks::ASK_TIMEOUT_DETAIL),
     );
 
+    // The sweep moved the TASK too (`awaiting_operator -> failed`), and
+    // observation-phase SQL pivots on the audit log — a bare `tasks.state`
+    // UPDATE is invisible to it. So the timeout must leave the same two
+    // task-lifecycle rows `crash_recovery` writes for the same reason;
+    // without them every query grouping on `task.finalize` silently drops
+    // the whole timed-out population.
+    let lifecycle = audit_payloads(&pool, &action_task_terminal("failed"), task_id).await;
+    assert_eq!(lifecycle.len(), 1, "one task.failed row for the expired task: {lifecycle:?}");
+    assert_eq!(lifecycle[0].get("lane").and_then(|v| v.as_str()), Some("fast"));
+
+    let finalize = audit_payloads(&pool, ACTION_TASK_FINALIZE, task_id).await;
+    assert_eq!(finalize.len(), 1, "one task.finalize row for the expired task: {finalize:?}");
+    assert_eq!(finalize[0].get("state").and_then(|v| v.as_str()), Some("failed"));
+    // Its own provenance, not a borrowed one. Reusing `crash_recovery`
+    // would put a cause into the audit log that did not happen, and would
+    // merge timeouts into the crashed population for every query that
+    // groups by provenance.
+    assert_eq!(
+        finalize[0].get("provenance").and_then(|v| v.as_str()),
+        Some(FINALIZE_PROVENANCE_ASK_EXPIRY),
+    );
+    // The task really did run before it escalated, so these are facts, not
+    // the never-claimed zeros a producer-cancel row would carry.
+    assert!(
+        finalize[0].get("started_at").map(|v| v.is_string()).unwrap_or(false),
+        "a suspended task WAS claimed, so started_at is a real timestamp: {finalize:?}",
+    );
+    assert!(
+        finalize[0].get("plan_count").and_then(|v| v.as_i64()).unwrap_or(0) >= 1,
+        "at least one plan ran before the escalation: {finalize:?}",
+    );
+
     std::env::remove_var(ASK_DEADLINE_ENV);
     handle.shutdown().await;
+}
+
+/// Every `audit_log` payload with this `action` naming `task_id`, oldest
+/// first.
+async fn audit_payloads(
+    pool: &sqlx::PgPool,
+    action: &str,
+    task_id: i64,
+) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT payload FROM audit_log \
+         WHERE action = $1 AND payload->>'task_id' = $2::text ORDER BY id",
+    )
+    .bind(action)
+    .bind(task_id)
+    .fetch_all(pool)
+    .await
+    .expect("read audit payloads")
 }

@@ -28,7 +28,7 @@ fn ctx() -> TaskContext {
         blocks: vec![],
         plan_count: 0,
         max_plans: 3,
-        resolved_ask: None,
+        resolved_asks: Vec::new(),
     }
 }
 
@@ -838,7 +838,7 @@ async fn terminal_python_skill_captured_under_grounding_gate() {
         blocks: vec![],
         plan_count: 0,
         max_plans: 5,
-        resolved_ask: None,
+        resolved_asks: Vec::new(),
     };
 
     let result = super::run_to_terminal(&pool, formulator, review, dispatcher, ctx)
@@ -933,7 +933,7 @@ async fn forced_synthesis_at_cap_answers_from_gathered_observations() {
             blocks: vec![],
             plan_count: 0,
             max_plans: 1,
-            resolved_ask: None,
+            resolved_asks: Vec::new(),
         }
     }
 

@@ -149,6 +149,20 @@ pub const ACTION_ASK_RESOLVED: &str = "ask.resolved";
 /// 1b). `actor='scheduler'`. Payload: `{ask_id, task_id}`.
 pub const ACTION_ASK_EXPIRED: &str = "ask.expired";
 
+/// `action` written when a replanned plan turned out to be one the
+/// operator had already approved, so the `Escalate` verdict proceeded
+/// instead of asking again (#564 slice 1b). `actor='scheduler'`. Payload:
+/// `{ask_id, task_id, plan_digest}`.
+///
+/// **This row is what makes the digest binding demonstrable.** Without it
+/// the audit trail goes `cassandra.verdict{kind=escalate}` → step dispatch
+/// with nothing in between, and the digest of the plan that actually ran
+/// appears only in the much earlier `ask.raised` row — so nothing in the
+/// log shows that the plan which executed is the plan the human approved,
+/// which is the single property the whole digest mechanism exists to
+/// provide.
+pub const ACTION_ASK_APPROVAL_APPLIED: &str = "ask.approval_applied";
+
 /// `prefix` of the per-terminal-state lifecycle row's `action`.
 /// Full action is built via [`action_task_terminal`] so the writer
 /// and any reader can't drift on the separator/format.
@@ -194,6 +208,22 @@ pub const FINALIZE_PROVENANCE_PRODUCER_CANCEL_PENDING: &str = "producer_cancel_p
 /// in-memory counters went away with the loop, and the producer cannot
 /// recover them.
 pub const FINALIZE_PROVENANCE_PRODUCER_CANCEL_SUSPENDED: &str = "producer_cancel_suspended";
+
+/// Value of the `provenance` field in a `task.finalize` payload emitted
+/// when the operator-ask deadline sweep expired an unanswered ask and
+/// failed its suspended task (#564 slice 1b).
+///
+/// **Its own value rather than any of the four above, for the same reason
+/// [`FINALIZE_PROVENANCE_PRODUCER_CANCEL_SUSPENDED`] got one.** Nothing
+/// cancelled this task and nothing crashed: a human was asked a question
+/// and the deadline passed. Borrowing `crash_recovery` would put a
+/// fabricated cause into the one log whose entire job is to be
+/// trustworthy, and would silently merge the timed-out population into the
+/// crashed one for every query that groups by provenance. Counters are JSON
+/// `null` — the lane runner released the task when the ask was raised, so
+/// its in-memory counters went with it, exactly as in
+/// [`FINALIZE_PROVENANCE_CRASH_RECOVERY`].
+pub const FINALIZE_PROVENANCE_ASK_EXPIRY: &str = "ask_expiry";
 
 /// Build the `action` string for a terminal-state lifecycle row.
 /// Centralises the `"task." + state` format so a future rename can't
@@ -395,6 +425,42 @@ pub fn build_producer_cancel_suspended_finalize_payload(
         "started_at":           started_at.map(format_rfc3339),
         "finished_at":          format_rfc3339(finished_at),
         "provenance":           FINALIZE_PROVENANCE_PRODUCER_CANCEL_SUSPENDED,
+    })
+}
+
+/// Build the `task.finalize` payload for a task the operator-ask deadline
+/// sweep failed closed, because nobody answered its ask in time (#564).
+///
+/// Same 10-key shape as the others. `state` is hard-pinned to `"failed"` —
+/// `db::asks::expire_due` moves the task `awaiting_operator → failed`, and a
+/// single-purpose helper cannot be misused into naming a state that did not
+/// happen. `started_at` is the real claim timestamp and `plan_count` is what
+/// the task actually burned before it escalated, so neither is fabricated.
+/// The two call counters are JSON `null` — genuinely unrecoverable, for the
+/// same reason as [`build_crashed_finalize_payload`]: the lane runner
+/// released this task when the ask was raised, and its in-memory counters
+/// went with it. `provenance` is [`FINALIZE_PROVENANCE_ASK_EXPIRY`], so an
+/// observation query separates timeouts from crashes and cancels without
+/// inferring anything.
+pub fn build_ask_expiry_finalize_payload(
+    task_id: i64,
+    lane: Lane,
+    plan_count: i32,
+    started_at: Option<OffsetDateTime>,
+    finished_at: OffsetDateTime,
+) -> Value {
+    let duration_ms: Option<u64> = started_at.map(|s| compute_duration_ms(Some(s), finished_at));
+    json!({
+        "task_id":              task_id,
+        "lane":                 lane.as_sql(),
+        "state":                "failed",
+        "plan_count":           plan_count,
+        "total_llm_calls":      Value::Null,
+        "total_dispatch_calls": Value::Null,
+        "total_duration_ms":    duration_ms,
+        "started_at":           started_at.map(format_rfc3339),
+        "finished_at":          format_rfc3339(finished_at),
+        "provenance":           FINALIZE_PROVENANCE_ASK_EXPIRY,
     })
 }
 

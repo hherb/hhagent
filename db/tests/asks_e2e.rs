@@ -1936,22 +1936,22 @@ fn a_none_plan_digest_round_trips_as_sql_null() {
 }
 
 /// Insert a pending task and claim it, so it is `running` — the state
-/// `asks::raise` requires. Shared by the `latest_resolved_for_task` tests
+/// `asks::raise` requires. Shared by the `resolved_for_task` tests
 /// below, each of which needs a running task before it can raise anything.
 async fn seed_running_task(pool: &sqlx::PgPool) -> i64 {
     use kastellan_db::tasks::{self, Lane};
 
     let task_id = tasks::insert_pending(
-        pool, Lane::Fast, serde_json::json!({"instruction": "latest_resolved_for_task probe"}),
+        pool, Lane::Fast, serde_json::json!({"instruction": "resolved_for_task probe"}),
     ).await.expect("insert pending");
     tasks::claim_one(pool, Lane::Fast, 60).await.expect("claim").expect("a pending task");
     task_id
 }
 
-/// A `pending` ask is not a resolved one — `latest_resolved_for_task` must
+/// A `pending` ask is not a resolved one — `resolved_for_task` must
 /// not surface a question nobody has answered yet.
 #[test]
-fn latest_resolved_for_task_returns_none_when_nothing_is_resolved() {
+fn resolved_for_task_is_empty_when_nothing_is_resolved() {
     let Some(h) = harness("asklrn") else {
         return;
     };
@@ -1968,16 +1968,19 @@ fn latest_resolved_for_task_returns_none_when_nothing_is_resolved() {
             Some("digest-a"), time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         ).await.expect("raise");
 
-        let got = asks::latest_resolved_for_task(pool, task_id).await.expect("read");
-        assert!(got.is_none(), "a pending ask must not be returned as resolved");
+        let got = asks::resolved_for_task(pool, task_id).await.expect("read");
+        assert!(got.is_empty(), "a pending ask must not be returned as resolved");
     });
 }
 
-/// A task that escalates twice (first approved, then denied) must see the
-/// SECOND decision, not the first — `resolved_at DESC, id DESC` must win
-/// over insertion order.
+/// A task that escalates twice must see BOTH decisions, newest first.
+///
+/// The count is the load-bearing half. A `LIMIT 1` read returns the second
+/// ask here too and would satisfy any assertion about `[0]` alone — which is
+/// exactly how the two-escalation livelock survived review. Assert the
+/// length, then the order.
 #[test]
-fn latest_resolved_for_task_returns_the_most_recent_resolution() {
+fn resolved_for_task_returns_every_resolution_newest_first() {
     let Some(h) = harness("asklrr") else {
         return;
     };
@@ -2010,17 +2013,23 @@ fn latest_resolved_for_task_returns_the_most_recent_resolution() {
         assert!(asks::resolve(pool, second.ask_id, "operator",
             &serde_json::json!({"choice": "deny"})).await.expect("resolve 2"));
 
-        let got = asks::latest_resolved_for_task(pool, task_id).await.expect("read")
-            .expect("a resolved ask");
-        assert_eq!(got.id, second.ask_id, "the LATEST resolution must win, not the first");
-        assert_eq!(got.plan_digest.as_deref(), Some("digest-b"));
+        let got = asks::resolved_for_task(pool, task_id).await.expect("read");
+        assert_eq!(
+            got.len(), 2,
+            "BOTH resolutions must come back — a LIMIT 1 read is what makes a task that \
+             escalates at two plans re-ask the first one forever",
+        );
+        assert_eq!(got[0].id, second.ask_id, "newest first");
+        assert_eq!(got[0].plan_digest.as_deref(), Some("digest-b"));
+        assert_eq!(got[1].id, first.ask_id, "the older decision is still visible");
+        assert_eq!(got[1].plan_digest.as_deref(), Some("digest-a"));
     });
 }
 
-/// An `expired` ask is a timeout, not a decision — `latest_resolved_for_task`
+/// An `expired` ask is a timeout, not a decision — `resolved_for_task`
 /// must not let one read as an answer.
 #[test]
-fn latest_resolved_for_task_ignores_expired_and_cancelled_asks() {
+fn resolved_for_task_ignores_expired_and_cancelled_asks() {
     let Some(h) = harness("asklrs") else {
         return;
     };
@@ -2042,8 +2051,8 @@ fn latest_resolved_for_task_ignores_expired_and_cancelled_asks() {
         let expired = asks::expire_due(pool).await.expect("expire");
         assert_eq!(expired.len(), 1, "the ask must have been swept");
 
-        let got = asks::latest_resolved_for_task(pool, expired_task_id).await.expect("read");
-        assert!(got.is_none(), "an expired ask is not a resolution and must not be returned");
+        let got = asks::resolved_for_task(pool, expired_task_id).await.expect("read");
+        assert!(got.is_empty(), "an expired ask is not a resolution and must not be returned");
 
         // ---- cancelled half: reached via the real production path —
         // `tasks::mark_cancelled` cancelling a task that has a pending ask,
@@ -2063,8 +2072,8 @@ fn latest_resolved_for_task_ignores_expired_and_cancelled_asks() {
             "the ask must actually have reached the cancelled state for this test to mean anything",
         );
 
-        let got = asks::latest_resolved_for_task(pool, cancelled_task_id).await.expect("read");
-        assert!(got.is_none(), "a cancelled ask is not a resolution and must not be returned");
+        let got = asks::resolved_for_task(pool, cancelled_task_id).await.expect("read");
+        assert!(got.is_empty(), "a cancelled ask is not a resolution and must not be returned");
     });
 }
 
@@ -2078,7 +2087,7 @@ fn latest_resolved_for_task_ignores_expired_and_cancelled_asks() {
 /// rather than simply wrong once, so a single call would not reliably catch
 /// its absence.
 #[test]
-fn latest_resolved_for_task_breaks_a_resolved_at_tie_by_higher_id() {
+fn resolved_for_task_breaks_a_resolved_at_tie_by_higher_id() {
     let Some(h) = harness("asklrt") else {
         return;
     };
@@ -2134,11 +2143,12 @@ fn latest_resolved_for_task_breaks_a_resolved_at_tie_by_higher_id() {
         // The higher-id ask must win, on repeated calls — a missing
         // `id DESC` tiebreaker is nondeterministic, not just wrong once.
         for attempt in 0..3 {
-            let got = asks::latest_resolved_for_task(pool, task_id).await.expect("read")
-                .expect("a resolved ask");
+            let got = asks::resolved_for_task(pool, task_id).await.expect("read");
+            assert_eq!(got.len(), 2, "attempt {attempt}: both resolutions are still returned");
             assert_eq!(
-                got.id, second.ask_id,
-                "attempt {attempt}: with a tied resolved_at, the higher id must win every call",
+                got[0].id, second.ask_id,
+                "attempt {attempt}: with a tied resolved_at, the higher id must sort first \
+                 on every call",
             );
         }
     });

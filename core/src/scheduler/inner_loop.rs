@@ -57,18 +57,27 @@ pub struct TaskContext {
     pub blocks: Vec<String>,
     pub plan_count: u32,
     pub max_plans: u32,
-    /// The task's most recently resolved operator ask, when it has one.
+    /// Every operator ask this task has already had answered, newest first.
+    /// Empty for a task nobody has been asked about.
     ///
     /// Read **once** by `runner::task_exec::run_one` before the first
     /// formulation and threaded in here, so the `Escalate` arm compares
-    /// digests against an in-memory value rather than issuing a second
-    /// query from inside the loop — and so a test can construct the
-    /// decision without a live Postgres (spec D4).
+    /// digests against in-memory values rather than issuing a second query
+    /// from inside the loop — and so a test can construct the decisions
+    /// without a live Postgres (spec D4).
+    ///
+    /// **A `Vec`, not an `Option`, because approvals bind to plan digests
+    /// and a task can hold several at once.** One live approval was enough
+    /// only for a task that escalates once. A task that escalates at two
+    /// different plans needs both: with only the newest kept, the earlier
+    /// plan re-asks a question the operator already answered, approving that
+    /// makes the other one stale, and the pair alternates until the ask
+    /// deadline. See `db::asks::resolved_for_task`.
     ///
     /// Never holds a denial in practice: `run_one` terminates a denied task
     /// before building this context. `asks::decide` still handles that case
     /// correctly rather than assuming it away.
-    pub resolved_ask: Option<kastellan_db::asks::Ask>,
+    pub resolved_asks: Vec<kastellan_db::asks::Ask>,
 }
 
 impl TaskContext {
@@ -536,17 +545,33 @@ pub async fn run_to_terminal(
                     // execute, and the replan runs the same normalisations
                     // so the two digests are comparable.
                     let digest = crate::cassandra::plan_digest::plan_digest(&plan);
-                    let approved = ctx.resolved_ask.as_ref().is_some_and(|a| {
+                    // ANY resolved ask may carry the approval, not just the
+                    // newest: a task that escalated at an earlier plan and
+                    // then at a later one holds two approvals, and this plan
+                    // is covered by whichever one names its digest.
+                    let approved = ctx.resolved_asks.iter().find(|a| {
                         matches!(asks::decide(a, &digest), asks::AskDecision::Approved)
                     });
-                    if approved {
+                    if let Some(approval) = approved {
                         tracing::info!(
                             task_id = ctx.task_id,
+                            ask_id = approval.id,
                             plan_count = ctx.plan_count,
                             severity = ?sev,
                             "Verdict::Escalate covered by a resolved operator approval for this \
                              exact plan; proceeding"
                         );
+                        // The audit trail otherwise reads
+                        // `cassandra.verdict{kind=escalate}` → step dispatch
+                        // with nothing in between, and the digest of the plan
+                        // that RAN appears only in the much earlier
+                        // `ask.raised` row. This row is what lets a reader
+                        // show that the plan which executed is the plan that
+                        // was approved — the single property the digest
+                        // binding exists to provide.
+                        asks::emit_approval_applied(
+                            pool, approval.id, ctx.task_id, &digest,
+                        ).await;
                         // Falls through to the refusal check below and then
                         // to the terminal check / step execution, exactly as
                         // an `Approve` verdict does.

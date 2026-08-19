@@ -231,7 +231,7 @@ fn ctx() -> TaskContext {
         blocks: vec![],
         plan_count: 0,
         max_plans: 3,
-        resolved_ask: None,
+        resolved_asks: Vec::new(),
     }
 }
 

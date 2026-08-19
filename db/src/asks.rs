@@ -711,11 +711,24 @@ pub async fn list_pending(pool: &PgPool, limit: i64) -> Result<Vec<Ask>, DbError
     Ok(out)
 }
 
-/// The task's most recently resolved ask, if it has one.
+/// **Every** decision an operator has already made about this task,
+/// newest first. Empty when nobody has answered anything yet.
 ///
 /// Slice 1b's single read: `run_one` calls it once per claimed task and
-/// both consumers work from that one value — the pre-plan deny check and
+/// both consumers work from that one list — the pre-plan deny check and
 /// the `Escalate` arm's digest comparison (spec D4).
+///
+/// **All of them, not just the newest, and that is the whole point.** An
+/// approval binds to a *plan digest*, so the caller has to answer "did the
+/// operator approve THIS plan", which is a lookup by digest and not by
+/// recency. A task that escalates at two different plans holds two
+/// approvals at once; returning only the newest made the older one
+/// invisible, so the earlier plan re-asked a question that had already been
+/// answered — and approving *that* made the newer approval the stale one.
+/// The two alternate forever, and `resume_budget` hands out a fresh plan
+/// allowance on every resume, so nothing but the ask deadline ends it. A
+/// task raises one ask per escalation, so this list is small and bounded by
+/// how many times a human chose to answer.
 ///
 /// **`state = 'resolved'` only.** An `expired` or `cancelled` ask is not a
 /// decision anybody made, and returning one would let a timeout read as an
@@ -726,25 +739,27 @@ pub async fn list_pending(pool: &PgPool, limit: i64) -> Result<Vec<Ask>, DbError
 ///
 /// Ordered `resolved_at DESC, id DESC`. `resolved_at` is `now()` at resolve
 /// time, so two asks resolved inside one transaction tick can tie — the
-/// same tiebreaker [`list_pending`] carries, for the same reason. A task
-/// that escalates twice (P approved, then P′ denied) must see the second
-/// decision, not the first.
-pub async fn latest_resolved_for_task(
-    pool: &PgPool,
-    task_id: i64,
-) -> Result<Option<Ask>, DbError> {
-    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+/// same tiebreaker [`list_pending`] carries, for the same reason. The order
+/// is no longer load-bearing for *which* decision applies (the caller
+/// matches on digest), but it stays deterministic so a caller that does
+/// look at `first()` — an operator display, a log line — sees the same row
+/// on every call rather than whatever physical row order the planner picked.
+pub async fn resolved_for_task(pool: &PgPool, task_id: i64) -> Result<Vec<Ask>, DbError> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {ASK_COLUMNS} FROM asks \
          WHERE task_id = $1 AND state = 'resolved' \
-         ORDER BY resolved_at DESC, id DESC \
-         LIMIT 1"
+         ORDER BY resolved_at DESC, id DESC"
     )))
     .bind(task_id)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
-    .map_err(|e| DbError::Query(format!("asks latest_resolved_for_task: {e}")))?;
+    .map_err(|e| DbError::Query(format!("asks resolved_for_task: {e}")))?;
 
-    row.as_ref().map(decode_ask_row).transpose()
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(decode_ask_row(row)?);
+    }
+    Ok(out)
 }
 
 /// Fetch one ask by id, in any state.

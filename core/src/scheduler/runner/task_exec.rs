@@ -42,15 +42,20 @@ use crate::scheduler::inner_loop::{
 /// A malformed resolution proceeds rather than terminating: failing toward
 /// running costs an escalation, where failing toward refusal kills a task
 /// for a reason nobody can see in the plan trail.
-pub(crate) fn pre_plan_outcome(resolved: Option<&Ask>) -> Option<Outcome> {
-    let ask = resolved?;
-    match resolution_choice(ask) {
-        Some(Choice::Deny) => Some(Outcome::Denied {
-            ask_id: ask.id,
-            reason: ask.body.clone(),
-        }),
-        _ => None,
-    }
+///
+/// **Scans every resolution, not just the newest.** A denial ends the task,
+/// so in practice it is always the last decision a task can hold and looking
+/// only at the newest would give the same answer — but that is a property of
+/// today's terminal handling, not of this function, and a scan costs nothing
+/// over a list bounded by how many times a human answered.
+pub(crate) fn pre_plan_outcome(resolved: &[Ask]) -> Option<Outcome> {
+    let denied = resolved
+        .iter()
+        .find(|ask| matches!(resolution_choice(ask), Some(Choice::Deny)))?;
+    Some(Outcome::Denied {
+        ask_id: denied.id,
+        reason: denied.body.clone(),
+    })
 }
 
 /// `(starting plan_count, max_plans)` for a claimed task, given the value
@@ -143,25 +148,34 @@ pub(super) async fn run_one(
         .unwrap_or(max_plans);
 
     // One read, two consumers (spec D4): the denial check just below, and
-    // the `Escalate` arm's digest comparison via `ctx.resolved_ask`.
+    // the `Escalate` arm's digest comparison via `ctx.resolved_asks`.
     //
-    // A read failure is NOT fatal. It means at worst that an approval is
-    // not seen and the plan escalates again — one more operator
-    // interaction — where failing the task would turn a transient DB blip
-    // into a lost task.
-    let resolved_ask = match kastellan_db::asks::latest_resolved_for_task(pool, task.id).await {
+    // A read failure FAILS THE TASK CLOSED. Proceeding with an empty list
+    // would skip the denial check as surely as the approval check, and those
+    // two are not equally safe to get wrong: an unseen approval costs one
+    // more operator interaction, while an unseen DENIAL lets a task the
+    // operator explicitly refused go on to plan and dispatch real steps
+    // before it escalates again. With the read failed there is no way to
+    // tell "nobody has decided yet" from "somebody decided and I could not
+    // read it", so this cannot proceed on the optimistic reading. The task
+    // ends `failed` and is re-submittable; a `Denied` outcome is not used
+    // because no denial was actually read.
+    let resolved_asks = match kastellan_db::asks::resolved_for_task(pool, task.id).await {
         Ok(a) => a,
         Err(e) => {
             tracing::warn!(
                 task_id = task.id, error = %e,
-                "could not read the task's resolved ask; proceeding as if there is none \
-                 (an approval will not be seen and the plan will escalate again)"
+                "could not read the task's resolved asks; failing the task closed, because \
+                 a failed read cannot distinguish 'no decision yet' from 'a decision I \
+                 could not see' — and the second one may be a denial"
             );
-            None
+            return failed_result(format!(
+                "could not read this task's resolved operator asks: {e}"
+            ));
         }
     };
 
-    if let Some(outcome) = pre_plan_outcome(resolved_ask.as_ref()) {
+    if let Some(outcome) = pre_plan_outcome(&resolved_asks) {
         tracing::info!(task_id = task.id, "operator denied this task's ask; terminating without planning");
         return InnerLoopResult {
             outcome,
@@ -187,7 +201,7 @@ pub(super) async fn run_one(
         blocks: vec![],
         plan_count: start_plan_count,
         max_plans: max_plans_for_run,
-        resolved_ask,
+        resolved_asks,
     };
 
     let task_id = ctx.task_id;
@@ -409,7 +423,7 @@ mod tests {
 
     #[test]
     fn a_denial_terminates_the_task_before_any_planning() {
-        let out = pre_plan_outcome(Some(&resolved_ask("deny"))).expect("a denial is terminal");
+        let out = pre_plan_outcome(&[resolved_ask("deny")]).expect("a denial is terminal");
         match out {
             Outcome::Denied { ask_id, reason } => {
                 assert_eq!(ask_id, 9);
@@ -423,12 +437,39 @@ mod tests {
 
     #[test]
     fn an_approval_does_not_terminate_the_task() {
-        assert!(pre_plan_outcome(Some(&resolved_ask("approve"))).is_none());
+        assert!(pre_plan_outcome(&[resolved_ask("approve")]).is_none());
     }
 
     #[test]
     fn no_resolved_ask_does_not_terminate_the_task() {
-        assert!(pre_plan_outcome(None).is_none());
+        assert!(pre_plan_outcome(&[]).is_none());
+    }
+
+    #[test]
+    fn a_denial_anywhere_in_the_list_terminates_the_task() {
+        // The list is newest-first, so an older denial sits BEHIND newer
+        // approvals. Only the newest being consulted would let a task the
+        // operator refused go on to plan and dispatch.
+        let mut approved = resolved_ask("approve");
+        approved.id = 11;
+        let mut denied = resolved_ask("deny");
+        denied.id = 9;
+        let out = pre_plan_outcome(&[approved, denied]).expect("a denial is terminal");
+        match out {
+            Outcome::Denied { ask_id, .. } => assert_eq!(ask_id, 9, "the denying ask is named"),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn several_approvals_and_no_denial_do_not_terminate_the_task() {
+        // The two-escalation shape: a task holding two live approvals must
+        // proceed to planning, where the digest comparison decides.
+        let mut first = resolved_ask("approve");
+        first.id = 9;
+        let mut second = resolved_ask("approve");
+        second.id = 11;
+        assert!(pre_plan_outcome(&[second, first]).is_none());
     }
 
     #[test]
@@ -438,7 +479,7 @@ mod tests {
         // that escalates again.
         let mut a = resolved_ask("deny");
         a.resolution = Some(serde_json::json!({"choice": "maybe"}));
-        assert!(pre_plan_outcome(Some(&a)).is_none());
+        assert!(pre_plan_outcome(&[a]).is_none());
     }
 
     #[test]

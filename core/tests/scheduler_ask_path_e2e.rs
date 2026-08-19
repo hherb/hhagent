@@ -21,7 +21,7 @@ use kastellan_core::cassandra::review::{ChainReviewStage, ReviewStage, ReviewSta
 use kastellan_core::cassandra::types::{DataClass, Plan, PlannedStep, Severity, Verdict};
 use kastellan_core::memory::embedder::NoOpEmbedder;
 use kastellan_core::scheduler::agent::{AgentError, FormulationMeta, PlanFormulator};
-use kastellan_core::scheduler::audit::ACTION_TASK_FINALIZE;
+use kastellan_core::scheduler::audit::{ACTION_ASK_APPROVAL_APPLIED, ACTION_TASK_FINALIZE};
 use kastellan_core::scheduler::inner_loop::{StepDispatcher, StepOutcome, TaskContext};
 use kastellan_core::scheduler::{spawn_scheduler, SchedulerHandle};
 use kastellan_db::tasks::{self, insert_pending, Lane};
@@ -130,6 +130,35 @@ impl PlanFormulator for TestFormulator {
             one_step_plan_with_param(n)
         } else {
             task_complete_plan("ok")
+        };
+        Ok((plan, test_meta()))
+    }
+}
+
+/// A formulator whose plan depends on the plan's INDEX WITHIN THE CURRENT
+/// RUN — `ctx.plans.len()` — rather than on a call counter.
+///
+/// That distinction is the whole test. `run_one` starts every resumed run
+/// with `plans: vec![]`, so index 0 is plan A and index 1 is plan B on every
+/// single run, and a resumed task re-derives the *same two digests* it
+/// escalated on before. A call counter (what `TestFormulator { vary: true }`
+/// uses) instead produces a brand-new digest every time, which is the
+/// separate "a different replan re-escalates" case.
+///
+/// Index >= 2 returns a terminal plan so the task can actually finish once
+/// both escalations are covered.
+struct PerRunIndexFormulator;
+
+#[async_trait]
+impl PlanFormulator for PerRunIndexFormulator {
+    async fn formulate_plan(
+        &self,
+        ctx: &TaskContext,
+    ) -> Result<(Plan, FormulationMeta), AgentError> {
+        let plan = match ctx.plans.len() {
+            0 => one_step_plan_with_param(1),
+            1 => one_step_plan_with_param(2),
+            _ => task_complete_plan("ok"),
         };
         Ok((plan, test_meta()))
     }
@@ -265,6 +294,15 @@ fn spawn_test_scheduler_varying(
     )
 }
 
+/// Returns plan A, then plan B, then a terminal plan — keyed on the plan
+/// index within the current run, so a resume replays the same digests.
+fn spawn_test_scheduler_per_run_index(
+    pool: &sqlx::PgPool,
+    review: Arc<ChainReviewStage>,
+) -> SchedulerHandle {
+    spawn_with(pool, Arc::new(PerRunIndexFormulator), review)
+}
+
 /// A reviewer chain of one [`EscalatingReview`].
 fn escalating(times: u32) -> Arc<ChainReviewStage> {
     Arc::new(ChainReviewStage::new(vec![Arc::new(EscalatingReview {
@@ -309,6 +347,19 @@ async fn count_asks_for(pool: &sqlx::PgPool, task_id: i64) -> i64 {
         .fetch_one(pool)
         .await
         .expect("count asks")
+}
+
+/// Rows of one `action` naming `task_id` in their payload.
+async fn count_audit_rows(pool: &sqlx::PgPool, action: &str, task_id: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log \
+         WHERE action = $1 AND payload->>'task_id' = $2::text",
+    )
+    .bind(action)
+    .bind(task_id)
+    .fetch_one(pool)
+    .await
+    .expect("count audit rows")
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +441,118 @@ async fn an_approval_lets_the_same_plan_through_on_resume() {
         count_asks_for(&pool, task_id).await,
         1,
         "an approved, identical replan must not re-escalate",
+    );
+
+    // The approved-proceed branch must leave a row. Without it the audit
+    // trail goes `cassandra.verdict{kind=escalate}` -> step dispatch with
+    // nothing between, and the digest of the plan that RAN appears only in
+    // the much earlier `ask.raised` row — so nothing in the log shows that
+    // the plan which executed is the plan the operator approved.
+    let applied: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM audit_log \
+         WHERE action = $1 AND payload->>'task_id' = $2::text ORDER BY id",
+    )
+    .bind(ACTION_ASK_APPROVAL_APPLIED)
+    .bind(task_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read ask.approval_applied rows");
+    assert_eq!(applied.len(), 1, "one row per approved-proceed, got {applied:?}");
+    assert_eq!(applied[0].get("ask_id").and_then(|v| v.as_i64()), Some(ask.id));
+    assert_eq!(
+        applied[0].get("plan_digest").and_then(|v| v.as_str()),
+        ask.plan_digest.as_deref(),
+        "the row must carry the digest of the plan that ran, and it must be the \
+         digest the operator approved — that binding is the whole point",
+    );
+
+    handle.shutdown().await;
+}
+
+/// A task that escalates at TWO different plans, each approved, must finish
+/// — with exactly two asks, not an unbounded alternating stream of them.
+///
+/// The livelock this pins: a task holds an approval per escalation, but the
+/// read was `LIMIT 1` and the context held one `Option<Ask>`, so approving
+/// the second question made the first approval invisible. The resumed run
+/// re-asked plan A, approving THAT made plan B's approval the stale one,
+/// and the two alternated forever — `resume_budget` grants a fresh plan
+/// allowance on every resume, so nothing but the ask deadline ended it.
+///
+/// The count assertion is the load-bearing one. With the defect the task
+/// never reaches `completed` AND a third ask is raised; either assertion
+/// alone would catch it, but the count says *what* went wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_escalations_at_two_plans_both_approved_finish_the_task() {
+    let Some((pool, _cluster)) = bring_up_pg("twoasks").await else {
+        return; // [SKIP]
+    };
+    let task_id = seed_task(&pool).await;
+
+    // Plan A, then plan B, then a terminal plan — keyed on the index within
+    // the run, so each resume replays the same two digests. The reviewer
+    // escalates the first five plans it sees, which is exactly the five
+    // non-terminal reviews across the three runs (1 + 2 + 2); the sixth,
+    // the terminal plan on the last run, is approved so the task can end.
+    let handle = spawn_test_scheduler_per_run_index(&pool, escalating(5));
+
+    // --- first escalation: plan A.
+    assert_eq!(
+        await_state(&pool, task_id, "awaiting_operator", 20).await,
+        "awaiting_operator",
+    );
+    let first = kastellan_db::asks::list_pending(&pool, 10).await.expect("list")[0].clone();
+    assert!(kastellan_db::asks::resolve(
+        &pool,
+        first.id,
+        "operator",
+        &serde_json::json!({"choice": "approve"}),
+    )
+    .await
+    .expect("resolve A"));
+
+    // --- second escalation: plan B. The resumed run gets past plan A on
+    // the first approval and stops on the NEXT plan, which is a different
+    // digest and therefore a genuinely new question.
+    assert_eq!(
+        await_state(&pool, task_id, "awaiting_operator", 20).await,
+        "awaiting_operator",
+    );
+    let second = kastellan_db::asks::list_pending(&pool, 10).await.expect("list")[0].clone();
+    assert_ne!(second.id, first.id, "the second ask must be a new row");
+    assert_ne!(
+        second.plan_digest, first.plan_digest,
+        "the two escalations must be about genuinely different plans, or this test \
+         proves nothing",
+    );
+    assert!(kastellan_db::asks::resolve(
+        &pool,
+        second.id,
+        "operator",
+        &serde_json::json!({"choice": "approve"}),
+    )
+    .await
+    .expect("resolve B"));
+
+    // --- both approvals are live at once, so the run walks plan A, plan B,
+    // and then the terminal plan without asking anything again.
+    assert_eq!(
+        await_state(&pool, task_id, "completed", 30).await,
+        "completed",
+        "with only the newest approval kept, plan A re-asks and the task alternates \
+         between two questions until its ask deadline",
+    );
+    assert_eq!(
+        count_asks_for(&pool, task_id).await,
+        2,
+        "one ask per escalation and no more — a third means the earlier approval \
+         went invisible when the later one landed",
+    );
+    // Both approvals were actually consulted on the final run, not just one.
+    assert_eq!(
+        count_audit_rows(&pool, ACTION_ASK_APPROVAL_APPLIED, task_id).await,
+        3,
+        "plan A on the second run, then plan A and plan B on the third",
     );
 
     handle.shutdown().await;
