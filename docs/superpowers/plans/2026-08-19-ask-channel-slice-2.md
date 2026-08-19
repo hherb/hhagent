@@ -1887,7 +1887,7 @@ Implements spec **D5**, **D6**, **D9**, **D12**.
   pub struct PgAskResolver; impl PgAskResolver { pub fn new(pool: sqlx::PgPool) -> Self }
   pub struct AskWiring { pub outbox: Arc<ChannelOutbox>, pub resolver: Arc<dyn AskResolver> }
   // handle_inbound gains a 3rd parameter: asks: Option<&AskWiring>
-  // ChannelBus::spawn gains a 6th parameter: asks: Option<AskWiring>
+  // ChannelBus::spawn gains a 6th parameter: asks: Option<Arc<AskWiring>>
   ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -1920,20 +1920,38 @@ impl AskResolver for RecordingResolver {
     }
 }
 
-fn wiring(resolver: Arc<RecordingResolver>) -> AskWiring {
-    AskWiring { outbox: Arc::new(ChannelOutbox::new()), resolver }
+fn wiring(resolver: Arc<RecordingResolver>) -> Arc<AskWiring> {
+    Arc::new(AskWiring { outbox: Arc::new(ChannelOutbox::new()), resolver })
 }
 
-fn command_msg(peer: &str, body: &str) -> IncomingMessage {
-    IncomingMessage {
-        channel: ChannelId("matrix".into()),
-        peer: PeerId(peer.into()),
-        conversation: ConversationId("!room:srv".into()),
-        body: body.into(),
-        evidence: None,
+/// A channel whose `send` forwards to an mpsc the test drains. The file's
+/// existing `RefusingChannel` refuses by design, so it cannot show that a
+/// core-initiated message actually reached the pump.
+struct RecordingChannel {
+    id: ChannelId,
+    inbound_rx: mpsc::Receiver<IncomingMessage>,
+    sent: mpsc::Sender<OutgoingMessage>,
+}
+
+#[async_trait::async_trait]
+impl Channel for RecordingChannel {
+    fn id(&self) -> ChannelId {
+        self.id.clone()
+    }
+    async fn recv(&mut self) -> Option<IncomingMessage> {
+        self.inbound_rx.recv().await
+    }
+    async fn send(&self, msg: OutgoingMessage) -> anyhow::Result<()> {
+        self.sent.send(msg).await.map_err(Into::into)
     }
 }
 ```
+
+**Use the fixtures this file already has** — do not add parallel copies:
+`FakeEvents` (fields `enqueued` and `audited` are accessed **directly**, e.g.
+`ev.audited.lock().unwrap()`, there are no accessor methods), the `msg(peer, body)`
+helper, `FakeCompleted { ids, rows }`, and `StaticPairings::from_peers([PeerId(..)])`
+(there is no `StaticPairings::with`).
 
 Then the tests:
 
@@ -1948,26 +1966,27 @@ async fn an_answer_from_a_paired_peer_resolves_and_never_enqueues() {
         reply: Some(kastellan_db::asks::ResolvedAsk { ask_id: 7, task_id: 412 }),
         ..Default::default()
     });
-    let events = FakeEvents::default();
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
     let ack = handle_inbound(
-        &StaticPairings::with(&[("matrix", "@horst:srv")]),
+        &auth,
         None,
-        Some(&wiring(resolver.clone())),
-        &events,
-        &command_msg("@horst:srv", "/approve tok9"),
+        Some(&*wiring(resolver.clone())),
+        &ev,
+        &msg("@me:srv", "/approve tok9"),
     )
     .await
     .expect("an ack is returned");
 
     assert!(ack.body.contains("412"), "the ack names the resuming task: {}", ack.body);
     assert_eq!(ack.conversation.0, "!room:srv");
-    assert!(events.enqueued().is_empty(), "an answer must never become a task");
+    assert!(ev.enqueued.lock().unwrap().is_empty(), "an answer must never become a task");
 
     let calls = resolver.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "tok9");
     assert_eq!(calls[0].1, "approve");
-    assert_eq!(calls[0].2, "matrix/@horst:srv", "the claimant is the transport's own sender");
+    assert_eq!(calls[0].2, "matrix/@me:srv", "the claimant is the transport's own sender");
 }
 
 /// **The load-bearing negative.** An unpaired peer's command must die at
@@ -1978,19 +1997,19 @@ async fn an_answer_from_a_paired_peer_resolves_and_never_enqueues() {
 #[tokio::test]
 async fn an_answer_from_an_unpaired_peer_never_reaches_the_resolver() {
     let resolver = Arc::new(RecordingResolver::default());
-    let events = FakeEvents::default();
+    let ev = FakeEvents::default();
     let ack = handle_inbound(
-        &StaticPairings::with(&[]),
+        &StaticPairings::new(),
         None,
-        Some(&wiring(resolver.clone())),
-        &events,
-        &command_msg("@stranger:srv", "/approve tok9"),
+        Some(&*wiring(resolver.clone())),
+        &ev,
+        &msg("@stranger:srv", "/approve tok9"),
     )
     .await;
 
     assert!(ack.is_none());
     assert!(resolver.calls.lock().unwrap().is_empty(), "the resolver must not be consulted");
-    assert!(events.actions().contains(&actions::REJECTED_UNPAIRED.to_string()));
+    assert_eq!(ev.audited.lock().unwrap()[0].0, actions::REJECTED_UNPAIRED);
 }
 
 /// A token that resolves nothing gets the indistinguishable sentence and
@@ -1999,20 +2018,15 @@ async fn an_answer_from_an_unpaired_peer_never_reaches_the_resolver() {
 #[tokio::test]
 async fn an_unanswerable_token_is_acknowledged_without_naming_a_cause() {
     let resolver = Arc::new(RecordingResolver::default()); // reply: None
-    let events = FakeEvents::default();
-    let ack = handle_inbound(
-        &StaticPairings::with(&[("matrix", "@horst:srv")]),
-        None,
-        Some(&wiring(resolver)),
-        &events,
-        &command_msg("@horst:srv", "/deny nope"),
-    )
-    .await
-    .expect("an ack is returned");
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let ack = handle_inbound(&auth, None, Some(&*wiring(resolver)), &ev, &msg("@me:srv", "/deny nope"))
+        .await
+        .expect("an ack is returned");
 
-    assert_eq!(ack.body, ACK_NOT_ANSWERABLE);
-    assert!(events.enqueued().is_empty());
-    assert!(events.actions().contains(&actions::ASK_ANSWER_REJECTED.to_string()));
+    assert_eq!(ack.body, crate::channel::ask_message::ACK_NOT_ANSWERABLE);
+    assert!(ev.enqueued.lock().unwrap().is_empty());
+    assert_eq!(ev.audited.lock().unwrap()[0].0, actions::ASK_ANSWER_REJECTED);
 }
 
 /// An ordinary message from the same peer must be unaffected — the arm is
@@ -2020,18 +2034,19 @@ async fn an_unanswerable_token_is_acknowledged_without_naming_a_cause() {
 #[tokio::test]
 async fn an_ordinary_message_still_enqueues_with_the_wiring_present() {
     let resolver = Arc::new(RecordingResolver::default());
-    let events = FakeEvents::default();
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
     let ack = handle_inbound(
-        &StaticPairings::with(&[("matrix", "@horst:srv")]),
+        &auth,
         None,
-        Some(&wiring(resolver.clone())),
-        &events,
-        &command_msg("@horst:srv", "what is my flight's GST?"),
+        Some(&*wiring(resolver.clone())),
+        &ev,
+        &msg("@me:srv", "what is my flight's GST?"),
     )
     .await;
 
     assert!(ack.is_none());
-    assert_eq!(events.enqueued().len(), 1);
+    assert_eq!(ev.enqueued.lock().unwrap().len(), 1);
     assert!(resolver.calls.lock().unwrap().is_empty());
 }
 
@@ -2039,63 +2054,63 @@ async fn an_ordinary_message_still_enqueues_with_the_wiring_present() {
 /// pre-slice-2 bus: `/approve x` is just a message.
 #[tokio::test]
 async fn without_wiring_a_command_is_an_ordinary_message() {
-    let events = FakeEvents::default();
-    let ack = handle_inbound(
-        &StaticPairings::with(&[("matrix", "@horst:srv")]),
-        None,
-        None,
-        &events,
-        &command_msg("@horst:srv", "/approve tok9"),
-    )
-    .await;
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let ack = handle_inbound(&auth, None, None, &ev, &msg("@me:srv", "/approve tok9")).await;
 
     assert!(ack.is_none());
-    assert_eq!(events.enqueued().len(), 1);
+    assert_eq!(ev.enqueued.lock().unwrap().len(), 1);
 }
 
 /// The bus registers its own reply queue into the outbox, which is what
 /// makes core-initiated delivery reach the same pump replies go through —
 /// and deregisters on shutdown, so a bus going away stops being a delivery
 /// target rather than accumulating messages nobody drains.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_bus_registers_its_channel_and_deregisters_on_shutdown() {
     let outbox = Arc::new(ChannelOutbox::new());
     let resolver: Arc<dyn AskResolver> = Arc::new(RecordingResolver::default());
-    let (ch, mut sent) = FakeChannel::new("matrix");
+    let (_inbound_tx, inbound_rx) = mpsc::channel::<IncomingMessage>(1);
+    let (sent_tx, mut sent_rx) = mpsc::channel::<OutgoingMessage>(4);
+    let channel = RecordingChannel {
+        id: ChannelId("matrix".into()),
+        inbound_rx,
+        sent: sent_tx,
+    };
 
     let bus = ChannelBus::spawn(
-        vec![Box::new(ch)],
-        Arc::new(StaticPairings::with(&[("matrix", "@horst:srv")])),
+        vec![Box::new(channel)],
+        Arc::new(StaticPairings::new()),
         None,
         Arc::new(FakeEvents::default()),
-        Box::new(NoCompletions),
-        Some(AskWiring { outbox: outbox.clone(), resolver }),
+        Box::new(FakeCompleted { ids: Mutex::new(vec![]), rows: HashMap::new() }),
+        Some(Arc::new(AskWiring { outbox: outbox.clone(), resolver })),
     );
 
     outbox
         .try_deliver(OutgoingMessage {
             channel: ChannelId("matrix".into()),
-            peer: PeerId("@horst:srv".into()),
+            peer: PeerId("@me:srv".into()),
             conversation: ConversationId("!room:srv".into()),
             body: "core-initiated".into(),
         })
         .expect("a running bus is a delivery target");
-    assert_eq!(sent.recv().await.expect("delivered").body, "core-initiated");
+    assert_eq!(sent_rx.recv().await.expect("delivered").body, "core-initiated");
 
     bus.shutdown().await;
     assert_eq!(
         outbox.try_deliver(OutgoingMessage {
             channel: ChannelId("matrix".into()),
-            peer: PeerId("@horst:srv".into()),
+            peer: PeerId("@me:srv".into()),
             conversation: ConversationId("!room:srv".into()),
             body: "after shutdown".into(),
         }),
-        Err(OutboxError::NoSuchChannel),
+        Err(crate::channel::outbox::OutboxError::NoSuchChannel),
     );
 }
 ```
 
-**Note for the implementer:** `FakeEvents`, `StaticPairings`, `FakeChannel` and `NoCompletions` already exist in this test file (or in `channel::auth`) under those or similar names — read the file and reuse what is there rather than adding parallel fakes. If `FakeEvents` has no `actions()`/`enqueued()` accessor, add the minimal one it needs.
+**Note for the implementer:** the only genuinely new fixtures are `RecordingResolver` and `RecordingChannel`. Everything else already exists in this file — reuse it.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -2262,7 +2277,7 @@ The code, immediately after the `authorize` match and before `screen_and_classif
     }
 ```
 
-`ChannelBus::spawn` gains `asks: Option<AskWiring>` as its **sixth** parameter. Inside the per-channel loop, right after `senders.insert(id.clone(), tx);`:
+`ChannelBus::spawn` gains `asks: Option<Arc<AskWiring>>` as its **sixth** parameter. **`Arc`, not a bare value:** each per-channel pump is a `tokio::spawn`'d `'static` task that calls `handle_inbound`, so it needs its own clone — exactly as it already clones `pairing: Option<Arc<dyn PairingService>>`. Clone it into each pump alongside `events`, and pass `asks.as_deref()` to `handle_inbound`. Inside the per-channel loop, right after `senders.insert(id.clone(), tx);`:
 
 ```rust
             // Publish this channel's reply queue so core-initiated messages
@@ -2281,9 +2296,9 @@ Store what `shutdown` needs on the struct:
 pub struct ChannelBus {
     handles: Vec<JoinHandle<()>>,
     bell: DeathBell,
-    /// Kept so `shutdown` can deregister; also keeps the `AskWiring`'s
-    /// `Arc`s alive for the bus's lifetime.
-    asks: Option<AskWiring>,
+    /// Kept so `shutdown` can deregister; also keeps the wiring alive for
+    /// the bus's lifetime.
+    asks: Option<Arc<AskWiring>>,
     /// The ids registered into the outbox, so shutdown removes exactly what
     /// spawn added.
     registered: Vec<ChannelId>,
@@ -2363,7 +2378,7 @@ Implements spec **D2**, **D13**, and completes the raise path.
 - Modify: `core/src/scheduler/runner.rs` (`spawn_scheduler`, `lane_loop`)
 - Modify: `core/src/scheduler/runner/task_exec.rs` (`run_one`)
 - Modify: `core/src/scheduler/agent.rs`, `core/src/scheduler/inner_loop/tests.rs`, `core/tests/router_agent_mock_e2e.rs`, `core/tests/scheduler_inner_loop_e2e.rs` (add `origin: None` to `TaskContext` literals)
-- Modify: `core/tests/scheduler_ask_path_e2e.rs` (the new e2e)
+- Modify: `core/tests/scheduler_asks_e2e.rs` (the new e2e, **plus `None, None` on its four existing `raise_and_suspend` call sites**)
 
 **Interfaces:**
 - Consumes: `delivery::{deliver_ask, delivery_audit_row}` (Task 5), `AskDestination`/`destination_from_task_payload` (Task 2), `ChannelOutbox` (Task 3).
@@ -2379,7 +2394,18 @@ Implements spec **D2**, **D13**, and completes the raise path.
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `core/tests/scheduler_ask_path_e2e.rs`, following that file's existing harness style:
+Add to `core/tests/scheduler_asks_e2e.rs` — **that** file, not `scheduler_ask_path_e2e.rs`:
+it drives `raise_and_suspend` directly and already has everything these tests need
+(`bring_up_pg`, `seed_running_task`, `plan_with_context`, `audit_actions_for`), whereas
+`scheduler_ask_path_e2e.rs` drives the whole scheduler through `spawn_test_scheduler` and
+has no such harness.
+
+**First**, append `None, None` to the four existing `raise_and_suspend` calls in this file
+(a non-channel task with no outbox is exactly what they mean, and each will now audit
+`ask.undelivered{reason: task_has_no_channel_origin}` — which is correct and worth knowing
+when reading their audit assertions).
+
+Then add the two new tests, in this file's style:
 
 ```rust
 /// The whole loop, end to end against a live Postgres: a channel task
@@ -2391,116 +2417,120 @@ Add to `core/tests/scheduler_ask_path_e2e.rs`, following that file's existing ha
 /// that resolves.** Every pure test on either side passes with the two
 /// halves disagreeing — the renderer could print one thing and the
 /// resolver expect another, and both suites stay green.
-#[test]
-fn a_raised_ask_is_delivered_and_its_token_resolves_it() {
-    let Some(h) = harness("askdl") else { return };
-    h.rt.block_on(async {
-        use kastellan_core::channel::{ChannelId, ConversationId, PeerId};
-        use kastellan_core::channel::ask_message::{destination_from_task_payload, parse_ask_command};
-        use kastellan_core::channel::outbox::ChannelOutbox;
-        use kastellan_core::scheduler::asks::raise_and_suspend;
-        use kastellan_db::tasks::Lane;
-        use kastellan_db::{asks, tasks};
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_raised_ask_is_delivered_and_its_token_resolves_it() {
+    let Some((pool, _cluster)) = bring_up_pg("deliver").await else { return };
 
-        let pool = h.migrated_pool("ask-delivery-e2e").await;
-        let pool = &pool;
-
-        let payload = serde_json::json!({
-            "kind": "channel", "instruction": "book the flight",
-            "channel": "matrix", "peer": "@horst:srv", "conversation": "!room:srv",
-        });
-        let task_id = tasks::insert_pending(pool, Lane::Fast, payload.clone()).await.unwrap();
-        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
-
-        let outbox = ChannelOutbox::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        outbox.register(ChannelId("matrix".into()), tx);
-
-        let dest = destination_from_task_payload(&payload).expect("destination");
-        let ask_id = raise_and_suspend(
-            pool, task_id, &escalating_plan(), "sends money to a stranger",
-            kastellan_core::cassandra::types::Severity::High, None,
-            Some(&outbox), Some(&dest),
-        )
-        .await
-        .expect("raise + deliver");
-
-        // The delivery carried a usable command, into the right room.
-        let sent = rx.recv().await.expect("the ask was delivered");
-        assert_eq!(sent.conversation.0, "!room:srv");
-        let approve = sent
-            .body
-            .lines()
-            .map(str::trim)
-            .find(|l| l.starts_with("/approve"))
-            .expect("an approve command was offered");
-        let cmd = parse_ask_command(approve).expect("the offered command parses");
-
-        // ... and that token resolves the ask, for the task's own peer.
-        let owner = asks::Claimant::new("matrix", "@horst:srv");
-        let resolved = asks::resolve_with_nonce(
-            pool, &asks::Nonce::from_wire(cmd.token), &owner,
-            &serde_json::json!({"choice": "approve"}),
-        )
-        .await
-        .unwrap()
-        .expect("the delivered token resolves the ask it was delivered for");
-        assert_eq!(resolved.ask_id, ask_id);
-        assert_eq!(resolved.task_id, task_id);
-        assert_eq!(tasks::observe_state(pool, task_id).await.unwrap(), "pending");
+    let payload = serde_json::json!({
+        "kind": "channel", "instruction": "book the flight",
+        "channel": "matrix", "peer": "@me:srv", "conversation": "!room:srv",
     });
+    let task_id = insert_pending(&pool, Lane::Fast, payload.clone()).await.expect("insert");
+    tasks::claim_one(&pool, Lane::Fast, 60).await.expect("claim").expect("a task");
+
+    let outbox = ChannelOutbox::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    outbox.register(ChannelId("matrix".into()), tx);
+
+    let dest = destination_from_task_payload(&payload).expect("destination");
+    let ask_id = asks::raise_and_suspend(
+        &pool, task_id, &plan_with_context("send the money"),
+        "sends money to a stranger", Severity::High, None,
+        Some(&outbox), Some(&dest),
+    )
+    .await
+    .expect("raise + deliver");
+
+    // The delivery carried a usable command, into the right room.
+    let sent = rx.recv().await.expect("the ask was delivered");
+    assert_eq!(sent.conversation.0, "!room:srv");
+    let approve = sent
+        .body
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("/approve"))
+        .expect("an approve command was offered")
+        .to_string();
+    let cmd = parse_ask_command(&approve).expect("the offered command parses");
+
+    // ... and that token resolves the ask, for the task's own peer.
+    let owner = kastellan_db::asks::Claimant::new("matrix", "@me:srv");
+    let resolved = kastellan_db::asks::resolve_with_nonce(
+        &pool,
+        &kastellan_db::asks::Nonce::from_wire(cmd.token),
+        &owner,
+        &serde_json::json!({"choice": "approve"}),
+    )
+    .await
+    .expect("resolve")
+    .expect("the delivered token resolves the ask it was delivered for");
+    assert_eq!(resolved.ask_id, ask_id);
+    assert_eq!(resolved.task_id, task_id);
+    assert_eq!(tasks::observe_state(&pool, task_id).await.expect("state"), "pending");
+
+    assert!(
+        audit_actions_for(&pool, task_id).await.iter().any(|a| a == ACTION_ASK_DELIVERED),
+        "a delivered ask must leave an ask.delivered row",
+    );
 }
 
 /// A delivery failure must not cost the ask. The registry has no channel,
 /// so `try_deliver` fails — and the ask must still be committed, the task
 /// still suspended, and `kastellan-cli inbox` still able to answer it.
-#[test]
-fn a_failed_delivery_still_leaves_a_durable_answerable_ask() {
-    let Some(h) = harness("askdf") else { return };
-    h.rt.block_on(async {
-        use kastellan_core::channel::ask_message::destination_from_task_payload;
-        use kastellan_core::channel::outbox::ChannelOutbox;
-        use kastellan_core::scheduler::asks::raise_and_suspend;
-        use kastellan_db::tasks::Lane;
-        use kastellan_db::{asks, tasks};
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_delivery_still_leaves_a_durable_answerable_ask() {
+    let Some((pool, _cluster)) = bring_up_pg("delivfail").await else { return };
 
-        let pool = h.migrated_pool("ask-delivery-failure-e2e").await;
-        let pool = &pool;
-
-        let payload = serde_json::json!({
-            "kind": "channel", "instruction": "book the flight",
-            "channel": "matrix", "peer": "@horst:srv", "conversation": "!room:srv",
-        });
-        let task_id = tasks::insert_pending(pool, Lane::Fast, payload.clone()).await.unwrap();
-        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
-
-        let empty_outbox = ChannelOutbox::new(); // nothing registered
-        let dest = destination_from_task_payload(&payload).expect("destination");
-        let ask_id = raise_and_suspend(
-            pool, task_id, &escalating_plan(), "sends money to a stranger",
-            kastellan_core::cassandra::types::Severity::High, None,
-            Some(&empty_outbox), Some(&dest),
-        )
-        .await
-        .expect("a delivery failure must not fail the raise");
-
-        assert_eq!(asks::get(pool, ask_id).await.unwrap().unwrap().state, "pending");
-        assert_eq!(tasks::observe_state(pool, task_id).await.unwrap(), "awaiting_operator");
-        assert!(asks::resolve(
-            pool, ask_id, "hherb", &serde_json::json!({"choice": "approve"}),
-        ).await.unwrap(), "the CLI must still be able to answer it");
+    let payload = serde_json::json!({
+        "kind": "channel", "instruction": "book the flight",
+        "channel": "matrix", "peer": "@me:srv", "conversation": "!room:srv",
     });
+    let task_id = insert_pending(&pool, Lane::Fast, payload.clone()).await.expect("insert");
+    tasks::claim_one(&pool, Lane::Fast, 60).await.expect("claim").expect("a task");
+
+    let empty_outbox = ChannelOutbox::new(); // nothing registered
+    let dest = destination_from_task_payload(&payload).expect("destination");
+    let ask_id = asks::raise_and_suspend(
+        &pool, task_id, &plan_with_context("send the money"),
+        "sends money to a stranger", Severity::High, None,
+        Some(&empty_outbox), Some(&dest),
+    )
+    .await
+    .expect("a delivery failure must not fail the raise");
+
+    assert_eq!(kastellan_db::asks::get(&pool, ask_id).await.unwrap().unwrap().state, "pending");
+    assert_eq!(
+        tasks::observe_state(&pool, task_id).await.expect("state"),
+        "awaiting_operator",
+    );
+    assert!(
+        audit_actions_for(&pool, task_id).await.iter().any(|a| a == ACTION_ASK_DELIVERY_FAILED),
+        "an undelivered ask must leave the compensating row",
+    );
+    assert!(
+        kastellan_db::asks::resolve(
+            &pool, ask_id, "hherb", &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap(),
+        "the CLI must still be able to answer it",
+    );
 }
 ```
 
-Reuse the file's existing plan fixture if it has one; otherwise add `fn escalating_plan() -> Plan` modelled on `plan_with_tool` in `scheduler/asks/pure.rs`'s tests.
+Add the imports these need at the top of the file:
+
+```rust
+use kastellan_core::channel::ask_message::{destination_from_task_payload, parse_ask_command};
+use kastellan_core::channel::outbox::ChannelOutbox;
+use kastellan_core::channel::ChannelId;
+use kastellan_core::scheduler::audit::{ACTION_ASK_DELIVERED, ACTION_ASK_DELIVERY_FAILED};
+```
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 ```bash
 source "$HOME/.cargo/env"
 KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin" \
-  cargo test -p kastellan-core --test scheduler_ask_path_e2e 2>&1 | tail -20
+  cargo test -p kastellan-core --test scheduler_asks_e2e 2>&1 | tail -20
 ```
 
 Expected: FAIL to compile — `raise_and_suspend` takes 6 arguments, not 8.
@@ -2608,7 +2638,7 @@ At the `Escalate` arm's call site:
 source "$HOME/.cargo/env"
 cargo test -p kastellan-core --lib 2>&1 | tail -5
 KASTELLAN_PG_BIN_DIR="/Applications/Postgres 2.app/Contents/Versions/18/bin" \
-  cargo test -p kastellan-core --test scheduler_ask_path_e2e 2>&1 | tail -8
+  cargo test -p kastellan-core --test scheduler_asks_e2e 2>&1 | tail -8
 cargo clippy -p kastellan-core --all-targets -- -D warnings 2>&1 | tail -5
 ```
 
@@ -2617,7 +2647,7 @@ Expected: lib tests pass; the e2e reports its existing tests plus the 2 new ones
 - [ ] **Step 5: Commit**
 
 ```bash
-git add core/src/scheduler/ core/src/main.rs core/tests/scheduler_ask_path_e2e.rs \
+git add core/src/scheduler/ core/src/main.rs core/tests/scheduler_asks_e2e.rs \
         core/tests/router_agent_mock_e2e.rs core/tests/scheduler_inner_loop_e2e.rs
 git commit -m "feat(scheduler): a raised ask is delivered to the conversation it came from
 
@@ -2694,10 +2724,10 @@ In `core/src/main.rs`, immediately before the `spawn_scheduler` call:
 Thread the parameter through each module's `supervise_*` → retry loop → `attempt` function (follow the existing `pool`/`sandboxes` threading exactly), and build the wiring at the `ChannelBus::spawn` call:
 
 ```rust
-    let asks = kastellan_core::channel::bus::AskWiring {
+    let asks = Arc::new(kastellan_core::channel::bus::AskWiring {
         outbox,
         resolver: Arc::new(kastellan_core::channel::bus::PgAskResolver::new(pool.clone())),
-    };
+    });
     BootOutcome::Started(StartedChannel::from_bus(ChannelBus::spawn(
         vec![Box::new(worker.channel)],
         authorizer,
