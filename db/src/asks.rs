@@ -51,10 +51,20 @@ use zeroize::Zeroize;
 use crate::tasks;
 use crate::DbError;
 
-/// Entropy in an ask nonce. 32 bytes → 64 hex chars, the same width as
-/// the SHA-256 it is stored under, and far past guessing range for a
-/// token that gates someone else's approval.
-const NONCE_BYTES: usize = 32;
+/// Nonce length in bytes, hex-encoded to twice that on the wire.
+///
+/// **5 bytes — 10 hex characters (#564 slice 2, spec D17).** It was 32
+/// when the nonce was the sole barrier; `resolve_with_nonce` now also
+/// requires the claimant to be the task's own peer, so the nonce is
+/// correlation plus defence in depth and 64 characters bought nothing but
+/// a message no operator would retype at 2 a.m.
+///
+/// 40 bits, against an attacker who must already be a paired peer
+/// answering their own task's ask, gets one attempt per inbound message,
+/// leaves a `channel.ask_answer_rejected` audit row on each miss, and has
+/// until the 24 h deadline. No migration: the column stores the SHA-256,
+/// which is 64 hex characters whatever the input length.
+const NONCE_BYTES: usize = 5;
 
 /// One decoded `asks` row.
 ///
@@ -156,6 +166,52 @@ impl Drop for Nonce {
 pub struct RaisedAsk {
     pub ask_id: i64,
     pub nonce: Nonce,
+}
+
+/// Who is claiming the right to answer an ask: a `(channel, peer)` pair
+/// that some transport has already authenticated.
+///
+/// **A struct, not two `&str` parameters.** The two fields are both
+/// free-form strings that appear adjacent in the only call, so as separate
+/// parameters a transposition compiles and silently checks the peer
+/// against the channel — which matches nothing, which fails closed, but
+/// fails closed *invisibly*: every approval simply stops working with no
+/// error that names the cause. Same reasoning as [`Nonce`], one field over.
+///
+/// **Construct it from the transport's own view of the sender**, never
+/// from anything in a message body. A body-supplied identity hands the
+/// entitlement check straight back to the sender.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Claimant {
+    channel: String,
+    peer: String,
+}
+
+impl Claimant {
+    pub fn new(channel: impl Into<String>, peer: impl Into<String>) -> Self {
+        Self { channel: channel.into(), peer: peer.into() }
+    }
+
+    /// The `asks.resolved_by` attribution: `"<channel>/<peer>"`.
+    ///
+    /// Composed here rather than taken as a parameter, so the identity in
+    /// the audit trail is by construction the identity the entitlement
+    /// guard matched on.
+    pub fn attribution(&self) -> String {
+        format!("{}/{}", self.channel, self.peer)
+    }
+
+    pub(crate) fn channel(&self) -> &str { &self.channel }
+    pub(crate) fn peer(&self) -> &str { &self.peer }
+}
+
+/// What a successful [`resolve_with_nonce`] hands back. `task_id` is what
+/// lets the caller's acknowledgement name the task that is resuming; a
+/// `bool` could not, and a second query for it would race the resumption.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedAsk {
+    pub ask_id: i64,
+    pub task_id: i64,
 }
 
 /// One row [`expire_due`] retired, for the caller's audit emission.
@@ -455,17 +511,31 @@ pub async fn resolve(
 ///
 /// Same semantics as [`resolve`] otherwise: one transaction, exactly-once,
 /// first-responder-wins, `choice` enforced against `options`. Returns
-/// `true` iff **this** call resolved it; `false` for a wrong/unissued
-/// nonce, an already-resolved ask, one that expired/was cancelled, or one
-/// past its deadline. Those cases are deliberately indistinguishable —
-/// splitting them would hand a nonce-guessing peer an existence oracle
-/// over ask ids.
+/// `Some(ResolvedAsk)` iff **this** call resolved it; `None` for a
+/// wrong/unissued nonce, an already-resolved ask, one that expired/was
+/// cancelled, one past its deadline, or a claimant that does not own the
+/// task. Those cases are deliberately indistinguishable — splitting them
+/// would hand a nonce-guessing peer an existence oracle over ask ids.
+///
+/// **The claimant must own the task (#564 slice 2, spec D16).** The nonce
+/// is delivered as a message into a conversation, so it is a *bearer*
+/// token: everyone who can read that conversation holds it. Possession
+/// alone therefore never established entitlement, and the guard below adds
+/// the half this doc used to defer to the caller — ask N is answerable
+/// only by the `(channel, peer)` recorded on the task that raised it.
+///
+/// It is a predicate in the same guarded UPDATE rather than a check in the
+/// caller, because a caller-side check is a TOCTOU: it would establish
+/// entitlement against a row read outside the transaction that commits the
+/// resolution. In the guard it is atomic, fail-closed, and inherits the
+/// no-existence-oracle property — a wrong peer is indistinguishable from a
+/// wrong nonce.
 pub async fn resolve_with_nonce(
     pool: &PgPool,
     nonce: &Nonce,
-    resolved_by: &str,
+    claimant: &Claimant,
     resolution: &serde_json::Value,
-) -> Result<bool, DbError> {
+) -> Result<Option<ResolvedAsk>, DbError> {
     let nonce_hash = sha256_hex(nonce.expose());
 
     let mut tx = pool
@@ -480,24 +550,34 @@ pub async fn resolve_with_nonce(
              resolved_by = $2, \
              resolution = $3 \
          WHERE nonce_sha256 = $1 AND state = 'pending' AND deadline_at > now() \
+           AND EXISTS (SELECT 1 FROM tasks t \
+                        WHERE t.id = asks.task_id \
+                          AND t.payload->>'kind' = 'channel' \
+                          AND t.payload->>'channel' = $4 \
+                          AND t.payload->>'peer' = $5) \
          RETURNING id, task_id, options",
     )
     .bind(&nonce_hash)
-    .bind(resolved_by)
+    .bind(claimant.attribution())
     .bind(resolution)
+    .bind(claimant.channel())
+    .bind(claimant.peer())
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| DbError::Query(format!("asks resolve_with_nonce: {e}")))?;
 
     let Some(row) = row else {
-        // Wrong/unissued nonce, lost the race, or past the deadline.
-        // Dropping `tx` rolls back; nothing was written either way.
-        return Ok(false);
+        // Wrong/unissued nonce, a claimant who does not own the task, lost
+        // the race, or past the deadline. Dropping `tx` rolls back; nothing
+        // was written either way, and the four are deliberately one answer.
+        return Ok(None);
     };
     let (resolved_ask_id, task_id) = decode_resolved_ids(&row)?;
     reject_choice_outside_options(&row, resolved_ask_id, resolution)?;
 
-    finish_resolve(tx, resolved_ask_id, task_id).await
+    finish_resolve(tx, resolved_ask_id, task_id)
+        .await
+        .map(|_| Some(ResolvedAsk { ask_id: resolved_ask_id, task_id }))
 }
 
 /// Enforce that `resolution.choice` names one of the ask's own `options`.
@@ -901,5 +981,22 @@ mod tests {
                  filling the whole buffer?",
             );
         }
+    }
+
+    /// D17: 5 bytes, hex-encoded — 10 characters, short enough to copy off a
+    /// phone screen. Pinned because the whole point of the change is the
+    /// LENGTH, and nothing else in the suite would notice it drifting back.
+    #[test]
+    fn the_nonce_is_ten_characters() {
+        assert_eq!(NONCE_BYTES, 5);
+        assert_eq!(generate_nonce().len(), 10);
+    }
+
+    /// The attribution is the two claimant fields joined, and it is the only
+    /// thing that reaches `resolved_by`. Pure, so it needs no cluster.
+    #[test]
+    fn claimant_attribution_is_channel_slash_peer() {
+        let c = Claimant::new("matrix", "@horst:kastellan.dev");
+        assert_eq!(c.attribution(), "matrix/@horst:kastellan.dev");
     }
 }
