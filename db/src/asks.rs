@@ -102,16 +102,19 @@ pub struct Ask {
 /// A correlation nonce in plaintext: the unforgeable capability to
 /// resolve one specific ask.
 ///
-/// **A newtype rather than a `String`, and the reason is a bug the type
-/// makes impossible.** [`resolve_with_nonce`] takes the secret and the
-/// caller's `resolved_by` attribution in adjacent parameters; as two
-/// `&str`s, transposing them **compiles**. At runtime that hashes the peer
-/// id (matching nothing, so a silent `Ok(false)` rather than an error) and
-/// writes the **plaintext nonce into `asks.resolved_by`** — a column on a
-/// table with no DELETE grant, whence it flows into the operator inbox and
-/// slice 1b's audit rows. Every other precaution here (no field on
-/// [`Ask`], hash-only storage, matching by SQL predicate) is defeated by
-/// an argument swap, so the compiler holds this one.
+/// **A newtype rather than a `String`.** Until #564 slice 2,
+/// [`resolve_with_nonce`] took the secret and the caller's `resolved_by`
+/// attribution as adjacent `&str` parameters, and transposing them
+/// **compiled**: it would have hashed the peer id instead of the nonce
+/// (matching nothing, so a silent `Ok(false)` under that signature) and
+/// written the **plaintext nonce into `asks.resolved_by`** — a column on a
+/// table with no DELETE grant, whence it would have flowed into the
+/// operator inbox and slice 1b's audit rows. That parameter no longer
+/// exists: the second argument is now a [`Claimant`] (see its own doc),
+/// a distinct type the compiler cannot confuse with a `Nonce`, so the
+/// transposition hazard itself is gone. The newtype still earns its keep
+/// on the reasons below — it is what keeps the plaintext out of logs,
+/// `Serialize`, and `Deref`, and zeroizes it on drop.
 ///
 /// No `Display`, no `Serialize`, no `Deref`, and `Debug` renders
 /// `<redacted>`: the plaintext leaves only through [`Nonce::expose`],
@@ -489,10 +492,11 @@ pub async fn resolve(
 /// [`Nonce::from_wire`]); it is hashed here with [`sha256_hex`] and matched
 /// against the stored `nonce_sha256` — never the other way around, so a DB
 /// read still cannot recover a live token. Guarded `WHERE nonce_sha256 =
-/// $1 AND state = 'pending' AND deadline_at > now()`, so a peer who does
-/// not hold the nonce [`raise`] handed out cannot resolve (or even
-/// discover) anyone else's ask. See [`resolve`]'s doc for why the by-id
-/// form is not safe for this caller.
+/// $1 AND state = 'pending' AND deadline_at > now() AND EXISTS (…)` — the
+/// `EXISTS` is the D16 ownership check described below — so a peer who
+/// does not hold the nonce [`raise`] handed out, or who is not the task's
+/// own peer, cannot resolve (or even discover) anyone else's ask. See
+/// [`resolve`]'s doc for why the by-id form is not safe for this caller.
 ///
 /// **Timing is not a concern here and "fixing" it would be a regression.**
 /// What the `WHERE` compares is the SHA-256 *hash*, not the token, so a
@@ -502,12 +506,16 @@ pub async fn resolve(
 /// `core::channel::auth::constant_time_eq` — that would reintroduce the
 /// Rust-side comparison this module exists to avoid.
 ///
-/// **What this does NOT establish: that the peer is entitled to answer.**
-/// The nonce proves the caller holds the capability for *this* ask; it says
-/// nothing about who they are, and `resolved_by` is an unverified string
-/// this function stores verbatim into the audit trail. Pairing the nonce
-/// with a peer `channel::auth` has already authorized — "id and authority
-/// kept separate", per the ROADMAP — is the caller's job in slice 2.
+/// **What the nonce ALONE does not establish: that the peer is entitled to
+/// answer.** The nonce proves the caller holds the capability for *this*
+/// ask; on its own it says nothing about who they are. Before #564 slice
+/// 2, `resolved_by` was an unverified string this function stored verbatim
+/// into the audit trail, and pairing the nonce with a peer `channel::auth`
+/// had already authorized — "id and authority kept separate", per the
+/// ROADMAP — was left as the caller's job. **It no longer is left to the
+/// caller.** The D16 paragraph below closes exactly this gap inside the
+/// guard itself, and `resolved_by` is now composed from the claimant the
+/// guard matched rather than taken as a parameter — see [`Claimant`].
 ///
 /// Same semantics as [`resolve`] otherwise: one transaction, exactly-once,
 /// first-responder-wins, `choice` enforced against `options`. Returns
@@ -956,16 +964,16 @@ mod tests {
 
     /// `generate_nonce` must draw its full width from the CSPRNG. Length
     /// alone does not establish that: `fill_bytes(&mut bytes[..4])` still
-    /// yields 64 hex chars and still differs between two draws, while
-    /// leaving 28 of 32 bytes permanently zero — for a token whose only job
-    /// is to be unguessable by an untrusted peer.
+    /// yields 10 hex chars and still differs between two draws, while
+    /// leaving 1 of `NONCE_BYTES` (5) bytes permanently zero — for a token
+    /// whose only job is to be unguessable by an untrusted peer.
     #[test]
     fn generate_nonce_varies_in_every_byte_position() {
         const DRAWS: usize = 64;
         let sample: Vec<String> = (0..DRAWS).map(|_| generate_nonce()).collect();
 
         for n in &sample {
-            assert_eq!(n.len(), NONCE_BYTES * 2, "32 bytes hex-encoded");
+            assert_eq!(n.len(), NONCE_BYTES * 2, "NONCE_BYTES bytes hex-encoded");
             assert!(n.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
         }
 

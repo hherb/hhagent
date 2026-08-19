@@ -782,9 +782,12 @@ fn resolve_with_nonce_rejects_a_wrong_nonce_and_leaves_the_ask_pending() {
             "test setup: must not collide with the real nonce",
         );
 
+        // The owning claimant, deliberately — the point of this test is the
+        // hash mismatch alone. A non-owning claimant would make `EXISTS`
+        // refuse it too, and the three D16 tests already cover that path.
         let lost = asks::resolve_with_nonce(
             &pool, &asks::Nonce::from_wire(unissued_nonce.clone()),
-            &asks::Claimant::new("matrix", "@stranger:evil.example"),
+            &asks::Claimant::new("matrix", "@horst:kastellan.dev"),
             &serde_json::json!({"choice": "approve"}),
         ).await.unwrap();
         assert!(lost.is_none(), "an unissued nonce must not resolve the ask");
@@ -856,11 +859,15 @@ fn resolve_with_nonce_on_an_already_resolved_ask_returns_false() {
         ).await.unwrap();
         assert!(first.is_some(), "the first resolve must win");
 
-        // Same nonce, second call: the ask is no longer `pending`, so the
-        // guarded UPDATE finds nothing — clean `Ok(None)`, not an error,
-        // and the winner's decision is untouched.
+        // Same nonce, same OWNING claimant, second call: the ask is no
+        // longer `pending`, so the guarded UPDATE finds nothing — clean
+        // `Ok(None)`, not an error, and the winner's decision is untouched.
+        // The claimant must match the task's own peer here, or a mismatched
+        // claimant would make `EXISTS` refuse it independently of
+        // `state = 'pending'`, and this would stop proving what it is named
+        // for.
         let second = asks::resolve_with_nonce(
-            &pool, &raised.nonce, &asks::Claimant::new("matrix", "@someone-else:evil.example"),
+            &pool, &raised.nonce, &asks::Claimant::new("matrix", "@horst:kastellan.dev"),
             &serde_json::json!({"choice": "deny"}),
         ).await.unwrap();
         assert!(second.is_none(), "resolving an already-resolved ask by nonce must lose cleanly");
@@ -1481,7 +1488,16 @@ fn a_nonce_resolves_only_its_own_ask() {
         use kastellan_db::tasks::Lane;
         use kastellan_db::{asks, tasks};
 
-        let raise_one = |peer: &'static str| {
+        // Both tasks carry the SAME peer. This test is about the `nonce`
+        // predicate isolating one ask from another, not about D16's
+        // per-peer ownership guard (that is the D16 tests' job) — if A and
+        // B had distinct peers, `EXISTS` alone would already refuse a
+        // cross-ask attempt, and the assertions below would no longer be
+        // attributable to the nonce.
+        let peer = "@shared:kastellan.dev";
+        let claimant = asks::Claimant::new("matrix", peer);
+
+        let raise_one = || {
             let pool = pool.clone();
             async move {
                 let tid = tasks::insert_pending(
@@ -1496,12 +1512,12 @@ fn a_nonce_resolves_only_its_own_ask() {
                 (tid, r)
             }
         };
-        let (task_a, ask_a) = raise_one("@a:kastellan.dev").await;
-        let (task_b, ask_b) = raise_one("@b:kastellan.dev").await;
+        let (task_a, ask_a) = raise_one().await;
+        let (task_b, ask_b) = raise_one().await;
 
         // A's nonce resolves A...
         assert!(asks::resolve_with_nonce(
-            pool, &ask_a.nonce, &asks::Claimant::new("matrix", "@a:kastellan.dev"),
+            pool, &ask_a.nonce, &claimant,
             &serde_json::json!({"choice": "approve"}),
         ).await.unwrap().is_some());
 
@@ -1514,10 +1530,12 @@ fn a_nonce_resolves_only_its_own_ask() {
         assert_eq!(tasks::observe_state(pool, task_b).await.unwrap(), "awaiting_operator");
         assert_eq!(tasks::observe_state(pool, task_a).await.unwrap(), "pending");
 
-        // A's (now spent) nonce must not open B either.
+        // A's (now spent) nonce must not open B either. Same claimant as
+        // the first call, so this failure is attributable to the nonce
+        // alone — the claimant owns both tasks equally.
         assert!(
             asks::resolve_with_nonce(
-                pool, &ask_a.nonce, &asks::Claimant::new("matrix", "@a:kastellan.dev"),
+                pool, &ask_a.nonce, &claimant,
                 &serde_json::json!({"choice": "approve"}),
             ).await.unwrap().is_none(),
             "a spent nonce must not resolve anything, least of all another ask",
@@ -1526,7 +1544,7 @@ fn a_nonce_resolves_only_its_own_ask() {
 
         // B's own nonce still works, so the failed attempt cost B nothing.
         assert!(asks::resolve_with_nonce(
-            pool, &ask_b.nonce, &asks::Claimant::new("matrix", "@b:kastellan.dev"),
+            pool, &ask_b.nonce, &claimant,
             &serde_json::json!({"choice": "deny"}),
         ).await.unwrap().is_some());
     });
@@ -1625,7 +1643,7 @@ fn an_ask_past_its_deadline_cannot_be_resolved_even_before_the_sweep_runs() {
         use kastellan_db::{asks, tasks};
 
         let task_id = tasks::insert_pending(
-            pool, Lane::Fast, serde_json::json!({"instruction": "deadline probe"}),
+            pool, Lane::Fast, channel_payload("@late:kastellan.dev"),
         ).await.unwrap();
         tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
         let raised = asks::raise(
