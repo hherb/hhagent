@@ -33,7 +33,8 @@ matches on `nonce_sha256` with zero callers. Do not build a second mechanism.
 3. One arm in `bus::handle_inbound` recognising `/approve <nonce>` / `/deny <nonce>`,
    behind a new `AskResolver` seam.
 4. A best-effort delivery step in `scheduler::asks::raise_and_suspend`.
-5. `db::asks::resolve_with_nonce` returns `Option<ResolvedAsk>` instead of `bool`.
+5. `db::asks::resolve_with_nonce` takes the claimant `(channel, peer)` and returns
+   `Option<ResolvedAsk>` instead of `bool`; `NONCE_BYTES` drops 32 → 5.
 6. `TaskContext.origin`, set once in `run_one` from the payload it already holds.
 7. New audit rows: `ask.delivered`, `ask.undelivered`, `ask.delivery_failed`,
    `channel.ask_answer_rejected`; `ask.resolved` gains a channel actor.
@@ -113,7 +114,8 @@ carve-out's reasoning one arm above it:
   This is the "id and authority kept separate" constraint from the ROADMAP: the nonce
   proves the caller holds the capability for *this* ask, and `channel::auth` proves the
   caller is someone the operator paired. `resolve_with_nonce`'s own doc says the second
-  half is the caller's job, and this is the caller.
+  half is the caller's job, and this is the caller — see D16, which is the *strong* form
+  of that half.
 - **Before `screen_and_classify`.** An answer must never become a task. A `/deny …` that
   fell through to the enqueue path would be handed to the planner as an instruction.
 
@@ -217,6 +219,66 @@ movement diff is reviewable on its own and the test count is verifiable across i
 `boot_supervisor/tests/` is the worked example. Slice 2 grows this file, so the split
 comes first, as its own commit, with the test count asserted identical before and after.
 
+### D16 — The claimant must be the task's own peer, and the check lives in the guarded UPDATE
+
+**The nonce is a bearer token, and in a shared room everybody can read it.** It is
+delivered as a message into the conversation, so every peer with read access holds it —
+which means it never protected against the case the ROADMAP reached for it to solve
+("on a Matrix room any peer who can send can guess an id and resolve someone else's
+approval"). Guessing was the wrong threat: *reading* is the easy path.
+
+What actually closes it is binding the resolution to the task's own peer: ask N is
+answerable only by the `(channel, peer)` recorded on the task that raised it. A co-present
+room member can then read the token and still not use it.
+
+The check is **not** a Rust-side pre-flight in the caller. It is a predicate inside
+`resolve_with_nonce`'s existing guarded UPDATE:
+
+```sql
+WHERE nonce_sha256 = $1
+  AND state = 'pending'
+  AND deadline_at > now()
+  AND EXISTS (SELECT 1 FROM tasks t
+               WHERE t.id = asks.task_id
+                 AND t.payload->>'kind'    = 'channel'
+                 AND t.payload->>'channel' = $2
+                 AND t.payload->>'peer'    = $3)
+```
+
+A caller-side check would be a TOCTOU: verify, then resolve, with the entitlement
+established against a row read outside the transaction that commits the resolution. In
+the guard it is atomic and fail-closed, and it inherits the no-existence-oracle property
+for free — a wrong peer is indistinguishable from a wrong nonce, which is exactly what
+D9 requires of the ack.
+
+**A side effect worth having:** `resolved_by` stops being a free `&str` parameter and is
+computed *inside* the function as `"<channel>/<peer>"` from the same two arguments the
+guard uses. That deletes the hazard the `Nonce` newtype was created to defend against —
+`resolve_with_nonce(pool, nonce, resolved_by, …)` took the secret and the attribution as
+adjacent `&str`s, and transposing them compiled. There is now no attribution parameter to
+transpose. Slice 1a's newtype stays: it still stops the nonce being logged or serialized,
+and defence that has become redundant along one axis is not defence to delete.
+
+A task with no channel origin therefore cannot be answered from a channel at all — the
+`EXISTS` finds nothing. That is the correct pairing with D3, which does not deliver such an
+ask in the first place.
+
+### D17 — The nonce shrinks to 5 bytes
+
+With D16 carrying the entitlement, the nonce is correlation plus defence in depth rather
+than the sole barrier, and 32 bytes buys nothing but an unusable message. `NONCE_BYTES`
+drops 32 → 5: **10 hex characters**, copyable from a phone, so `/approve 7f3a9c2e1b` is a
+command a tired operator will actually run at 2 a.m. — which is the population this whole
+feature is for.
+
+40 bits against an attacker who must already be a *paired peer answering their own task's
+ask* (D16), gets one attempt per inbound message, writes a `channel.ask_answer_rejected`
+audit row on each miss, and has until the 24 h deadline. Nothing about that is close.
+
+No migration: `asks.nonce_sha256` stores the SHA-256, which is 64 hex characters whatever
+the input length. Asks raised before the change keep their long nonces and resolve
+normally — the column and the predicate are unchanged.
+
 ## Control flow
 
 **Raising and delivering** (`scheduler::asks::raise_and_suspend`):
@@ -247,19 +309,25 @@ inbound message
            → parse_ask_command(body)
                ├─ None    → screen_and_classify → enqueue / injection_blocked (unchanged)
                └─ Some(cmd)
-                    → resolver.resolve(nonce, choice, "<channel>/<peer>")
+                    → resolver.resolve(nonce, choice, Claimant{channel, peer})
+                        │   └─ one guarded UPDATE: nonce ∧ pending ∧ deadline ∧ owning peer
                         ├─ Some(ResolvedAsk) → audit ask.resolved (actor channel)
                         │                      → ack "✓ Approved — task N is resuming."
                         └─ None              → audit channel.ask_answer_rejected
                                                → ack the indistinguishable sentence
 ```
 
+The `Claimant` is built from the **inbound message's own** channel and peer — the pair
+`authorize` just recognised — never from anything in the body. A body-supplied identity
+would be the whole point of D16 handed back to the sender.
+
 What the channel surface writes matches the CLI's shape exactly:
 `resolution = {"choice": "approve" | "deny"}` — **no `free_text` key**, because the strict
-two-token parser rejects trailing prose, so there is none to store. `resolved_by` is
-`"<channel>/<peer>"` (e.g. `matrix/@horst:kastellan.dev`), which is the peer
-`channel::auth` authorized, never the nonce — the `Nonce` newtype makes the transposition
-that would write the token there a compile error.
+two-token parser rejects trailing prose, so there is none to store. `resolved_by` is no
+longer a parameter at all: `resolve_with_nonce` composes it as `"<channel>/<peer>"` from
+the same `Claimant` its guard matched on (D16), so the attribution in the audit trail is
+the identity the entitlement was checked against, by construction rather than by the
+caller's good behaviour.
 
 The ack is sent to the conversation the **command** arrived on, which is the same one the
 ask was delivered to in every reachable case; deriving it from the inbound message rather
@@ -279,8 +347,8 @@ plan writes outside the scratch directory
 
 This expires 2026-08-20 09:14 UTC. Reply with one of:
 
-/approve 9f2c7a1d…e41b
-/deny 9f2c7a1d…e41b
+/approve 7f3a9c2e1b
+/deny 7f3a9c2e1b
 ```
 
 ## Audit rows
@@ -331,17 +399,33 @@ without; audits `ask.delivery_failed` when the receiver is gone; and — the one
 matters — **the ask is committed and the outcome is `AwaitingOperator` in every one of
 those failure cases**.
 
+`db::asks` (PG e2e, D16 — the entitlement guard, where the interesting cases live):
+
+- the owning peer resolves; **a different paired peer, holding the correct nonce, does
+  not** — this is the co-present-room case and the reason D16 exists, so it is the one
+  test that must exist even if the others are cut;
+- the right peer on the *wrong channel* does not resolve (a `matrix`/`email` collision on
+  the same peer string);
+- an ask whose task has no channel origin resolves through neither peer (pairs with D3);
+- `resolved_by` lands as `"<channel>/<peer>"` without the caller supplying it;
+- a wrong peer and a wrong nonce are **indistinguishable** in the return value (D9);
+- a pre-existing 64-hex nonce still resolves after `NONCE_BYTES` drops (D17's
+  no-migration claim, asserted rather than argued).
+
 PG e2e (`core/tests/`): raise against a channel-originated task → the outbox receives a
-message containing the nonce → `resolve_with_nonce` with that nonce → the task is back in
-`pending` and `resolved_for_task` carries the approval. This is the only test that proves
-the delivered token is the one that resolves; every pure test above could pass with the
-two halves disagreeing.
+message containing the nonce → resolve as that task's peer → the task is back in `pending`
+and `resolved_for_task` carries the approval. This is the only test that proves the
+delivered token is the one that resolves; every pure test above could pass with the two
+halves disagreeing.
 
 Mutation set to run, chosen where the per-module rounds would not look (the #572 lesson —
 a mutation score measures the mutation set): invert the D5 ordering so the command is
 screened first; make `parse_ask_command` accept three tokens; make `try_deliver` return
 `Ok` on a closed queue; delete the `origin.is_none()` arm; make the rejected-answer ack
-name which failure occurred (D9); return `Ok(())` from `deliver` before the audit call.
+name which failure occurred (D9); return `Ok(())` from `deliver` before the audit call;
+and — the two that matter most — **drop the `EXISTS` clause from the D16 guard**, and
+build the `Claimant` from the ask's own task instead of the inbound message, which is the
+shape that would make the check tautologically true.
 
 ## What this slice deliberately excludes
 
@@ -359,18 +443,24 @@ name which failure occurred (D9); return `Ok(())` from `deliver` before the audi
 
 ## Open risks
 
-**A 64-hex nonce is a lot to copy on a phone.** The message prints complete commands so it
-is a copy, not a transcription, but if that proves annoying in practice the fix is a
-shorter nonce in `db::asks::generate_nonce` (16 bytes is still far past guessing range),
-not a shortcut that resolves by id. Revisit after the first live escalation.
-
 **The concern text is the only thing telling the operator what they are approving.** It is
 the reviewer's `reason` string, and if it turns out to be too terse to decide on, the
 answer is to put the plan digest and a step summary in the message — not to let the
 operator ask the agent for detail, which would be the agent explaining its own plan to its
 own reviewer.
 
-**Two peers in one room both see every ask for tasks they did not start.** Delivery goes
-to the task's origin conversation, so a shared room means a shared inbox. Acceptable while
-the deployment is single-user; the moment it is not, the destination needs to be the
-*task's peer* in a direct conversation rather than its conversation id.
+**A shared room still leaks the question, even though D16 stops it being answered.** Two
+peers in one room both *see* every ask raised for tasks they did not start; what they
+cannot do is resolve one. Confidentiality and authority are separate properties and slice 2
+only fixes the second. If the deployment stops being single-user, the destination should
+become the task's peer in a direct conversation rather than its conversation id — which is
+a change to `destination_from_task_payload` alone.
+
+**The trust root under all of this is the homeserver.** `ev.sender` on an inbound event is
+what the homeserver asserts, and the bus has no device-verification gate, so a compromised
+homeserver can forge a paired peer. D16 does not change that, and neither would signing
+approvals: an attacker who can forge messages forges the *instruction* too, and the chain
+(forged instruction → escalation → forged approval) defeats review either way. Closing it
+means authenticating **every** inbound message, which is a channel-wide redesign and is
+deliberately out of scope here. Recorded so the next person weighing message signing does
+not have to re-derive why it is not a slice-2 problem.
