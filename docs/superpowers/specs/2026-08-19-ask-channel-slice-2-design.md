@@ -365,8 +365,12 @@ The deadline is **RFC 3339 with the nanoseconds zeroed**. `OffsetDateTime`'s `Di
 not a wire format — in `time` 0.3 the hour is unpadded and a subsecond fraction is always
 emitted, so a deadline taken from `now_utc()` renders as
 `2026-08-21 9:14:32.482913571 +00:00:00`. A 24-hour approval window has no business
-claiming nanosecond precision, and the fixture that hid this was the one input
-(whole-second epoch) for which the two formats agree.
+claiming nanosecond precision. Worth recording why this survived to the final review:
+**nothing asserted the deadline at all**, so no fixture could have caught it — the
+whole-second fixture did not agree with RFC 3339 either (`Display` writes the `.`
+unconditionally, giving `…20.0 +00:00:00`), it just looked unremarkable to a human.
+A rendered field that no test mentions is a field with no coverage, however many tests
+render it.
 
 ## Audit rows
 

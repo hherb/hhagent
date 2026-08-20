@@ -243,9 +243,12 @@ pub fn render_ask(
 /// **`OffsetDateTime`'s `Display` is not a wire format.** In `time` 0.3.49
 /// the hour is unpadded and a subsecond fraction is *always* emitted, so a
 /// deadline taken from `now_utc()` renders as
-/// `2026-08-21 9:14:32.482913571 +00:00:00`. That went unnoticed because
-/// every fixture used a whole-second epoch, whose nanoseconds are exactly
-/// zero — the one input for which `Display` emits no fraction at all.
+/// `2026-08-21 9:14:32.482913571 +00:00:00`. It went unnoticed for the
+/// dull reason: **nothing asserted the deadline at all**, so no fixture
+/// could have caught it. (`Display` writes the `.` unconditionally — a
+/// whole-second instant still renders `…20.0 +00:00:00`, so the old
+/// fixture did not hide this by agreeing with RFC 3339; it merely looked
+/// unremarkable to a human reading the test.)
 ///
 /// The nanoseconds are zeroed rather than formatted away: a 24-hour
 /// approval deadline has no business claiming nanosecond precision, and
@@ -507,10 +510,14 @@ mod tests {
     /// test in this module stayed green — nothing asserted the deadline
     /// appeared at all. **Second**, `OffsetDateTime`'s `Display` always
     /// emits a subsecond fraction and an unpadded hour, so a live deadline
-    /// rendered as `2026-08-21 9:14:32.482913571 +00:00:00`; the old
-    /// fixture's whole-second epoch has exactly zero nanoseconds, which is
-    /// the one input that hides it. Hence [`messy_deadline`]: a fixture with
-    /// nanoseconds set, so this can never regress invisibly again.
+    /// rendered as `2026-08-21 9:14:32.482913571 +00:00:00`. The two are
+    /// one story: the *first* is why the second survived to the final
+    /// review. A whole-second fixture does not hide a `Display` render —
+    /// `Display` writes the `.` unconditionally, so it still shows
+    /// `…20.0 +00:00:00` — it just looks unremarkable to a human, and
+    /// nothing was asserting on it either way. Hence [`messy_deadline`]:
+    /// a fixture with nanoseconds set, so a revert is loud rather than
+    /// merely ugly.
     #[test]
     fn the_deadline_is_rendered_legibly_with_no_nanosecond_noise() {
         let msg = render_ask(412, "c", "tok", messy_deadline());
@@ -600,9 +607,11 @@ mod tests {
     /// The same instant as [`deadline`], plus nanoseconds — i.e. the shape a
     /// real `OffsetDateTime::now_utc() + Duration` actually has.
     ///
-    /// A whole-second fixture is not a representative one here: it is the
-    /// single input for which `Display` emits no subsecond fraction, so it
-    /// hides exactly the defect the deadline test exists to catch.
+    /// A whole-second fixture is not a representative one here. It does not
+    /// suppress the fraction — `Display` writes the `.` unconditionally, so
+    /// a whole second still renders `…20.0 +00:00:00` — but a single `.0` is
+    /// the kind of thing a human skims past, whereas nine digits is not.
+    /// Test against the shape production actually produces.
     fn messy_deadline() -> time::OffsetDateTime {
         time::OffsetDateTime::from_unix_timestamp_nanos(1_787_000_000_482_913_571).unwrap()
     }
