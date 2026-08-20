@@ -79,10 +79,14 @@ pub fn deliver_ask(
 
 /// The `(action, payload)` for one delivery outcome.
 ///
-/// Split from [`deliver_ask`] so the mapping is testable without a pool —
-/// and so the rule that no payload carries the token, the concern or the
-/// rendered body is asserted in one place rather than trusted at three
-/// call sites.
+/// Split from [`deliver_ask`] so the mapping is testable without a pool.
+/// None of the three payloads below can carry the token, the concern or the
+/// rendered body: `DeliveryOutcome` itself never holds them past this
+/// point. `tests::no_audit_payload_carries_the_token_the_concern_or_the_body`
+/// pins the exact key set of each payload so that a future field added to
+/// a `DeliveryOutcome` variant (e.g. a `concern` for debuggability) that
+/// this mapping then passed through would fail the test, rather than the
+/// property silently ceasing to hold.
 pub fn delivery_audit_row(
     ask_id: i64,
     task_id: i64,
@@ -169,6 +173,21 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Undelivered { reason: REASON_NO_CHANNEL });
     }
 
+    /// The two prior tests each leave exactly one `Option` populated, so
+    /// they pass under either check order — neither observes which of
+    /// `dest` / `outbox` `deliver_ask` looks at first. Only `(None, None)`
+    /// does: with both absent, checking `dest` first reports
+    /// `REASON_NO_ORIGIN` ("this task came from the CLI"), while checking
+    /// `outbox` first would report `REASON_NO_CHANNEL` ("this host cannot
+    /// reach you") instead. The order is load-bearing for a CLI-originated
+    /// task running on a daemon with no channel configured at all, and this
+    /// is the only input that pins it.
+    #[test]
+    fn with_neither_a_destination_nor_an_outbox_the_missing_origin_is_reported() {
+        let outcome = deliver_ask(None, None, 412, "c", "tok", deadline());
+        assert_eq!(outcome, DeliveryOutcome::Undelivered { reason: REASON_NO_ORIGIN });
+    }
+
     /// The bus restarts under the scheduler, so a registered-but-dead queue
     /// is a real state. It must be reported, not swallowed.
     #[test]
@@ -199,19 +218,44 @@ mod tests {
     /// every role that can read the trail. Same rule as `ask.raised`, which
     /// omits it for the same reason — and this is the path that actually
     /// holds the plaintext, so the omission has to be asserted.
+    ///
+    /// **Pins the exact key set of each payload**, not just the absence of
+    /// today's literals. `DeliveryOutcome` never carries the token, the
+    /// concern or the rendered body in the first place, so a `!contains`
+    /// check alone is true unconditionally — it would not catch a future
+    /// `DeliveryOutcome` variant that grew a `concern` field this mapping
+    /// then passed straight through. The `assert_eq!` on the sorted key
+    /// list is what actually guards that: it fails the moment an extra key
+    /// appears, whatever it's named or contains. The `!contains` checks
+    /// stay as belt-and-braces against the *known* literals.
     #[test]
     fn no_audit_payload_carries_the_token_the_concern_or_the_body() {
-        let cases = [
-            DeliveryOutcome::Delivered { channel: "matrix".into(), peer: "@horst:srv".into() },
-            DeliveryOutcome::Undelivered { reason: REASON_NO_ORIGIN },
-            DeliveryOutcome::Failed { channel: "matrix".into(), reason: "queue_closed" },
+        let cases: [(DeliveryOutcome, &[&str]); 3] = [
+            (
+                DeliveryOutcome::Delivered { channel: "matrix".into(), peer: "@horst:srv".into() },
+                &["ask_id", "channel", "peer", "task_id"],
+            ),
+            (
+                DeliveryOutcome::Undelivered { reason: REASON_NO_ORIGIN },
+                &["ask_id", "reason", "task_id"],
+            ),
+            (
+                DeliveryOutcome::Failed { channel: "matrix".into(), reason: "queue_closed" },
+                &["ask_id", "channel", "reason", "task_id"],
+            ),
         ];
-        for outcome in cases {
+        for (outcome, expected_keys) in cases {
             let (_action, payload) = delivery_audit_row(7, 412, &outcome);
             let rendered = serde_json::to_string(&payload).unwrap();
             assert!(!rendered.contains("tok9"), "token leaked: {rendered}");
             assert!(!rendered.contains("writes outside scratch"), "concern leaked: {rendered}");
             assert!(!rendered.contains("/approve"), "body leaked: {rendered}");
+
+            let mut keys: Vec<&str> =
+                payload.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, expected_keys, "unexpected key set for {outcome:?}: {rendered}");
+
             assert_eq!(payload["ask_id"], 7);
             assert_eq!(payload["task_id"], 412);
         }
