@@ -87,13 +87,33 @@ impl AskChoice {
 }
 
 /// A parsed answer: which verb, and the opaque correlation token.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `Debug` is hand-written to **redact `token`**: it is the live, plaintext
+/// correlation token off the wire, one boundary before it becomes a
+/// `db::asks::Nonce` — whose own hand-written `Debug` prints
+/// `Nonce(<redacted>)` for the same reason. See also [`super::PeerEvidence`]
+/// elsewhere in this module tree, which redacts `presented_token` the same
+/// way. Derive-by-default is the wrong side of that trade for a
+/// secret-bearing type: the whole point of a `Debug` impl is that someone
+/// eventually reaches for it, and a `?cmd` in a `tracing` call on the
+/// inbound path would otherwise write the live approval token to the
+/// daemon log.
+#[derive(Clone, Eq, PartialEq)]
 pub struct AskCommand {
     pub choice: AskChoice,
     /// Taken verbatim off the wire. Not a `Nonce` yet — this module is pure
     /// and the `db` newtype zeroizes on drop; the conversion happens at the
     /// resolver boundary, which is the only place that should hold one.
     pub token: String,
+}
+
+impl std::fmt::Debug for AskCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AskCommand")
+            .field("choice", &self.choice)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Recognise `/approve <token>` or `/deny <token>`, or `None` for anything
@@ -319,10 +339,29 @@ mod tests {
 
     /// A clamp that splits a multi-byte character panics on a String slice.
     /// The concern is free text and can be any language.
+    ///
+    /// Must use a character whose width does **not** evenly divide
+    /// `CONCERN_CAP` (512), or the cap always lands exactly on a boundary
+    /// and the boundary-walk's decrementing branch never runs. `é` is
+    /// 2 bytes and 512 is even, so it doesn't exercise this at all; a 3-byte
+    /// CJK character does, since 512 isn't a multiple of 3.
     #[test]
     fn clamping_a_multibyte_concern_does_not_panic() {
-        let msg = render_ask(9, &"é".repeat(CONCERN_CAP), "tok", deadline());
+        let msg = render_ask(9, &"中".repeat(CONCERN_CAP), "tok", deadline());
         assert!(msg.contains("/approve tok"));
+    }
+
+    /// `Debug` must never render the live token — the same property
+    /// `channel::tests::peer_evidence_debug_redacts_the_presented_token`
+    /// asserts for `PeerEvidence::presented_token`, and for the same reason:
+    /// nothing today debug-formats an `AskCommand`, but the whole point of a
+    /// `Debug` impl is that someone eventually will.
+    #[test]
+    fn ask_command_debug_redacts_the_token() {
+        let cmd = AskCommand { choice: AskChoice::Approve, token: "S3CRET-TOKEN-VALUE".to_string() };
+        let rendered = format!("{cmd:?}");
+        assert!(!rendered.contains("S3CRET-TOKEN-VALUE"), "token leaked into Debug: {rendered}");
+        assert!(rendered.contains("redacted"), "must say it was redacted: {rendered}");
     }
 
     #[test]
