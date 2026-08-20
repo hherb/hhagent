@@ -527,6 +527,10 @@ async fn main() -> Result<()> {
             ),
         );
 
+    // TODO(#564 slice 2 task 8): pass the real `ChannelOutbox` once the
+    // channel bus registers into one at bring-up; until then every raised
+    // ask is durable but undelivered (`ask.undelivered{reason:
+    // no_channel_configured}`), same as a Matrix-less build.
     let scheduler = kastellan_core::scheduler::spawn_scheduler(
         pool.clone(),
         formulator,
@@ -534,6 +538,7 @@ async fn main() -> Result<()> {
         dispatcher,
         entity_extractor.clone(),
         embedder,
+        None,
     );
     info!("scheduler spawned (lane_fast + lane_long)");
 

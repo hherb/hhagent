@@ -17,6 +17,7 @@ use kastellan_db::tasks::Task;
 
 use crate::cassandra::review::ChainReviewStage;
 use crate::cassandra::types::DataClass;
+use crate::channel::outbox::ChannelOutbox;
 use crate::scheduler::agent::PlanFormulator;
 use crate::scheduler::asks::{resolution_choice, Choice};
 use crate::scheduler::inner_loop::{
@@ -92,6 +93,7 @@ pub(super) async fn run_one(
     dispatcher: Arc<dyn StepDispatcher>,
     task: &Task,
     max_plans: u32,
+    outbox: Option<&ChannelOutbox>,
 ) -> InnerLoopResult {
     let instruction = task.payload.get("instruction")
         .and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -230,11 +232,12 @@ pub(super) async fn run_one(
         plan_count: start_plan_count,
         max_plans: max_plans_for_run,
         resolved_asks,
+        origin: crate::channel::ask_message::destination_from_task_payload(&task.payload),
     };
 
     let task_id = ctx.task_id;
     let dispatcher_for_purge = std::sync::Arc::clone(&dispatcher);
-    let result = match run_to_terminal(pool, formulator, review, dispatcher, ctx).await {
+    let result = match run_to_terminal(pool, formulator, review, dispatcher, ctx, outbox).await {
         Ok(r) => r,
         Err(e) => failed_result(format!("inner_loop: {e}")),
     };

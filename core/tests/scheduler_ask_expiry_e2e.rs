@@ -181,6 +181,7 @@ fn spawn_test_scheduler(pool: &sqlx::PgPool, review: Arc<ChainReviewStage>) -> S
         Arc::new(NoopDispatcher),
         Arc::new(kastellan_core::entity_extraction::NoOpEntityExtractor::new()),
         Arc::new(NoOpEmbedder::new()),
+        None,
     )
 }
 

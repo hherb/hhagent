@@ -205,6 +205,7 @@ fn make_ctx(task_id: i64, max_plans: u32) -> TaskContext {
         plan_count: 0,
         max_plans,
         resolved_asks: Vec::new(),
+        origin: None,
     }
 }
 
@@ -260,7 +261,7 @@ async fn happy_path_one_plan_returns_completed() {
     let review = Arc::new(ChainReviewStage::new(vec![Arc::new(NoopReviewStage)]));
     let dispatcher = Arc::new(ScriptedDispatcher { table: Default::default(), tools: Default::default() });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3), None)
         .await
         .unwrap();
 
@@ -369,7 +370,7 @@ async fn tool_fail_then_recover_returns_completed() {
     let review = Arc::new(ChainReviewStage::new(vec![Arc::new(NoopReviewStage)]));
     let dispatcher = Arc::new(ScriptedDispatcher { table: Default::default(), tools: Default::default() });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3), None)
         .await
         .unwrap();
 
@@ -407,7 +408,7 @@ async fn plan_iteration_cap_exhausted_returns_failed() {
     let review = Arc::new(ChainReviewStage::new(vec![Arc::new(NoopReviewStage)]));
     let dispatcher = Arc::new(ScriptedDispatcher { table: Default::default(), tools: Default::default() });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3), None)
         .await
         .unwrap();
 
@@ -463,7 +464,7 @@ async fn cancel_mid_execution_returns_cancelled() {
 
     let pool2 = pool.clone();
     let h = tokio::spawn(async move {
-        run_to_terminal(&pool2, formulator, review, dispatcher, make_ctx(id, 3)).await
+        run_to_terminal(&pool2, formulator, review, dispatcher, make_ctx(id, 3), None).await
     });
 
     // Wait for the dispatcher to signal that iter 1's step is in flight.
@@ -586,7 +587,7 @@ async fn refusal_plan_terminates_with_state_refused() {
     let review = Arc::new(ChainReviewStage::new(vec![Arc::new(NoopReviewStage)]));
     let dispatcher = Arc::new(ScriptedDispatcher { table: Default::default(), tools: Default::default() });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3), None)
         .await
         .unwrap();
 
@@ -713,7 +714,7 @@ async fn reviewer_constitutional_block_wins_over_agent_refusal() {
     })]));
     let dispatcher = Arc::new(ScriptedDispatcher { table: Default::default(), tools: Default::default() });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3), None)
         .await
         .unwrap();
 
@@ -781,7 +782,7 @@ async fn verdict_block_on_refusal_plan_does_not_loop() {
     })]));
     let dispatcher = Arc::new(ScriptedDispatcher { table: Default::default(), tools: Default::default() });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3), None)
         .await
         .unwrap();
 
@@ -880,7 +881,7 @@ async fn agent_floor_raise_chain_blocks_low_classification_step() {
     ]));
     let dispatcher = Arc::new(ScriptedDispatcher { table: Default::default(), tools: Default::default() });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3), None)
         .await
         .unwrap();
 
@@ -976,7 +977,7 @@ async fn agent_invoke_pinned_skill_expands_and_dispatches() {
         tools: ["shell-exec".to_string()].into_iter().collect(),
     });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 4))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 4), None)
         .await.unwrap();
     assert!(matches!(result.outcome, Outcome::Completed(_)), "got {:?}", result.outcome);
     assert_eq!(result.dispatch_count, 1, "the expanded template's single step dispatched");
@@ -1007,7 +1008,7 @@ async fn agent_invoke_unknown_skill_refuses_then_replans() {
         tools: ["shell-exec".to_string()].into_iter().collect(),
     });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 4))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 4), None)
         .await.unwrap();
     match result.outcome {
         Outcome::Completed(v) => assert_eq!(v["body"], "recovered"),
@@ -1043,7 +1044,7 @@ async fn agent_invoke_pinned_skill_with_unregistered_tool_refuses() {
         tools: ["shell-exec".to_string()].into_iter().collect(), // web-fetch absent
     });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 4))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 4), None)
         .await.unwrap();
     match result.outcome {
         Outcome::Completed(v) => assert_eq!(v["body"], "recovered"),
@@ -1094,7 +1095,7 @@ async fn invoke_driven_task_suppresses_recrystallisation() {
         tools: ["shell-exec".to_string()].into_iter().collect(),
     });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 4))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 4), None)
         .await.unwrap();
     assert!(matches!(result.outcome, Outcome::Completed(_)));
     assert!(result.terminal_l3_skill.is_none(),
@@ -1137,7 +1138,7 @@ async fn omitted_data_ceiling_resolves_against_the_raised_floor_and_is_audited()
     let review = Arc::new(ChainReviewStage::new(vec![Arc::new(NoopReviewStage)]));
     let dispatcher = Arc::new(ScriptedDispatcher { table: Default::default(), tools: Default::default() });
 
-    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3))
+    let result = run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3), None)
         .await
         .unwrap();
     assert!(matches!(result.outcome, Outcome::Completed(_)), "got {:?}", result.outcome);
@@ -1192,7 +1193,7 @@ async fn a_declared_data_ceiling_is_audited_as_declared() {
     let review = Arc::new(ChainReviewStage::new(vec![Arc::new(NoopReviewStage)]));
     let dispatcher = Arc::new(ScriptedDispatcher { table: Default::default(), tools: Default::default() });
 
-    run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3))
+    run_to_terminal(&pool, formulator, review, dispatcher, make_ctx(id, 3), None)
         .await
         .unwrap();
 

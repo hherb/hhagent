@@ -15,6 +15,8 @@ use kastellan_db::DbError;
 
 use crate::cassandra::plan_digest::plan_digest;
 use crate::cassandra::types::{Plan, Severity};
+use crate::channel::ask_message::AskDestination;
+use crate::channel::outbox::ChannelOutbox;
 
 use super::pure::{deadline_from_env, ASK_KIND_PLAN_APPROVAL};
 use crate::scheduler::audit::{
@@ -49,6 +51,18 @@ use crate::scheduler::audit::{
 /// re-formulate — and re-execute — iterations it already ran (#564 slice
 /// 1b, D11). `None` means "no history to carry", which is what a run that
 /// escalated on its very first plan honestly has.
+///
+/// **Delivery is best-effort and comes last** (spec D2). `raise` has
+/// already committed by then: the ask is durable and the task is
+/// suspended. Every delivery failure is audited and returns `Ok`, because
+/// a Matrix outage must not become a task failure on the one path where
+/// the reviewer said a human must decide — and `kastellan-cli inbox` can
+/// still answer it.
+///
+/// Eight parameters: six are the ask being raised, two are where to send
+/// it. Bundling them would only move the list to the call site, which has
+/// exactly one caller.
+#[allow(clippy::too_many_arguments)]
 pub async fn raise_and_suspend(
     pool: &PgPool,
     task_id: i64,
@@ -56,6 +70,8 @@ pub async fn raise_and_suspend(
     concern: &str,
     severity: Severity,
     resume_state: Option<&serde_json::Value>,
+    outbox: Option<&ChannelOutbox>,
+    dest: Option<&AskDestination>,
 ) -> Result<i64, DbError> {
     let digest = plan_digest(plan);
     let deadline_at = OffsetDateTime::now_utc() + Duration::seconds(deadline_from_env());
@@ -72,12 +88,20 @@ pub async fn raise_and_suspend(
     )
     .await?;
 
-    // Destructured rather than field-accessed so the nonce's drop (and its
-    // zeroize) is visible at this call site instead of implied.
     let db_asks::RaisedAsk { ask_id, nonce } = raised;
+    emit_ask_raised(pool, ask_id, task_id, &digest, severity, deadline_at).await;
+
+    // The one place the plaintext nonce is used. It goes into a message
+    // body and nowhere else — not the audit row, not a log line.
+    let outcome =
+        super::delivery::deliver_ask(outbox, dest, task_id, concern, nonce.expose(), deadline_at);
     drop(nonce);
 
-    emit_ask_raised(pool, ask_id, task_id, &digest, severity, deadline_at).await;
+    let (action, payload) = super::delivery::delivery_audit_row(ask_id, task_id, &outcome);
+    if let Err(e) = kastellan_db::audit::insert(pool, SCHEDULER_AUDIT_ACTOR, action, payload).await {
+        tracing::warn!(ask_id, task_id, error = %e, "audit insert for ask delivery failed (best-effort)");
+    }
+
     Ok(ask_id)
 }
 

@@ -326,6 +326,7 @@ fn spawn_with(
         Arc::new(NoopDispatcher),
         Arc::new(kastellan_core::entity_extraction::NoOpEntityExtractor::new()),
         Arc::new(NoOpEmbedder::new()),
+        None,
     )
 }
 
@@ -389,6 +390,7 @@ fn spawn_test_scheduler_recording_history(
         Arc::new(RecordingDispatcher { dispatched: Arc::clone(&dispatched) }),
         Arc::new(kastellan_core::entity_extraction::NoOpEntityExtractor::new()),
         Arc::new(NoOpEmbedder::new()),
+        None,
     );
     (handle, seen, dispatched)
 }

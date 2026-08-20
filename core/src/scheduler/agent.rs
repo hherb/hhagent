@@ -379,6 +379,7 @@ mod tests {
             plan_count: 0,
             max_plans: 5,
             resolved_asks: Vec::new(),
+            origin: None,
         }
     }
 
