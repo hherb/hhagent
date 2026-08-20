@@ -194,6 +194,7 @@ async fn attempt(
     pool: PgPool,
     sandboxes: SandboxBackends,
     force_routing: Option<Arc<ForceRoutingConfig>>,
+    outbox: Arc<kastellan_core::channel::outbox::ChannelOutbox>,
 ) -> BootOutcome {
     let cfg = match kastellan_core::channel::email::config::EmailConfig::from_env() {
         // Unset ⇒ channel absent. Silent on purpose: this is the default for
@@ -255,13 +256,21 @@ async fn attempt(
     let authorizer = Arc::new(kastellan_core::channel::auth::DbPeerAuthorizer::new(pool.clone()));
     let pairing = Arc::new(kastellan_core::channel::pairing::DbPairingService::new(pool.clone()));
     let events = Arc::new(kastellan_core::channel::bus::PgChannelEvents::new(pool.clone()));
+    // Wired even though `EmailChannel::send` still refuses unconditionally
+    // (outbound SMTP is a later slice): an email-originated ask therefore
+    // produces an honest `ask.delivery_failed` audit row instead of a
+    // silent drop, which is the correct behaviour until SMTP lands.
+    let asks = Arc::new(kastellan_core::channel::bus::AskWiring {
+        outbox,
+        resolver: Arc::new(kastellan_core::channel::bus::PgAskResolver::new(pool.clone())),
+    });
     BootOutcome::Started(StartedChannel::from_bus(ChannelBus::spawn(
         vec![Box::new(spawned.channel)],
         authorizer,
         Some(pairing),
         events,
         Box::new(completed),
-        None, // ask wiring: deferred to #564 slice 2 task 8
+        Some(asks),
     )))
 }
 
@@ -277,6 +286,7 @@ pub(crate) fn supervise_email_channel(
     pool: &PgPool,
     sandboxes: &SandboxBackends,
     force_routing: &Option<Arc<ForceRoutingConfig>>,
+    outbox: Arc<kastellan_core::channel::outbox::ChannelOutbox>,
 ) -> ChannelSupervisor {
     let pool = pool.clone();
     let sandboxes = sandboxes.clone();
@@ -287,7 +297,7 @@ pub(crate) fn supervise_email_channel(
         RestartBackoff::default(),
         ReportingPolicy::default(),
         Some(audit),
-        move || attempt(pool.clone(), sandboxes.clone(), force_routing.clone()),
+        move || attempt(pool.clone(), sandboxes.clone(), force_routing.clone(), outbox.clone()),
     )
 }
 
