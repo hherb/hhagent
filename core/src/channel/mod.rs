@@ -18,6 +18,7 @@
 //! async pump over the [`Channel`] transport seam + the DB seams, so the whole
 //! inbound→enqueue→complete→reply loop is testable with fakes (no network, no PG).
 
+pub mod ask_message;
 pub mod audit_text;
 pub mod auth;
 pub mod boot_supervisor;
@@ -25,6 +26,7 @@ pub mod bus;
 pub mod email;
 pub mod ingest;
 pub mod matrix;
+pub mod outbox;
 pub mod pairing;
 pub mod polled_driver;
 pub mod pump_liveness;
@@ -148,16 +150,27 @@ pub mod actions {
     /// `send` happens afterwards, in the per-channel pump, and can still fail
     /// (in slice 1 `EmailChannel::send` fails *unconditionally*, since there is
     /// no outbound worker yet). A failure emits [`REPLY_UNDELIVERED`] for the
-    /// same reply, so the pair is what an operator queries: a `channel.replied`
-    /// with no matching `channel.reply_undelivered` is a delivered reply. The
-    /// name is kept because these strings are a committed operator-facing
-    /// interface (see `auth::UnauthenticReason::as_str`); the doc is what was
-    /// wrong, and it claimed delivery.
+    /// same reply, so a `channel.replied` with no matching
+    /// `channel.reply_undelivered` is a delivered reply. The name is kept
+    /// because these strings are a committed operator-facing interface (see
+    /// `auth::UnauthenticReason::as_str`); the doc is what was wrong, and it
+    /// claimed delivery.
+    ///
+    /// **The converse does not hold** — see [`REPLY_UNDELIVERED`].
     pub const REPLIED: &str = "channel.replied";
-    /// A reply was routed to its channel but the transport refused to deliver
-    /// it — the compensating row for a [`REPLIED`] that did not land. Carries
-    /// the channel + peer only, never the reply body and never the error
-    /// string (which is transport text, not a fixed label).
+    /// A message was routed to its channel but the transport refused to
+    /// deliver it. Carries the channel + peer only, never the reply body and
+    /// never the error string (which is transport text, not a fixed label).
+    ///
+    /// Usually the compensating row for a [`REPLIED`] that did not land —
+    /// but **not always, and an anti-join on that pairing will report false
+    /// positives.** Since #564 slice 2 the per-channel pump also drains
+    /// core-initiated messages from the `ChannelOutbox`, so a *raised ask*
+    /// whose transport refused it lands here too, with `ask.delivered`
+    /// behind it rather than `channel.replied`. Because the payload is
+    /// channel + peer only, such a row names neither the ask nor the task
+    /// and is correlatable only by timestamp; carrying `ask_id` into the
+    /// pump is tracked as its own issue.
     pub const REPLY_UNDELIVERED: &str = "channel.reply_undelivered";
     /// A message failed transport authenticity (DMARC and/or token) — dropped
     /// before authorization, so it never reaches the pairing carve-out.
@@ -191,6 +204,32 @@ pub mod actions {
     /// which until #517 was permanent and produced no row at all. `ran_ms` is
     /// what tells a sustained outage apart from a flapping channel.
     pub const CHANNEL_DIED: &str = "channel.died";
+    /// A paired peer's attempt to answer an ask did not stand (#564 slice
+    /// 2). Carries the channel + peer only — never the token, never the
+    /// body.
+    ///
+    /// **Three distinct producers write this one action:**
+    /// 1. a well-formed `/approve`/`/deny` whose token resolved nothing;
+    /// 2. a *malformed* attempt — the body's first token is one of the two
+    ///    verbs but the rest does not parse (`/approve tok9 thanks!`),
+    ///    which gets [`super::ask_message::ACK_MALFORMED_COMMAND`] and is
+    ///    kept out of the enqueue path so a live token never lands in
+    ///    `tasks.payload`;
+    /// 3. the resolver returning `Err` — e.g. a DB outage — which
+    ///    `handle_inbound` deliberately collapses into the same arm as (1),
+    ///    because an error path that looks different to the peer is the
+    ///    existence oracle the refusal path refuses to be.
+    ///
+    /// **Deliberately does not say which.** Within (1) alone, wrong token,
+    /// already answered, past its deadline and "not this peer's ask" are
+    /// one outcome by construction (`db::asks::resolve_with_nonce`),
+    /// because splitting them hands a token-guessing peer an existence
+    /// oracle. Splitting *these three* is a durable payload-shape change
+    /// and is deferred to a later slice, so a reader counting rows today
+    /// must not assume they are all case (1). What the row is for is
+    /// counting: repeated rejections from a paired peer are a signal even
+    /// when no single one is.
+    pub const ASK_ANSWER_REJECTED: &str = "channel.ask_answer_rejected";
 }
 
 #[cfg(test)]

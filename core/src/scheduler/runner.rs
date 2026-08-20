@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 
+use crate::channel::outbox::ChannelOutbox;
 use crate::entity_extraction::EntityExtractor;
 use crate::memory::embedder::Embedder;
 
@@ -80,6 +81,11 @@ impl SchedulerHandle {
 
 /// Spawn the two lane runners. Returns a handle the daemon's
 /// shutdown path uses to flip the watch channel and join.
+///
+/// `outbox` is where a raised ask is delivered (#564 slice 2, spec D13);
+/// `None` on a daemon built or configured without channels. Cloned into
+/// both lanes — the `Arc` is what lets a raised ask in either lane reach
+/// the one registry the channel bus registers its queues into.
 pub fn spawn_scheduler(
     pool: PgPool,
     formulator: Arc<dyn PlanFormulator>,
@@ -87,18 +93,19 @@ pub fn spawn_scheduler(
     dispatcher: Arc<dyn StepDispatcher>,
     entity_extractor: Arc<dyn EntityExtractor>,
     embedder: Arc<dyn Embedder>,
+    outbox: Option<Arc<ChannelOutbox>>,
 ) -> SchedulerHandle {
     let (tx, rx) = watch::channel(false);
 
     let fast = tokio::spawn(lane_loop(
         pool.clone(), formulator.clone(), review.clone(), dispatcher.clone(),
-        entity_extractor.clone(), embedder.clone(),
+        entity_extractor.clone(), embedder.clone(), outbox.clone(),
         Lane::Fast, DEFAULT_DEADLINE_FAST_S, DEFAULT_MAX_PLANS_FAST, rx.clone(),
     ));
     let sweep = tokio::spawn(sweep_loop(pool.clone(), rx.clone()));
     let long = tokio::spawn(lane_loop(
         pool, formulator, review, dispatcher,
-        entity_extractor, embedder,
+        entity_extractor, embedder, outbox,
         Lane::Long, DEFAULT_DEADLINE_LONG_S, DEFAULT_MAX_PLANS_LONG, rx,
     ));
 
@@ -127,11 +134,15 @@ async fn sweep_loop(pool: PgPool, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-// Five of the nine params are the shared scheduler dependencies
-// (pool + the four stage handles); the rest are the per-lane tuning
-// constants. They are genuinely distinct inputs to the loop, so the
-// arg-count heuristic is suppressed rather than papered over with a
-// dependency-bundle struct that would only move the list to the call site.
+// Eleven params: `pool`, the five stage handles (formulator, review,
+// dispatcher, entity extractor, embedder), the `outbox`, the shutdown
+// watch, and three per-lane tuning values. They are genuinely distinct
+// inputs to the loop, so the arg-count heuristic is suppressed rather than
+// papered over with a dependency-bundle struct that would only move the
+// list to the call site. `outbox` — positionally the 7th — is where a
+// raised ask is delivered (#564 slice 2), `None` on a channel-less daemon:
+// one more genuinely distinct dependency, not a reason to change the shape
+// of the suppression.
 #[allow(clippy::too_many_arguments)]
 async fn lane_loop(
     pool: PgPool,
@@ -140,6 +151,7 @@ async fn lane_loop(
     dispatcher: Arc<dyn StepDispatcher>,
     entity_extractor: Arc<dyn EntityExtractor>,
     embedder: Arc<dyn Embedder>,
+    outbox: Option<Arc<ChannelOutbox>>,
     lane: Lane,
     deadline_seconds: i64,
     max_plans: u32,
@@ -193,7 +205,7 @@ async fn lane_loop(
     // is what keeps the drain race-free with newly-arriving tasks.
     drain_lane(
         &pool, formulator.clone(), review.clone(), dispatcher.clone(),
-        entity_extractor.clone(), embedder.clone(),
+        entity_extractor.clone(), embedder.clone(), outbox.as_deref(),
         lane, deadline_seconds, max_plans, &shutdown,
     ).await;
     if *shutdown.borrow() { return; }
@@ -210,7 +222,7 @@ async fn lane_loop(
 
         drain_lane(
             &pool, formulator.clone(), review.clone(), dispatcher.clone(),
-            entity_extractor.clone(), embedder.clone(),
+            entity_extractor.clone(), embedder.clone(), outbox.as_deref(),
             lane, deadline_seconds, max_plans, &shutdown,
         ).await;
     }
@@ -220,9 +232,9 @@ async fn lane_loop(
 /// Pulled out of `lane_loop` so the same body runs both in the initial
 /// startup pass and on each NOTIFY/heartbeat wake. Honours `shutdown`
 /// between every claim.
-// Same nine-input shape as `lane_loop` (it forwards them straight
-// through); see the note there for why the arg-count heuristic is
-// suppressed instead of bundled.
+// Same eleven-input shape as `lane_loop` (it forwards them straight
+// through, `outbox` included, as a borrow); see the note there for why the
+// arg-count heuristic is suppressed instead of bundled.
 #[allow(clippy::too_many_arguments)]
 async fn drain_lane(
     pool: &PgPool,
@@ -231,6 +243,7 @@ async fn drain_lane(
     dispatcher: Arc<dyn StepDispatcher>,
     entity_extractor: Arc<dyn EntityExtractor>,
     embedder: Arc<dyn Embedder>,
+    outbox: Option<&ChannelOutbox>,
     lane: Lane,
     deadline_seconds: i64,
     max_plans: u32,
@@ -357,7 +370,7 @@ async fn drain_lane(
 
         let result = run_one(
             pool, formulator.clone(), review.clone(), dispatcher.clone(),
-            &claimed, max_plans,
+            &claimed, max_plans, outbox,
         ).await;
 
         // A non-terminal outcome: the task suspended on an operator ask.

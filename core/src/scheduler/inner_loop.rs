@@ -84,6 +84,14 @@ pub struct TaskContext {
     /// before building this context. `asks::decide` still handles that case
     /// correctly rather than assuming it away.
     pub resolved_asks: Vec<kastellan_db::asks::Ask>,
+    /// Where this task came from, if it came from a channel — the routing
+    /// an escalation's question is delivered to (#564 slice 2, spec D13).
+    ///
+    /// Computed once in `runner::task_exec::run_one` from the payload it
+    /// already holds, rather than re-read from the DB on the escalation
+    /// path. `None` for a `kastellan-cli ask` or scheduled task, whose ask
+    /// is answered through `kastellan-cli inbox`.
+    pub origin: Option<crate::channel::ask_message::AskDestination>,
 }
 
 impl TaskContext {
@@ -307,12 +315,18 @@ fn qualify_plan_methods(dispatcher: &dyn StepDispatcher, task_id: i64, steps: &m
 /// Run the inner loop until terminal. Returns an [`InnerLoopResult`]
 /// carrying the terminal [`Outcome`] plus the per-task counters the
 /// lane runner needs for the spec §7 `task.finalize` audit row.
+///
+/// `outbox` is where a raised ask is delivered (#564 slice 2, spec D13);
+/// `None` on a daemon built or configured without channels, in which case
+/// every escalation is undelivered but still durable — see
+/// `asks::deliver_ask`.
 pub async fn run_to_terminal(
     pool: &PgPool,
     formulator: Arc<dyn PlanFormulator>,
     review: Arc<ChainReviewStage>,
     dispatcher: Arc<dyn StepDispatcher>,
     mut ctx: TaskContext,
+    outbox: Option<&crate::channel::outbox::ChannelOutbox>,
 ) -> Result<InnerLoopResult, InnerLoopError> {
     use kastellan_db::tasks;
 
@@ -593,6 +607,7 @@ pub async fn run_to_terminal(
                         );
                         match asks::raise_and_suspend(
                             pool, ctx.task_id, &plan, reason, *sev, Some(&resume_state),
+                            outbox, ctx.origin.as_ref(),
                         )
                         .await
                         {

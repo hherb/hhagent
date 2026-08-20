@@ -59,6 +59,67 @@ pub enum PairingOutcome {
     NotAPairingAttempt,
 }
 
+/// Resolution seam for an answer arriving over a channel.
+///
+/// A trait because the real implementation needs a `PgPool` and this
+/// module's tests are deliberately PG-free (spec D12). Its counterpart
+/// [`super::outbox::ChannelOutbox`] gets no trait: the real registry with a
+/// drained receiver *is* the perfect fake, so wrapping it would only stop
+/// the tests covering the real thing.
+#[async_trait::async_trait]
+pub trait AskResolver: Send + Sync {
+    /// Resolve the ask the nonce correlates to, if `claimant` owns its task.
+    /// `Ok(None)` covers every refusal, indistinguishably.
+    async fn resolve(
+        &self,
+        nonce: &kastellan_db::asks::Nonce,
+        choice: &str,
+        claimant: &kastellan_db::asks::Claimant,
+    ) -> anyhow::Result<Option<kastellan_db::asks::ResolvedAsk>>;
+}
+
+/// Real DB-backed `AskResolver`.
+pub struct PgAskResolver {
+    pool: sqlx::PgPool,
+}
+
+impl PgAskResolver {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl AskResolver for PgAskResolver {
+    async fn resolve(
+        &self,
+        nonce: &kastellan_db::asks::Nonce,
+        choice: &str,
+        claimant: &kastellan_db::asks::Claimant,
+    ) -> anyhow::Result<Option<kastellan_db::asks::ResolvedAsk>> {
+        Ok(kastellan_db::asks::resolve_with_nonce(
+            &self.pool,
+            nonce,
+            claimant,
+            // Built by `db::asks` rather than spelled here: this document's
+            // key has to match what `reject_choice_outside_options`
+            // validates and what `scheduler::asks::resolution_choice`
+            // reads, and those live in two other places.
+            &kastellan_db::asks::resolution(choice, None),
+        )
+        .await?)
+    }
+}
+
+/// Everything a bus needs to take part in the operator-ask loop: the
+/// registry it publishes its outbound queue into, and the resolver it hands
+/// answers to. `None` at `spawn` means this bus does neither, and behaves
+/// exactly as it did before #564 slice 2.
+pub struct AskWiring {
+    pub outbox: Arc<super::outbox::ChannelOutbox>,
+    pub resolver: Arc<dyn AskResolver>,
+}
+
 /// Real DB-backed `ChannelEvents` over the runtime pool.
 pub struct PgChannelEvents {
     pool: sqlx::PgPool,
@@ -137,13 +198,42 @@ impl CompletedTasks for PgCompletedTasks {
 ///        operator-only. So an evidence-bearing `Rejected` skips straight to
 ///        the drop + audit, same as if no `PairingService` were configured;
 ///      - `Recognised` — proceed to step 2.
-///   2. **screen** (injection guard) and enqueue or block.
+///   2. **recognise an answer** — if the body parses as `/approve <token>`
+///      or `/deny <token>`, it is an answer to a raised ask, not an
+///      instruction. Placement is the security content (spec D5): AFTER
+///      authorization, so only a paired peer can resolve anything and the
+///      claimant is the sender the transport vouched for; and BEFORE
+///      screening + enqueue, so an answer can never become a task.
 ///
-/// Returns `Some(ack)` only on a successful pairing (the per-channel task delivers
-/// it via the same channel).
+///      The injection guard deliberately does **not** run on it (spec D6):
+///      the body is a closed set — one of two fixed verbs plus an opaque
+///      token — that is parsed into a command and never interpolated into
+///      a plan, a prompt or a tool argument, so there is nothing for a
+///      screen to protect, and a false positive would block the one action
+///      this whole path exists to enable.
+///
+///      A body that only *looks* like an attempt — it carries an
+///      `/approve`/`/deny` token somewhere but does not parse — also does
+///      not fall through to step 3. It gets the plain usage ack instead,
+///      never the enqueue path: falling through would write a live token
+///      verbatim into `tasks.payload` (durable, no DELETE grant) and hand
+///      it to the planner. `/approve tok9 thanks!` and a quoted reply that
+///      echoes the ask's own command lines are both this shape.
+///
+///      **This containment arm runs whether or not `asks` is wired.** The
+///      wiring decides whether an answer can be *resolved*; it must not
+///      decide whether a command-shaped body is kept out of the task
+///      queue. A token raised on one channel can be pasted into another,
+///      and a channel added later whose boot path forgets the wiring would
+///      otherwise silently reopen the leak.
+///   3. **screen** (injection guard) and enqueue or block.
+///
+/// Returns `Some(ack)` on a successful pairing or a recognised answer (the
+/// per-channel task delivers it via the same channel).
 pub async fn handle_inbound(
     authorizer: &dyn PeerAuthorizer,
     pairing: Option<&dyn PairingService>,
+    asks: Option<&AskWiring>,
     events: &dyn ChannelEvents,
     msg: &IncomingMessage,
 ) -> Option<OutgoingMessage> {
@@ -208,6 +298,86 @@ pub async fn handle_inbound(
                 .await;
             return None;
         }
+    }
+
+    if let Some(wiring) = asks {
+        if let Some(cmd) = super::ask_message::parse_ask_command(&msg.body) {
+            let claimant =
+                kastellan_db::asks::Claimant::new(msg.channel.0.clone(), msg.peer.0.clone());
+            let nonce = kastellan_db::asks::Nonce::from_wire(cmd.token);
+            let resolution = wiring.resolver.resolve(&nonce, cmd.choice.as_str(), &claimant).await;
+            // `Ok(None)` (wrong/expired/not-this-peer's token) and `Err`
+            // (e.g. a DB outage) are collapsed into ONE arm below, sharing
+            // one audit call and one ack body: a DB error and a refused
+            // answer must look the same to the peer, or the error path
+            // becomes the existence oracle the refusal path refuses to be.
+            // Structural, not just parallel code, so a later edit cannot
+            // let the two drift apart by touching only one arm.
+            let body = if let Ok(Some(resolved)) = resolution {
+                events
+                    .audit(
+                        crate::scheduler::audit::ACTION_ASK_RESOLVED,
+                        serde_json::json!({
+                            "ask_id": resolved.ask_id,
+                            "task_id": resolved.task_id,
+                            "choice": cmd.choice.as_str(),
+                            "resolved_by": claimant.attribution(),
+                            "via": "channel",
+                        }),
+                    )
+                    .await;
+                super::ask_message::ack_resolved(cmd.choice, resolved.task_id)
+            } else {
+                if let Err(e) = &resolution {
+                    // Logged only here, never audited: the DB crate's
+                    // `DbError` renders query context, not the token — but
+                    // even so this must never reach a durable,
+                    // operator-queried row, only the rotating daemon log.
+                    warn!(error = %e, "ask resolution failed");
+                }
+                events
+                    .audit(
+                        actions::ASK_ANSWER_REJECTED,
+                        serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
+                    )
+                    .await;
+                super::ask_message::ACK_NOT_ANSWERABLE.to_string()
+            };
+            return Some(OutgoingMessage {
+                channel: msg.channel.clone(),
+                peer: msg.peer.clone(),
+                conversation: msg.conversation.clone(),
+                body,
+            });
+        }
+    }
+
+    if super::ask_message::looks_like_ask_command(&msg.body) {
+        // Looks like an attempted answer but did not parse (extra words, a
+        // missing token, a quoted reply echoing the ask's own command
+        // lines). Must NOT fall through to `screen_and_classify`: the body
+        // can still carry a live approval token, and enqueueing it would
+        // write that token verbatim into `tasks.payload` — a durable
+        // column with no DELETE grant — and hand it to the planner as an
+        // instruction. This is the failure the whole ordering exists to
+        // prevent, arriving through the parser's strictness instead of
+        // through authorization.
+        //
+        // Deliberately OUTSIDE the `if let Some(wiring)` above: containment
+        // is a property of the inbound path, not of this bus's
+        // configuration. See the ordering doc on `handle_inbound`.
+        events
+            .audit(
+                actions::ASK_ANSWER_REJECTED,
+                serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
+            )
+            .await;
+        return Some(OutgoingMessage {
+            channel: msg.channel.clone(),
+            peer: msg.peer.clone(),
+            conversation: msg.conversation.clone(),
+            body: super::ask_message::ACK_MALFORMED_COMMAND.to_string(),
+        });
     }
 
     match screen_and_classify(msg) {
@@ -292,6 +462,12 @@ pub struct ChannelBus {
     /// through [`death_signal`](Self::death_signal) — see [`DeathBell`] for why
     /// the bus reports its own death rather than being polled for liveness.
     bell: DeathBell,
+    /// Kept so `shutdown` can deregister; also keeps the wiring alive for
+    /// the bus's lifetime.
+    asks: Option<Arc<AskWiring>>,
+    /// The ids registered into the outbox, so shutdown removes exactly what
+    /// spawn added.
+    registered: Vec<ChannelId>,
 }
 
 impl ChannelBus {
@@ -305,9 +481,11 @@ impl ChannelBus {
         pairing: Option<Arc<dyn PairingService>>,
         events: Arc<dyn ChannelEvents>,
         mut completed: Box<dyn CompletedTasks>,
+        asks: Option<Arc<AskWiring>>,
     ) -> Self {
         let mut handles = Vec::new();
         let mut senders: HashMap<ChannelId, mpsc::Sender<OutgoingMessage>> = HashMap::new();
+        let mut registered = Vec::new();
         // Every pump below takes a guard off this bell. Each of them has at
         // least one terminal exit — a `break`, a `while let` that ends, a panic
         // — and before #517 all of them were silent: the bus kept looking
@@ -318,11 +496,20 @@ impl ChannelBus {
         for mut ch in channels {
             let id = ch.id();
             let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(32);
-            senders.insert(id.clone(), tx);
+            senders.insert(id.clone(), tx.clone());
+
+            // Publish this channel's reply queue so core-initiated messages
+            // (a raised ask) go through the same pump replies do — one queue
+            // per channel, no second delivery path.
+            if let Some(w) = &asks {
+                w.outbox.register(id.clone(), tx.clone());
+                registered.push(id.clone());
+            }
 
             let authorizer = authorizer.clone();
             let pairing = pairing.clone();
             let events = events.clone();
+            let asks_for_pump = asks.clone();
             let life = bell.guard();
             handles.push(tokio::spawn(async move {
                 let _life = life;
@@ -330,28 +517,62 @@ impl ChannelBus {
                     tokio::select! {
                         inbound = ch.recv() => match inbound {
                             Some(msg) => {
-                                if let Some(ack) =
-                                    handle_inbound(&*authorizer, pairing.as_deref(), &*events, &msg).await
+                                if let Some(ack) = handle_inbound(
+                                    &*authorizer,
+                                    pairing.as_deref(),
+                                    asks_for_pump.as_deref(),
+                                    &*events,
+                                    &msg,
+                                )
+                                .await
                                 {
+                                    // Any ack `handle_inbound` returns, not
+                                    // just the pairing one: since #564
+                                    // slice 2 this also carries "✓
+                                    // Approved", "✗ not answerable" and the
+                                    // malformed-command usage line. An
+                                    // operator whose approval landed but
+                                    // whose confirmation never arrived
+                                    // should not be reading a log line that
+                                    // says "pairing".
                                     if let Err(e) = ch.send(ack).await {
-                                        warn!(channel = %id.0, error = %e, "pairing ack send failed");
+                                        warn!(channel = %id.0, error = %e, "inbound ack send failed");
                                     }
                                 }
                             }
                             None => { info!(channel = %id.0, "inbound closed"); break; }
                         },
                         Some(out) = rx.recv() => {
-                            // `handle_completed` already wrote `channel.replied`
-                            // when it queued this — that row means "routed",
-                            // not "delivered" (see `actions::REPLIED`). The
-                            // actual transport attempt is HERE, so a failure
-                            // must leave its own durable trace, or the audit
-                            // trail asserts a delivery that never happened. In
-                            // slice 1 `EmailChannel::send` always fails, so
-                            // without this pair every email answer looked
-                            // delivered. Payload is channel + peer only: the
-                            // error is transport text, not a fixed label, and
-                            // the body must never be persisted.
+                            // TWO producers feed this `rx`, and they leave
+                            // different rows behind:
+                            //   - a completed-task reply from
+                            //     `handle_completed`, which already wrote
+                            //     `channel.replied` when it queued this —
+                            //     that row means "routed", not "delivered"
+                            //     (see `actions::REPLIED`);
+                            //   - a core-initiated message from the
+                            //     `ChannelOutbox` (#564 slice 2), i.e. a
+                            //     raised ask, which has `ask.delivered`
+                            //     behind it instead and NO `channel.replied`.
+                            // Until slice 2 the first was the only producer,
+                            // so "already wrote `channel.replied`" read as an
+                            // invariant; it is not one any more, which is why
+                            // a `channel.reply_undelivered` can now be an
+                            // orphan with no `channel.replied` to pair with.
+                            //
+                            // The actual transport attempt is HERE either
+                            // way, so a failure must leave its own durable
+                            // trace, or the audit trail asserts a delivery
+                            // that never happened. `EmailChannel::send` still
+                            // always fails, so without this pair every email
+                            // answer looked delivered. Payload is channel +
+                            // peer only: the error is transport text, not a
+                            // fixed label, and the body must never be
+                            // persisted. That also means an ask failure
+                            // recorded here names neither the ask nor the
+                            // task — correlating it needs the outbound
+                            // message to carry its `ask_id`, tracked
+                            // separately.
                             let peer = out.peer.clone();
                             if let Err(e) = ch.send(out).await {
                                 warn!(channel = %id.0, error = %e, "channel send failed");
@@ -381,7 +602,7 @@ impl ChannelBus {
             info!("outbound pump stopped");
         }));
 
-        Self { handles, bell }
+        Self { handles, bell, asks, registered }
     }
 
     /// A future that completes as soon as **any** pump task has ended — by
@@ -416,6 +637,14 @@ impl ChannelBus {
     /// that release racing the pool close. Mirrors the scheduler/audit-mirror
     /// shutdowns, which signal-then-join for the same reason.
     pub async fn shutdown(self) {
+        // Stop being a delivery target first: an ask queued after this point
+        // would go into a channel whose pump is about to be aborted, which
+        // is a message that vanishes rather than one that fails.
+        if let Some(w) = &self.asks {
+            for id in &self.registered {
+                w.outbox.deregister(id);
+            }
+        }
         for h in &self.handles {
             h.abort();
         }

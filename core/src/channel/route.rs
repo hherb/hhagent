@@ -13,23 +13,20 @@
 
 use serde_json::Value;
 
-use super::{ChannelId, ConversationId, OutgoingMessage, PeerId};
+use super::OutgoingMessage;
 
 /// Build the reply for a finalized channel task. Returns `None` (with no error)
 /// when `payload.kind != "channel"` (an `ask`/`l3_run` completion the bus must
 /// ignore) or routing metadata is missing/malformed (the caller logs a warn).
 pub fn reply_for_completed_task(payload: &Value, result: Option<&Value>) -> Option<OutgoingMessage> {
-    if payload.get("kind").and_then(Value::as_str) != Some("channel") {
-        return None;
-    }
-    let channel = payload.get("channel").and_then(Value::as_str)?;
-    let peer = payload.get("peer").and_then(Value::as_str)?;
-    let conversation = payload.get("conversation").and_then(Value::as_str)?;
-
+    // The same four keys the ask-delivery path reads, through the same
+    // function (spec D10) — so where an ask is asked and where its task's
+    // answer is delivered cannot drift apart.
+    let dest = super::ask_message::destination_from_task_payload(payload)?;
     Some(OutgoingMessage {
-        channel: ChannelId(channel.to_string()),
-        peer: PeerId(peer.to_string()),
-        conversation: ConversationId(conversation.to_string()),
+        channel: dest.channel,
+        peer: dest.peer,
+        conversation: dest.conversation,
         body: reply_body(result),
     })
 }
@@ -42,6 +39,20 @@ pub fn reply_body(result: Option<&Value>) -> String {
     // The non-completion outcomes carry the fixed `kind`s that
     // `Outcome::result_payload()` (`scheduler/inner_loop.rs`) stamps.
     match result.get("kind").and_then(Value::as_str) {
+        // An operator ask timed out (#564 slice 2, spec D14). The generic
+        // error arm below renders this as "Sorry — that failed:
+        // ask_timeout", which is true and tells the user nothing: their
+        // request stalled because a question *about* it went unanswered.
+        // Matched on the exact detail string `db::asks` defines, so a
+        // different error carrying a similar-looking detail is unaffected.
+        Some("error")
+            if result.get("detail").and_then(Value::as_str)
+                == Some(kastellan_db::asks::ASK_TIMEOUT_DETAIL) =>
+        {
+            "I needed an operator to approve something before continuing, and nobody \
+             answered in time, so I stopped."
+                .to_string()
+        }
         Some("error") => format!(
             "Sorry — that failed: {}",
             result.get("detail").and_then(Value::as_str).unwrap_or("unknown error")
@@ -94,6 +105,8 @@ fn compact(v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    use super::super::{ChannelId, ConversationId, PeerId};
 
     fn channel_payload() -> Value {
         json!({"kind":"channel","channel":"matrix","peer":"@me:srv","conversation":"!room:srv","instruction":"hi"})
@@ -201,5 +214,42 @@ mod tests {
             assert!(!body.contains('{'), "never raw JSON: {body:?}");
             assert!(body.contains("declined"), "must read as a refusal: {body:?}");
         }
+    }
+
+    /// D14. An expired ask already reaches the room — `notify_task_completed`
+    /// is an `AFTER UPDATE OF state` trigger and `awaiting_operator → failed`
+    /// crosses into its terminal set — so the only question is what it says.
+    /// "Sorry — that failed: ask_timeout" is true and useless; the user's
+    /// question stalled because nobody answered a question about it.
+    #[test]
+    fn an_ask_timeout_reads_as_an_unanswered_question_not_a_crash() {
+        let body = reply_body(Some(&json!({"kind": "error", "detail": "ask_timeout"})));
+        assert!(!body.contains("ask_timeout"), "the raw detail string is not user-facing: {body}");
+        let lowered = body.to_lowercase();
+        assert!(lowered.contains("answer"), "must say nobody answered: {body}");
+    }
+
+    /// Every other error detail keeps the existing generic rendering — the new
+    /// arm must be exactly one detail string wide, not a prefix match that
+    /// swallows unrelated failures.
+    #[test]
+    fn other_error_details_are_unchanged_by_the_timeout_arm() {
+        let body = reply_body(Some(&json!({"kind": "error", "detail": "ask_timeout_but_not_really"})));
+        assert!(body.contains("ask_timeout_but_not_really"), "{body}");
+    }
+
+    /// D10: the ask's destination and the reply's routing are read off the same
+    /// payload by the same function. Asserted directly, because the failure
+    /// mode is silent — the two drift, and an ask is delivered to a
+    /// conversation the answer never returns to.
+    #[test]
+    fn the_reply_route_and_the_ask_destination_agree() {
+        use crate::channel::ask_message::destination_from_task_payload;
+        let p = channel_payload();
+        let reply = reply_for_completed_task(&p, Some(&json!({"kind": "completed"}))).expect("reply");
+        let dest = destination_from_task_payload(&p).expect("destination");
+        assert_eq!(reply.channel, dest.channel);
+        assert_eq!(reply.peer, dest.peer);
+        assert_eq!(reply.conversation, dest.conversation);
     }
 }

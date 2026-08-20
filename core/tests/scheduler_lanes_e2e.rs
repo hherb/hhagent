@@ -263,6 +263,7 @@ async fn two_lanes_run_concurrently() {
         dispatcher,
         entity_extractor,
         embedder,
+        None,
     );
 
     // Wait for both `tasks_completed` NOTIFYs.

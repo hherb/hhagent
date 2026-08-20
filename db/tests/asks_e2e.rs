@@ -165,7 +165,7 @@ fn raise_suspends_the_task_and_releases_the_lease() {
         assert!(!tasks::any_live_worker(&pool).await.unwrap());
 
         // The nonce is returned in plaintext exactly once and stored hashed.
-        assert_eq!(raised.nonce.expose().len(), 64, "32 bytes hex-encoded");
+        assert_eq!(raised.nonce.expose().len(), 10, "5 bytes hex-encoded (#564 slice 2, D17)");
         let stored: String = sqlx::query_scalar("SELECT nonce_sha256 FROM asks WHERE id = $1")
             .bind(raised.ask_id).fetch_one(&pool).await.unwrap();
         assert_eq!(stored, asks::sha256_hex(raised.nonce.expose()));
@@ -701,7 +701,7 @@ fn resolve_with_nonce_succeeds_and_re_enqueues_the_task() {
             .await.expect("admin pool");
 
         let task_id = tasks::insert_pending(
-            &pool, Lane::Fast, serde_json::json!({"instruction": "nonce resolve probe"}),
+            &pool, Lane::Fast, channel_payload("@horst:kastellan.dev"),
         ).await.unwrap();
         tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
         let raised = asks::raise(
@@ -711,10 +711,10 @@ fn resolve_with_nonce_succeeds_and_re_enqueues_the_task() {
         ).await.unwrap();
 
         let won = asks::resolve_with_nonce(
-            &pool, &raised.nonce, "matrix/@horst:kastellan.dev",
+            &pool, &raised.nonce, &asks::Claimant::new("matrix", "@horst:kastellan.dev"),
             &serde_json::json!({"choice": "approve"}),
         ).await.unwrap();
-        assert!(won, "resolving with the correct plaintext nonce must succeed");
+        assert!(won.is_some(), "resolving with the correct plaintext nonce must succeed");
 
         // The task is back in the queue, claimable again — same outcome
         // as the by-id path.
@@ -763,7 +763,7 @@ fn resolve_with_nonce_rejects_a_wrong_nonce_and_leaves_the_ask_pending() {
             .await.expect("admin pool");
 
         let task_id = tasks::insert_pending(
-            &pool, Lane::Fast, serde_json::json!({"instruction": "wrong nonce probe"}),
+            &pool, Lane::Fast, channel_payload("@horst:kastellan.dev"),
         ).await.unwrap();
         tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
         let raised = asks::raise(
@@ -782,11 +782,15 @@ fn resolve_with_nonce_rejects_a_wrong_nonce_and_leaves_the_ask_pending() {
             "test setup: must not collide with the real nonce",
         );
 
+        // The owning claimant, deliberately — the point of this test is the
+        // hash mismatch alone. A non-owning claimant would make `EXISTS`
+        // refuse it too, and the three D16 tests already cover that path.
         let lost = asks::resolve_with_nonce(
-            &pool, &asks::Nonce::from_wire(unissued_nonce.clone()), "matrix/@stranger:evil.example",
+            &pool, &asks::Nonce::from_wire(unissued_nonce.clone()),
+            &asks::Claimant::new("matrix", "@horst:kastellan.dev"),
             &serde_json::json!({"choice": "approve"}),
         ).await.unwrap();
-        assert!(!lost, "an unissued nonce must not resolve the ask");
+        assert!(lost.is_none(), "an unissued nonce must not resolve the ask");
 
         // Nothing moved: the ask is still pending, unresolved, and the
         // task is still suspended.
@@ -799,10 +803,10 @@ fn resolve_with_nonce_rejects_a_wrong_nonce_and_leaves_the_ask_pending() {
         // The real nonce still works afterwards — a failed guess must not
         // have consumed or corrupted the row.
         let won = asks::resolve_with_nonce(
-            &pool, &raised.nonce, "matrix/@horst:kastellan.dev",
+            &pool, &raised.nonce, &asks::Claimant::new("matrix", "@horst:kastellan.dev"),
             &serde_json::json!({"choice": "approve"}),
         ).await.unwrap();
-        assert!(won, "the correct nonce must still resolve the ask after a wrong guess");
+        assert!(won.is_some(), "the correct nonce must still resolve the ask after a wrong guess");
     });
 }
 
@@ -840,7 +844,7 @@ fn resolve_with_nonce_on_an_already_resolved_ask_returns_false() {
             .await.expect("admin pool");
 
         let task_id = tasks::insert_pending(
-            &pool, Lane::Fast, serde_json::json!({"instruction": "double nonce resolve probe"}),
+            &pool, Lane::Fast, channel_payload("@horst:kastellan.dev"),
         ).await.unwrap();
         tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
         let raised = asks::raise(
@@ -850,24 +854,221 @@ fn resolve_with_nonce_on_an_already_resolved_ask_returns_false() {
         ).await.unwrap();
 
         let first = asks::resolve_with_nonce(
-            &pool, &raised.nonce, "matrix/@horst:kastellan.dev",
+            &pool, &raised.nonce, &asks::Claimant::new("matrix", "@horst:kastellan.dev"),
             &serde_json::json!({"choice": "approve"}),
         ).await.unwrap();
-        assert!(first, "the first resolve must win");
+        assert!(first.is_some(), "the first resolve must win");
 
-        // Same nonce, second call: the ask is no longer `pending`, so the
-        // guarded UPDATE finds nothing — clean `Ok(false)`, not an error,
-        // and the winner's decision is untouched.
+        // Same nonce, same OWNING claimant, second call: the ask is no
+        // longer `pending`, so the guarded UPDATE finds nothing — clean
+        // `Ok(None)`, not an error, and the winner's decision is untouched.
+        // The claimant must match the task's own peer here, or a mismatched
+        // claimant would make `EXISTS` refuse it independently of
+        // `state = 'pending'`, and this would stop proving what it is named
+        // for.
         let second = asks::resolve_with_nonce(
-            &pool, &raised.nonce, "matrix/@someone-else:evil.example",
+            &pool, &raised.nonce, &asks::Claimant::new("matrix", "@horst:kastellan.dev"),
             &serde_json::json!({"choice": "deny"}),
         ).await.unwrap();
-        assert!(!second, "resolving an already-resolved ask by nonce must lose cleanly");
+        assert!(second.is_none(), "resolving an already-resolved ask by nonce must lose cleanly");
 
         let got = asks::get(&pool, raised.ask_id).await.unwrap().unwrap();
         assert_eq!(got.resolved_by.as_deref(), Some("matrix/@horst:kastellan.dev"),
             "a losing nonce resolve must not overwrite the winner");
         assert_eq!(got.resolution, Some(serde_json::json!({"choice": "approve"})));
+    });
+}
+
+// ---------------------------------------------------------------------
+// D16: the entitlement guard. A nonce is a bearer token delivered into a
+// conversation, so possessing it proves nothing about who is entitled to
+// use it — these pin that `resolve_with_nonce` also requires the claimant
+// to be the task's own `(channel, peer)`.
+// ---------------------------------------------------------------------
+
+/// **The reason D16 exists.** The nonce is delivered as a message into a
+/// room, so every peer who can read that room holds it. Possession
+/// therefore proves nothing about entitlement, and before this guard a
+/// co-present peer could resolve someone else's approval by copying the
+/// token out of the scrollback — the exact attack the nonce was chosen to
+/// prevent, defeated by reading instead of guessing.
+#[test]
+fn a_different_peer_holding_the_correct_nonce_cannot_resolve() {
+    let Some(h) = harness("askcl") else { return };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-claimant-e2e").await;
+        let pool = &pool;
+        use kastellan_db::tasks::Lane;
+        use kastellan_db::{asks, tasks};
+
+        let task_id = tasks::insert_pending(
+            pool, Lane::Fast, channel_payload("@horst:kastellan.dev"),
+        ).await.unwrap();
+        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve", "deny"]), Some("d1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
+        ).await.unwrap();
+
+        // Correct nonce, wrong peer, same room, same channel.
+        let intruder = asks::Claimant::new("matrix", "@someone-else:kastellan.dev");
+        let got = asks::resolve_with_nonce(
+            pool, &raised.nonce, &intruder, &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap();
+        assert!(got.is_none(), "a peer who does not own the task must not resolve its ask");
+
+        // And the ask is untouched, so the real owner can still answer.
+        assert_eq!(asks::get(pool, raised.ask_id).await.unwrap().unwrap().state, "pending");
+        let owner = asks::Claimant::new("matrix", "@horst:kastellan.dev");
+        assert!(asks::resolve_with_nonce(
+            pool, &raised.nonce, &owner, &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap().is_some());
+    });
+}
+
+/// The channel is half of the identity. Two transports can carry the same
+/// peer string (an email address that is also a Matrix localpart), and
+/// matching on the peer alone would let one transport answer the other's
+/// asks — with only the weaker of the two authentications behind it.
+#[test]
+fn the_right_peer_on_the_wrong_channel_cannot_resolve() {
+    let Some(h) = harness("askch") else { return };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-claimant-channel-e2e").await;
+        let pool = &pool;
+        use kastellan_db::tasks::Lane;
+        use kastellan_db::{asks, tasks};
+
+        let task_id = tasks::insert_pending(
+            pool, Lane::Fast, channel_payload("@horst:kastellan.dev"),
+        ).await.unwrap();
+        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve", "deny"]), Some("d1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
+        ).await.unwrap();
+
+        let wrong_transport = asks::Claimant::new("email", "@horst:kastellan.dev");
+        assert!(asks::resolve_with_nonce(
+            pool, &raised.nonce, &wrong_transport,
+            &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap().is_none());
+    });
+}
+
+/// An ask on a task with no channel origin is answerable only through the
+/// local CLI (`asks::resolve`, by id). The `EXISTS` finds no row for any
+/// claimant, which pairs with spec D3: such an ask is never delivered to a
+/// channel in the first place, so nothing should be able to answer it from
+/// one.
+#[test]
+fn an_ask_on_a_cli_task_resolves_through_no_claimant_at_all() {
+    let Some(h) = harness("askcli") else { return };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-cli-task-e2e").await;
+        let pool = &pool;
+        use kastellan_db::tasks::Lane;
+        use kastellan_db::{asks, tasks};
+
+        let task_id = tasks::insert_pending(
+            pool, Lane::Fast, serde_json::json!({"instruction": "cli task"}),
+        ).await.unwrap();
+        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve", "deny"]), Some("d1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
+        ).await.unwrap();
+
+        let anyone = asks::Claimant::new("matrix", "@horst:kastellan.dev");
+        assert!(asks::resolve_with_nonce(
+            pool, &raised.nonce, &anyone, &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap().is_none());
+
+        // The local operator path still works — this is not a wedge.
+        assert!(asks::resolve(
+            pool, raised.ask_id, "hherb", &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap());
+    });
+}
+
+/// `resolved_by` is composed inside the resolver from the claimant its own
+/// guard matched, not supplied by the caller. That is what makes the
+/// attribution in the audit trail the identity the entitlement was checked
+/// against — and it removes the parameter that used to sit adjacent to the
+/// nonce, where transposing the two compiled and wrote the live token into
+/// a column on a table with no DELETE grant.
+#[test]
+fn resolved_by_is_composed_from_the_claimant_the_guard_matched() {
+    let Some(h) = harness("askrb") else { return };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-resolved-by-e2e").await;
+        let pool = &pool;
+        use kastellan_db::tasks::Lane;
+        use kastellan_db::{asks, tasks};
+
+        let task_id = tasks::insert_pending(
+            pool, Lane::Fast, channel_payload("@horst:kastellan.dev"),
+        ).await.unwrap();
+        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve", "deny"]), Some("d1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
+        ).await.unwrap();
+
+        let owner = asks::Claimant::new("matrix", "@horst:kastellan.dev");
+        let resolved = asks::resolve_with_nonce(
+            pool, &raised.nonce, &owner, &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap().expect("owner resolves");
+        assert_eq!(resolved.ask_id, raised.ask_id);
+        assert_eq!(resolved.task_id, task_id);
+
+        let got = asks::get(pool, raised.ask_id).await.unwrap().unwrap();
+        assert_eq!(got.resolved_by.as_deref(), Some("matrix/@horst:kastellan.dev"));
+    });
+}
+
+/// D17's no-migration claim, asserted rather than argued: the column stores
+/// a SHA-256 whatever the input length, so an ask raised before the nonce
+/// shrank still resolves. Simulated by resolving a nonce of the OLD length
+/// that we inject through the same public path a pre-change row took.
+#[test]
+fn a_long_legacy_nonce_still_resolves_after_the_nonce_shrank() {
+    let Some(h) = harness("asklg") else { return };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-legacy-nonce-e2e").await;
+        let pool = &pool;
+        use kastellan_db::tasks::Lane;
+        use kastellan_db::{asks, tasks};
+
+        let task_id = tasks::insert_pending(
+            pool, Lane::Fast, channel_payload("@horst:kastellan.dev"),
+        ).await.unwrap();
+        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            pool, task_id, "plan_approval", "approve?",
+            &serde_json::json!(["approve", "deny"]), Some("d1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
+        ).await.unwrap();
+
+        // Overwrite the stored hash with the hash of a 64-char nonce, which
+        // is exactly the row shape a pre-D17 ask has.
+        let legacy = "a".repeat(64);
+        sqlx::query("UPDATE asks SET nonce_sha256 = $2 WHERE id = $1")
+            .bind(raised.ask_id)
+            .bind(asks::sha256_hex(&legacy))
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let owner = asks::Claimant::new("matrix", "@horst:kastellan.dev");
+        assert!(asks::resolve_with_nonce(
+            pool, &asks::Nonce::from_wire(legacy), &owner,
+            &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap().is_some());
     });
 }
 
@@ -1133,6 +1334,27 @@ fn harness(tag: &str) -> Option<Harness> {
     Some(Harness { cluster, rt })
 }
 
+/// The `tasks.payload` shape a channel-originated task carries.
+///
+/// The five keys here are a **subset** of the seven
+/// `channel::ingest::build_channel_task_payload` writes — the two
+/// classification-floor keys are omitted because nothing in `db` reads
+/// them. `db` cannot depend on `core`, so this is a hand-written copy and
+/// necessarily is; the cross-crate agreement is pinned on the `core` side
+/// instead, by `core/tests/scheduler_asks_e2e.rs::channel_payload`, which
+/// calls the real producer. The D16 entitlement guard reads three of these
+/// keys (`kind`, `channel`, `peer`), so every nonce test needs a task that
+/// has them.
+fn channel_payload(peer: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "channel",
+        "instruction": "what is my flight's GST?",
+        "channel": "matrix",
+        "peer": peer,
+        "conversation": "!room:kastellan.dev",
+    })
+}
+
 /// A task may escalate MORE THAN ONCE over its life, and that is what makes
 /// `asks_one_pending_per_task` partial rather than a plain unique index.
 ///
@@ -1155,7 +1377,7 @@ fn a_task_can_raise_a_second_ask_once_the_first_is_resolved() {
         use kastellan_db::{asks, tasks};
 
         let task_id = tasks::insert_pending(
-            pool, Lane::Fast, serde_json::json!({"instruction": "re-raise probe"}),
+            pool, Lane::Fast, channel_payload("@horst:kastellan.dev"),
         ).await.unwrap();
         tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
 
@@ -1166,8 +1388,9 @@ fn a_task_can_raise_a_second_ask_once_the_first_is_resolved() {
         ).await.expect("first raise");
 
         assert!(asks::resolve_with_nonce(
-            pool, &first.nonce, "operator/cli", &serde_json::json!({"choice": "approve"}),
-        ).await.unwrap());
+            pool, &first.nonce, &asks::Claimant::new("matrix", "@horst:kastellan.dev"),
+            &serde_json::json!({"choice": "approve"}),
+        ).await.unwrap().is_some());
 
         // Resolved → task back to `pending` → re-claim → escalate again.
         tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
@@ -1272,11 +1495,20 @@ fn a_nonce_resolves_only_its_own_ask() {
         use kastellan_db::tasks::Lane;
         use kastellan_db::{asks, tasks};
 
-        let raise_one = |instruction: &'static str| {
+        // Both tasks carry the SAME peer. This test is about the `nonce`
+        // predicate isolating one ask from another, not about D16's
+        // per-peer ownership guard (that is the D16 tests' job) — if A and
+        // B had distinct peers, `EXISTS` alone would already refuse a
+        // cross-ask attempt, and the assertions below would no longer be
+        // attributable to the nonce.
+        let peer = "@shared:kastellan.dev";
+        let claimant = asks::Claimant::new("matrix", peer);
+
+        let raise_one = || {
             let pool = pool.clone();
             async move {
                 let tid = tasks::insert_pending(
-                    &pool, Lane::Fast, serde_json::json!({"instruction": instruction}),
+                    &pool, Lane::Fast, channel_payload(peer),
                 ).await.unwrap();
                 tasks::claim_one(&pool, Lane::Fast, 60).await.unwrap().unwrap();
                 let r = asks::raise(
@@ -1287,14 +1519,14 @@ fn a_nonce_resolves_only_its_own_ask() {
                 (tid, r)
             }
         };
-        let (task_a, ask_a) = raise_one("peer A's task").await;
-        let (task_b, ask_b) = raise_one("peer B's task").await;
+        let (task_a, ask_a) = raise_one().await;
+        let (task_b, ask_b) = raise_one().await;
 
         // A's nonce resolves A...
         assert!(asks::resolve_with_nonce(
-            pool, &ask_a.nonce, "matrix/@a:kastellan.dev",
+            pool, &ask_a.nonce, &claimant,
             &serde_json::json!({"choice": "approve"}),
-        ).await.unwrap());
+        ).await.unwrap().is_some());
 
         // ...and B is untouched: still pending, still suspended, and its own
         // nonce still works. If `resolve_with_nonce` matched on anything but
@@ -1305,21 +1537,23 @@ fn a_nonce_resolves_only_its_own_ask() {
         assert_eq!(tasks::observe_state(pool, task_b).await.unwrap(), "awaiting_operator");
         assert_eq!(tasks::observe_state(pool, task_a).await.unwrap(), "pending");
 
-        // A's (now spent) nonce must not open B either.
+        // A's (now spent) nonce must not open B either. Same claimant as
+        // the first call, so this failure is attributable to the nonce
+        // alone — the claimant owns both tasks equally.
         assert!(
-            !asks::resolve_with_nonce(
-                pool, &ask_a.nonce, "matrix/@a:kastellan.dev",
+            asks::resolve_with_nonce(
+                pool, &ask_a.nonce, &claimant,
                 &serde_json::json!({"choice": "approve"}),
-            ).await.unwrap(),
+            ).await.unwrap().is_none(),
             "a spent nonce must not resolve anything, least of all another ask",
         );
         assert_eq!(asks::get(pool, ask_b.ask_id).await.unwrap().unwrap().state, "pending");
 
         // B's own nonce still works, so the failed attempt cost B nothing.
         assert!(asks::resolve_with_nonce(
-            pool, &ask_b.nonce, "matrix/@b:kastellan.dev",
+            pool, &ask_b.nonce, &claimant,
             &serde_json::json!({"choice": "deny"}),
-        ).await.unwrap());
+        ).await.unwrap().is_some());
     });
 }
 
@@ -1416,7 +1650,7 @@ fn an_ask_past_its_deadline_cannot_be_resolved_even_before_the_sweep_runs() {
         use kastellan_db::{asks, tasks};
 
         let task_id = tasks::insert_pending(
-            pool, Lane::Fast, serde_json::json!({"instruction": "deadline probe"}),
+            pool, Lane::Fast, channel_payload("@late:kastellan.dev"),
         ).await.unwrap();
         tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
         let raised = asks::raise(
@@ -1437,10 +1671,10 @@ fn an_ask_past_its_deadline_cannot_be_resolved_even_before_the_sweep_runs() {
         assert_eq!(asks::get(pool, raised.ask_id).await.unwrap().unwrap().state, "pending");
 
         assert!(
-            !asks::resolve_with_nonce(
-                pool, &raised.nonce, "matrix/@late:kastellan.dev",
+            asks::resolve_with_nonce(
+                pool, &raised.nonce, &asks::Claimant::new("matrix", "@late:kastellan.dev"),
                 &serde_json::json!({"choice": "approve"}),
-            ).await.unwrap(),
+            ).await.unwrap().is_none(),
             "the correct nonce must NOT resolve an ask past its deadline",
         );
         assert!(
@@ -1483,7 +1717,7 @@ fn a_choice_outside_the_asks_own_options_is_refused() {
         use kastellan_db::{asks, tasks};
 
         let task_id = tasks::insert_pending(
-            pool, Lane::Fast, serde_json::json!({"instruction": "choice probe"}),
+            pool, Lane::Fast, channel_payload("@horst:kastellan.dev"),
         ).await.unwrap();
         tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
         let raised = asks::raise(
@@ -1491,6 +1725,12 @@ fn a_choice_outside_the_asks_own_options_is_refused() {
             &serde_json::json!(["approve", "deny"]), None,
             time::OffsetDateTime::now_utc() + time::Duration::seconds(600), None,
         ).await.unwrap();
+
+        // The claimant must own the task for the guarded UPDATE to find the
+        // row at all — otherwise every "bad choice" call below would return
+        // `Ok(None)` (wrong claimant) rather than the `Err` this test is
+        // actually about.
+        let owner = asks::Claimant::new("matrix", "@horst:kastellan.dev");
 
         // Each of these is a DIFFERENT way to miss, and each used to be
         // stored verbatim.
@@ -1502,7 +1742,7 @@ fn a_choice_outside_the_asks_own_options_is_refused() {
             serde_json::json!({"choice": 1}),               // right key, wrong type
         ] {
             let err = asks::resolve_with_nonce(
-                pool, &raised.nonce, "matrix/@peer:evil.example", &bad,
+                pool, &raised.nonce, &owner, &bad,
             ).await.expect_err(
                 "a resolution naming no offered option must be an Err, not a stored decision",
             );
@@ -1526,9 +1766,9 @@ fn a_choice_outside_the_asks_own_options_is_refused() {
         // And a legitimate choice still works, so the guard is not simply
         // refusing everything.
         assert!(asks::resolve_with_nonce(
-            pool, &raised.nonce, "matrix/@horst:kastellan.dev",
+            pool, &raised.nonce, &owner,
             &serde_json::json!({"choice": "deny", "free_text": "not this time"}),
-        ).await.unwrap());
+        ).await.unwrap().is_some());
         let done = asks::get(pool, raised.ask_id).await.unwrap().unwrap();
         assert_eq!(done.state, "resolved");
         assert_eq!(
@@ -1852,7 +2092,7 @@ fn resolving_an_ask_whose_task_cannot_resume_fails_closed_and_rolls_back() {
         use kastellan_db::{asks, tasks};
 
         let task_id = tasks::insert_pending(
-            pool, Lane::Fast, serde_json::json!({"instruction": "fail-closed probe"}),
+            pool, Lane::Fast, channel_payload("@horst:kastellan.dev"),
         ).await.unwrap();
         tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
         let raised = asks::raise(
@@ -1869,10 +2109,11 @@ fn resolving_an_ask_whose_task_cannot_resume_fails_closed_and_rolls_back() {
             .bind(task_id).execute(pool).await.unwrap();
 
         let err = asks::resolve_with_nonce(
-            pool, &raised.nonce, "operator/cli", &serde_json::json!({"choice": "approve"}),
+            pool, &raised.nonce, &asks::Claimant::new("matrix", "@horst:kastellan.dev"),
+            &serde_json::json!({"choice": "approve"}),
         ).await.expect_err(
-            "a pending ask whose task cannot resume must fail LOUDLY, not return Ok(false) — \
-             Ok(false) reads as 'you lost a race' and would hide a corrupt pair",
+            "a pending ask whose task cannot resume must fail LOUDLY, not return Ok(None) — \
+             Ok(None) reads as 'you lost a race' and would hide a corrupt pair",
         );
         let msg = err.to_string();
         assert!(msg.contains(&raised.ask_id.to_string()), "error must name the ask: {msg}");
@@ -1912,7 +2153,7 @@ fn raise_persists_the_body_and_options_it_was_given() {
         use kastellan_db::{asks, tasks};
 
         let task_id = tasks::insert_pending(
-            pool, Lane::Fast, serde_json::json!({"instruction": "body probe"}),
+            pool, Lane::Fast, channel_payload("@horst:kastellan.dev"),
         ).await.unwrap();
         tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
 
@@ -1933,9 +2174,9 @@ fn raise_persists_the_body_and_options_it_was_given() {
         // The third option is genuinely accepted — proving `options` reached
         // the resolver's validation, not just the row.
         assert!(asks::resolve_with_nonce(
-            pool, &raised.nonce, "operator/cli",
+            pool, &raised.nonce, &asks::Claimant::new("matrix", "@horst:kastellan.dev"),
             &serde_json::json!({"choice": "approve_without_attachments"}),
-        ).await.unwrap());
+        ).await.unwrap().is_some());
     });
 }
 

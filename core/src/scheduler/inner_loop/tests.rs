@@ -29,6 +29,7 @@ fn ctx() -> TaskContext {
         plan_count: 0,
         max_plans: 3,
         resolved_asks: Vec::new(),
+        origin: None,
     }
 }
 
@@ -839,9 +840,10 @@ async fn terminal_python_skill_captured_under_grounding_gate() {
         plan_count: 0,
         max_plans: 5,
         resolved_asks: Vec::new(),
+        origin: None,
     };
 
-    let result = super::run_to_terminal(&pool, formulator, review, dispatcher, ctx)
+    let result = super::run_to_terminal(&pool, formulator, review, dispatcher, ctx, None)
         .await
         .unwrap();
 
@@ -934,6 +936,7 @@ async fn forced_synthesis_at_cap_answers_from_gathered_observations() {
             plan_count: 0,
             max_plans: 1,
             resolved_asks: Vec::new(),
+            origin: None,
         }
     }
 
@@ -951,6 +954,7 @@ async fn forced_synthesis_at_cap_answers_from_gathered_observations() {
         review.clone(),
         std::sync::Arc::new(OkDispatcher),
         ctx,
+        None,
     )
     .await
     .unwrap();
@@ -979,6 +983,7 @@ async fn forced_synthesis_at_cap_answers_from_gathered_observations() {
         review.clone(),
         std::sync::Arc::new(OkDispatcher),
         ctx,
+        None,
     )
     .await
     .unwrap();
@@ -1013,6 +1018,7 @@ async fn forced_synthesis_at_cap_answers_from_gathered_observations() {
         review,
         std::sync::Arc::new(OkDispatcher),
         ctx,
+        None,
     )
     .await
     .unwrap();

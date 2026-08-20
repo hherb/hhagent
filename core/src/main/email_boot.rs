@@ -188,12 +188,22 @@ fn classify_spawn_error(e: anyhow::Error) -> BootOutcome {
 ///   hiccup on an already-open pool is a generic DB-listener condition, not an
 ///   email misconfiguration — the same reading Matrix gives it).
 ///
+/// `outbox` is the shared core-initiated-outbound registry (#564 slice 2).
+/// The bus registers its own reply queue into it on spawn and deregisters on
+/// shutdown, which is what lets a raised ask reach the same pump replies go
+/// through. It is created in `main` before both the scheduler and this
+/// supervisor, because each supervisor restarts its bus underneath and a
+/// held `Sender` would be stale after the first restart. See the
+/// registration note at the call site for what the audit trail does — and
+/// does not — say about email delivery today.
+///
 /// There is still no `Err` variant anywhere on this path, so no future `?` can
 /// reintroduce the daemon-aborting behaviour this module's docs argue against.
 async fn attempt(
     pool: PgPool,
     sandboxes: SandboxBackends,
     force_routing: Option<Arc<ForceRoutingConfig>>,
+    outbox: Arc<kastellan_core::channel::outbox::ChannelOutbox>,
 ) -> BootOutcome {
     let cfg = match kastellan_core::channel::email::config::EmailConfig::from_env() {
         // Unset ⇒ channel absent. Silent on purpose: this is the default for
@@ -255,12 +265,37 @@ async fn attempt(
     let authorizer = Arc::new(kastellan_core::channel::auth::DbPeerAuthorizer::new(pool.clone()));
     let pairing = Arc::new(kastellan_core::channel::pairing::DbPairingService::new(pool.clone()));
     let events = Arc::new(kastellan_core::channel::bus::PgChannelEvents::new(pool.clone()));
+    // Wired so an email peer can still ANSWER an ask (the inbound half
+    // works today); outbound SMTP is a later slice.
+    //
+    // Be precise about what the audit trail says for the OUTBOUND half,
+    // because an earlier version of this comment claimed the opposite and
+    // the spec repeated it. `ChannelOutbox::try_deliver` fails only on
+    // `NoSuchChannel`/`QueueFull`/`QueueClosed`; this bus registers a live
+    // sender and its pump drains it, so a raised ask is accepted and
+    // audited **`ask.delivered`** — never `ask.delivery_failed`.
+    // `EmailChannel::send`'s unconditional refusal happens afterwards, in
+    // the pump, which writes `channel.reply_undelivered {channel, peer}` —
+    // a row naming neither the ask nor the task.
+    //
+    // So for email, `ask.delivered` currently means "queued", and it is
+    // always false in the sense an operator cares about. That is the
+    // general caveat on `ACTION_ASK_DELIVERED` ("queued, not delivered to
+    // the human"), except that here it is guaranteed rather than a race.
+    // Making the failure correlatable needs the outbound message to carry
+    // its `ask_id` into the pump — tracked as its own issue rather than
+    // widened into this slice.
+    let asks = Arc::new(kastellan_core::channel::bus::AskWiring {
+        outbox,
+        resolver: Arc::new(kastellan_core::channel::bus::PgAskResolver::new(pool.clone())),
+    });
     BootOutcome::Started(StartedChannel::from_bus(ChannelBus::spawn(
         vec![Box::new(spawned.channel)],
         authorizer,
         Some(pairing),
         events,
         Box::new(completed),
+        Some(asks),
     )))
 }
 
@@ -276,6 +311,7 @@ pub(crate) fn supervise_email_channel(
     pool: &PgPool,
     sandboxes: &SandboxBackends,
     force_routing: &Option<Arc<ForceRoutingConfig>>,
+    outbox: Arc<kastellan_core::channel::outbox::ChannelOutbox>,
 ) -> ChannelSupervisor {
     let pool = pool.clone();
     let sandboxes = sandboxes.clone();
@@ -286,7 +322,7 @@ pub(crate) fn supervise_email_channel(
         RestartBackoff::default(),
         ReportingPolicy::default(),
         Some(audit),
-        move || attempt(pool.clone(), sandboxes.clone(), force_routing.clone()),
+        move || attempt(pool.clone(), sandboxes.clone(), force_routing.clone(), outbox.clone()),
     )
 }
 

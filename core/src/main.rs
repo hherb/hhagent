@@ -527,6 +527,12 @@ async fn main() -> Result<()> {
             ),
         );
 
+    // The core-initiated-outbound registry, created HERE because both sides
+    // need it and neither can own it: the scheduler is spawned on the next
+    // line, the channel supervisors below it, and each supervisor restarts
+    // its bus underneath. See `channel::outbox`.
+    let outbox = std::sync::Arc::new(kastellan_core::channel::outbox::ChannelOutbox::new());
+
     let scheduler = kastellan_core::scheduler::spawn_scheduler(
         pool.clone(),
         formulator,
@@ -534,6 +540,7 @@ async fn main() -> Result<()> {
         dispatcher,
         entity_extractor.clone(),
         embedder,
+        Some(outbox.clone()),
     );
     info!("scheduler spawned (lane_fast + lane_long)");
 
@@ -548,7 +555,8 @@ async fn main() -> Result<()> {
     // homeserver still stops, loudly. Returns without awaiting: bring-up now
     // proceeds in the background rather than holding startup for up to the
     // 60s login timeout. See `main/matrix_boot.rs`.
-    let matrix = matrix_boot::supervise_matrix_channel(&pool, &sandboxes, &force_routing);
+    let matrix =
+        matrix_boot::supervise_matrix_channel(&pool, &sandboxes, &force_routing, outbox.clone());
 
     // ── Channel bus (Phase 2 slice #5 — email fallback). ──
     // Gated on KASTELLAN_EMAIL_ENDPOINT (checked inside): unset ⇒ the daemon is
@@ -561,7 +569,8 @@ async fn main() -> Result<()> {
     // config must not take Matrix, the scheduler, and the graceful-shutdown
     // path below down with it. Nothing on that path returns `Result`, so no
     // future `?` can reinstate the abort. See `main/email_boot.rs`.
-    let email = email_boot::supervise_email_channel(&pool, &sandboxes, &force_routing);
+    let email =
+        email_boot::supervise_email_channel(&pool, &sandboxes, &force_routing, outbox.clone());
 
     bootstrap::wait_for_shutdown().await?;
 

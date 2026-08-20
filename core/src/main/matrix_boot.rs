@@ -91,10 +91,15 @@ fn classify_homeserver(homeserver_url: &str, forced: bool) -> Option<BootOutcome
 ///   5c invariant: the egress proxy needs a real network route).
 /// * `force_routing` — the resolved egress force-routing config; `Some` ⇒ each
 ///   (re)spawn gets a 1:1 transparent-tunnel sidecar via `MatrixEgress`.
+/// * `outbox` — the core-initiated-outbound registry (#564 slice 2 task 8);
+///   this bus registers its outbound queue into it and hands it a
+///   `PgAskResolver` so a raised ask can reach this channel and an answer on
+///   it can resolve back to the task.
 async fn attempt(
     pool: PgPool,
     sandboxes: SandboxBackends,
     force_routing: Option<Arc<ForceRoutingConfig>>,
+    outbox: Arc<kastellan_core::channel::outbox::ChannelOutbox>,
 ) -> BootOutcome {
     let Some(spawn_cfg) = kastellan_core::channel::matrix::daemon_spawn_config_from_env(
         std::env::current_exe().ok().as_deref().and_then(|p| p.parent()),
@@ -189,12 +194,17 @@ async fn attempt(
     let authorizer = Arc::new(kastellan_core::channel::auth::DbPeerAuthorizer::new(pool.clone()));
     let pairing = Arc::new(kastellan_core::channel::pairing::DbPairingService::new(pool.clone()));
     let events = Arc::new(kastellan_core::channel::bus::PgChannelEvents::new(pool.clone()));
+    let asks = Arc::new(kastellan_core::channel::bus::AskWiring {
+        outbox,
+        resolver: Arc::new(kastellan_core::channel::bus::PgAskResolver::new(pool.clone())),
+    });
     BootOutcome::Started(StartedChannel::from_bus(ChannelBus::spawn(
         vec![Box::new(worker.channel)],
         authorizer,
         Some(pairing),
         events,
         Box::new(completed),
+        Some(asks),
     )))
 }
 
@@ -213,6 +223,7 @@ pub(crate) fn supervise_matrix_channel(
     pool: &PgPool,
     sandboxes: &SandboxBackends,
     force_routing: &Option<Arc<ForceRoutingConfig>>,
+    outbox: Arc<kastellan_core::channel::outbox::ChannelOutbox>,
 ) -> ChannelSupervisor {
     let pool = pool.clone();
     let sandboxes = sandboxes.clone();
@@ -223,7 +234,7 @@ pub(crate) fn supervise_matrix_channel(
         RestartBackoff::default(),
         ReportingPolicy::default(),
         Some(audit),
-        move || attempt(pool.clone(), sandboxes.clone(), force_routing.clone()),
+        move || attempt(pool.clone(), sandboxes.clone(), force_routing.clone(), outbox.clone()),
     )
 }
 

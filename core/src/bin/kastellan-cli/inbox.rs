@@ -178,11 +178,9 @@ async fn inbox_resolve(args: &[String]) -> ExitCode {
     };
 
     // Free text is carried for the record and shown to the operator; it is
-    // never interpolated into a plan (spec D10).
-    let resolution = match &note {
-        Some(t) => serde_json::json!({"choice": choice, "free_text": t}),
-        None => serde_json::json!({"choice": choice}),
-    };
+    // never interpolated into a plan (spec D10). Shaped by `db::asks` so
+    // this surface and the channel resolver cannot drift on the key names.
+    let resolution = kastellan_db::asks::resolution(choice, note.as_deref());
     let resolved_by = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "operator".to_string());
@@ -204,12 +202,18 @@ async fn inbox_resolve(args: &[String]) -> ExitCode {
         Err(e) => { eprintln!("inbox resolve: {e}"); return ExitCode::from(1); }
     }
 
+    // `via` names the answering SURFACE, and both surfaces write it (#564
+    // slice 2). The channel resolver writes `via: "channel"`; without this
+    // key here, `payload->>'via'` would be NULL for exactly the CLI half of
+    // one `ask.resolved` population, so any observation query splitting on
+    // it silently mis-buckets every operator answer given at the terminal.
     let payload = serde_json::json!({
         "ask_id": ask_id,
         "task_id": task_id,
         "choice": choice,
         "resolved_by": resolved_by,
         "free_text": note,
+        "via": "cli",
     });
     if let Err(e) =
         kastellan_db::audit::insert(&pool, CLI_AUDIT_ACTOR, ACTION_ASK_RESOLVED, payload).await

@@ -60,7 +60,12 @@ tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Time
-time        = { version = "0.3", features = ["serde", "macros"] }
+# `formatting` is what makes `OffsetDateTime::format(&Rfc3339)` exist. It is
+# declared rather than inherited from a transitive enabler because
+# `channel::ask_message::render_ask` depends on it directly: `Display` for
+# `OffsetDateTime` is not a wire format (unpadded hour, an always-present
+# subsecond fraction), so an operator-facing deadline must go through RFC 3339.
+time        = { version = "0.3", features = ["serde", "macros", "formatting"] }
 # Timezone-aware datetime with automatic DST + IANA tz DB. Used to inject a
 # trusted current-date/time block into the planner prompt (and, later, travel /
 # timezone features). License: Unlicense OR MIT — AGPL-compatible. Safe in
