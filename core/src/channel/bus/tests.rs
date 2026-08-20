@@ -79,6 +79,23 @@ fn wiring(resolver: Arc<RecordingResolver>) -> Arc<AskWiring> {
     Arc::new(AskWiring { outbox: Arc::new(ChannelOutbox::new()), resolver })
 }
 
+/// A resolver that always errors — the shape a DB outage or a transient
+/// query failure takes. Exists to exercise `handle_inbound`'s `Err` arm,
+/// which nothing else in this file reaches.
+struct FailingResolver;
+
+#[async_trait::async_trait]
+impl AskResolver for FailingResolver {
+    async fn resolve(
+        &self,
+        _nonce: &kastellan_db::asks::Nonce,
+        _choice: &str,
+        _claimant: &kastellan_db::asks::Claimant,
+    ) -> anyhow::Result<Option<kastellan_db::asks::ResolvedAsk>> {
+        anyhow::bail!("simulated db outage")
+    }
+}
+
 /// A channel whose `send` forwards to an mpsc the test drains. The file's
 /// existing `RefusingChannel` refuses by design, so it cannot show that a
 /// core-initiated message actually reached the pump.
@@ -589,6 +606,19 @@ async fn an_answer_from_a_paired_peer_resolves_and_never_enqueues() {
     assert_eq!(calls[0].0, "tok9");
     assert_eq!(calls[0].1, "approve");
     assert_eq!(calls[0].2, "matrix/@me:srv", "the claimant is the transport's own sender");
+
+    // The audit row is a durable, operator-queried record — a typo in the
+    // action const or the payload shape ships silently otherwise.
+    let audited = ev.audited.lock().unwrap();
+    assert_eq!(audited.len(), 1);
+    let (action, payload) = &audited[0];
+    assert_eq!(action, crate::scheduler::audit::ACTION_ASK_RESOLVED);
+    assert_eq!(payload["ask_id"], 7);
+    assert_eq!(payload["task_id"], 412);
+    assert_eq!(payload["choice"], "approve");
+    assert_eq!(payload["resolved_by"], "matrix/@me:srv");
+    assert_eq!(payload["via"], "channel");
+    assert!(!payload.to_string().contains("tok9"), "the audit row must not carry the token");
 }
 
 /// **The load-bearing negative.** An unpaired peer's command must die at
@@ -709,4 +739,97 @@ async fn the_bus_registers_its_channel_and_deregisters_on_shutdown() {
         }),
         Err(crate::channel::outbox::OutboxError::NoSuchChannel),
     );
+}
+
+/// A body that only *looks* like an attempted answer — first token
+/// `/approve`/`/deny`, but it does not parse — must not fall through to
+/// screening + enqueue. Without this arm, `/approve tok9 thanks!` (exactly
+/// what a person types) would be written verbatim into `tasks.payload`,
+/// carrying the LIVE approval token into a durable, no-DELETE-grant column
+/// and handing it to the planner as an instruction — a capability leak,
+/// not a cosmetic one.
+#[tokio::test]
+async fn a_malformed_command_is_not_enqueued_and_gets_a_usage_hint() {
+    let resolver = Arc::new(RecordingResolver::default());
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let ack = handle_inbound(
+        &auth,
+        None,
+        Some(&*wiring(resolver.clone())),
+        &ev,
+        &msg("@me:srv", "/approve tok9 thanks!"),
+    )
+    .await
+    .expect("an ack is returned");
+
+    assert_eq!(ack.body, crate::channel::ask_message::ACK_MALFORMED_COMMAND);
+    assert!(ev.enqueued.lock().unwrap().is_empty(), "a malformed command must never become a task");
+    assert!(
+        resolver.calls.lock().unwrap().is_empty(),
+        "a malformed command never resolves to anything — the resolver must not be consulted"
+    );
+    let audited = ev.audited.lock().unwrap();
+    assert_eq!(audited[0].0, actions::ASK_ANSWER_REJECTED);
+    let rendered = audited[0].1.to_string();
+    assert!(!rendered.contains("tok9"), "the audit row must not carry the token: {rendered}");
+    assert!(!ack.body.contains("tok9"), "the ack must not echo the token: {}", ack.body);
+}
+
+/// The companion positive: a WELL-FORMED command whose token resolves
+/// nothing must still get the deliberately vague `ACK_NOT_ANSWERABLE`, not
+/// the new usage hint — conflating the two would turn "wrong token" into
+/// something a peer could distinguish from "malformed", re-opening the
+/// oracle `resolve_with_nonce` closes. `an_unanswerable_token_is_...`
+/// above already pins this shape; this test exists to make the CONTRAST
+/// with the malformed case explicit in one place.
+#[tokio::test]
+async fn a_well_formed_but_unresolvable_command_still_gets_the_vague_ack() {
+    let resolver = Arc::new(RecordingResolver::default()); // reply: None
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let ack = handle_inbound(
+        &auth,
+        None,
+        Some(&*wiring(resolver.clone())),
+        &ev,
+        &msg("@me:srv", "/approve tok9"),
+    )
+    .await
+    .expect("an ack is returned");
+
+    assert_eq!(ack.body, crate::channel::ask_message::ACK_NOT_ANSWERABLE);
+    assert_ne!(
+        ack.body,
+        crate::channel::ask_message::ACK_MALFORMED_COMMAND,
+        "a well-formed-but-unresolvable command must not get the malformed-syntax hint"
+    );
+    assert_eq!(resolver.calls.lock().unwrap().len(), 1, "a well-formed command DOES reach the resolver");
+}
+
+/// The error path (a DB outage, say) must be acknowledged identically to a
+/// refusal — same action, same body — or the error path becomes the
+/// existence oracle the refusal path refuses to be. `resolve`'s `Ok(None)`
+/// and `Err` arms are collapsed in `handle_inbound` precisely so this
+/// can't drift; this test is what actually exercises the `Err` half, which
+/// nothing else in this file reaches.
+#[tokio::test]
+async fn a_resolver_error_is_acknowledged_identically_to_a_refusal() {
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let w = Arc::new(AskWiring {
+        outbox: Arc::new(ChannelOutbox::new()),
+        resolver: Arc::new(FailingResolver),
+    });
+    let ack = handle_inbound(&auth, None, Some(&*w), &ev, &msg("@me:srv", "/approve tok9"))
+        .await
+        .expect("an ack is returned");
+
+    assert_eq!(ack.body, crate::channel::ask_message::ACK_NOT_ANSWERABLE);
+    assert!(ev.enqueued.lock().unwrap().is_empty());
+    let audited = ev.audited.lock().unwrap();
+    assert_eq!(audited[0].0, actions::ASK_ANSWER_REJECTED);
+    let rendered = audited[0].1.to_string();
+    assert!(!rendered.contains("simulated db outage"), "the audit row must not carry the error text");
+    assert!(!rendered.contains("tok9"), "the audit row must not carry the token");
 }

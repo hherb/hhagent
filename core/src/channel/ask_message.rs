@@ -32,6 +32,27 @@ pub const ACK_NOT_ANSWERABLE: &str =
     "\u{2717} That approval token isn't answerable. It may be mistyped, or the question \
      may no longer be open.";
 
+/// The sentence sent back when a body looks like an attempted answer —
+/// its first whitespace token is `/approve` or `/deny` — but does not
+/// parse as one (extra words, a missing token, ...).
+///
+/// **Deliberately distinct from [`ACK_NOT_ANSWERABLE`].** That sentence is
+/// vague on purpose, because a well-formed command that resolves nothing
+/// must not become an existence oracle. This one is a syntax problem, not
+/// a resolution outcome — the peer typed something extra (`/approve tok9
+/// thanks!` is exactly what a person types), and there is nothing to leak
+/// by telling them plainly what the two valid shapes are. Never echoes the
+/// body or any part of a token.
+///
+/// Existing to close a capability leak, not just for politeness: without
+/// an arm that catches this shape, a malformed command falls through to
+/// `screen_and_classify` and gets enqueued — writing a **live** approval
+/// token verbatim into `tasks.payload` (a durable column with no DELETE
+/// grant) and handing it to the planner as an instruction.
+pub const ACK_MALFORMED_COMMAND: &str =
+    "Usage: /approve <token> or /deny <token> \u{2014} exactly the verb and the token, \
+     nothing else.";
+
 /// Where an ask is delivered: the channel, peer and conversation of the
 /// task that raised it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,6 +165,27 @@ pub fn parse_ask_command(body: &str) -> Option<AskCommand> {
         _ => return None,
     };
     Some(AskCommand { choice, token: token.to_string() })
+}
+
+/// True when `body`'s first whitespace token is `/approve` or `/deny`
+/// (case-insensitive), whether or not the whole body goes on to parse as a
+/// command.
+///
+/// The bus uses this to tell "an attempted answer that is malformed" apart
+/// from "an ordinary message" when [`parse_ask_command`] returns `None`.
+/// Those two must not be treated the same: an ordinary message may safely
+/// fall through to screening and enqueue, but a malformed *attempt* may
+/// still carry a live approval token later in the body (`/approve tok9
+/// thanks!`), and enqueueing it would write that token verbatim into
+/// `tasks.payload` and hand it to the planner. Only the leading verb is
+/// checked — the same reason [`parse_ask_command`] itself does no shape
+/// check on the token (spec D7) applies here: this function's job is to
+/// recognise an *attempt*, not to validate one.
+pub fn looks_like_ask_command(body: &str) -> bool {
+    matches!(
+        body.split_whitespace().next().map(str::to_ascii_lowercase).as_deref(),
+        Some("/approve") | Some("/deny")
+    )
 }
 
 /// The message an escalated plan sends into its task's conversation.
@@ -286,6 +328,59 @@ mod tests {
         ] {
             assert!(parse_ask_command(body).is_none(), "must not parse as a command: {body:?}");
         }
+    }
+
+    /// Bodies whose FIRST token is `/approve`/`/deny` must be recognised as
+    /// an attempt even when they do not parse — this is the distinction
+    /// `handle_inbound` uses to keep a malformed attempt out of the
+    /// enqueue path. Case-insensitive, same as `parse_ask_command`.
+    #[test]
+    fn a_malformed_attempt_still_looks_like_a_command() {
+        for body in [
+            "/approve",
+            "/deny",
+            "/approve  ",
+            "/approve a b",
+            "/approve token trailing prose",
+            "/approve tok9 thanks!",
+            "  /APPROVE abc extra\n",
+            "/Deny abc extra",
+        ] {
+            assert!(looks_like_ask_command(body), "should look like an attempt: {body:?}");
+            assert!(parse_ask_command(body).is_none(), "and must not itself parse: {body:?}");
+        }
+    }
+
+    /// Bodies that are not an attempt at all — no leading verb, or a
+    /// different leading word — must not be flagged, or an ordinary
+    /// message that happens to mention approval would be blocked from
+    /// ever reaching the planner.
+    #[test]
+    fn an_ordinary_message_does_not_look_like_a_command() {
+        for body in [
+            "approve 7f3a9c2e1b",
+            "please /approve 7f3a9c2e1b",
+            "what is my flight's GST?",
+            "",
+            "/approver 7f3a9c2e1b",
+        ] {
+            assert!(!looks_like_ask_command(body), "should not look like an attempt: {body:?}");
+        }
+    }
+
+    /// Well-formed commands look like commands too, obviously — this pins
+    /// that the two functions never disagree on the shapes both accept.
+    #[test]
+    fn a_well_formed_command_also_looks_like_one() {
+        assert!(looks_like_ask_command("/approve tok9"));
+        assert!(looks_like_ask_command("/deny tok9"));
+    }
+
+    /// The malformed-command ack must never echo the body it is refusing.
+    #[test]
+    fn the_malformed_ack_names_no_part_of_the_body() {
+        assert!(!ACK_MALFORMED_COMMAND.contains("tok9"));
+        assert!(!ACK_MALFORMED_COMMAND.to_lowercase().contains("thanks"));
     }
 
     /// The two vocabularies must agree: what the wire parser produces is

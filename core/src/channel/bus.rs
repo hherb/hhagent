@@ -207,6 +207,13 @@ impl CompletedTasks for PgCompletedTasks {
 ///      a plan, a prompt or a tool argument, so there is nothing for a
 ///      screen to protect, and a false positive would block the one action
 ///      this whole path exists to enable.
+///
+///      A body that only *looks* like an attempt — its first token is
+///      `/approve`/`/deny` but the rest does not parse — also does not
+///      fall through to step 3. It gets the plain usage ack instead, never
+///      the enqueue path: falling through would write a live token
+///      verbatim into `tasks.payload` (durable, no DELETE grant) and hand
+///      it to the planner. `/approve tok9 thanks!` is exactly this shape.
 ///   3. **screen** (injection guard) and enqueue or block.
 ///
 /// Returns `Some(ack)` on a successful pairing or a recognised answer (the
@@ -286,52 +293,72 @@ pub async fn handle_inbound(
             let claimant =
                 kastellan_db::asks::Claimant::new(msg.channel.0.clone(), msg.peer.0.clone());
             let nonce = kastellan_db::asks::Nonce::from_wire(cmd.token);
-            let body = match wiring.resolver.resolve(&nonce, cmd.choice.as_str(), &claimant).await
-            {
-                Ok(Some(resolved)) => {
-                    events
-                        .audit(
-                            crate::scheduler::audit::ACTION_ASK_RESOLVED,
-                            serde_json::json!({
-                                "ask_id": resolved.ask_id,
-                                "task_id": resolved.task_id,
-                                "choice": cmd.choice.as_str(),
-                                "resolved_by": claimant.attribution(),
-                                "via": "channel",
-                            }),
-                        )
-                        .await;
-                    super::ask_message::ack_resolved(cmd.choice, resolved.task_id)
-                }
-                Ok(None) => {
-                    events
-                        .audit(
-                            actions::ASK_ANSWER_REJECTED,
-                            serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
-                        )
-                        .await;
-                    super::ask_message::ACK_NOT_ANSWERABLE.to_string()
-                }
-                Err(e) => {
-                    // Fail closed and say nothing specific: a DB error and a
-                    // refused answer must look the same to the peer, or the
-                    // error path becomes the existence oracle the refusal
-                    // path refuses to be.
+            let resolution = wiring.resolver.resolve(&nonce, cmd.choice.as_str(), &claimant).await;
+            // `Ok(None)` (wrong/expired/not-this-peer's token) and `Err`
+            // (e.g. a DB outage) are collapsed into ONE arm below, sharing
+            // one audit call and one ack body: a DB error and a refused
+            // answer must look the same to the peer, or the error path
+            // becomes the existence oracle the refusal path refuses to be.
+            // Structural, not just parallel code, so a later edit cannot
+            // let the two drift apart by touching only one arm.
+            let body = if let Ok(Some(resolved)) = resolution {
+                events
+                    .audit(
+                        crate::scheduler::audit::ACTION_ASK_RESOLVED,
+                        serde_json::json!({
+                            "ask_id": resolved.ask_id,
+                            "task_id": resolved.task_id,
+                            "choice": cmd.choice.as_str(),
+                            "resolved_by": claimant.attribution(),
+                            "via": "channel",
+                        }),
+                    )
+                    .await;
+                super::ask_message::ack_resolved(cmd.choice, resolved.task_id)
+            } else {
+                if let Err(e) = &resolution {
+                    // Logged only here, never audited: the DB crate's
+                    // `DbError` renders query context, not the token — but
+                    // even so this must never reach a durable,
+                    // operator-queried row, only the rotating daemon log.
                     warn!(error = %e, "ask resolution failed");
-                    events
-                        .audit(
-                            actions::ASK_ANSWER_REJECTED,
-                            serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
-                        )
-                        .await;
-                    super::ask_message::ACK_NOT_ANSWERABLE.to_string()
                 }
+                events
+                    .audit(
+                        actions::ASK_ANSWER_REJECTED,
+                        serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
+                    )
+                    .await;
+                super::ask_message::ACK_NOT_ANSWERABLE.to_string()
             };
             return Some(OutgoingMessage {
                 channel: msg.channel.clone(),
                 peer: msg.peer.clone(),
                 conversation: msg.conversation.clone(),
                 body,
+            });
+        } else if super::ask_message::looks_like_ask_command(&msg.body) {
+            // Looks like an attempted answer but did not parse (extra
+            // words, a missing token — `/approve tok9 thanks!` is exactly
+            // what a person types). Must NOT fall through to
+            // `screen_and_classify`: the body can still carry a live
+            // approval token later in the text, and enqueueing it would
+            // write that token verbatim into `tasks.payload` — a durable
+            // column with no DELETE grant — and hand it to the planner as
+            // an instruction. This is the failure the whole ordering
+            // exists to prevent, arriving through the parser's strictness
+            // instead of through authorization.
+            events
+                .audit(
+                    actions::ASK_ANSWER_REJECTED,
+                    serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
+                )
+                .await;
+            return Some(OutgoingMessage {
+                channel: msg.channel.clone(),
+                peer: msg.peer.clone(),
+                conversation: msg.conversation.clone(),
+                body: super::ask_message::ACK_MALFORMED_COMMAND.to_string(),
             });
         }
     }
