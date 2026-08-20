@@ -14,6 +14,13 @@ pub mod pure;
 // Re-exported flat so every existing `scheduler::asks::<item>` path keeps
 // resolving. Listed explicitly rather than with a glob so the module's
 // public surface stays visible in one place.
+//
+// [`delivery`] is deliberately NOT in this list — it is new in slice 2, so
+// no pre-split path depends on it, and its callers reach it as
+// `asks::delivery::<item>`. That means this list is the flat compatibility
+// surface, not the whole public surface; `delivery`'s own items
+// (`deliver_ask`, `delivery_audit_row`, `DeliveryOutcome`, the two
+// `REASON_*` consts) are public too.
 pub use lifecycle::{raise_and_suspend, sweep_expired_and_audit};
 pub use pure::{
     ask_deadline_seconds, decide, deadline_from_env, resolution_choice, resume_state_from,

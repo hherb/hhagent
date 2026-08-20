@@ -150,16 +150,27 @@ pub mod actions {
     /// `send` happens afterwards, in the per-channel pump, and can still fail
     /// (in slice 1 `EmailChannel::send` fails *unconditionally*, since there is
     /// no outbound worker yet). A failure emits [`REPLY_UNDELIVERED`] for the
-    /// same reply, so the pair is what an operator queries: a `channel.replied`
-    /// with no matching `channel.reply_undelivered` is a delivered reply. The
-    /// name is kept because these strings are a committed operator-facing
-    /// interface (see `auth::UnauthenticReason::as_str`); the doc is what was
-    /// wrong, and it claimed delivery.
+    /// same reply, so a `channel.replied` with no matching
+    /// `channel.reply_undelivered` is a delivered reply. The name is kept
+    /// because these strings are a committed operator-facing interface (see
+    /// `auth::UnauthenticReason::as_str`); the doc is what was wrong, and it
+    /// claimed delivery.
+    ///
+    /// **The converse does not hold** — see [`REPLY_UNDELIVERED`].
     pub const REPLIED: &str = "channel.replied";
-    /// A reply was routed to its channel but the transport refused to deliver
-    /// it — the compensating row for a [`REPLIED`] that did not land. Carries
-    /// the channel + peer only, never the reply body and never the error
-    /// string (which is transport text, not a fixed label).
+    /// A message was routed to its channel but the transport refused to
+    /// deliver it. Carries the channel + peer only, never the reply body and
+    /// never the error string (which is transport text, not a fixed label).
+    ///
+    /// Usually the compensating row for a [`REPLIED`] that did not land —
+    /// but **not always, and an anti-join on that pairing will report false
+    /// positives.** Since #564 slice 2 the per-channel pump also drains
+    /// core-initiated messages from the `ChannelOutbox`, so a *raised ask*
+    /// whose transport refused it lands here too, with `ask.delivered`
+    /// behind it rather than `channel.replied`. Because the payload is
+    /// channel + peer only, such a row names neither the ask nor the task
+    /// and is correlatable only by timestamp; carrying `ask_id` into the
+    /// pump is tracked as its own issue.
     pub const REPLY_UNDELIVERED: &str = "channel.reply_undelivered";
     /// A message failed transport authenticity (DMARC and/or token) — dropped
     /// before authorization, so it never reaches the pairing carve-out.

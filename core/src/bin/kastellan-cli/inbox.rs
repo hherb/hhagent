@@ -178,11 +178,9 @@ async fn inbox_resolve(args: &[String]) -> ExitCode {
     };
 
     // Free text is carried for the record and shown to the operator; it is
-    // never interpolated into a plan (spec D10).
-    let resolution = match &note {
-        Some(t) => serde_json::json!({"choice": choice, "free_text": t}),
-        None => serde_json::json!({"choice": choice}),
-    };
+    // never interpolated into a plan (spec D10). Shaped by `db::asks` so
+    // this surface and the channel resolver cannot drift on the key names.
+    let resolution = kastellan_db::asks::resolution(choice, note.as_deref());
     let resolved_by = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "operator".to_string());

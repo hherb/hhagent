@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use kastellan_core::cassandra::review::{ChainReviewStage, ReviewStage, ReviewStageContext};
 use kastellan_core::cassandra::types::{DataClass, Plan, PlannedStep, Severity, Verdict};
+use kastellan_core::channel::ask_message::parse_ask_command;
 use kastellan_core::channel::ingest::build_channel_task_payload;
+use kastellan_core::channel::outbox::ChannelOutbox;
 use kastellan_core::channel::{ChannelId, ConversationId, IncomingMessage, PeerId};
 use kastellan_core::memory::embedder::NoOpEmbedder;
 use kastellan_core::scheduler::agent::{AgentError, FormulationMeta, PlanFormulator};
@@ -601,6 +603,103 @@ async fn a_channel_tasks_escalation_is_delivered_against_its_own_origin() {
         Some(REASON_NO_ORIGIN),
         "a task with no routing metadata really has no origin — without this the \
          assertion above could pass on a `deliver_ask` that ignored `dest` entirely",
+    );
+
+    handle.shutdown().await;
+}
+
+/// **The outbox must survive the trip from `spawn_scheduler` to the wire.**
+///
+/// The test above deliberately spawns with `outbox: None` and asserts on
+/// the `reason` label, so it is insensitive to the outbox argument itself.
+/// That left a seven-hop thread — `main` → `spawn_scheduler` → `lane_loop`
+/// → `drain_lane` → `run_one` → `run_to_terminal` → `raise_and_suspend` →
+/// `deliver_ask` — with **no test anywhere passing `Some`**: all five
+/// `spawn_scheduler` call sites in tests and all 18 `run_to_terminal` call
+/// sites passed `None`, and the one test proving delivery works calls
+/// `raise_and_suspend` directly, bypassing the runner entirely.
+///
+/// So `Some(outbox.clone())` in `main.rs`, or either `outbox.as_deref()` in
+/// `runner.rs`, could be mutated to `None` with the whole ~3400-test suite
+/// still green, while every live escalation audited `ask.undelivered` and
+/// the operator's room stayed silent. That is precisely the `origin: None`
+/// defect the whole-branch review caught, one to three call frames further
+/// out; the fix wave closed only the `task_exec` half.
+///
+/// The assertion is the **rendered message on the receiver**, not an audit
+/// row: an `ask.delivered` row proves the outcome mapping, whereas a body
+/// carrying a token that parses back out proves the whole chain — the
+/// destination came from the task's own payload, the nonce reached the
+/// renderer, and the message was queued to the channel the task came from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_raised_ask_travels_the_whole_runner_to_the_registered_channel() {
+    let Some((pool, _cluster)) = bring_up_pg("outbox").await else {
+        return; // [SKIP]
+    };
+    let channel_task = seed_channel_task(&pool).await;
+
+    // A real outbox with a real registered queue — the same shape the bus
+    // registers. `ChannelOutbox` hands no `Sender` back out, so a drained
+    // receiver IS the perfect fake and no trait double is needed.
+    let outbox = Arc::new(ChannelOutbox::new());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    outbox.register(ChannelId("matrix".into()), tx);
+
+    let handle = spawn_scheduler(
+        pool.clone(),
+        Arc::new(TestFormulator { vary: false, calls: Arc::new(Mutex::new(0)) }),
+        escalating(u32::MAX),
+        Arc::new(NoopDispatcher),
+        Arc::new(kastellan_core::entity_extraction::NoOpEntityExtractor::new()),
+        Arc::new(NoOpEmbedder::new()),
+        Some(Arc::clone(&outbox)),
+    );
+
+    // Bounded: an unbounded `recv().await` would hang the Linux gate on
+    // regression rather than failing it.
+    let sent = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+        .await
+        .expect("the ask must reach the registered channel within 20s")
+        .expect("the outbox sender must still be open");
+
+    assert_eq!(sent.channel.0, "matrix", "delivered to the task's own channel");
+    assert_eq!(sent.peer.0, "@me:srv", "addressed to the peer the task came from");
+    assert_eq!(sent.conversation.0, "!room:srv", "into the conversation it came from");
+    assert!(
+        sent.body.contains(&format!("task {channel_task}")),
+        "the message names its task: {}",
+        sent.body,
+    );
+
+    // The delivered token must be the one that actually resolves the ask —
+    // the two halves are rendered and stored by different code, so parsing
+    // it back out of the wire body is what pins them together.
+    let line = sent
+        .body
+        .lines()
+        .find(|l| l.trim_start().starts_with("/approve "))
+        .expect("the message offers an /approve line");
+    let cmd = parse_ask_command(line.trim()).expect("the offered line parses as a command");
+    let ask = kastellan_db::asks::list_pending(&pool, 10).await.expect("list")[0].clone();
+    assert!(
+        kastellan_db::asks::resolve_with_nonce(
+            &pool,
+            &kastellan_db::asks::Nonce::from_wire(cmd.token),
+            &kastellan_db::asks::Claimant::new("matrix", "@me:srv"),
+            &serde_json::json!({"choice": "approve"}),
+        )
+        .await
+        .expect("resolve")
+        .is_some(),
+        "the token delivered on the wire must resolve ask {}",
+        ask.id,
+    );
+
+    assert_eq!(
+        undelivered_reason(&pool, channel_task).await,
+        None,
+        "a delivered ask must leave no `ask.undelivered` row — this is the assertion \
+         that fails if the outbox is dropped anywhere between `main` and `deliver_ask`",
     );
 
     handle.shutdown().await;

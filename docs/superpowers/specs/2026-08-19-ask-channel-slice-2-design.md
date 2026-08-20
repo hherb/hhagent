@@ -473,8 +473,21 @@ shape that would make the check tautologically true.
   ROADMAP items under the same heading; neither is needed to answer an ask.
 - **Email delivery in practice.** The code is transport-agnostic and an email-originated
   task will be routed to `EmailChannel`, whose `send` still refuses unconditionally
-  (outbound SMTP is email slice 2). That produces an honest `ask.delivery_failed` row
-  rather than a silent drop, and it is the correct behaviour until SMTP lands.
+  (outbound SMTP is email slice 2).
+
+  **Correction (post-review).** An earlier draft of this bullet claimed that produces an
+  honest `ask.delivery_failed` row. It does not, and the code comment that repeated the
+  claim has been corrected too. `ChannelOutbox::try_deliver` fails only on
+  `NoSuchChannel` / `QueueFull` / `QueueClosed`; the email bus registers a live sender and
+  its pump drains it, so the ask is accepted and audited **`ask.delivered`**. The
+  unconditional refusal happens later in the pump, which writes
+  `channel.reply_undelivered {channel, peer}` — naming neither the ask nor the task, and
+  filed under a *reply* action. Two consequences worth carrying: for email `ask.delivered`
+  is always false in the sense an operator cares about, and the 1:1
+  `channel.replied` ↔ `channel.reply_undelivered` pairing documented on those consts no
+  longer holds (an ask failure is an orphan with no `channel.replied` behind it). Making
+  the failure correlatable requires the outbound message to carry its `ask_id` into the
+  pump; deferred to its own issue rather than widened into this slice.
 - **Answering from an unpaired peer, by any means.** D5 forecloses it.
 
 ## Open risks
@@ -491,6 +504,35 @@ cannot do is resolve one. Confidentiality and authority are separate properties 
 only fixes the second. If the deployment stops being single-user, the destination should
 become the task's peer in a direct conversation rather than its conversation id — which is
 a change to `destination_from_task_payload` alone.
+
+**`looks_like_ask_command` now refuses ordinary messages containing a bare `/approve`
+token, and that is a deliberate trade rather than an oversight.** It scans every whitespace
+token (stripping leading `>` / `|` quote markers) instead of only the first, because the
+first-token version was shaped to the reported instance (`/approve tok9 thanks!`) rather
+than to the property, and three shapes an operator actually produces slipped past it into
+`tasks.payload` carrying a live token: a quoted reply (Element's rich-reply fallback quotes
+the rendered ask *including both command lines*), a leading mention pill, and prose around
+the command.
+
+The cost is a false positive: a legitimate instruction containing a bare `/approve` token
+is refused with the usage ack instead of being enqueued. On Matrix that costs one rephrase
+and the refusal explains itself. **On email it is worse and worth naming** — a thread reply
+quoting earlier correspondence that mentions `/approve` is refused, and since
+`EmailChannel::send` still bails unconditionally the sender gets no ack at all, so the
+message is simply dropped. Accepted because such a message carries no live token (so the
+refusal costs availability, not correctness) while the miss costs a durable secret in a
+column with no DELETE grant, and because email inbound is a gated fallback.
+
+**The shape-guess is the wrong instrument, and #582 replaces it.** Widening once more for
+the next unanticipated shape only raises the false-positive cost again. The exact question
+is "does any token in this body hash to a live nonce?" — one indexed lookup, zero false
+positives and zero false negatives. It carries one non-obvious design decision (an
+unscoped existence check is precisely the oracle D9 and D16 refuse to be), which is why it
+is its own issue rather than a fix-up here.
+
+**Whether Element even sends a leading `/` is still unverified** — see #581. It gates
+whether the offered vocabulary should change (e.g. accepting a bare `approve <token>`),
+which would in turn widen this recogniser further and raise the false-positive cost above.
 
 **The trust root under all of this is the homeserver.** `ev.sender` on an inbound event is
 what the homeserver asserts, and the bus has no device-verification gate, so a compromised

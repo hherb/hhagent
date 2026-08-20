@@ -588,6 +588,42 @@ pub async fn resolve_with_nonce(
         .map(|_| Some(ResolvedAsk { ask_id: resolved_ask_id, task_id }))
 }
 
+/// The key naming the decision inside an `asks.resolution` document.
+///
+/// A `const` rather than four hand-typed string literals because the
+/// producers and the consumer live in three crates and never meet in a
+/// signature: `PgAskResolver` and the CLI write it, this module's
+/// [`reject_choice_outside_options`] validates it, and
+/// `scheduler::asks::resolution_choice` reads it back to decide whether a
+/// plan may proceed. Renaming it in the resolver alone once left the whole
+/// suite green while every live operator answer came back "not answerable"
+/// — the resolver's document failed the `options` check, and D9 collapses
+/// that into the same vague sentence as a mistyped token, so there was no
+/// diagnosable cause anywhere.
+pub const RESOLUTION_CHOICE_KEY: &str = "choice";
+
+/// The key carrying the operator's optional free-text note.
+///
+/// Never interpolated into a plan (spec D10) — carried for the record and
+/// shown back to the operator.
+pub const RESOLUTION_FREE_TEXT_KEY: &str = "free_text";
+
+/// Build the resolution document every answering surface stores.
+///
+/// The one writer, so the wire spelling of the keys exists in exactly one
+/// place. `choice` is still validated against the ask's own `options` by
+/// [`reject_choice_outside_options`] on the write path — this constructor
+/// shapes the document, it does not authorize its contents.
+pub fn resolution(choice: &str, free_text: Option<&str>) -> serde_json::Value {
+    match free_text {
+        Some(t) => serde_json::json!({
+            RESOLUTION_CHOICE_KEY: choice,
+            RESOLUTION_FREE_TEXT_KEY: t,
+        }),
+        None => serde_json::json!({ RESOLUTION_CHOICE_KEY: choice }),
+    }
+}
+
 /// Enforce that `resolution.choice` names one of the ask's own `options`.
 ///
 /// The migration calls `resolution` a closed set; before this, nothing
@@ -613,7 +649,7 @@ fn reject_choice_outside_options(
         .map_err(|e| DbError::Query(format!("decode asks.options: {e}")))?;
 
     let choice = resolution
-        .get("choice")
+        .get(RESOLUTION_CHOICE_KEY)
         .and_then(|c| c.as_str())
         .ok_or_else(|| {
             DbError::Other(format!(

@@ -9,6 +9,7 @@
 use kastellan_db::asks::Ask;
 
 use crate::cassandra::types::Plan;
+use crate::channel::ask_message::AskChoice;
 use crate::scheduler::inner_loop::{PlanRecord, StepOutcome};
 
 /// The answers a `plan_approval` ask offers.
@@ -51,21 +52,32 @@ pub const DEFAULT_ASK_DEADLINE_S: i64 = 86_400;
 /// checking against a hardcoded `{approve, deny}` would silently accept the
 /// wrong vocabulary for it.
 ///
-/// `db::asks::resolve` already enforces the closed set on the way in, so
-/// every arm returning `None` here is defence in depth — against a
-/// direct-SQL writer, or a resolver added later that forgets. They must
-/// return `None` and never `Approve`: `None` leads to raising a fresh ask,
-/// which costs one operator interaction, while a wrong `Approve` lets a
-/// plan run that nobody approved.
+/// **Both** DB resolvers already enforce the closed set on the way in —
+/// `db::asks::resolve` (the CLI's by-id path) and `resolve_with_nonce` (the
+/// channel's), which share `reject_choice_outside_options`. Slice 2 added
+/// the second one, and it did not forget. So every arm returning `None`
+/// here is defence in depth — against a direct-SQL writer, or a *third*
+/// resolver added later that does forget. They must return `None` and never
+/// `Approve`: `None` leads to raising a fresh ask, which costs one operator
+/// interaction, while a wrong `Approve` lets a plan run that nobody
+/// approved.
 pub fn resolution_choice(ask: &Ask) -> Option<Choice> {
-    let choice = ask.resolution.as_ref()?.get("choice")?.as_str()?;
+    // The key and both spellings come from the layers that WRITE them
+    // (`db::asks::RESOLUTION_CHOICE_KEY`, `AskChoice::as_str`) rather than
+    // being re-typed here. Re-typing them made the agreement structural on
+    // the write side only: a respelling on either side left this reader
+    // returning `None` → `NotForThisPlan` → the task silently re-asking a
+    // question the operator had already answered. Fail-safe direction,
+    // silent failure mode, and nothing measured the seam.
+    let choice =
+        ask.resolution.as_ref()?.get(kastellan_db::asks::RESOLUTION_CHOICE_KEY)?.as_str()?;
     let offered = ask.options.as_array()?;
     if !offered.iter().any(|o| o.as_str() == Some(choice)) {
         return None;
     }
     match choice {
-        "approve" => Some(Choice::Approve),
-        "deny" => Some(Choice::Deny),
+        c if c == AskChoice::Approve.as_str() => Some(Choice::Approve),
+        c if c == AskChoice::Deny.as_str() => Some(Choice::Deny),
         _ => None,
     }
 }

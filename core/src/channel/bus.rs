@@ -63,9 +63,9 @@ pub enum PairingOutcome {
 ///
 /// A trait because the real implementation needs a `PgPool` and this
 /// module's tests are deliberately PG-free (spec D12). Its counterpart
-/// [`ChannelOutbox`] gets no trait: the real registry with a drained
-/// receiver *is* the perfect fake, so wrapping it would only stop the tests
-/// covering the real thing.
+/// [`super::outbox::ChannelOutbox`] gets no trait: the real registry with a
+/// drained receiver *is* the perfect fake, so wrapping it would only stop
+/// the tests covering the real thing.
 #[async_trait::async_trait]
 pub trait AskResolver: Send + Sync {
     /// Resolve the ask the nonce correlates to, if `claimant` owns its task.
@@ -101,7 +101,11 @@ impl AskResolver for PgAskResolver {
             &self.pool,
             nonce,
             claimant,
-            &serde_json::json!({"choice": choice}),
+            // Built by `db::asks` rather than spelled here: this document's
+            // key has to match what `reject_choice_outside_options`
+            // validates and what `scheduler::asks::resolution_choice`
+            // reads, and those live in two other places.
+            &kastellan_db::asks::resolution(choice, None),
         )
         .await?)
     }
@@ -208,12 +212,20 @@ impl CompletedTasks for PgCompletedTasks {
 ///      screen to protect, and a false positive would block the one action
 ///      this whole path exists to enable.
 ///
-///      A body that only *looks* like an attempt — its first token is
-///      `/approve`/`/deny` but the rest does not parse — also does not
-///      fall through to step 3. It gets the plain usage ack instead, never
-///      the enqueue path: falling through would write a live token
+///      A body that only *looks* like an attempt — it carries an
+///      `/approve`/`/deny` token somewhere but does not parse — also does
+///      not fall through to step 3. It gets the plain usage ack instead,
+///      never the enqueue path: falling through would write a live token
 ///      verbatim into `tasks.payload` (durable, no DELETE grant) and hand
-///      it to the planner. `/approve tok9 thanks!` is exactly this shape.
+///      it to the planner. `/approve tok9 thanks!` and a quoted reply that
+///      echoes the ask's own command lines are both this shape.
+///
+///      **This containment arm runs whether or not `asks` is wired.** The
+///      wiring decides whether an answer can be *resolved*; it must not
+///      decide whether a command-shaped body is kept out of the task
+///      queue. A token raised on one channel can be pasted into another,
+///      and a channel added later whose boot path forgets the wiring would
+///      otherwise silently reopen the leak.
 ///   3. **screen** (injection guard) and enqueue or block.
 ///
 /// Returns `Some(ack)` on a successful pairing or a recognised answer (the
@@ -337,30 +349,35 @@ pub async fn handle_inbound(
                 conversation: msg.conversation.clone(),
                 body,
             });
-        } else if super::ask_message::looks_like_ask_command(&msg.body) {
-            // Looks like an attempted answer but did not parse (extra
-            // words, a missing token — `/approve tok9 thanks!` is exactly
-            // what a person types). Must NOT fall through to
-            // `screen_and_classify`: the body can still carry a live
-            // approval token later in the text, and enqueueing it would
-            // write that token verbatim into `tasks.payload` — a durable
-            // column with no DELETE grant — and hand it to the planner as
-            // an instruction. This is the failure the whole ordering
-            // exists to prevent, arriving through the parser's strictness
-            // instead of through authorization.
-            events
-                .audit(
-                    actions::ASK_ANSWER_REJECTED,
-                    serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
-                )
-                .await;
-            return Some(OutgoingMessage {
-                channel: msg.channel.clone(),
-                peer: msg.peer.clone(),
-                conversation: msg.conversation.clone(),
-                body: super::ask_message::ACK_MALFORMED_COMMAND.to_string(),
-            });
         }
+    }
+
+    if super::ask_message::looks_like_ask_command(&msg.body) {
+        // Looks like an attempted answer but did not parse (extra words, a
+        // missing token, a quoted reply echoing the ask's own command
+        // lines). Must NOT fall through to `screen_and_classify`: the body
+        // can still carry a live approval token, and enqueueing it would
+        // write that token verbatim into `tasks.payload` — a durable
+        // column with no DELETE grant — and hand it to the planner as an
+        // instruction. This is the failure the whole ordering exists to
+        // prevent, arriving through the parser's strictness instead of
+        // through authorization.
+        //
+        // Deliberately OUTSIDE the `if let Some(wiring)` above: containment
+        // is a property of the inbound path, not of this bus's
+        // configuration. See the ordering doc on `handle_inbound`.
+        events
+            .audit(
+                actions::ASK_ANSWER_REJECTED,
+                serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
+            )
+            .await;
+        return Some(OutgoingMessage {
+            channel: msg.channel.clone(),
+            peer: msg.peer.clone(),
+            conversation: msg.conversation.clone(),
+            body: super::ask_message::ACK_MALFORMED_COMMAND.to_string(),
+        });
     }
 
     match screen_and_classify(msg) {
@@ -526,17 +543,36 @@ impl ChannelBus {
                             None => { info!(channel = %id.0, "inbound closed"); break; }
                         },
                         Some(out) = rx.recv() => {
-                            // `handle_completed` already wrote `channel.replied`
-                            // when it queued this — that row means "routed",
-                            // not "delivered" (see `actions::REPLIED`). The
-                            // actual transport attempt is HERE, so a failure
-                            // must leave its own durable trace, or the audit
-                            // trail asserts a delivery that never happened. In
-                            // slice 1 `EmailChannel::send` always fails, so
-                            // without this pair every email answer looked
-                            // delivered. Payload is channel + peer only: the
-                            // error is transport text, not a fixed label, and
-                            // the body must never be persisted.
+                            // TWO producers feed this `rx`, and they leave
+                            // different rows behind:
+                            //   - a completed-task reply from
+                            //     `handle_completed`, which already wrote
+                            //     `channel.replied` when it queued this —
+                            //     that row means "routed", not "delivered"
+                            //     (see `actions::REPLIED`);
+                            //   - a core-initiated message from the
+                            //     `ChannelOutbox` (#564 slice 2), i.e. a
+                            //     raised ask, which has `ask.delivered`
+                            //     behind it instead and NO `channel.replied`.
+                            // Until slice 2 the first was the only producer,
+                            // so "already wrote `channel.replied`" read as an
+                            // invariant; it is not one any more, which is why
+                            // a `channel.reply_undelivered` can now be an
+                            // orphan with no `channel.replied` to pair with.
+                            //
+                            // The actual transport attempt is HERE either
+                            // way, so a failure must leave its own durable
+                            // trace, or the audit trail asserts a delivery
+                            // that never happened. `EmailChannel::send` still
+                            // always fails, so without this pair every email
+                            // answer looked delivered. Payload is channel +
+                            // peer only: the error is transport text, not a
+                            // fixed label, and the body must never be
+                            // persisted. That also means an ask failure
+                            // recorded here names neither the ask nor the
+                            // task — correlating it needs the outbound
+                            // message to carry its `ask_id`, tracked
+                            // separately.
                             let peer = out.peer.clone();
                             if let Err(e) = ch.send(out).await {
                                 warn!(channel = %id.0, error = %e, "channel send failed");

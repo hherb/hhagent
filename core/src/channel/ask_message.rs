@@ -92,16 +92,24 @@ pub fn destination_from_task_payload(payload: &Value) -> Option<AskDestination> 
 ///
 /// Deliberately distinct from `scheduler::asks::Choice`, which reads a
 /// *stored* resolution: these are different layers (the wire vocabulary vs.
-/// the record), and coupling them would make the channel module depend on
-/// the scheduler for a two-variant enum.
+/// the record). Note the dependency only runs one way — the scheduler
+/// already imports from this module (`asks::lifecycle`, `asks::pure`), so
+/// what merging them would cost is the layering, not a cycle.
 ///
 /// The agreement with `asks.options` — which `db::asks::resolve_with_nonce`
-/// validates a submitted choice against — is **structural**, not asserted:
-/// `raise_and_suspend` builds that array by calling [`Self::as_str`], so a
-/// respelling here respells both sides at once.
-/// `the_wire_verbs_are_the_stored_choices` still pins today's two spellings,
-/// because the stored value is durable and a rename would strand every ask
-/// raised before it.
+/// validates a submitted choice against — is **structural on the write
+/// side**: `raise_and_suspend` builds that array by calling [`Self::as_str`],
+/// so a respelling here respells both at once.
+///
+/// It is *not* automatically structural on the read side, and an earlier
+/// version of this doc claimed it was without qualification.
+/// `scheduler::asks::resolution_choice` has to map the stored string back to
+/// a variant, and while it did so with hand-typed literals a respelling here
+/// left it returning `None` → `NotForThisPlan` → the task re-asking a
+/// question the operator had already answered. It now compares against
+/// [`Self::as_str`] for that reason. `the_wire_verbs_are_the_stored_choices`
+/// still pins today's two spellings, because the stored value is durable and
+/// a rename would strand every ask raised before it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AskChoice {
     Approve,
@@ -185,25 +193,67 @@ pub fn parse_ask_command(body: &str) -> Option<AskCommand> {
     Some(AskCommand { choice, token: token.to_string() })
 }
 
-/// True when `body`'s first whitespace token is `/approve` or `/deny`
-/// (case-insensitive), whether or not the whole body goes on to parse as a
-/// command.
+/// True when **any** whitespace token of `body` is `/approve` or `/deny`
+/// (case-insensitive, ignoring leading quote markers), whether or not the
+/// whole body goes on to parse as a command.
 ///
 /// The bus uses this to tell "an attempted answer that is malformed" apart
 /// from "an ordinary message" when [`parse_ask_command`] returns `None`.
 /// Those two must not be treated the same: an ordinary message may safely
 /// fall through to screening and enqueue, but a malformed *attempt* may
-/// still carry a live approval token later in the body (`/approve tok9
-/// thanks!`), and enqueueing it would write that token verbatim into
-/// `tasks.payload` and hand it to the planner. Only the leading verb is
-/// checked — the same reason [`parse_ask_command`] itself does no shape
-/// check on the token (spec D7) applies here: this function's job is to
-/// recognise an *attempt*, not to validate one.
+/// still carry a live approval token somewhere in the body, and enqueueing
+/// it would write that token verbatim into `tasks.payload` — a durable
+/// column with no DELETE grant — and hand it to the planner.
+///
+/// **Why the whole body and not just the leading verb.** The first version
+/// of this checked `split_whitespace().next()`, which was shaped to the
+/// instance that was reported (`/approve tok9 thanks!`) rather than to the
+/// property. Three shapes an operator actually produces slipped straight
+/// past it into the task queue, each carrying a live token:
+///
+/// - **A quoted reply.** Element's plain-text rich-reply fallback prefixes
+///   every quoted line with `> `, and the message being replied to *is* the
+///   rendered ask — both command lines included. `workers/matrix` forwards
+///   `text.body` raw (nothing calls ruma's `remove_plain_reply_fallback`),
+///   so the first token is `>`. Hitting *reply* on the ask is arguably the
+///   most natural way to answer it.
+/// - **A leading mention.** Element renders a start-of-message pill into
+///   the plain body as the display name, so addressing the bot before the
+///   command is a certain trigger.
+/// - **Prose around the command**: `should I /approve 7f3a9c2e1b ?`
+///
+/// The cost is a false positive: an ordinary instruction that happens to
+/// contain a bare `/approve` token is now refused with
+/// [`ACK_MALFORMED_COMMAND`] instead of being enqueued. That is the right
+/// side to err on — such a message carries no live token, so the refusal
+/// costs one rephrase, while the miss costs a durable secret. The refusal
+/// is visible and self-explaining, which the old fall-through was not: an
+/// enqueued "answer" got no acknowledgement at all, so the operator
+/// believed they had approved while the task sat suspended until it
+/// expired.
+///
+/// On email the refusal is *not* visible, because `EmailChannel::send`
+/// still bails unconditionally — so a quoting thread reply that mentions
+/// `/approve` is dropped silently. Accepted, and recorded as a residual in
+/// the slice-2 spec's "Open risks" rather than left implicit.
+///
+/// **This whole predicate is a guess, and #582 replaces it with the exact
+/// question** — does any token in the body hash to a live nonce? Do not
+/// widen this function a third time; that only trades a false negative for
+/// a bigger false positive. If a new leaking shape turns up, add it to
+/// #582's motivation rather than to the match arm here.
+///
+/// Still no *shape* check on the token — the same reason
+/// [`parse_ask_command`] does none (spec D7) applies here: this function's
+/// job is to recognise an *attempt*, not to validate one.
 pub fn looks_like_ask_command(body: &str) -> bool {
-    matches!(
-        body.split_whitespace().next().map(str::to_ascii_lowercase).as_deref(),
-        Some("/approve") | Some("/deny")
-    )
+    body.split_whitespace().any(|tok| {
+        // `>` is the reply-fallback / email-quote marker, `|` a diff or
+        // table gutter. Stripped so a quoted command is still recognised
+        // when the client emits no space after the marker.
+        let tok = tok.trim_start_matches(['>', '|']);
+        tok.eq_ignore_ascii_case("/approve") || tok.eq_ignore_ascii_case("/deny")
+    })
 }
 
 /// The message an escalated plan sends into its task's conversation.
@@ -277,10 +327,26 @@ fn render_deadline(at: OffsetDateTime) -> String {
 /// commands are offered" is an invariant the tests assert and production
 /// should therefore actually hold, not merely happen to.
 ///
+/// **Splits on more than `str::lines` does, deliberately.** `lines()` breaks
+/// on `\n` only (stripping a trailing `\r`), so a `reason` carrying a bare
+/// `\r`, U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR was one "line"
+/// here and got a single `> ` prefix — while a client that treats those code
+/// points as breaks rendered the text after them as its own unfenced,
+/// command-shaped line. The obvious test could not catch it either, because
+/// it measured the result with `lines()` too and so shared the assumption it
+/// was supposed to be checking.
+///
 /// Costs at most two bytes per line; see [`CONCERN_CAP`] for why the cap is
 /// applied before this rather than after.
 fn fence(concern: &str) -> String {
-    concern.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
+    // CRLF collapsed first so a `\r\n` break yields one segment, not an
+    // empty one between the two characters.
+    concern
+        .replace("\r\n", "\n")
+        .split(['\n', '\r', '\u{2028}', '\u{2029}'])
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The acknowledgement for an answer that resolved an ask.
@@ -418,20 +484,49 @@ mod tests {
         }
     }
 
-    /// Bodies that are not an attempt at all — no leading verb, or a
-    /// different leading word — must not be flagged, or an ordinary
-    /// message that happens to mention approval would be blocked from
-    /// ever reaching the planner.
+    /// Bodies containing no ask verb at all must not be flagged, or an
+    /// ordinary message would be blocked from ever reaching the planner.
+    ///
+    /// The verb must be a whole token and must carry its slash: `approve
+    /// <tok>` and `/approver <tok>` are ordinary text. That is what keeps
+    /// the widened check from swallowing every message that discusses
+    /// approval, and it is why the recogniser matches tokens rather than
+    /// running a substring search.
     #[test]
     fn an_ordinary_message_does_not_look_like_a_command() {
         for body in [
             "approve 7f3a9c2e1b",
-            "please /approve 7f3a9c2e1b",
             "what is my flight's GST?",
             "",
             "/approver 7f3a9c2e1b",
+            "disapprove/approve is not a token",
         ] {
             assert!(!looks_like_ask_command(body), "should not look like an attempt: {body:?}");
+        }
+    }
+
+    /// The shapes an operator actually produces when answering an ask, none
+    /// of which the original leading-token check caught. Each one carries a
+    /// live token, so each must be intercepted rather than enqueued —
+    /// enqueueing writes the token into `tasks.payload` and hands it to the
+    /// planner.
+    ///
+    /// `> …` is Element's plain-text rich-reply fallback, which quotes the
+    /// rendered ask *including both command lines*; the mention form is
+    /// what a start-of-message pill flattens to. Both are what a person
+    /// gets by answering the message in front of them rather than by
+    /// composing a bare command.
+    #[test]
+    fn the_shapes_a_person_actually_sends_are_all_recognised() {
+        for body in [
+            "> <@kastellan:srv> \u{26a0} Approval needed \u{2014} task 412\n> /approve 7f3a9c2e1b",
+            ">/approve 7f3a9c2e1b",
+            "@kastellan /approve 7f3a9c2e1b",
+            "please /approve 7f3a9c2e1b",
+            "should I /deny 7f3a9c2e1b ?",
+            "/APPROVE 7f3a9c2e1b thanks!",
+        ] {
+            assert!(looks_like_ask_command(body), "should look like an attempt: {body:?}");
         }
     }
 
@@ -500,6 +595,34 @@ mod tests {
         // The concern is still legible, just quoted — fencing must not eat it.
         assert!(msg.contains("> /approve deadbeef"), "the forged line is quoted, not dropped: {msg}");
         assert!(msg.contains("> the plan writes outside the scratch dir"), "{msg}");
+    }
+
+    /// The fence must hold for separators `str::lines` does not recognise.
+    ///
+    /// The test above cannot catch this: it collects with `msg.lines()`,
+    /// which splits on `\n` exactly as `fence` used to, so the assertion and
+    /// the code under test shared one assumption and the property was
+    /// measured only where it already held. A `reason` breaking on U+2028,
+    /// U+2029 or a bare `\r` therefore put an unfenced, command-shaped run
+    /// of text in the operator's room on any client that renders those as
+    /// breaks.
+    ///
+    /// So this asserts against the RAW rendered string: every occurrence of
+    /// the forged verb must be preceded by the quote marker.
+    #[test]
+    fn the_fence_holds_for_separators_str_lines_does_not_split_on() {
+        for sep in ['\u{2028}', '\u{2029}', '\r'] {
+            let hostile = format!("looks fine{sep}/approve deadbeef");
+            let msg = render_ask(1, &hostile, "tok123", deadline());
+            assert!(
+                msg.contains("> /approve deadbeef"),
+                "the forged line must be fenced when split by {sep:?}: {msg}",
+            );
+            assert!(
+                !msg.contains(&format!("{sep}/approve")),
+                "an unfenced command must not survive the {sep:?} separator: {msg}",
+            );
+        }
     }
 
     /// The deadline must actually reach the operator, and be readable when

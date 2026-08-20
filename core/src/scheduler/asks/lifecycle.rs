@@ -5,7 +5,10 @@
 //! `scheduler_ask*_e2e` integration suites rather than unit tests. The
 //! decision rules it applies are in [`super::pure`], which is unit-tested.
 //!
-//! Spec: `docs/superpowers/specs/2026-08-18-ask-path-slice-1b-design.md`.
+//! Specs: `docs/superpowers/specs/2026-08-18-ask-path-slice-1b-design.md`
+//! for the raise/suspend/sweep half, and
+//! `docs/superpowers/specs/2026-08-19-ask-channel-slice-2-design.md` for the
+//! delivery step (D2) this module now also performs.
 
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
@@ -58,10 +61,10 @@ use crate::scheduler::audit::{
 /// comparable.
 ///
 /// `resume_state` is the suspended run's history, from
-/// [`resume_state_from`], stored on the ask so the resumed task does not
-/// re-formulate — and re-execute — iterations it already ran (#564 slice
-/// 1b, D11). `None` means "no history to carry", which is what a run that
-/// escalated on its very first plan honestly has.
+/// [`super::pure::resume_state_from`], stored on the ask so the resumed
+/// task does not re-formulate — and re-execute — iterations it already ran
+/// (#564 slice 1b, D11). `None` means "no history to carry", which is what
+/// a run that escalated on its very first plan honestly has.
 ///
 /// **Delivery is best-effort and comes last** (spec D2). `raise` has
 /// already committed by then: the ask is durable and the task is
@@ -115,6 +118,42 @@ pub async fn raise_and_suspend(
     let outcome =
         super::delivery::deliver_ask(outbox, dest, task_id, concern, nonce.expose(), deadline_at);
     drop(nonce);
+
+    // A failed delivery means the room is silent and a human was never
+    // asked — and until this warn existed, the ONLY trace was an audit row
+    // nothing polls. The failure modes are routine rather than exotic: a
+    // bus between bring-ups, a backed-up reply queue, or a graceful restart
+    // (`main` stops both channel supervisors BEFORE the scheduler drains,
+    // so every escalation in that window is `no_such_channel`). The log
+    // otherwise asserts the raise at INFO and says nothing further, which
+    // reads as success. Same posture as `sweep_expired_and_audit`'s warn
+    // below — this path was the one place in the module held to a lower
+    // standard than its own neighbours.
+    //
+    // `REASON_NO_ORIGIN` stays deliberately quiet: a task with no channel
+    // origin is the ordinary CLI case, where the inbox is the answering
+    // surface and nothing is wrong. Warning on it would train the operator
+    // to ignore the two lines that do mean something.
+    match &outcome {
+        super::delivery::DeliveryOutcome::Failed { channel, reason } => tracing::warn!(
+            ask_id,
+            task_id,
+            channel = %channel,
+            reason = %reason,
+            "ask delivery refused by the channel; the operator was NOT told",
+        ),
+        super::delivery::DeliveryOutcome::Undelivered { reason }
+            if *reason == super::delivery::REASON_NO_CHANNEL =>
+        {
+            tracing::warn!(
+                ask_id,
+                task_id,
+                reason = %reason,
+                "ask raised but no channel is configured; the operator was NOT told",
+            )
+        }
+        _ => {}
+    }
 
     let (action, payload) = super::delivery::delivery_audit_row(ask_id, task_id, &outcome);
     if let Err(e) = kastellan_db::audit::insert(pool, SCHEDULER_AUDIT_ACTOR, action, payload).await {
@@ -191,7 +230,7 @@ pub(crate) async fn emit_approval_applied(
 /// Expire every overdue ask and emit its audit rows. Returns how many were
 /// retired.
 ///
-/// Mirrors [`super::crash_recovery::sweep_and_audit`] exactly: the DB sweep
+/// Mirrors [`crate::scheduler::crash_recovery::sweep_and_audit`] exactly: the DB sweep
 /// is fail-closed (its error propagates) and the audit inserts are
 /// best-effort.
 ///

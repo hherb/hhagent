@@ -621,6 +621,48 @@ async fn an_answer_from_a_paired_peer_resolves_and_never_enqueues() {
     assert!(!payload.to_string().contains("tok9"), "the audit row must not carry the token");
 }
 
+/// **A denial must submit `deny`.** The twin of the mainline above, and it
+/// exists because nothing else in the workspace measures the verb the bus
+/// hands the resolver on the *success* arm.
+///
+/// Before this test, replacing `cmd.choice.as_str()` at the `resolve` call
+/// with the literal `"approve"` left every test in the workspace green: the
+/// only `/deny` case took the rejected arm with a `reply: None` resolver
+/// and could not inspect the recorded choice. Live, that mutation is the
+/// exact inverse of the feature's purpose — the ack says "Denied" and the
+/// audit row says `choice: "deny"` (both read `cmd.choice` independently),
+/// while the database stores `approve` and `run_one` then executes the plan
+/// the operator refused. Audit trail and reality diverge in silence.
+///
+/// So the assertion that bites is `calls[0].1`, not the ack.
+#[tokio::test]
+async fn a_denial_submits_deny_not_approve() {
+    let resolver = Arc::new(RecordingResolver {
+        reply: Some(kastellan_db::asks::ResolvedAsk { ask_id: 8, task_id: 413 }),
+        ..Default::default()
+    });
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let ack = handle_inbound(
+        &auth,
+        None,
+        Some(&*wiring(resolver.clone())),
+        &ev,
+        &msg("@me:srv", "/deny tok9"),
+    )
+    .await
+    .expect("an ack is returned");
+
+    let calls = resolver.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, "deny", "the stored choice must be the verb the operator typed");
+    assert_eq!(calls[0].0, "tok9");
+
+    assert_eq!(ev.audited.lock().unwrap()[0].1["choice"], "deny");
+    assert!(ack.body.contains("413"), "the ack names the denied task: {}", ack.body);
+    assert!(ev.enqueued.lock().unwrap().is_empty(), "an answer must never become a task");
+}
+
 /// **The load-bearing negative.** An unpaired peer's command must die at
 /// `authorize` and never reach the resolver at all. Asserted as "zero
 /// calls" rather than "returned None", because a resolver that is reached
@@ -652,13 +694,24 @@ async fn an_unanswerable_token_is_acknowledged_without_naming_a_cause() {
     let resolver = Arc::new(RecordingResolver::default()); // reply: None
     let ev = FakeEvents::default();
     let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
-    let ack = handle_inbound(&auth, None, Some(&*wiring(resolver)), &ev, &msg("@me:srv", "/deny nope"))
-        .await
-        .expect("an ack is returned");
+    let ack = handle_inbound(
+        &auth,
+        None,
+        Some(&*wiring(resolver.clone())),
+        &ev,
+        &msg("@me:srv", "/deny nope"),
+    )
+    .await
+    .expect("an ack is returned");
 
     assert_eq!(ack.body, crate::channel::ask_message::ACK_NOT_ANSWERABLE);
     assert!(ev.enqueued.lock().unwrap().is_empty());
     assert_eq!(ev.audited.lock().unwrap()[0].0, actions::ASK_ANSWER_REJECTED);
+    // Cloned rather than moved into `wiring` so the submitted verb is
+    // observable: a rejected answer must still carry the choice the peer
+    // typed, or the resolver is being asked a different question from the
+    // one the operator answered.
+    assert_eq!(resolver.calls.lock().unwrap()[0].1, "deny");
 }
 
 /// An ordinary message from the same peer must be unaffected — the arm is
@@ -682,16 +735,52 @@ async fn an_ordinary_message_still_enqueues_with_the_wiring_present() {
     assert!(resolver.calls.lock().unwrap().is_empty());
 }
 
-/// A bus built without ask wiring must behave byte-identically to the
-/// pre-slice-2 bus: `/approve x` is just a message.
+/// A bus built without ask wiring cannot RESOLVE an answer — but it must
+/// still refuse to enqueue one.
+///
+/// This deliberately reverses the original slice-2 behaviour, which let an
+/// unwired bus treat `/approve x` as an ordinary message "byte-identically
+/// to the pre-slice-2 bus". Containment is a property of the inbound path,
+/// not of one bus's configuration: a token raised on Matrix can be pasted
+/// into email, and a channel added later whose boot path forgets
+/// `AskWiring` would otherwise silently reopen the `tasks.payload` leak.
+/// The body reaches neither the resolver (there is none) nor the queue.
 #[tokio::test]
-async fn without_wiring_a_command_is_an_ordinary_message() {
+async fn without_wiring_a_command_is_still_kept_out_of_the_queue() {
     let ev = FakeEvents::default();
     let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
-    let ack = handle_inbound(&auth, None, None, &ev, &msg("@me:srv", "/approve tok9")).await;
+    let ack = handle_inbound(&auth, None, None, &ev, &msg("@me:srv", "/approve tok9"))
+        .await
+        .expect("a usage ack is returned even with no wiring");
 
-    assert!(ack.is_none());
-    assert_eq!(ev.enqueued.lock().unwrap().len(), 1);
+    assert_eq!(ack.body, crate::channel::ask_message::ACK_MALFORMED_COMMAND);
+    assert!(ev.enqueued.lock().unwrap().is_empty(), "a live token must never be enqueued");
+    assert_eq!(ev.audited.lock().unwrap()[0].0, actions::ASK_ANSWER_REJECTED);
+}
+
+/// The widened recogniser closes the shapes a person actually sends. A
+/// quoted reply — Element's rich-reply fallback quotes the rendered ask
+/// including both of its command lines — must be intercepted, not
+/// enqueued, because it carries a live token verbatim.
+///
+/// This is the same defect the leading-token check was written for, through
+/// the door that check left open; it is pinned at the bus rather than only
+/// on the recogniser so the containment arm, not just the predicate, is
+/// what the assertion measures.
+#[tokio::test]
+async fn a_quoted_reply_echoing_the_ask_is_never_enqueued() {
+    let resolver = Arc::new(RecordingResolver::default());
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let body = "> <@kastellan:srv> \u{26a0} Approval needed \u{2014} task 412\n\
+                > /approve 7f3a9c2e1b\n> /deny 7f3a9c2e1b\n\nyes go ahead";
+    let ack = handle_inbound(&auth, None, Some(&*wiring(resolver.clone())), &ev, &msg("@me:srv", body))
+        .await
+        .expect("a usage ack is returned");
+
+    assert_eq!(ack.body, crate::channel::ask_message::ACK_MALFORMED_COMMAND);
+    assert!(ev.enqueued.lock().unwrap().is_empty(), "a live token must never be enqueued");
+    assert!(resolver.calls.lock().unwrap().is_empty(), "an unparseable body resolves nothing");
 }
 
 /// The bus registers its own reply queue into the outbox, which is what

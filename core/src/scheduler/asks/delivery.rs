@@ -1,8 +1,11 @@
 //! Delivering a raised ask to the conversation its task came from.
 //!
-//! **Pure and sync**, deliberately: the decision (where does this go, and
-//! did it get there?) and the audit row it produces are both separated from
-//! the `await`ing emitter in [`super::lifecycle`]. That is what lets every
+//! **Sync and separable**, deliberately: the decision (where does this go,
+//! and did it get there?) and the audit row it produces are both separated
+//! from the `await`ing emitter in [`super::lifecycle`]. Not *pure* —
+//! `deliver_ask` pushes into a live queue via `ChannelOutbox::try_deliver`,
+//! which is the whole observable effect; only `delivery_audit_row` is a
+//! pure function. That is what lets every
 //! branch below — including all three failure branches — have a unit test,
 //! on a path whose async half needs a live Postgres.
 //!

@@ -336,6 +336,11 @@ async fn db_peer_authorizer_covers_all_evidence_arms_against_a_real_pairing_tabl
 /// it against the task payload, the resolution JSON, the `ask.resolved`
 /// audit row, and the task returning to `pending` so the lane runner picks
 /// it up.
+///
+/// Runs **both verbs** against the one cluster. The second half is not
+/// symmetry for its own sake: it is the only assertion in the workspace
+/// that reads the STORED choice for a `/deny`, and so the only one that can
+/// see the wire verb and the persisted value disagree.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_real_pg_ask_resolver_resolves_an_answer_arriving_over_the_bus() {
     if skip_if_no_supervisor() {
@@ -442,6 +447,62 @@ async fn a_real_pg_ask_resolver_resolves_an_answer_arriving_over_the_bus() {
     assert!(
         !serde_json::to_string(&resolved_row.payload).unwrap().contains(&token),
         "the audit payload must never carry the token",
+    );
+
+    // ── The same round trip with the other verb. ──
+    //
+    // Reusing this cluster rather than standing up a second one: the PG
+    // bring-up is the expensive part, and what needs pinning is one line of
+    // agreement, not a second environment.
+    //
+    // Without this, `cmd.choice.as_str()` in `handle_inbound` could be
+    // replaced by the literal `"approve"` and the entire workspace stayed
+    // green — every other test that reaches the resolver's success arm
+    // sends `/approve`. Live, the operator types `/deny`, the ack says
+    // "Denied" and the audit row says `choice: "deny"` (both read
+    // `cmd.choice` directly), while the row below would say `approve` and
+    // `run_one` would execute the plan the human refused. This assertion is
+    // the only one in the workspace positioned to see that divergence,
+    // because it reads the STORED value rather than the ack.
+    tasks::claim_one(&pool, Lane::Fast, 60).await.expect("claim").expect("the resumed task");
+    let denied = kastellan_db::asks::raise(
+        &pool,
+        task_id,
+        "plan_approval",
+        "still sends money to a stranger",
+        &serde_json::json!(["approve", "deny"]),
+        Some("digest2"),
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        None,
+    )
+    .await
+    .expect("raise the second ask");
+    let deny_token = denied.nonce.expose().to_string();
+
+    let deny_ack = handle_inbound(
+        &authorizer,
+        None,
+        Some(&wiring),
+        &events,
+        &IncomingMessage {
+            channel: channel.clone(),
+            peer: peer.clone(),
+            conversation: conversation.clone(),
+            body: format!("/deny {deny_token}"),
+            evidence: None,
+        },
+    )
+    .await
+    .expect("a denial must be acknowledged");
+    assert_eq!(deny_ack.body, ack_resolved(AskChoice::Deny, task_id));
+
+    let deny_ask =
+        kastellan_db::asks::get(&pool, denied.ask_id).await.expect("get").expect("the second ask");
+    assert_eq!(deny_ask.state, "resolved");
+    assert_eq!(
+        deny_ask.resolution.as_ref().and_then(|r| r.get("choice")).and_then(|c| c.as_str()),
+        Some("deny"),
+        "the STORED choice must be the verb the operator typed, not the other one",
     );
 
     pool.close().await;
