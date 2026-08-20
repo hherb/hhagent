@@ -26,6 +26,7 @@ pub mod bus;
 pub mod email;
 pub mod ingest;
 pub mod matrix;
+pub mod outbox;
 pub mod pairing;
 pub mod polled_driver;
 pub mod pump_liveness;
