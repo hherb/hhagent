@@ -7,6 +7,7 @@
 //! Specs: `docs/superpowers/specs/2026-08-18-ask-path-slice-1b-design.md`
 //! and `docs/superpowers/specs/2026-08-19-ask-channel-slice-2-design.md`.
 
+pub mod delivery;
 pub mod lifecycle;
 pub mod pure;
 

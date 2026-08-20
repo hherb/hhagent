@@ -163,6 +163,39 @@ pub const ACTION_ASK_EXPIRED: &str = "ask.expired";
 /// provide.
 pub const ACTION_ASK_APPROVAL_APPLIED: &str = "ask.approval_applied";
 
+/// `action` written when a raised ask was queued to a channel for delivery
+/// (#564 slice 2). `actor='scheduler'`. Payload: `{ask_id, task_id,
+/// channel, peer}`.
+///
+/// "Queued", not "delivered to the human": the transport attempt happens in
+/// the channel's own pump afterwards and can still fail, exactly as
+/// `channel.replied` means routed rather than delivered.
+///
+/// The plaintext nonce, the rendered body and the concern text are all
+/// deliberately absent — this is the one path that holds the live token.
+pub const ACTION_ASK_DELIVERED: &str = "ask.delivered";
+
+/// `action` written when a raised ask was not delivered anywhere, and that
+/// is expected (#564 slice 2). `actor='scheduler'`. Payload: `{ask_id,
+/// task_id, reason}`.
+///
+/// Two reasons: the task has no channel origin (a `kastellan-cli ask` or
+/// scheduled task — the CLI inbox is its surface), or no channel is
+/// configured on this host at all. Distinct from
+/// [`ACTION_ASK_DELIVERY_FAILED`], which means a channel existed and
+/// refused: without the split, "this task came from the CLI" and "this host
+/// cannot reach you" are one row.
+pub const ACTION_ASK_UNDELIVERED: &str = "ask.undelivered";
+
+/// `action` written when a raised ask's channel refused the message (#564
+/// slice 2). `actor='scheduler'`. Payload: `{ask_id, task_id, channel,
+/// reason}`, where `reason` is a fixed `OutboxError` label.
+///
+/// **Never fails the ask.** The row is already committed and the task is
+/// already suspended; the CLI still answers it. This row is the only trace
+/// that the human was not told.
+pub const ACTION_ASK_DELIVERY_FAILED: &str = "ask.delivery_failed";
+
 /// `prefix` of the per-terminal-state lifecycle row's `action`.
 /// Full action is built via [`action_task_terminal`] so the writer
 /// and any reader can't drift on the separator/format.
