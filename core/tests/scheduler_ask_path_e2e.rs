@@ -19,9 +19,14 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use kastellan_core::cassandra::review::{ChainReviewStage, ReviewStage, ReviewStageContext};
 use kastellan_core::cassandra::types::{DataClass, Plan, PlannedStep, Severity, Verdict};
+use kastellan_core::channel::ingest::build_channel_task_payload;
+use kastellan_core::channel::{ChannelId, ConversationId, IncomingMessage, PeerId};
 use kastellan_core::memory::embedder::NoOpEmbedder;
 use kastellan_core::scheduler::agent::{AgentError, FormulationMeta, PlanFormulator};
-use kastellan_core::scheduler::audit::{ACTION_ASK_APPROVAL_APPLIED, ACTION_TASK_FINALIZE};
+use kastellan_core::scheduler::asks::delivery::{REASON_NO_CHANNEL, REASON_NO_ORIGIN};
+use kastellan_core::scheduler::audit::{
+    ACTION_ASK_APPROVAL_APPLIED, ACTION_ASK_UNDELIVERED, ACTION_TASK_FINALIZE,
+};
 use kastellan_core::scheduler::inner_loop::{StepDispatcher, StepOutcome, TaskContext};
 use kastellan_core::scheduler::{spawn_scheduler, SchedulerHandle};
 use kastellan_db::tasks::{self, insert_pending, Lane};
@@ -427,6 +432,26 @@ async fn seed_task(pool: &sqlx::PgPool) -> i64 {
     .expect("insert")
 }
 
+/// Seed one `pending` task whose payload is **channel-originated**, built by
+/// calling the real producer rather than hand-writing the JSON.
+///
+/// `run_one` derives `TaskContext.origin` from exactly this payload via
+/// `destination_from_task_payload`, so a rename on either side has to fail
+/// a test rather than silently stop every escalation being delivered.
+async fn seed_channel_task(pool: &sqlx::PgPool) -> i64 {
+    let mut payload = build_channel_task_payload(&IncomingMessage {
+        channel: ChannelId("matrix".into()),
+        peer: PeerId("@me:srv".into()),
+        conversation: ConversationId("!room:srv".into()),
+        body: "book the flight".into(),
+        evidence: None,
+    });
+    // Same low cap as `seed_task`, for the same reason. The channel producer
+    // does not write one (a real channel task takes the lane default).
+    payload["max_plans"] = serde_json::json!(3);
+    insert_pending(pool, Lane::Fast, payload).await.expect("insert")
+}
+
 /// Poll `tasks.state` until it equals `want`, or give up after `secs` and
 /// return whatever it last saw. A fixed sleep would pass or fail on
 /// machine speed rather than on behaviour.
@@ -447,6 +472,20 @@ async fn count_asks_for(pool: &sqlx::PgPool, task_id: i64) -> i64 {
         .fetch_one(pool)
         .await
         .expect("count asks")
+}
+
+/// The `reason` on the one `ask.undelivered` row naming `task_id`.
+async fn undelivered_reason(pool: &sqlx::PgPool, task_id: i64) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT payload->>'reason' FROM audit_log \
+         WHERE action = $1 AND payload->>'task_id' = $2::text ORDER BY id DESC LIMIT 1",
+    )
+    .bind(ACTION_ASK_UNDELIVERED)
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await
+    .expect("read ask.undelivered reason")
+    .flatten()
 }
 
 /// Rows of one `action` naming `task_id` in their payload.
@@ -499,6 +538,69 @@ async fn an_escalated_plan_suspends_the_task_and_writes_no_finalize_row() {
     assert!(
         pending[0].plan_digest.is_some(),
         "the raised ask binds to the digest of the plan that escalated",
+    );
+
+    handle.shutdown().await;
+}
+
+/// `TaskContext.origin` must be derived from the task's own payload, inside
+/// `run_one`, and must reach `raise_and_suspend`.
+///
+/// **The line this exists for is `task_exec.rs`'s `origin:
+/// destination_from_task_payload(&task.payload)`.** Mutating it to `origin:
+/// None` left the entire 3396-test suite green: every other full-scheduler
+/// e2e here seeds a payload with no routing metadata, and
+/// `scheduler_asks_e2e` reaches `raise_and_suspend` directly with a
+/// destination it computed itself, never through `run_one`. On a live host
+/// the mutation makes every escalation audit
+/// `ask.undelivered{reason: task_has_no_channel_origin}` and the operator's
+/// room stays silent — indistinguishable in CI from the feature working,
+/// and identical to the pre-slice behaviour.
+///
+/// **The assertion is the REASON, not the presence of a row.** This
+/// scheduler is spawned with `outbox: None`, so `deliver_ask` returns
+/// `Undelivered` either way — but with `no_channel_configured` only if it
+/// got past the origin check first. The two labels can differ *only* if
+/// `ctx.origin` was genuinely computed from the payload, which is why one
+/// string comparison pins the whole wiring.
+///
+/// The second task is the contrast that makes the first assertion mean
+/// something: same scheduler, same run, a payload with no routing metadata,
+/// and it must land on the other label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_channel_tasks_escalation_is_delivered_against_its_own_origin() {
+    let Some((pool, _cluster)) = bring_up_pg("origin").await else {
+        return; // [SKIP]
+    };
+    let channel_task = seed_channel_task(&pool).await;
+    let plain_task = seed_task(&pool).await;
+
+    // Escalate every plan, so both tasks suspend and neither resumes.
+    // `spawn_with` passes `outbox: None` — a channel-less daemon.
+    let handle = spawn_test_scheduler(&pool, escalating(u32::MAX));
+
+    assert_eq!(
+        await_state(&pool, channel_task, "awaiting_operator", 20).await,
+        "awaiting_operator",
+    );
+    assert_eq!(
+        await_state(&pool, plain_task, "awaiting_operator", 20).await,
+        "awaiting_operator",
+    );
+
+    assert_eq!(
+        undelivered_reason(&pool, channel_task).await.as_deref(),
+        Some(REASON_NO_CHANNEL),
+        "a channel-originated task's escalation must fail delivery on the MISSING \
+         CHANNEL, not on a missing origin — `{REASON_NO_ORIGIN}` here means `run_one` \
+         never derived `TaskContext.origin` from the payload, and on a host that does \
+         have a channel the operator would simply never be asked",
+    );
+    assert_eq!(
+        undelivered_reason(&pool, plain_task).await.as_deref(),
+        Some(REASON_NO_ORIGIN),
+        "a task with no routing metadata really has no origin — without this the \
+         assertion above could pass on a `deliver_ask` that ignored `dest` entirely",
     );
 
     handle.shutdown().await;

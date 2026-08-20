@@ -509,8 +509,17 @@ impl ChannelBus {
                                 )
                                 .await
                                 {
+                                    // Any ack `handle_inbound` returns, not
+                                    // just the pairing one: since #564
+                                    // slice 2 this also carries "✓
+                                    // Approved", "✗ not answerable" and the
+                                    // malformed-command usage line. An
+                                    // operator whose approval landed but
+                                    // whose confirmation never arrived
+                                    // should not be reading a log line that
+                                    // says "pairing".
                                     if let Err(e) = ch.send(ack).await {
-                                        warn!(channel = %id.0, error = %e, "pairing ack send failed");
+                                        warn!(channel = %id.0, error = %e, "inbound ack send failed");
                                     }
                                 }
                             }

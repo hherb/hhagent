@@ -193,16 +193,31 @@ pub mod actions {
     /// which until #517 was permanent and produced no row at all. `ran_ms` is
     /// what tells a sustained outage apart from a flapping channel.
     pub const CHANNEL_DIED: &str = "channel.died";
-    /// A paired peer sent a well-formed `/approve`/`/deny` whose token
-    /// resolved nothing (#564 slice 2). Carries the channel + peer only —
-    /// never the token, never the body.
+    /// A paired peer's attempt to answer an ask did not stand (#564 slice
+    /// 2). Carries the channel + peer only — never the token, never the
+    /// body.
     ///
-    /// **Deliberately does not say why.** Wrong token, already answered,
-    /// past its deadline and "not this peer's ask" are one outcome by
-    /// construction (`db::asks::resolve_with_nonce`), because splitting
-    /// them hands a token-guessing peer an existence oracle. What the row
-    /// is for is counting: repeated rejections from a paired peer are a
-    /// signal even when no single one is.
+    /// **Three distinct producers write this one action:**
+    /// 1. a well-formed `/approve`/`/deny` whose token resolved nothing;
+    /// 2. a *malformed* attempt — the body's first token is one of the two
+    ///    verbs but the rest does not parse (`/approve tok9 thanks!`),
+    ///    which gets [`super::ask_message::ACK_MALFORMED_COMMAND`] and is
+    ///    kept out of the enqueue path so a live token never lands in
+    ///    `tasks.payload`;
+    /// 3. the resolver returning `Err` — e.g. a DB outage — which
+    ///    `handle_inbound` deliberately collapses into the same arm as (1),
+    ///    because an error path that looks different to the peer is the
+    ///    existence oracle the refusal path refuses to be.
+    ///
+    /// **Deliberately does not say which.** Within (1) alone, wrong token,
+    /// already answered, past its deadline and "not this peer's ask" are
+    /// one outcome by construction (`db::asks::resolve_with_nonce`),
+    /// because splitting them hands a token-guessing peer an existence
+    /// oracle. Splitting *these three* is a durable payload-shape change
+    /// and is deferred to a later slice, so a reader counting rows today
+    /// must not assume they are all case (1). What the row is for is
+    /// counting: repeated rejections from a paired peer are a signal even
+    /// when no single one is.
     pub const ASK_ANSWER_REJECTED: &str = "channel.ask_answer_rejected";
 }
 

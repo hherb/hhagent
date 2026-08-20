@@ -269,7 +269,19 @@ async fn a_raised_ask_is_delivered_and_its_token_resolves_it() {
     .expect("raise + deliver");
 
     // The delivery carried a usable command, into the right room.
-    let sent = rx.recv().await.expect("the ask was delivered");
+    //
+    // Bounded, and that matters more than it looks: `outbox` still holds the
+    // `Sender`, so a `deliver_ask` regressed to a no-op never closes the
+    // channel and `rx.recv()` returns neither a message nor `None` — it
+    // waits forever. `cargo test` has no per-test timeout, so an unbounded
+    // await here would HANG the Linux gate instead of failing it.
+    let sent = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect(
+            "no ask reached the outbox within 10s — `raise_and_suspend` delivered nothing; \
+             this timeout is what turns that regression into a failure instead of a hang",
+        )
+        .expect("the ask was delivered");
     assert_eq!(sent.conversation.0, "!room:srv");
     let approve = sent
         .body
@@ -285,12 +297,12 @@ async fn a_raised_ask_is_delivered_and_its_token_resolves_it() {
     // The submitted choice is derived from the wire vocabulary
     // (`AskChoice::as_str()`), not retyped as `"approve"` — the second
     // cross-crate pin this file carries. `render_ask` prints `/approve
-    // <token>` and `raise_and_suspend` writes `AskChoice::Approve.as_str()`'s
-    // value into `asks.options`; `resolve_with_nonce` validates the
-    // submitted choice against exactly that array. A literal here would
-    // stay green even if the wire vocabulary and the stored options drifted
-    // apart, because it would happen to match today's spelling on both
-    // sides by coincidence rather than by construction.
+    // <token>`, `raise_and_suspend` builds `asks.options` by calling
+    // `AskChoice::{Approve,Deny}::as_str()`, and `resolve_with_nonce`
+    // validates the submitted choice against exactly that array. A literal
+    // here would stay green even if the wire vocabulary and the stored
+    // options drifted apart, because it would happen to match today's
+    // spelling on both sides by coincidence rather than by construction.
     let resolved = kastellan_db::asks::resolve_with_nonce(
         &pool,
         &kastellan_db::asks::Nonce::from_wire(cmd.token),

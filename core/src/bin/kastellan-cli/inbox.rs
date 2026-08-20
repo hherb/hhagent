@@ -204,12 +204,18 @@ async fn inbox_resolve(args: &[String]) -> ExitCode {
         Err(e) => { eprintln!("inbox resolve: {e}"); return ExitCode::from(1); }
     }
 
+    // `via` names the answering SURFACE, and both surfaces write it (#564
+    // slice 2). The channel resolver writes `via: "channel"`; without this
+    // key here, `payload->>'via'` would be NULL for exactly the CLI half of
+    // one `ask.resolved` population, so any observation query splitting on
+    // it silently mis-buckets every operator answer given at the terminal.
     let payload = serde_json::json!({
         "ask_id": ask_id,
         "task_id": task_id,
         "choice": choice,
         "resolved_by": resolved_by,
         "free_text": note,
+        "via": "cli",
     });
     if let Err(e) =
         kastellan_db::audit::insert(&pool, CLI_AUDIT_ACTOR, ACTION_ASK_RESOLVED, payload).await

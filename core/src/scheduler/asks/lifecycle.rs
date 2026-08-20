@@ -15,7 +15,7 @@ use kastellan_db::DbError;
 
 use crate::cassandra::plan_digest::plan_digest;
 use crate::cassandra::types::{Plan, Severity};
-use crate::channel::ask_message::AskDestination;
+use crate::channel::ask_message::{AskChoice, AskDestination};
 use crate::channel::outbox::ChannelOutbox;
 
 use super::pure::{deadline_from_env, ASK_KIND_PLAN_APPROVAL};
@@ -32,13 +32,24 @@ use crate::scheduler::audit::{
 /// transaction, so there is no window where either exists without the
 /// other.
 ///
-/// **The plaintext nonce is dropped unread, and that is correct for this
-/// slice** (spec D5). Slice 1b's only answer surface is `kastellan-cli
-/// inbox`, which resolves by row id — the path `db::asks::resolve` reserves
-/// for a trusted local caller. Logging the nonce would put a live approval
-/// token into `~/.local/state/kastellan/*.out`, a plaintext file with none
-/// of `audit_log`'s role gating. Slice 2 delivers it over Matrix at raise
-/// time; it never needs to recover one raised earlier.
+/// **The plaintext nonce is exposed exactly once, to render the message
+/// body, and reaches nothing else.** Not the `ask.raised` payload, not the
+/// delivery audit row, not a log line: `audit_log` is readable by every
+/// role that can read the audit trail, and
+/// `~/.local/state/kastellan/*.out` is a plaintext file with none of even
+/// that gating. Slice 1b dropped it unread because its only answer surface
+/// was `kastellan-cli inbox`, which resolves by row id; slice 2's whole
+/// point is that the operator answers over the channel, which needs the
+/// token on the wire. It is still never *recoverable* — the column is
+/// hashed, so an ask whose delivery failed is answerable only from the CLI.
+///
+/// **That widens the plaintext's live range across the
+/// [`emit_ask_raised`] await, and this doc says so rather than leaving it
+/// silent.** The ordering is forced: `raise` → audit → deliver. Delivering
+/// before the `ask.raised` row would let a crash in between leave a live
+/// token in an operator's room with nothing in the audit trail explaining
+/// it. The `Nonce` newtype zeroizes on drop and its `Debug` redacts, so
+/// what the wider range costs is memory-residency time, not a new sink.
 ///
 /// `plan` is digested as passed — i.e. *after* `apply_floor_raise`,
 /// `data_ceiling` resolution, invoke expansion and namespace completion.
@@ -81,13 +92,21 @@ pub async fn raise_and_suspend(
         task_id,
         ASK_KIND_PLAN_APPROVAL,
         concern,
-        &serde_json::json!(["approve", "deny"]),
+        // Built from the wire vocabulary rather than retyped as literals:
+        // `db::asks::resolve_with_nonce` validates a submitted choice
+        // against exactly this array, and the channel submits
+        // `AskChoice::as_str()`. Two hand-written string literals make that
+        // agreement a coincidence that every test on both sides keeps
+        // green while a live approval fails closed.
+        &serde_json::json!([AskChoice::Approve.as_str(), AskChoice::Deny.as_str()]),
         Some(&digest),
         deadline_at,
         resume_state,
     )
     .await?;
 
+    // Destructured rather than field-accessed so the nonce's drop (and its
+    // zeroize) is visible at this call site instead of implied.
     let db_asks::RaisedAsk { ask_id, nonce } = raised;
     emit_ask_raised(pool, ask_id, task_id, &digest, severity, deadline_at).await;
 

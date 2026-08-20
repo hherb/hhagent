@@ -9,13 +9,16 @@ use std::collections::HashMap;
 
 use tokio::sync::mpsc;
 
+use kastellan_core::channel::ask_message::{ack_resolved, AskChoice};
 use kastellan_core::channel::auth::{
     AuthDecision, DbPeerAuthorizer, PeerAuthorizer, StaticPairings, UnauthenticReason,
 };
 use kastellan_core::channel::bus::{
-    handle_completed, handle_inbound, CompletedTasks, PgChannelEvents, PgCompletedTasks,
+    handle_completed, handle_inbound, AskWiring, CompletedTasks, PgAskResolver, PgChannelEvents,
+    PgCompletedTasks,
 };
-use kastellan_core::channel::ingest::sha256_hex;
+use kastellan_core::channel::ingest::{build_channel_task_payload, sha256_hex};
+use kastellan_core::channel::outbox::ChannelOutbox;
 use kastellan_core::channel::{
     actions, ChannelId, ConversationId, IncomingMessage, OutgoingMessage, PeerEvidence, PeerId,
 };
@@ -312,4 +315,225 @@ async fn db_peer_authorizer_covers_all_evidence_arms_against_a_real_pairing_tabl
 
     admin.close().await;
     runtime.close().await;
+}
+
+/// `PgAskResolver` — the ONLY production glue between an inbound
+/// `/approve` and the database — driven through `handle_inbound` against a
+/// real cluster.
+///
+/// **Nothing else covers it.** `bus.rs`'s unit tests use a fake
+/// `AskResolver`; `db/tests/asks_e2e.rs` builds its own resolution JSON;
+/// `scheduler_asks_e2e` calls `resolve_with_nonce` directly. So renaming
+/// the resolver's `"choice"` key to anything else left the whole suite
+/// green, while live every operator answer came back "That approval token
+/// isn't answerable" — `reject_choice_outside_options` returns `Err`, the
+/// bus collapses `Err` and `Ok(None)` into one arm on purpose (D9), and the
+/// operator has no way to tell a key-name bug from a mistyped token.
+///
+/// Deliberately end to end rather than a unit test of `PgAskResolver`: the
+/// composition is the part with no other coverage — the claimant built from
+/// the message's own `(channel, peer)`, the D16 entitlement guard matching
+/// it against the task payload, the resolution JSON, the `ask.resolved`
+/// audit row, and the task returning to `pending` so the lane runner picks
+/// it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_pg_ask_resolver_resolves_an_answer_arriving_over_the_bus() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let Some(bin_dir) = pg_bin_dir_or_skip() else {
+        return; // skip-as-pass
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "ar-d",
+        "ar-l",
+        &format!("kastellan-supervisor-test-pg-ar-{suffix}"),
+    );
+    let pool = probe_and_pool(&cluster.conn_spec).await;
+
+    // A channel-originated task, from the real producer: the D16 guard
+    // matches the claimant against `payload->>'channel'`/`'peer'`, so a
+    // hand-written payload would test the guard against its own fiction.
+    let channel = ChannelId("matrix".into());
+    let peer = PeerId("@me:srv".into());
+    let conversation = ConversationId("!room:srv".into());
+    let payload = build_channel_task_payload(&IncomingMessage {
+        channel: channel.clone(),
+        peer: peer.clone(),
+        conversation: conversation.clone(),
+        body: "book the flight".into(),
+        evidence: None,
+    });
+    let task_id = tasks::insert_pending(&pool, Lane::Fast, payload).await.expect("insert");
+    tasks::claim_one(&pool, Lane::Fast, 60).await.expect("claim").expect("a task");
+
+    // Raise the ask the operator is about to answer. Raised through the db
+    // layer rather than the scheduler because what is under test here is the
+    // INBOUND half; the outbound half has its own e2e.
+    let raised = kastellan_db::asks::raise(
+        &pool,
+        task_id,
+        "plan_approval",
+        "sends money to a stranger",
+        &serde_json::json!(["approve", "deny"]),
+        Some("digest"),
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        None,
+    )
+    .await
+    .expect("raise");
+    // The one place a test may look at the plaintext: it stands in for the
+    // rendered message the operator would be copying from.
+    let token = raised.nonce.expose().to_string();
+
+    let events = PgChannelEvents::new(pool.clone());
+    let authorizer = StaticPairings::from_peers([peer.clone()]);
+    let wiring = AskWiring {
+        outbox: std::sync::Arc::new(ChannelOutbox::new()),
+        resolver: std::sync::Arc::new(PgAskResolver::new(pool.clone())),
+    };
+    let answer = IncomingMessage {
+        channel: channel.clone(),
+        peer: peer.clone(),
+        conversation: conversation.clone(),
+        body: format!("/approve {token}"),
+        evidence: None,
+    };
+
+    let ack = handle_inbound(&authorizer, None, Some(&wiring), &events, &answer)
+        .await
+        .expect("an answered command must be acknowledged");
+    assert_eq!(
+        ack.body,
+        ack_resolved(AskChoice::Approve, task_id),
+        "the success ack, not the not-answerable one — a resolver whose resolution JSON \
+         does not name `choice` fails the ask's `options` check and lands here",
+    );
+    assert_eq!(ack.conversation, conversation, "the ack goes back where the command came from");
+
+    // The durable consequences: the ask is answered and the task is back in
+    // the queue for the lane runner.
+    let ask = kastellan_db::asks::get(&pool, raised.ask_id).await.expect("get").expect("an ask");
+    assert_eq!(ask.state, "resolved");
+    assert_eq!(
+        ask.resolution.as_ref().and_then(|r| r.get("choice")).and_then(|c| c.as_str()),
+        Some("approve"),
+    );
+    assert_eq!(
+        ask.resolved_by.as_deref(),
+        Some("matrix/@me:srv"),
+        "composed by `resolve_with_nonce` from the claimant its guard matched",
+    );
+    assert_eq!(tasks::observe_state(&pool, task_id).await.expect("state"), "pending");
+
+    // ... and the audit row both surfaces share, under the channel actor.
+    let audits = kastellan_db::audit::fetch_since(&pool, 0, 500).await.expect("audit fetch");
+    let resolved_row = audits
+        .iter()
+        .find(|r| r.action == kastellan_core::scheduler::audit::ACTION_ASK_RESOLVED)
+        .expect("an ask.resolved row");
+    assert_eq!(resolved_row.actor, "channel");
+    assert_eq!(resolved_row.payload["via"], "channel");
+    assert_eq!(resolved_row.payload["choice"], "approve");
+    assert_eq!(resolved_row.payload["task_id"], task_id);
+    assert_eq!(resolved_row.payload["resolved_by"], "matrix/@me:srv");
+    assert!(
+        !serde_json::to_string(&resolved_row.payload).unwrap().contains(&token),
+        "the audit payload must never carry the token",
+    );
+
+    pool.close().await;
+}
+
+/// A second peer in the same room holds the same bearer token — the ask was
+/// delivered as a message — and must still not be able to answer (D16).
+///
+/// The refusal is indistinguishable from a wrong token by design, so this
+/// asserts the two things that ARE observable: the ack is the vague one, and
+/// the task did not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paired_peer_who_does_not_own_the_task_cannot_answer_its_ask() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let Some(bin_dir) = pg_bin_dir_or_skip() else {
+        return; // skip-as-pass
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "ax-d",
+        "ax-l",
+        &format!("kastellan-supervisor-test-pg-ax-{suffix}"),
+    );
+    let pool = probe_and_pool(&cluster.conn_spec).await;
+
+    let channel = ChannelId("matrix".into());
+    let owner = PeerId("@me:srv".into());
+    let bystander = PeerId("@someone-else:srv".into());
+    let conversation = ConversationId("!room:srv".into());
+    let payload = build_channel_task_payload(&IncomingMessage {
+        channel: channel.clone(),
+        peer: owner.clone(),
+        conversation: conversation.clone(),
+        body: "book the flight".into(),
+        evidence: None,
+    });
+    let task_id = tasks::insert_pending(&pool, Lane::Fast, payload).await.expect("insert");
+    tasks::claim_one(&pool, Lane::Fast, 60).await.expect("claim").expect("a task");
+
+    let raised = kastellan_db::asks::raise(
+        &pool,
+        task_id,
+        "plan_approval",
+        "sends money to a stranger",
+        &serde_json::json!(["approve", "deny"]),
+        Some("digest"),
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        None,
+    )
+    .await
+    .expect("raise");
+
+    let events = PgChannelEvents::new(pool.clone());
+    // Both peers are PAIRED — the bystander is authorized to talk to the
+    // bot. Entitlement to answer THIS ask is a separate question, and that
+    // separation is the whole of D16.
+    let authorizer = StaticPairings::from_peers([owner.clone(), bystander.clone()]);
+    let wiring = AskWiring {
+        outbox: std::sync::Arc::new(ChannelOutbox::new()),
+        resolver: std::sync::Arc::new(PgAskResolver::new(pool.clone())),
+    };
+    let answer = IncomingMessage {
+        channel,
+        peer: bystander,
+        conversation,
+        body: format!("/approve {}", raised.nonce.expose()),
+        evidence: None,
+    };
+
+    let ack = handle_inbound(&authorizer, None, Some(&wiring), &events, &answer)
+        .await
+        .expect("even a refused answer is acknowledged");
+    assert_eq!(
+        ack.body,
+        kastellan_core::channel::ask_message::ACK_NOT_ANSWERABLE,
+        "a bystander holding the bearer token gets the same vague refusal as a mistyped one",
+    );
+    assert_eq!(
+        kastellan_db::asks::get(&pool, raised.ask_id).await.unwrap().unwrap().state,
+        "pending",
+        "the ask must still be open for the peer who actually owns the task",
+    );
+    assert_eq!(tasks::observe_state(&pool, task_id).await.expect("state"), "awaiting_operator");
+
+    let audits = kastellan_db::audit::fetch_since(&pool, 0, 500).await.expect("audit fetch");
+    assert!(
+        audits.iter().any(|r| r.action == actions::ASK_ANSWER_REJECTED),
+        "a refused answer must leave a countable row",
+    );
+
+    pool.close().await;
 }

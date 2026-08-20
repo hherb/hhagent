@@ -343,13 +343,30 @@ existing outbound pump. Slice 2 adds no second completion path.
 ⚠️ Approval needed — task 412
 
 An operator decision is required before I continue:
-plan writes outside the scratch directory
+> plan writes outside the scratch directory
 
-This expires 2026-08-20 09:14 UTC. Reply with one of:
+This expires 2026-08-20T09:14:31Z. Reply with one of:
 
 /approve 7f3a9c2e1b
 /deny 7f3a9c2e1b
 ```
+
+Two details of that rendering are load-bearing rather than cosmetic.
+
+The concern is **quoted line by line**. It is the reviewer's `reason` — model-authored
+text spliced into a message whose other content is two `/`-leading command lines — so
+without the fence a `reason` containing a line beginning `/approve` puts extra
+command-shaped lines in the operator's room. The forged tokens resolve nothing
+(`resolve_with_nonce` decides that, and only it), so what the fence buys is legibility,
+not containment: "exactly two commands are offered" becomes a property production
+enforces rather than one the tests merely assert.
+
+The deadline is **RFC 3339 with the nanoseconds zeroed**. `OffsetDateTime`'s `Display` is
+not a wire format — in `time` 0.3 the hour is unpadded and a subsecond fraction is always
+emitted, so a deadline taken from `now_utc()` renders as
+`2026-08-21 9:14:32.482913571 +00:00:00`. A 24-hour approval window has no business
+claiming nanosecond precision, and the fixture that hid this was the one input
+(whole-second epoch) for which the two formats agree.
 
 ## Audit rows
 
@@ -358,15 +375,30 @@ This expires 2026-08-20 09:14 UTC. Reply with one of:
 | `scheduler` | `ask.delivered` | `ask_id, task_id, channel, peer` | the message was queued to a channel |
 | `scheduler` | `ask.undelivered` | `ask_id, task_id, reason` | no origin, or no channel configured |
 | `scheduler` | `ask.delivery_failed` | `ask_id, task_id, channel, reason` | the queue refused it |
-| `channel` | `ask.resolved` | `ask_id, task_id, choice, via: "channel", channel, peer` | a peer's answer resolved an ask |
-| `channel` | `channel.ask_answer_rejected` | `channel, peer` | a well-formed command whose token resolved nothing |
+| `channel` | `ask.resolved` | `ask_id, task_id, choice, resolved_by, via: "channel"` | a peer's answer resolved an ask |
+| `channel` | `channel.ask_answer_rejected` | `channel, peer` | an answer attempt did not stand — see below |
 
 Never in any payload: the nonce, the rendered body, the concern text. `ask.resolved` is
 deliberately the **same action** slice 1b's CLI writes, with a different actor and a `via`
 field, so observation SQL grouping on `ask.resolved` sees both surfaces as one population.
+The CLI writes `via: "cli"` for the same reason, so the column is total rather than NULL
+for half the rows.
+
+The channel row's identity key is **`resolved_by`**, not a `channel` + `peer` pair. That
+is the composed `"<channel>/<peer>"` attribution `resolve_with_nonce` built from the
+claimant its D16 guard matched on — the identity the write was *authorised* against — and
+it is byte-identical to what that query stored in `asks.resolved_by`. Two loose fields
+would be weaker provenance for the same information, and would not line up with the CLI
+row's own `resolved_by`.
 
 `channel.ask_answer_rejected` carries channel + peer only — a fixed-label row, no token
-fragment. Repeated rejections from a paired peer are worth being able to count.
+fragment. Repeated rejections from a paired peer are worth being able to count. **Three
+producers write it**: a well-formed command whose token resolved nothing; a malformed
+attempt (leading verb, body does not parse), which gets the usage ack and never reaches
+enqueue; and a resolver `Err`, which is collapsed into the first arm on purpose so a DB
+outage cannot become the existence oracle the refusal path refuses to be. Telling the
+three apart in the payload is a durable shape change and is deferred to a later slice, so
+a reader counting these rows today must not assume they are all the first case.
 
 ## Testing
 

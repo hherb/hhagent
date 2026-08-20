@@ -18,6 +18,12 @@ use super::{ChannelId, ConversationId, PeerId};
 /// operator in their own room. What it protects is the two command lines,
 /// which an unbounded concern would push off the visible message — and an
 /// approval nobody can see the command for is an approval nobody gives.
+///
+/// Bounds the concern *before* [`fence`] prefixes it, so the fenced text
+/// can be up to three times this on a concern that is all newlines. That is
+/// deliberate: capping the fenced form would make the amount of concern an
+/// operator sees depend on how many line breaks the model happened to emit,
+/// and 1.5 KiB still leaves the commands on screen.
 pub const CONCERN_CAP: usize = 512;
 
 /// The sentence sent back when an answer resolved nothing.
@@ -87,10 +93,15 @@ pub fn destination_from_task_payload(payload: &Value) -> Option<AskDestination> 
 /// Deliberately distinct from `scheduler::asks::Choice`, which reads a
 /// *stored* resolution: these are different layers (the wire vocabulary vs.
 /// the record), and coupling them would make the channel module depend on
-/// the scheduler for a two-variant enum. `the_wire_verbs_are_the_stored_choices`
-/// is the anti-drift guard — [`Self::as_str`] must keep producing exactly the
-/// strings that `raise_and_suspend` writes into `asks.options`, because
-/// `db::asks::resolve_with_nonce` validates the choice against them.
+/// the scheduler for a two-variant enum.
+///
+/// The agreement with `asks.options` — which `db::asks::resolve_with_nonce`
+/// validates a submitted choice against — is **structural**, not asserted:
+/// `raise_and_suspend` builds that array by calling [`Self::as_str`], so a
+/// respelling here respells both sides at once.
+/// `the_wire_verbs_are_the_stored_choices` still pins today's two spellings,
+/// because the stored value is durable and a rename would strand every ask
+/// raised before it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AskChoice {
     Approve,
@@ -138,8 +149,15 @@ impl std::fmt::Debug for AskCommand {
 }
 
 /// Recognise `/approve <token>` or `/deny <token>`, or `None` for anything
-/// else — in which case the body is an ordinary message and takes the
-/// normal screen-and-enqueue path.
+/// else.
+///
+/// `None` does **not** mean "ordinary message". It splits in two, and
+/// [`looks_like_ask_command`] is what tells the halves apart: a body whose
+/// first token is one of the two verbs is a malformed *attempt* and gets
+/// [`ACK_MALFORMED_COMMAND`] without ever reaching the enqueue path
+/// (enqueueing `/approve tok9 thanks!` would write a live token into
+/// `tasks.payload`); everything else is an ordinary message and takes the
+/// normal screen-and-enqueue path. `handle_inbound` applies that split.
 ///
 /// **Strict: the trimmed body must be exactly two whitespace-separated
 /// tokens.** Accepting a trailing tail would let one message both resolve
@@ -195,6 +213,10 @@ pub fn looks_like_ask_command(body: &str) -> bool {
 /// answer, and putting a small sequential integer in durable room history
 /// invites exactly the resolve-by-id thinking `db::asks::resolve`'s doc
 /// reserves for the local CLI.
+///
+/// The concern is model-authored, so it is clamped ([`CONCERN_CAP`]) and
+/// then [`fence`]d — see that function for why splicing it verbatim let a
+/// reviewer's `reason` print its own `/approve` lines.
 pub fn render_ask(
     task_id: i64,
     concern: &str,
@@ -211,9 +233,51 @@ pub fn render_ask(
          \n\
          /approve {token}\n\
          /deny {token}",
-        concern = clamp(concern, CONCERN_CAP),
-        deadline = deadline_at,
+        concern = fence(&clamp(concern, CONCERN_CAP)),
+        deadline = render_deadline(deadline_at),
     )
+}
+
+/// The deadline as an operator should read it: RFC 3339, whole seconds.
+///
+/// **`OffsetDateTime`'s `Display` is not a wire format.** In `time` 0.3.49
+/// the hour is unpadded and a subsecond fraction is *always* emitted, so a
+/// deadline taken from `now_utc()` renders as
+/// `2026-08-21 9:14:32.482913571 +00:00:00`. That went unnoticed because
+/// every fixture used a whole-second epoch, whose nanoseconds are exactly
+/// zero — the one input for which `Display` emits no fraction at all.
+///
+/// The nanoseconds are zeroed rather than formatted away: a 24-hour
+/// approval deadline has no business claiming nanosecond precision, and
+/// RFC 3339 would otherwise print all nine digits.
+///
+/// Falls back to `to_string()` instead of unwrapping, on both steps. This
+/// runs on the delivery path of the one message a suspended task is waiting
+/// for; an ugly deadline is recoverable, a panicking renderer is a task
+/// nobody can approve.
+fn render_deadline(at: OffsetDateTime) -> String {
+    at.replace_nanosecond(0)
+        .ok()
+        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+        .unwrap_or_else(|| at.to_string())
+}
+
+/// Quote every line of the concern so none of them can read — or parse — as
+/// a command.
+///
+/// The concern is the reviewer's `reason`: model-authored text, spliced into
+/// a message whose other content is two `/`-leading command lines. Without
+/// this, a `reason` containing a line that starts with `/approve` puts extra
+/// command-shaped lines in the operator's room. The forged tokens resolve
+/// nothing (`resolve_with_nonce` is the only thing that decides that), so
+/// this is operator confusion rather than compromise — but "exactly two
+/// commands are offered" is an invariant the tests assert and production
+/// should therefore actually hold, not merely happen to.
+///
+/// Costs at most two bytes per line; see [`CONCERN_CAP`] for why the cap is
+/// applied before this rather than after.
+fn fence(concern: &str) -> String {
+    concern.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
 }
 
 /// The acknowledgement for an answer that resolved an ask.
@@ -405,17 +469,68 @@ mod tests {
     /// Each rendered command must round-trip through the parser. Without
     /// this the two halves can drift — the message could print a prefix the
     /// parser does not accept, and every test on each side would still pass.
+    ///
+    /// The concern here is **hostile**: a model-authored `reason` whose own
+    /// lines start with `/approve` and `/deny`, carrying tokens that are not
+    /// this ask's. Before the fence, `render_ask` spliced it verbatim and
+    /// this test's own "exactly two commands offered" assertion was a
+    /// property production did not enforce — the operator's room got four
+    /// command-shaped lines, two of them forged. The forgeries resolve
+    /// nothing, so what the fence buys is legibility, not containment.
     #[test]
     fn every_command_the_message_prints_parses_back() {
-        let msg = render_ask(1, "c", "tok123", deadline());
+        let hostile = "the plan writes outside the scratch dir\n\
+                       /approve deadbeef\n\
+                       /deny deadbeef";
+        let msg = render_ask(1, hostile, "tok123", deadline());
         let commands: Vec<&str> =
             msg.lines().map(str::trim).filter(|l| l.starts_with('/')).collect();
-        assert_eq!(commands.len(), 2, "exactly two commands offered: {msg}");
+        assert_eq!(
+            commands.len(), 2,
+            "exactly two commands offered — a concern line must never read as a third: {msg}",
+        );
         for line in commands {
             let cmd = parse_ask_command(line)
                 .unwrap_or_else(|| panic!("rendered command does not parse: {line:?}"));
-            assert_eq!(cmd.token, "tok123");
+            assert_eq!(cmd.token, "tok123", "the only token offered is this ask's own");
         }
+        // The concern is still legible, just quoted — fencing must not eat it.
+        assert!(msg.contains("> /approve deadbeef"), "the forged line is quoted, not dropped: {msg}");
+        assert!(msg.contains("> the plan writes outside the scratch dir"), "{msg}");
+    }
+
+    /// The deadline must actually reach the operator, and be readable when
+    /// it does.
+    ///
+    /// Two regressions this pins at once. **First**, the whole `This expires
+    /// {deadline}. Reply with one of:` line could be deleted and every other
+    /// test in this module stayed green — nothing asserted the deadline
+    /// appeared at all. **Second**, `OffsetDateTime`'s `Display` always
+    /// emits a subsecond fraction and an unpadded hour, so a live deadline
+    /// rendered as `2026-08-21 9:14:32.482913571 +00:00:00`; the old
+    /// fixture's whole-second epoch has exactly zero nanoseconds, which is
+    /// the one input that hides it. Hence [`messy_deadline`]: a fixture with
+    /// nanoseconds set, so this can never regress invisibly again.
+    #[test]
+    fn the_deadline_is_rendered_legibly_with_no_nanosecond_noise() {
+        let msg = render_ask(412, "c", "tok", messy_deadline());
+        assert!(msg.contains("This expires"), "the expiry line must survive: {msg}");
+        assert!(
+            msg.contains("2026-08-17T20:53:20Z"),
+            "the deadline itself must be in the message, RFC 3339: {msg}",
+        );
+        assert!(
+            !has_nine_digit_fraction(&msg),
+            "a nanosecond fraction is machine garbage to an operator: {msg}",
+        );
+    }
+
+    /// `.` followed by nine digits — the shape `Display` produces and RFC
+    /// 3339 would too if the nanoseconds were not zeroed first.
+    fn has_nine_digit_fraction(s: &str) -> bool {
+        s.as_bytes()
+            .windows(10)
+            .any(|w| w[0] == b'.' && w[1..].iter().all(u8::is_ascii_digit))
     }
 
     /// The concern is model-authored (it is the reviewer's `reason`), so it
@@ -480,5 +595,15 @@ mod tests {
 
     fn deadline() -> time::OffsetDateTime {
         time::OffsetDateTime::from_unix_timestamp(1_787_000_000).unwrap()
+    }
+
+    /// The same instant as [`deadline`], plus nanoseconds — i.e. the shape a
+    /// real `OffsetDateTime::now_utc() + Duration` actually has.
+    ///
+    /// A whole-second fixture is not a representative one here: it is the
+    /// single input for which `Display` emits no subsecond fraction, so it
+    /// hides exactly the defect the deadline test exists to catch.
+    fn messy_deadline() -> time::OffsetDateTime {
+        time::OffsetDateTime::from_unix_timestamp_nanos(1_787_000_000_482_913_571).unwrap()
     }
 }

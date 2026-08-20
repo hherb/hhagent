@@ -136,10 +136,30 @@ pub const ACTION_TASK_SUBMITTED: &str = "task.submitted";
 /// the nonce is a live approval token.
 pub const ACTION_ASK_RAISED: &str = "ask.raised";
 
-/// `action` written when an operator answered a raised ask (#564 slice 1b).
-/// `actor='cli'` from `kastellan-cli inbox resolve`; a future channel
-/// resolver writes the same action under its own actor. Payload:
-/// `{ask_id, task_id, choice, resolved_by, free_text}`.
+/// `action` written when an operator answered a raised ask (#564 slice 1b,
+/// extended by slice 2). **Two actors write it, and the `via` key is what
+/// tells them apart:**
+///
+/// - `actor='cli'`, `via='cli'` — `kastellan-cli inbox resolve`. Payload:
+///   `{ask_id, task_id, choice, resolved_by, free_text, via}`. `free_text`
+///   is the operator's optional `--note` and is CLI-only.
+/// - `actor='channel'`, `via='channel'` — `bus::handle_inbound` resolved a
+///   peer's `/approve`/`/deny`. Payload:
+///   `{ask_id, task_id, choice, resolved_by, via}`, with **no `free_text`**:
+///   the strict two-token parser rejects trailing prose, so there is none
+///   to store.
+///
+/// Deliberately the *same* action for both, so observation SQL grouping on
+/// `ask.resolved` sees one population; `via` is written by both surfaces so
+/// the column is total rather than NULL for half the rows.
+///
+/// `resolved_by` is the attribution in both cases, but composed differently
+/// and that is the point: the CLI passes an operator-supplied string, while
+/// the channel's is `Claimant::attribution()` — `"<channel>/<peer>"` from
+/// the same claimant `resolve_with_nonce`'s D16 entitlement guard matched
+/// on, and the identical value that query writes into `asks.resolved_by`.
+/// So the channel row's attribution is the identity the write was
+/// authorised against rather than the identity a caller chose to declare.
 ///
 /// `choice` is what separates an operator denial from a CASSANDRA block:
 /// both land in `tasks.state='blocked'` (see `Outcome::final_state`).

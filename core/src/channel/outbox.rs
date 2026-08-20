@@ -83,7 +83,13 @@ impl ChannelOutbox {
         self.senders.write().expect("outbox lock not poisoned").remove(id);
     }
 
-    /// Queue `msg` for the channel it names. Never blocks; never panics.
+    /// Queue `msg` for the channel it names.
+    ///
+    /// Never blocks — a full queue is `Err(QueueFull)`, not backpressure —
+    /// which is what makes it callable from the sync `deliver_ask`. It can
+    /// still panic on a poisoned lock, same as `register`/`deregister`; the
+    /// `RwLock` is only ever held for a map lookup with no `await` inside,
+    /// so the only way to poison it is a panic in `HashMap`.
     pub fn try_deliver(&self, msg: OutgoingMessage) -> Result<(), OutboxError> {
         let senders = self.senders.read().expect("outbox lock not poisoned");
         let tx = senders.get(&msg.channel).ok_or(OutboxError::NoSuchChannel)?;

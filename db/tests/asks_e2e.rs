@@ -1334,10 +1334,17 @@ fn harness(tag: &str) -> Option<Harness> {
     Some(Harness { cluster, rt })
 }
 
-/// The `tasks.payload` shape a channel-originated task carries — the four
-/// keys `channel::ingest::build_channel_task_payload` writes. The D16
-/// entitlement guard reads three of them, so every nonce test needs a task
-/// that has them.
+/// The `tasks.payload` shape a channel-originated task carries.
+///
+/// The five keys here are a **subset** of the seven
+/// `channel::ingest::build_channel_task_payload` writes — the two
+/// classification-floor keys are omitted because nothing in `db` reads
+/// them. `db` cannot depend on `core`, so this is a hand-written copy and
+/// necessarily is; the cross-crate agreement is pinned on the `core` side
+/// instead, by `core/tests/scheduler_asks_e2e.rs::channel_payload`, which
+/// calls the real producer. The D16 entitlement guard reads three of these
+/// keys (`kind`, `channel`, `peer`), so every nonce test needs a task that
+/// has them.
 fn channel_payload(peer: &str) -> serde_json::Value {
     serde_json::json!({
         "kind": "channel",

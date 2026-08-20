@@ -134,14 +134,15 @@ async fn sweep_loop(pool: PgPool, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-// Five of the nine params are the shared scheduler dependencies
-// (pool + the four stage handles); the rest are the per-lane tuning
-// constants. They are genuinely distinct inputs to the loop, so the
-// arg-count heuristic is suppressed rather than papered over with a
-// dependency-bundle struct that would only move the list to the call site.
-// `outbox` is the tenth: where a raised ask is delivered (#564 slice 2),
-// `None` on a channel-less daemon — one more genuinely distinct dependency,
-// not a reason to change the shape of the suppression.
+// Eleven params: `pool`, the five stage handles (formulator, review,
+// dispatcher, entity extractor, embedder), the `outbox`, the shutdown
+// watch, and three per-lane tuning values. They are genuinely distinct
+// inputs to the loop, so the arg-count heuristic is suppressed rather than
+// papered over with a dependency-bundle struct that would only move the
+// list to the call site. `outbox` — positionally the 7th — is where a
+// raised ask is delivered (#564 slice 2), `None` on a channel-less daemon:
+// one more genuinely distinct dependency, not a reason to change the shape
+// of the suppression.
 #[allow(clippy::too_many_arguments)]
 async fn lane_loop(
     pool: PgPool,
@@ -231,9 +232,9 @@ async fn lane_loop(
 /// Pulled out of `lane_loop` so the same body runs both in the initial
 /// startup pass and on each NOTIFY/heartbeat wake. Honours `shutdown`
 /// between every claim.
-// Same ten-input shape as `lane_loop` (it forwards them straight
-// through); see the note there for why the arg-count heuristic is
-// suppressed instead of bundled.
+// Same eleven-input shape as `lane_loop` (it forwards them straight
+// through, `outbox` included, as a borrow); see the note there for why the
+// arg-count heuristic is suppressed instead of bundled.
 #[allow(clippy::too_many_arguments)]
 async fn drain_lane(
     pool: &PgPool,
