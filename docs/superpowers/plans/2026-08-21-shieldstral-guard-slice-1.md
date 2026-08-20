@@ -1461,7 +1461,14 @@ fn render_section(name: &str, cases: &[ScoredCase], tau: f32) -> String {
         Some((t, m)) => s.push_str(&format!(
             "  margin-maximising tau: {t:.3}  (margin {m:+.4})\n"
         )),
-        None => s.push_str("  margin-maximising tau: NONE (classes overlap)\n"),
+        // `best_tau` returns None for TWO reasons — the classes overlap,
+        // or some adjudicated case is unmeasured — so the message names
+        // both. Naming only overlap would misreport an unmeasurable run
+        // as an inseparable one, sending the reader after the corpus when
+        // the backend is what is wrong.
+        None => s.push_str(
+            "  margin-maximising tau: NONE (classes overlap, or a case is unmeasured)\n",
+        ),
     }
     s
 }
