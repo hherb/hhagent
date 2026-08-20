@@ -272,6 +272,7 @@ async fn spawn_email_channel(events: Vec<Value>, skipped: Vec<Value>) -> Handle 
         None, // no pairing carve-out: email always carries evidence, see bus::handle_inbound.
         Arc::new(events_sink.clone()),
         Box::new(NeverCompleted),
+        None,
     );
 
     Handle { events: events_sink, bus, ack_log }

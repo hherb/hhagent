@@ -193,6 +193,17 @@ pub mod actions {
     /// which until #517 was permanent and produced no row at all. `ran_ms` is
     /// what tells a sustained outage apart from a flapping channel.
     pub const CHANNEL_DIED: &str = "channel.died";
+    /// A paired peer sent a well-formed `/approve`/`/deny` whose token
+    /// resolved nothing (#564 slice 2). Carries the channel + peer only —
+    /// never the token, never the body.
+    ///
+    /// **Deliberately does not say why.** Wrong token, already answered,
+    /// past its deadline and "not this peer's ask" are one outcome by
+    /// construction (`db::asks::resolve_with_nonce`), because splitting
+    /// them hands a token-guessing peer an existence oracle. What the row
+    /// is for is counting: repeated rejections from a paired peer are a
+    /// signal even when no single one is.
+    pub const ASK_ANSWER_REJECTED: &str = "channel.ask_answer_rejected";
 }
 
 #[cfg(test)]

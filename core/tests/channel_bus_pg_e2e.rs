@@ -69,7 +69,7 @@ async fn channel_inbound_enqueues_and_completion_routes_a_reply() {
         body: "what's on my calendar?".into(),
         evidence: None,
     };
-    handle_inbound(&authorizer, None, &events, &msg).await;
+    handle_inbound(&authorizer, None, None, &events, &msg).await;
 
     let pending = tasks::list(&pool, Some(Lane::Fast), Some("pending"), 10)
         .await

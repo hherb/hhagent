@@ -134,6 +134,7 @@ async fn paired_inbound_round_trips_to_a_sent_reply() {
         None,
         Arc::new(events),
         Box::new(completed),
+        None,
     );
 
     // The fixture's canned inbound is paired + benign → enqueued → completed →
@@ -177,6 +178,7 @@ async fn unpaired_inbound_is_dropped_no_reply() {
         None,
         Arc::new(events.clone()),
         Box::new(completed),
+        None,
     );
 
     // Give the loop time; the unpaired message must NOT enqueue and NOTHING is sent.

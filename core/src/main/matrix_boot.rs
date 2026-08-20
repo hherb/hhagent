@@ -195,6 +195,7 @@ async fn attempt(
         Some(pairing),
         events,
         Box::new(completed),
+        None, // ask wiring: deferred to #564 slice 2 task 8
     )))
 }
 

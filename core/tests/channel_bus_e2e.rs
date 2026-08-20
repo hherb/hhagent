@@ -104,6 +104,7 @@ async fn inbound_message_round_trips_to_a_reply() {
         None,
         Arc::new(events),
         Box::new(completed),
+        None,
     );
 
     // Poll the outbox until the reply lands (bounded), then shutdown.
