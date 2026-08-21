@@ -447,6 +447,22 @@ fn for_tool_defaults_to_strict_fail_closed() {
 /// form.
 const _: () = assert!(RELAXED_CHAT_TEMPLATE_WEIGHT < 0.45);
 
+/// The OTHER direction, which the bound above does not cover.
+///
+/// `sub_threshold_catalogue_scores_are_exactly_three_values` argues
+/// from `smallest + smallest >= BLOCK_THRESHOLD`, and that argument
+/// holds for [`GuardProfile::Strict`] only. Under
+/// [`GuardProfile::Relaxed`] the chat-template family collapses to one
+/// flat [`RELAXED_CHAT_TEMPLATE_WEIGHT`] added after the scan, so the
+/// sum that has to clear the threshold is
+/// `RELAXED_CHAT_TEMPLATE_WEIGHT + smallest_catalogue_weight`.
+///
+/// Today that is `0.40 + 0.40 = 0.80`. **Lowering** the relaxed weight
+/// to 0.20 would put `0.60` in the legacy band while the `< 0.45`
+/// bound above stayed green — it stops the value being raised INTO the
+/// band, not lowered so that a sum lands in it.
+const _: () = assert!(RELAXED_CHAT_TEMPLATE_WEIGHT + 0.40 >= BLOCK_THRESHOLD);
+
 /// Finding F1 from the slice-1 guard-model spec, pinned structurally.
 ///
 /// The reachable score set is {0, 0.40, 0.50, 0.75, 0.80, 0.90, 1.0},

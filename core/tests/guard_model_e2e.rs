@@ -1,21 +1,33 @@
 //! The guard adjudicator against a canned OpenAI-style backend.
 //!
-//! Hermetic cases, one per outcome the wiring slice must handle: a
-//! flagged document, a clear one, the two ways a 200 can be
-//! unmeasurable (neither verdict spelling; no `logprobs` block at all),
-//! a malformed body, a transport failure, an unconfigured guard and a
-//! half-configured one. Plus one `#[ignore]` live test.
+//! Hermetic cases, one per outcome the wiring slice must handle: the
+//! request envelope that goes out, a flagged document, a clear one, the
+//! four ways a 200 can be unmeasurable (neither verdict spelling; only
+//! one; no `logprobs` block; empty `choices`/`top_logprobs`), a
+//! malformed body, a transport failure, an unconfigured guard and a
+//! half-configured one. Plus one `#[ignore]` live instrument.
 //!
 //! The mock is the same hand-rolled one-shot HTTP/1.1 listener that
 //! `llm-router/tests/local_backend_e2e.rs` uses — bind `127.0.0.1:0`,
 //! accept once, parse `<headers>\r\n\r\n<body>` by `Content-Length`,
 //! write a hand-formatted response. No `wiremock`/`httpmock`/`axum`
 //! dev-dependency; the dependency footprint stays inspectable.
+//!
+//! **It also returns the request body**, like its sibling does. An
+//! earlier revision copied the listener and dropped the capture, which
+//! left the whole of `GuardClient::probability`'s request construction
+//! unpinned: deleting `.with_logprobs(..)` — which makes every live
+//! call `Unmeasured`, i.e. the tier silently dead — or swapping the
+//! tuned policy prompt for a naive one — which the study measured
+//! moving an indirect injection from 0.9998 to 0.0038, *confidently
+//! safe* — kept every test in this file green. See
+//! `serves_the_pinned_request_envelope`.
 
 use kastellan_core::cassandra::guard_model::{GuardAdjudication, GuardClient};
-use kastellan_llm_router::RouterConfig;
+use kastellan_llm_router::{RouterConfig, RouterError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 /// Keeps the mock's task handle alive for the duration of a test.
 struct MockGuard(tokio::task::JoinHandle<()>);
@@ -59,9 +71,17 @@ fn canned(yes_logprob: f64, no_logprob: f64) -> String {
     .to_string()
 }
 
-/// Bind a one-shot HTTP/1.1 mock on an ephemeral port and return the
-/// base URL to point a guard config at.
-async fn spawn_mock(status: u16, body: String) -> (String, MockGuard) {
+/// Bind a one-shot HTTP/1.1 mock on an ephemeral port.
+///
+/// Returns the base URL to point a guard config at, a receiver for the
+/// request body the mock was sent, and the task guard.
+///
+/// The receiver is what makes the request assertable. Tests that only
+/// care about the response ignore it.
+async fn spawn_mock(
+    status: u16,
+    body: String,
+) -> (String, oneshot::Receiver<String>, MockGuard) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
     let port = listener.local_addr().expect("local_addr").port();
     let base_url = format!("http://127.0.0.1:{port}/v1");
@@ -71,6 +91,8 @@ async fn spawn_mock(status: u16, body: String) -> (String, MockGuard) {
         500 => "HTTP/1.1 500 Internal Server Error",
         other => panic!("mock does not model status {other}"),
     };
+
+    let (tx, rx) = oneshot::channel();
 
     let handle = tokio::spawn(async move {
         let Ok((mut sock, _peer)) = listener.accept().await else { return };
@@ -93,6 +115,11 @@ async fn spawn_mock(status: u16, body: String) -> (String, MockGuard) {
             if buf.len() < headers_end + 4 + content_length {
                 continue;
             }
+            let served = String::from_utf8_lossy(
+                &buf[headers_end + 4..headers_end + 4 + content_length],
+            )
+            .into_owned();
+            let _ = tx.send(served);
             let resp = format!(
                 "{status_line}\r\nContent-Type: application/json\r\n\
                  Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
@@ -105,7 +132,7 @@ async fn spawn_mock(status: u16, body: String) -> (String, MockGuard) {
         }
     });
 
-    (base_url, MockGuard(handle))
+    (base_url, rx, MockGuard(handle))
 }
 
 /// Byte index of the first `\r\n\r\n`, if present.
@@ -132,9 +159,124 @@ fn header_content_length(headers: &str) -> Option<usize> {
     None
 }
 
+/// **The load-bearing test of this file.** Everything else asserts what
+/// the client does with a canned RESPONSE; this asserts what it puts on
+/// the wire, which is what determines whether the tier works at all.
+///
+/// Each assertion below corresponds to a mutation that keeps every
+/// other test in this file green while breaking production:
+///
+/// - drop `.with_logprobs(..)` → llama.cpp returns no distribution →
+///   every call is `Unmeasured` → the tier is silently dead;
+/// - `TOP_LOGPROBS` away from 20 → a different configuration from the
+///   one the whole study was measured under;
+/// - swap `policy::build_messages` for a naive user message → measured
+///   moving an indirect injection from 0.9998 to **0.0038**;
+/// - drop `max_tokens`/`temperature` → the logit pair stops being
+///   reproducible.
+///
+/// The digest in `policy.rs` proves the STRINGS did not drift. Only
+/// this proves they reach the model.
+#[tokio::test]
+async fn serves_the_pinned_request_envelope() {
+    use kastellan_core::cassandra::guard_model::policy::{INSTRUCT, QUERY, SYSTEM_PROMPT};
+
+    let (url, served, _srv) = spawn_mock(200, canned(-0.01, -5.0)).await;
+    let client = GuardClient::from_config(&guard_cfg(&url))
+        .expect("not misconfigured")
+        .expect("configured");
+    let _ = client.adjudicate("THE-DOCUMENT-BODY", 0.5).await.expect("ok");
+
+    let body = served.await.expect("mock received a request");
+    let sent: serde_json::Value =
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("wire body not JSON: {e}\n{body}"));
+
+    assert_eq!(sent["model"], "shieldstral-test", "wire body: {body}");
+    assert_eq!(sent["logprobs"], true, "logprobs must be requested: {body}");
+    assert_eq!(sent["top_logprobs"], 20, "measured at 20 alternatives: {body}");
+    assert_eq!(sent["max_tokens"], 1, "only position 0 is read: {body}");
+    assert_eq!(sent["temperature"], 0.0, "the logit pair must be reproducible: {body}");
+
+    let msgs = sent["messages"].as_array().expect("messages array");
+    assert_eq!(msgs.len(), 2, "system then user: {body}");
+    assert_eq!(msgs[0]["role"], "system");
+    assert_eq!(msgs[0]["content"], SYSTEM_PROMPT, "the system prompt must be the artefact");
+    assert_eq!(msgs[1]["role"], "user");
+
+    let user = msgs[1]["content"].as_str().expect("user content");
+    let i = user.find(INSTRUCT).expect("the TUNED instruct block must be sent");
+    let q = user.find(QUERY).expect("the broad query must be sent");
+    let d = user.find("THE-DOCUMENT-BODY").expect("the document must be sent");
+    assert!(i < q && q < d, "envelope order must be Instruct, Query, Document: {user}");
+}
+
+/// The **worse** half of the unmeasurable trap, and the one most likely
+/// against a live backend: exactly ONE verdict spelling present.
+///
+/// A sentinel floor would manufacture a confident ~0.9999 from that
+/// single observation. There is no floor, so it must be `Unmeasured`.
+#[tokio::test]
+async fn exactly_one_verdict_spelling_is_unmeasured_not_a_confident_score() {
+    let body = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "yes"},
+            "logprobs": {"content": [{
+                "token": "yes",
+                "logprob": -0.01,
+                "top_logprobs": [
+                    {"token": "yes",   "logprob": -0.01},
+                    {"token": "maybe", "logprob": -4.0}
+                ]
+            }]}
+        }]
+    })
+    .to_string();
+    let (url, _served, _srv) = spawn_mock(200, body).await;
+    let client = GuardClient::from_config(&guard_cfg(&url))
+        .expect("not misconfigured")
+        .expect("configured");
+    let got = client.adjudicate("some document", 0.5).await.expect("ok");
+    assert_eq!(
+        got,
+        GuardAdjudication::Unmeasured,
+        "one spelling is not a distribution; it must not manufacture a score"
+    );
+}
+
+/// A 200 with an empty `choices` array, and one with an empty
+/// `top_logprobs`. Both are shapes a real backend returns, and both
+/// must be `Unmeasured`.
+#[tokio::test]
+async fn empty_choices_and_empty_top_logprobs_are_unmeasured() {
+    for (name, body) in [
+        ("empty choices", serde_json::json!({"choices": []}).to_string()),
+        (
+            "empty top_logprobs",
+            serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "yes"},
+                    "logprobs": {"content": [{
+                        "token": "yes", "logprob": -0.01, "top_logprobs": []
+                    }]}
+                }]
+            })
+            .to_string(),
+        ),
+    ] {
+        let (url, _served, _srv) = spawn_mock(200, body).await;
+        let client = GuardClient::from_config(&guard_cfg(&url))
+            .expect("not misconfigured")
+            .expect("configured");
+        let got = client.adjudicate("some document", 0.5).await.expect("ok");
+        assert_eq!(got, GuardAdjudication::Unmeasured, "{name} must not read as safe");
+    }
+}
+
 #[tokio::test]
 async fn a_confident_yes_flags() {
-    let (url, _srv) = spawn_mock(200, canned(-0.01, -5.0)).await;
+    let (url, _served, _srv) = spawn_mock(200, canned(-0.01, -5.0)).await;
     let client = GuardClient::from_config(&guard_cfg(&url))
         .expect("not misconfigured")
         .expect("configured");
@@ -144,7 +286,7 @@ async fn a_confident_yes_flags() {
 
 #[tokio::test]
 async fn a_confident_no_is_clear() {
-    let (url, _srv) = spawn_mock(200, canned(-5.0, -0.01)).await;
+    let (url, _served, _srv) = spawn_mock(200, canned(-5.0, -0.01)).await;
     let client = GuardClient::from_config(&guard_cfg(&url))
         .expect("not misconfigured")
         .expect("configured");
@@ -171,7 +313,7 @@ async fn neither_verdict_spelling_is_unmeasured_not_clear() {
         }]
     })
     .to_string();
-    let (url, _srv) = spawn_mock(200, body).await;
+    let (url, _served, _srv) = spawn_mock(200, body).await;
     let client = GuardClient::from_config(&guard_cfg(&url))
         .expect("not misconfigured")
         .expect("configured");
@@ -198,7 +340,7 @@ async fn a_response_with_no_logprobs_block_is_unmeasured() {
         }]
     })
     .to_string();
-    let (url, _srv) = spawn_mock(200, body).await;
+    let (url, _served, _srv) = spawn_mock(200, body).await;
     let client = GuardClient::from_config(&guard_cfg(&url))
         .expect("not misconfigured")
         .expect("configured");
@@ -214,24 +356,29 @@ async fn a_response_with_no_logprobs_block_is_unmeasured() {
 /// verdict.
 #[tokio::test]
 async fn a_malformed_200_body_surfaces_rather_than_deciding() {
-    let (url, _srv) = spawn_mock(200, "{ this is not json".to_string()).await;
+    let (url, _served, _srv) = spawn_mock(200, "{ this is not json".to_string()).await;
     let client = GuardClient::from_config(&guard_cfg(&url))
         .expect("not misconfigured")
         .expect("configured");
-    assert!(
-        client.adjudicate("some document", 0.5).await.is_err(),
-        "a malformed body is a transport-layer failure, not a Clear verdict"
-    );
+    // The VARIANT, not merely `is_err()`: a bare `is_err()` would also
+    // pass if the mock died and the call timed out, i.e. it would stop
+    // testing decoding without saying so.
+    match client.adjudicate("some document", 0.5).await {
+        Err(RouterError::DecodeResponse { .. }) => {}
+        other => panic!("expected a decode failure, got {other:?}"),
+    }
 }
 
 #[tokio::test]
 async fn an_http_error_surfaces_rather_than_deciding() {
-    let (url, _srv) = spawn_mock(500, "upstream exploded".to_string()).await;
+    let (url, _served, _srv) = spawn_mock(500, "upstream exploded".to_string()).await;
     let client = GuardClient::from_config(&guard_cfg(&url))
         .expect("not misconfigured")
         .expect("configured");
-    let got = client.adjudicate("some document", 0.5).await;
-    assert!(got.is_err(), "the adjudicator reports; it never decides to allow");
+    match client.adjudicate("some document", 0.5).await {
+        Err(RouterError::HttpStatus { status, .. }) => assert_eq!(status, 500),
+        other => panic!("the adjudicator reports; it never decides to allow: {other:?}"),
+    }
 }
 
 #[test]
@@ -272,22 +419,61 @@ fn a_half_configured_guard_is_an_error_not_unconfigured() {
 /// ```
 ///
 /// Produces the number Open Risk 1 in the slice-1 spec makes a
-/// precondition on the wiring slice: p50 latency at REALISTIC document
+/// precondition on the wiring slice: latency at REALISTIC document
 /// sizes. Measurement 1's 30-43 ms was on ~26-token strings; the
 /// chokepoint caps documents at `SCAN_BYTE_CAP` = 64 KiB, where prompt
 /// processing rather than the single decode token will dominate.
+///
+/// **This takes ONE sample per (size, kind) and asserts no latency
+/// bound.** It is an instrument, not a gate: it prints numbers a human
+/// reads. Turning it into a p50 needs repetition, and turning it into a
+/// precondition needs a bound — both belong with the wiring slice, and
+/// naming that here stops the printed number being mistaken for a p50.
+///
+/// **It fails rather than skips when unconfigured.** It is `#[ignore]`,
+/// so the only way to reach it is to ask for it by name; an operator
+/// who asks for it and gets a silent PASS because two env vars were
+/// unset has learned nothing while being told everything is fine —
+/// the false-green pattern CLAUDE.md calls out for the bwrap skips.
 #[tokio::test]
 #[ignore = "needs a live Shieldstral server; see the doc comment"]
 async fn live_shieldstral_size_sweep() {
+    use kastellan_core::cassandra::guard_model::policy::policy_digest;
+
     let cfg = RouterConfig::from_env().expect("router config");
+    // Asserted, not assumed: `for_guard` prevents the IMPLICIT fallback
+    // to the planner endpoint, but nothing stops an operator pointing
+    // KASTELLAN_LLM_GUARD_URL at it by hand — and a general chat model
+    // asked "Is this content unsafe?" will usually have both spellings
+    // in its top-20 and usually answer these two obvious seeds
+    // correctly, so it would PASS this sweep while producing numbers
+    // that mean nothing. This is the one test that touches a real
+    // server, so it is the only place that check can be made.
+    assert_ne!(
+        cfg.guard_url.as_deref(),
+        Some(cfg.local_url.as_str()),
+        "the guard endpoint is the PLANNER endpoint; a different model would \
+         answer the guard prompt with prose and yield a number that looks \
+         exactly like a score and means nothing"
+    );
     let client = match GuardClient::from_config(&cfg) {
-        Ok(None) => {
-            eprintln!("[SKIP] KASTELLAN_LLM_GUARD_URL / KASTELLAN_LLM_GUARD_MODEL unset");
-            return;
-        }
+        Ok(None) => panic!(
+            "this test was asked for by name but KASTELLAN_LLM_GUARD_URL / \
+             KASTELLAN_LLM_GUARD_MODEL are unset; a skip here would report as \
+             PASSED and teach an operator nothing"
+        ),
         Err(e) => panic!("guard tier is misconfigured: {e}"),
         Ok(Some(c)) => c,
     };
+
+    // Echoed so a saved run says what produced it — the same reason the
+    // calibration report carries a header.
+    println!(
+        "[live] endpoint={} model={} policy_digest={}",
+        cfg.guard_url.as_deref().unwrap_or("<unset>"),
+        cfg.guard_model.as_deref().unwrap_or("<unset>"),
+        policy_digest()
+    );
 
     // A known attack must flag at every size and a known benign must
     // not: the sweep measures latency but must not stop checking

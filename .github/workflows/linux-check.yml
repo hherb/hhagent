@@ -140,6 +140,38 @@ jobs:
       - name: cargo test (core install plan — per-OS defaults, #568)
         run: "cargo test -p kastellan-core --lib install::plan:: --locked"
 
+      # The guard-model tier (Shieldstral adjudicator + calibration
+      # harness). Hermetic — pure functions, a tempdir corpus, and
+      # loopback mocks; no PG, no bwrap, no model, no network.
+      #
+      # These satisfy the "whose value is firing on a PULL REQUEST"
+      # clause above more sharply than most:
+      #
+      #   * `policy::` carries the cross-implementation digest pin. It
+      #     exists so that a reword of the tuned prompt fails a test
+      #     instead of silently moving every score — and a reword
+      #     arrives in a diff, which is a PR event. The study's ablation
+      #     moved a textbook indirect injection from 0.9998 to 0.0038 by
+      #     changing only that block.
+      #   * `guard_calibration::corpus::` holds
+      #     `every_evasion_case_really_is_a_catalogue_miss`, which
+      #     catches a future CATALOGUE entry silently invalidating a
+      #     corpus case. That change arrives in someone ELSE's PR
+      #     touching `injection_guard.rs` — exactly the case a per-PR
+      #     gate must catch and an occasional operator run will not.
+      #
+      # The `guard` substring matches `cassandra::guard_model::` and
+      # `guard_calibration::` in one step.
+      - name: cargo test (core guard tier — prompt digest, corpus, report)
+        run: "cargo test -p kastellan-core --lib guard --locked"
+
+      # The adjudicator against a loopback mock. `--test` excludes
+      # `#[ignore]`d cases by default, so the live Shieldstral sweep in
+      # this file does not run here — same hermeticity argument as the
+      # `kastellan-worker-mail` step above.
+      - name: cargo test (core guard adjudicator e2e — loopback mock)
+        run: "cargo test -p kastellan-core --test guard_model_e2e --locked"
+
   # The Matrix worker's live SDK path (`workers/matrix/src/sdk_live.rs`) is
   # behind the optional `live-matrix` feature (`dep:matrix-sdk`). The `check`
   # job above builds the default `--workspace`, which deliberately excludes that

@@ -343,3 +343,26 @@ exists before that slice commits to D4.
    llama.cpp server on both hosts. Fail-open means an outage degrades silently to
    today's catalogue-only behaviour — correct, but it means the tier's absence needs to
    be observable, which is an audit question for the wiring slice.
+6. **The guard inherits the planner's 180 s request timeout, and that is four orders of
+   magnitude past its target latency.** `for_guard` copies `timeout` along with the rest
+   of the config, so a configured guard uses `KASTELLAN_LLM_TIMEOUT_MS` — default
+   `180_000`. That is right for a 26B planner generating a plan and wrong for a 3B
+   classifier decoding one token at a measured p50 of 30–43 ms.
+
+   Risk 5 models the endpoint being **down**, where `connect_timeout` (5 s) applies and
+   the failure is fast. This is the endpoint being **up but hung** — accepted connection,
+   no response — where nothing fires for three minutes. Under D4 the tier sits on nearly
+   every worker output, so that is a per-document stall on the dispatcher path, in the
+   same class as the per-call boot warning D1 rules out for being its own denial of
+   service.
+
+   **Deliberately not fixed in this slice, because fixing it means inventing a number.**
+   Open risk 1 says latency at realistic document sizes is unmeasured; a timeout chosen
+   before that measurement would be a guess wearing a constant's clothing, and this slice
+   ships no wiring for it to protect. The `for_guard` test that asserts
+   `guard.timeout == cfg.timeout` records the inheritance as *observed*, not as endorsed.
+
+   **The wiring slice owes a guard-specific bound** derived from the size sweep — a
+   `KASTELLAN_LLM_GUARD_TIMEOUT_MS` or an equivalent clamp in `for_guard`. Tracked as a
+   follow-up issue so it is not re-derived from scratch:
+   [#586](https://github.com/hherb/kastellan/issues/586).

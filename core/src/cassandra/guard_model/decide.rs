@@ -25,7 +25,11 @@ pub enum GuardAdjudication {
     Flagged,
     /// The model judged the document safe, below `tau`.
     Clear,
-    /// No probability could be derived. NOT a pass.
+    /// No usable probability. NOT a pass.
+    ///
+    /// Covers both doors: no verdict pair came back (`None`), and a
+    /// score came back that is not a number (non-finite). See
+    /// [`decide`].
     Unmeasured,
 }
 
@@ -44,10 +48,21 @@ pub enum GuardAdjudication {
 /// `p >= tau` flags. Inclusive on purpose: an exactly-at-threshold
 /// score is the ambiguous case, and the tier escalates up.
 ///
+/// **A non-finite `p` is `Unmeasured`, not `Clear`.** `NaN >= tau` is
+/// `false`, so without the explicit guard a `NaN` would fall through
+/// the flag arm into `Clear` — the same fail-open this enum exists to
+/// make unrepresentable, reached through the `Some` door instead of the
+/// `None` door. It is not reachable from the wire today (`serde_json`
+/// rejects an out-of-range float with `NumberOutOfRange` rather than
+/// decoding it to an infinity, so `binary_token_probability` cannot
+/// produce a `NaN`), but "unreachable" is a property of a dependency's
+/// parser, and this is a security control.
+///
 /// Pure.
 pub fn decide(p: Option<f32>, tau: f32) -> GuardAdjudication {
     match p {
         None => GuardAdjudication::Unmeasured,
+        Some(p) if !p.is_finite() => GuardAdjudication::Unmeasured,
         Some(p) if p >= tau => GuardAdjudication::Flagged,
         Some(_) => GuardAdjudication::Clear,
     }
@@ -83,8 +98,30 @@ mod tests {
         }
     }
 
+    /// A non-finite score must take the `Unmeasured` door, not fall
+    /// through the `>=` guard into `Clear`. Named for the door it must
+    /// NOT take: `NaN >= tau` is false at every `tau`, so the naive
+    /// three-arm match sends it to `Clear` — a fail-open reached
+    /// through `Some`.
     #[test]
-    fn default_tau_is_the_model_cards_default_and_is_not_a_fitted_threshold() {
+    fn a_non_finite_score_is_unmeasured_and_never_clear() {
+        for p in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for tau in [0.0, DEFAULT_TAU, 1.0] {
+                assert_eq!(
+                    decide(Some(p), tau),
+                    GuardAdjudication::Unmeasured,
+                    "p={p} tau={tau} must be Unmeasured, not a verdict"
+                );
+            }
+        }
+    }
+
+    /// Pins the VALUE only. That `DEFAULT_TAU` is not a fitted
+    /// threshold is a fact about how it was chosen and is not
+    /// assertable; it lives in the const's doc comment and in D9, not
+    /// in this test's name.
+    #[test]
+    fn default_tau_is_the_model_cards_default() {
         assert_eq!(DEFAULT_TAU, 0.5);
     }
 }

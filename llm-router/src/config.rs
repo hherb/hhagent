@@ -650,7 +650,18 @@ mod tests {
         assert_eq!(guard.local_url, "http://127.0.0.1:8080/v1");
         assert_eq!(guard.local_model, "shieldstral-1.0-3b-q8");
         assert_ne!(guard.local_url, planner_url, "must not be the planner endpoint");
-        assert_eq!(guard.timeout, cfg.timeout, "timeout is inherited");
+        // Pins the inheritance as OBSERVED, not as endorsed. 180 s is the
+        // planner's budget; the guard's measured p50 is 30-43 ms, and on
+        // the dispatcher hot path an endpoint that is up-but-hung would
+        // stall three minutes per document. Open risk 6 in the slice-1
+        // spec owns this; a guard-specific bound belongs with the wiring
+        // slice, where the size sweep will have produced a number to
+        // derive it from. Changing this line without changing that risk
+        // would hide the gap rather than close it.
+        assert_eq!(
+            guard.timeout, cfg.timeout,
+            "timeout is inherited (see slice-1 spec, open risk 6)"
+        );
         assert_eq!(
             guard.disable_thinking, cfg.disable_thinking,
             "thinking suppression is inherited: measured byte-identical on Shieldstral"

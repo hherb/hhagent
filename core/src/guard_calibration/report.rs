@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::cassandra::guard_model::{decide, GuardAdjudication};
 use crate::cassandra::injection_guard::BLOCK_THRESHOLD;
 use crate::guard_calibration::corpus::{Label, Provenance};
 
@@ -17,7 +18,13 @@ pub struct ScoredCase {
     pub provenance: Provenance,
     /// From the shipping `screen()`, computed at report time.
     pub catalogue_score: f32,
-    /// `None` means the call was unmeasurable — not a pass.
+    /// `None` means the guard produced no usable verdict — not a pass.
+    ///
+    /// Also `None` for a case the catalogue already blocks, which the
+    /// CLI never sends to the model at all. That overload is safe
+    /// because every consumer here (`confusion_at`, `best_tau`,
+    /// `render_distribution`) filters on [`ScoredCase::is_adjudicated`]
+    /// first, so an excluded case's `probability` is never read.
     pub probability: Option<f32>,
 }
 
@@ -43,9 +50,38 @@ pub struct Confusion {
 }
 
 impl Confusion {
-    /// A run is valid only if every adjudicated case produced a score.
+    /// A run is believable only if every adjudicated case produced a
+    /// score **and at least one case was adjudicated at all**.
+    ///
+    /// The second clause is not pedantry. `confusion_at` only ever
+    /// increments `unmeasured` for cases that pass `is_adjudicated`, so
+    /// a corpus the catalogue already blocks end to end yields
+    /// `unmeasured == 0` with all four cells at zero — a green signal
+    /// over a matrix that counted nothing. That is the same empty-pass
+    /// [`super::corpus::CorpusError::Empty`] exists to reject, one step
+    /// further along.
     pub fn is_valid(&self) -> bool {
-        self.unmeasured == 0
+        self.unmeasured == 0 && self.scored() > 0
+    }
+
+    /// Why [`Confusion::is_valid`] is false, as an operator-facing
+    /// clause. `None` when the run is believable.
+    ///
+    /// Separate from `is_valid` because the two causes need different
+    /// actions — fix the backend, versus fix the corpus — and a caller
+    /// printing one message for both sends an operator after the wrong
+    /// thing.
+    pub fn invalidity(&self) -> Option<&'static str> {
+        if self.unmeasured > 0 {
+            Some("unmeasured cases present")
+        } else if self.scored() == 0 {
+            Some(
+                "no adjudicated cases -- the catalogue already blocks every case \
+                 in the corpus, so the matrix counted nothing",
+            )
+        } else {
+            None
+        }
     }
 
     /// Scored cases in the four cells.
@@ -55,6 +91,14 @@ impl Confusion {
 }
 
 /// Count the cells at `tau`.
+///
+/// **Delegates to the shipping [`decide`]** rather than re-writing
+/// `p >= tau` inline. The two must not drift: this is the tool that
+/// chooses `tau` *for* the adjudicator, so a report that disagreed with
+/// the adjudicator about which side of `tau` a case falls on would be
+/// calibrating against a threshold nothing enforces. `decide`'s
+/// boundary is pinned by its own table, including the inclusive
+/// `p == tau` case and the non-finite door.
 pub fn confusion_at(cases: &[ScoredCase], tau: f32) -> Confusion {
     let mut c = Confusion::default();
     for case in cases {
@@ -62,12 +106,12 @@ pub fn confusion_at(cases: &[ScoredCase], tau: f32) -> Confusion {
             c.excluded_already_blocked += 1;
             continue;
         }
-        match (case.probability, case.label) {
-            (None, _) => c.unmeasured += 1,
-            (Some(p), Label::Attack) if p >= tau => c.true_positive += 1,
-            (Some(_), Label::Attack) => c.false_negative += 1,
-            (Some(p), Label::Benign) if p >= tau => c.false_positive += 1,
-            (Some(_), Label::Benign) => c.true_negative += 1,
+        match (decide(case.probability, tau), case.label) {
+            (GuardAdjudication::Unmeasured, _) => c.unmeasured += 1,
+            (GuardAdjudication::Flagged, Label::Attack) => c.true_positive += 1,
+            (GuardAdjudication::Clear, Label::Attack) => c.false_negative += 1,
+            (GuardAdjudication::Flagged, Label::Benign) => c.false_positive += 1,
+            (GuardAdjudication::Clear, Label::Benign) => c.true_negative += 1,
         }
     }
     c
@@ -111,7 +155,12 @@ pub fn best_tau(cases: &[ScoredCase]) -> Result<(f32, f32), NoTau> {
     let mut min_attack = f32::INFINITY;
     let mut max_benign = f32::NEG_INFINITY;
     for case in cases.iter().filter(|c| c.is_adjudicated()) {
-        let Some(p) = case.probability else {
+        // Non-finite is Unmeasured here too, matching `decide`. Left to
+        // `f32::min`/`max` it would be silently DISCARDED (both skip
+        // NaN), fitting a threshold over a smaller population than the
+        // one reported — the exact failure this function short-circuits
+        // to avoid.
+        let Some(p) = case.probability.filter(|p| p.is_finite()) else {
             return Err(NoTau::Unmeasured);
         };
         match case.label {
@@ -133,11 +182,42 @@ pub fn best_tau(cases: &[ScoredCase]) -> Result<(f32, f32), NoTau> {
     Ok((max_benign + margin / 2.0, margin))
 }
 
+/// What produced a report, recorded in its header.
+///
+/// **A saved report that does not say what produced it cannot be
+/// audited later**, and three of these four fields are things
+/// `RouterConfig::for_guard` and
+/// [`crate::cassandra::guard_model::policy`] spend paragraphs guarding
+/// at *config* time but which nothing records at *report* time:
+///
+/// - `endpoint` / `model` — `for_guard` prevents the *implicit* fall
+///   back to the planner endpoint. It cannot prevent an operator
+///   pointing `KASTELLAN_LLM_GUARD_URL` at the planner by hand, and
+///   without this field a report scored by the wrong model is
+///   indistinguishable from a good one.
+/// - `policy_digest` — the prompt is a tuned artefact whose reword
+///   "moves every score". A score set that a reword invalidates must
+///   record which prompt produced it.
+/// - `profile` — the catalogue exclusions in a report are
+///   profile-dependent, and the harness models `Strict` while
+///   `web-fetch`/`web-search` run `Relaxed`.
+#[derive(Debug, Clone)]
+pub struct RunMeta {
+    pub endpoint: String,
+    pub model: String,
+    pub policy_digest: String,
+    pub profile: &'static str,
+}
+
 /// Render the operator-facing report.
-pub fn format_report(cases: &[ScoredCase], tau: f32) -> String {
+pub fn format_report(cases: &[ScoredCase], tau: f32, meta: &RunMeta) -> String {
     let mut out = String::new();
     out.push_str("guard calibration report\n");
     out.push_str("========================\n\n");
+    out.push_str(&format!("endpoint:      {}\n", meta.endpoint));
+    out.push_str(&format!("model:         {}\n", meta.model));
+    out.push_str(&format!("policy digest: {}\n", meta.policy_digest));
+    out.push_str(&format!("guard profile: {}\n", meta.profile));
     out.push_str(&format!("cases loaded: {}\n", cases.len()));
     out.push_str(&render_section("ALL", cases, tau));
 
@@ -227,7 +307,12 @@ fn render_distribution(cases: &[ScoredCase]) -> String {
         if scores.is_empty() {
             continue;
         }
-        scores.sort_by(|a, b| a.partial_cmp(b).expect("probabilities are not NaN"));
+        // `total_cmp` rather than `partial_cmp().expect(..)`: a total
+        // order needs no NaN precondition, so this is the only sort in
+        // the module that cannot panic. Non-finite scores are already
+        // routed to `Unmeasured` upstream, so none reach here — but a
+        // panic in a report renderer is a poor way to learn otherwise.
+        scores.sort_by(|a, b| a.total_cmp(b));
         let rendered: Vec<String> = scores.iter().map(|p| format!("{p:.4}")).collect();
         out.push_str(&format!("  {name} scores ({}): {}\n", scores.len(), rendered.join(" ")));
     }
@@ -237,6 +322,18 @@ fn render_distribution(cases: &[ScoredCase]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in run header. The fields are asserted individually by
+    /// `the_report_header_records_what_produced_it`; every other test
+    /// only needs them present.
+    fn meta() -> RunMeta {
+        RunMeta {
+            endpoint: "http://127.0.0.1:8080/v1".to_string(),
+            model: "shieldstral-test".to_string(),
+            policy_digest: "342e3d9661b2cbe2".to_string(),
+            profile: "Strict",
+        }
+    }
 
     fn case(
         id: &str,
@@ -383,7 +480,7 @@ mod tests {
             case("h", Label::Attack, Provenance::HandWritten, 0.0, Some(0.9)),
             case("c", Label::Attack, Provenance::Captured, 0.0, Some(0.1)),
         ];
-        let out = format_report(&cases, 0.5);
+        let out = format_report(&cases, 0.5, &meta());
 
         assert!(out.contains("-- ALL --"));
         assert!(out.contains("PROVISIONAL"), "must say its tau is not fitted");
@@ -428,7 +525,7 @@ mod tests {
             case("b", Label::Attack, Provenance::DerivedFromCatalogue, 0.0, Some(0.8)),
         ];
         assert_eq!(best_tau(&cases), Err(NoTau::SingleClass(Label::Attack)));
-        let out = format_report(&cases, 0.5);
+        let out = format_report(&cases, 0.5, &meta());
         assert!(out.contains("only attack cases"), "{out}");
         assert!(!out.contains("classes overlap"), "must not blame overlap: {out}");
     }
@@ -445,8 +542,110 @@ mod tests {
             Some(0.9),
         )];
         assert_eq!(best_tau(&cases), Err(NoTau::Empty));
-        let out = format_report(&cases, 0.5);
+        let out = format_report(&cases, 0.5, &meta());
         assert!(out.contains("no adjudicated cases"), "{out}");
+    }
+
+    /// **`confusion_at` must agree with the shipping adjudicator at the
+    /// boundary.** It used to write `p >= tau` inline, twice, with no
+    /// boundary case in any test — so a `>=` -> `>` mutation there
+    /// survived, and the calibration tool would have disagreed with
+    /// `decide` about which side of tau a case falls on, in the one
+    /// tool whose purpose is to choose tau for `decide`.
+    #[test]
+    fn the_matrix_flags_an_exactly_at_tau_score_just_as_decide_does() {
+        let cases = vec![
+            case("a", Label::Attack, Provenance::HandWritten, 0.0, Some(0.50)),
+            case("b", Label::Benign, Provenance::HandWritten, 0.0, Some(0.50)),
+        ];
+        let c = confusion_at(&cases, 0.50);
+        assert_eq!(c.true_positive, 1, "p == tau must be a TP, not a FN");
+        assert_eq!(c.false_positive, 1, "p == tau must be a FP, not a TN");
+        assert_eq!((c.false_negative, c.true_negative), (0, 0));
+    }
+
+    /// A non-finite score takes the `Unmeasured` door in the matrix and
+    /// in the fit alike — never a silent false negative, and never
+    /// silently dropped from the population being fitted.
+    #[test]
+    fn a_non_finite_score_is_unmeasured_in_the_matrix_and_in_the_fit() {
+        let cases = vec![
+            case("a", Label::Attack, Provenance::HandWritten, 0.0, Some(0.90)),
+            case("b", Label::Benign, Provenance::HandWritten, 0.0, Some(f32::NAN)),
+        ];
+        let c = confusion_at(&cases, 0.5);
+        assert_eq!(c.unmeasured, 1, "NaN must not read as a verdict");
+        assert_eq!(c.true_negative, 0);
+        assert!(!c.is_valid());
+        assert_eq!(best_tau(&cases), Err(NoTau::Unmeasured));
+    }
+
+    /// **A run that adjudicated NOTHING is not a clean run.** Every
+    /// case excluded means `unmeasured == 0` with all four cells at
+    /// zero; without the `scored() > 0` clause that reads as valid and
+    /// the CLI exits 0 over a matrix that counted nothing.
+    #[test]
+    fn a_fully_excluded_run_is_invalid_not_a_clean_pass() {
+        let cases = vec![
+            case("x", Label::Attack, Provenance::HandWritten, 1.0, Some(0.9)),
+            case("y", Label::Benign, Provenance::HandWritten, 0.75, Some(0.1)),
+        ];
+        let c = confusion_at(&cases, 0.5);
+        assert_eq!(c.excluded_already_blocked, 2);
+        assert_eq!(c.unmeasured, 0, "nothing was adjudicated, so nothing was unmeasured");
+        assert_eq!(c.scored(), 0);
+        assert!(!c.is_valid(), "an empty matrix must not read as valid");
+        assert_eq!(
+            c.invalidity(),
+            Some(
+                "no adjudicated cases -- the catalogue already blocks every case \
+                 in the corpus, so the matrix counted nothing"
+            )
+        );
+    }
+
+    /// The two invalidity causes are distinguished, because they need
+    /// different actions: fix the backend, versus fix the corpus.
+    #[test]
+    fn invalidity_names_the_cause_and_is_none_for_a_good_run() {
+        let good = confusion_at(
+            &[case("a", Label::Attack, Provenance::HandWritten, 0.0, Some(0.9))],
+            0.5,
+        );
+        assert_eq!(good.invalidity(), None);
+
+        let unmeasured = confusion_at(
+            &[case("a", Label::Attack, Provenance::HandWritten, 0.0, None)],
+            0.5,
+        );
+        assert_eq!(unmeasured.invalidity(), Some("unmeasured cases present"));
+    }
+
+    /// The exact tie. `min_attack == max_benign` is margin 0.0, which
+    /// is genuinely unseparable — a `margin < 0.0` mutation would
+    /// report a fittable threshold with zero separation, i.e. "there is
+    /// a boundary" where there demonstrably is none.
+    #[test]
+    fn best_tau_treats_an_exact_tie_as_overlap() {
+        let cases = vec![
+            case("a", Label::Attack, Provenance::HandWritten, 0.0, Some(0.50)),
+            case("b", Label::Benign, Provenance::HandWritten, 0.0, Some(0.50)),
+        ];
+        assert_eq!(best_tau(&cases), Err(NoTau::Overlap), "margin 0.0 separates nothing");
+    }
+
+    /// A saved report must say what produced it, or it cannot be
+    /// audited afterwards — in particular it must name the ENDPOINT and
+    /// MODEL, since `for_guard` can only prevent the implicit fallback
+    /// to the planner, not an operator pointing the guard URL there.
+    #[test]
+    fn the_report_header_records_what_produced_it() {
+        let cases = vec![case("a", Label::Attack, Provenance::HandWritten, 0.0, Some(0.9))];
+        let out = format_report(&cases, 0.5, &meta());
+        assert!(out.contains("http://127.0.0.1:8080/v1"), "must name the endpoint: {out}");
+        assert!(out.contains("shieldstral-test"), "must name the model: {out}");
+        assert!(out.contains("342e3d9661b2cbe2"), "must name the policy digest: {out}");
+        assert!(out.contains("guard profile: Strict"), "must name the profile: {out}");
     }
 
     /// D8 asks for the score distribution alongside the matrix: a
@@ -461,7 +660,7 @@ mod tests {
             // Excluded, so it must NOT appear in the distribution.
             case("x", Label::Attack, Provenance::HandWritten, 1.0, Some(0.99)),
         ];
-        let out = format_report(&cases, 0.5);
+        let out = format_report(&cases, 0.5, &meta());
         assert!(out.contains("attack scores (2): 0.8000 0.9500"), "{out}");
         assert!(out.contains("benign scores (1): 0.0200"), "{out}");
         assert!(
@@ -485,7 +684,7 @@ mod tests {
             case("b", Label::Benign, Provenance::HandWritten, 0.0, None),
         ];
         assert_eq!(best_tau(&cases), Err(NoTau::Unmeasured));
-        let out = format_report(&cases, 0.5);
+        let out = format_report(&cases, 0.5, &meta());
         assert!(out.contains("an adjudicated case is unmeasured"), "{out}");
         assert!(!out.contains("classes overlap"), "must not blame overlap: {out}");
         assert!(out.contains("RUN INVALID"), "{out}");

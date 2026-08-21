@@ -83,11 +83,12 @@ fn default_corpus_dir() -> PathBuf {
 }
 
 async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
+    use kastellan_core::cassandra::guard_model::policy::policy_digest;
     use kastellan_core::cassandra::guard_model::GuardClient;
-    use kastellan_core::cassandra::injection_guard::screen;
+    use kastellan_core::cassandra::injection_guard::{screen, BLOCK_THRESHOLD};
     use kastellan_core::guard_calibration::corpus::load_corpus_from_dir;
     use kastellan_core::guard_calibration::report::{
-        confusion_at, format_report, ScoredCase,
+        confusion_at, format_report, RunMeta, ScoredCase,
     };
     use kastellan_llm_router::RouterConfig;
 
@@ -106,6 +107,10 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Captured before `from_config` consumes the config, so the report
+    // header can name the endpoint that actually produced the scores.
+    let guard_endpoint = cfg.guard_url.clone().unwrap_or_default();
+    let guard_model = cfg.guard_model.clone().unwrap_or_default();
     let client = match GuardClient::from_config(&cfg) {
         Ok(None) => {
             eprintln!(
@@ -132,14 +137,26 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
     let mut scored: Vec<ScoredCase> = Vec::with_capacity(cases.len());
     for case in &cases {
         let catalogue_score = screen(&case.text).score;
-        // Sequential on purpose: this is offline tooling against one
-        // local server, and a burst of concurrent requests would make
-        // any latency figure taken alongside it meaningless.
-        let probability = match client.probability(&case.text).await {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("guard calibrate: {} failed: {e}", case.id);
-                return ExitCode::from(1);
+        // Cases the catalogue already blocks are NOT sent to the model.
+        // The report excludes them, so the call could only ever be
+        // discarded — and D4's reason for not consulting the model
+        // above the threshold ("there is no verdict it could return
+        // that would change the outcome, so the call would be pure
+        // latency") applies to the harness exactly as it does to the
+        // wiring. It also keeps an error on a case that is never
+        // adjudicated from aborting the whole run.
+        let probability = if catalogue_score >= BLOCK_THRESHOLD {
+            None
+        } else {
+            // Sequential on purpose: this is offline tooling against one
+            // local server, and a burst of concurrent requests would make
+            // any latency figure taken alongside it meaningless.
+            match client.probability(&case.text).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("guard calibrate: {} failed: {e}", case.id);
+                    return ExitCode::from(1);
+                }
             }
         };
         scored.push(ScoredCase {
@@ -151,14 +168,27 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
         });
     }
 
-    print!("{}", format_report(&scored, tau));
-    // A run containing any unmeasured case is reported as INVALID, not
-    // as a slightly smaller sample — so the exit status has to say so
-    // too, or a CI caller would read the zero and move on.
-    if confusion_at(&scored, tau).is_valid() {
-        ExitCode::from(0)
-    } else {
-        eprintln!("guard calibrate: run INVALID (unmeasured cases present)");
-        ExitCode::from(1)
+    let meta = RunMeta {
+        endpoint: guard_endpoint,
+        model: guard_model,
+        policy_digest: policy_digest(),
+        // The harness models Strict only. Named rather than assumed:
+        // `GuardProfile::for_tool` returns Relaxed for the web tools, so
+        // production adjudicates some cases this report excludes.
+        profile: "Strict (web-fetch/web-search run Relaxed; not modelled here)",
+    };
+    print!("{}", format_report(&scored, tau, &meta));
+
+    // A run that is not believable must not exit 0, or a CI caller
+    // reads the zero and moves on. TWO causes, reported separately
+    // because they need different actions: an unmeasured case means fix
+    // the backend, an empty matrix means fix the corpus.
+    let confusion = confusion_at(&scored, tau);
+    match confusion.invalidity() {
+        None => ExitCode::from(0),
+        Some(reason) => {
+            eprintln!("guard calibrate: run INVALID ({reason})");
+            ExitCode::from(1)
+        }
     }
 }
