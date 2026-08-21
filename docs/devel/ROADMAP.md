@@ -479,7 +479,25 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   `Flagged -> Block | Clear -> Allow | Unmeasured -> Allow, audited`; escalate-up only. There is deliberately **no**
   `escalates() -> bool` helper — a caller consuming a bool structurally cannot audit the `Unmeasured` distinction it
   is required to audit. Reviewed by one whole-branch pass (0 Critical, 6 Important, 10 Minor) and a scoped re-review
-  verdicting every finding addressed.
+  verdicting every finding addressed, then a **second round (2026-08-21: 1 Critical, 5 Important, 7 Minor, all fixed
+  on-branch)**. The Critical generalises past this slice: `guard_model_e2e`'s mock read the request only far enough
+  to find `Content-Length` and then **discarded it** — it had copied the listener from
+  `llm-router/tests/local_backend_e2e.rs` but dropped the `oneshot` that returns the served body, which is the half
+  with the value. That left the adjudicator's whole request construction unpinned, and two mutations that silently
+  kill the tier in production kept all eight tests green: deleting `.with_logprobs(..)` (no distribution comes back
+  ⇒ every call `Unmeasured`) and swapping the tuned policy prompt for a naive one (measured moving an indirect
+  injection 0.9998 → **0.0038**). *A mock that does not return what it was sent tests only your own canned
+  response.* Also fixed: none of the new `core` tests ran in CI (two hermetic steps added — the corpus test catches
+  a catalogue change arriving in **someone else's** PR, which an operator run cannot); `guard calibrate` had no
+  tests at all, including the unmeasured→exit-1 line; a run that adjudicated **nothing** exited 0 (`invalidity()` is now the single
+  definition, naming which cause fired, with `is_valid()` delegating to it — a shape that came from
+  mutation-testing the fix, which showed the CLI e2e staying green under a revert of `is_valid` alone); `SYSTEM_PROMPT` had no drift guard
+  and its apparent test was tautological; a non-finite score read as `Clear` (`decide` now routes it to
+  `Unmeasured`, and `confusion_at` delegates to `decide` rather than re-writing `p >= tau`); and **the feasibility
+  study itself was never corrected** — it now carries a SUPERSEDED banner, since it is the document a later session
+  actually opens. The guard inheriting the planner's 180 s timeout (vs a 30–43 ms target) is recorded as open risk 6
+  and filed as [#586](https://github.com/hherb/kastellan/issues/586) rather than fixed here, because choosing a
+  bound before the size sweep would be inventing a number.
 
 - [x] **Model-based CASSANDRA guard tier — the study and its five measurements. RE-OPENED 2026-08-13: Mistral Shieldstral 1.0 3B
   is now the recommended pick over Granite Guardian**, see
