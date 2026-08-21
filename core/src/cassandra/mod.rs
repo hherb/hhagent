@@ -16,11 +16,18 @@
 pub mod constitutional;
 pub mod data_ceiling;
 pub mod deterministic;
+pub mod guard_model;
 pub mod injection_guard;
 pub mod plan_digest;
 pub mod review;
 pub mod types;
 
+// DEFAULT_TAU is deliberately NOT re-exported here. `cassandra::DEFAULT_TAU`
+// is an unqualified, production-sounding name for a value D9 says is
+// provisional and must never be promoted to a default; callers reach for
+// `cassandra::guard_model::DEFAULT_TAU`, where the module name carries
+// that caveat.
+pub use guard_model::{GuardAdjudication, GuardClient};
 pub use injection_guard::{
     extract_scannable_text, screen, screen_with_profile, GuardProfile, InjectionDecision,
     InjectionVerdict, BLOCK_THRESHOLD, RELAXED_CHAT_TEMPLATE_WEIGHT, SCAN_BYTE_CAP,

@@ -275,3 +275,149 @@ fn cli_relations_show_missing_id_exits_two() {
         "stderr must carry the show-usage line; got: {stderr}",
     );
 }
+
+/// `guard` mirrors the `observation` posture: the dispatcher validates
+/// its subcommand and every flag BEFORE `with_runtime`, so a typo
+/// exits 2 without spawning tokio worker threads or touching the
+/// network. Added with the guard-model slice, which introduced the
+/// dispatcher; this file is the contract every dispatcher rides on.
+#[test]
+fn cli_guard_unknown_subcommand_exits_two() {
+    let bin = cli_binary();
+    if !bin.exists() {
+        eprintln!(
+            "[SKIP] cli_guard_unknown_subcommand_exits_two: kastellan-cli binary not built at {}",
+            bin.display(),
+        );
+        return;
+    }
+
+    let out = Command::new(&bin)
+        .args(["guard", "frobnicate"])
+        .env_clear()
+        .envs(bad_args_env())
+        .output()
+        .expect("spawn cli guard frobnicate");
+
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "`guard frobnicate` must exit 2; got {:?}\nstderr={stderr}",
+        out.status,
+    );
+    assert!(
+        stderr.contains("guard: unknown subcommand"),
+        "stderr must carry the dispatcher-prefixed unknown-subcommand line; got: {stderr}",
+    );
+}
+
+/// Bare `guard` with no subcommand prints usage and exits 2.
+#[test]
+fn cli_guard_with_no_subcommand_exits_two_with_usage() {
+    let bin = cli_binary();
+    if !bin.exists() {
+        eprintln!(
+            "[SKIP] cli_guard_with_no_subcommand_exits_two_with_usage: kastellan-cli binary not built at {}",
+            bin.display(),
+        );
+        return;
+    }
+
+    let out = Command::new(&bin)
+        .args(["guard"])
+        .env_clear()
+        .envs(bad_args_env())
+        .output()
+        .expect("spawn cli guard");
+
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(stderr.contains("usage: kastellan-cli guard calibrate"), "got: {stderr}");
+}
+
+/// **Flag validation happens before the runtime AND before the corpus
+/// load**, so a bad `--tau` cannot be mistaken for a corpus problem.
+/// Both the out-of-range and the non-numeric spellings must be
+/// rejected: `"nan".parse::<f32>()` SUCCEEDS, and a NaN tau silently
+/// compares false against every score.
+#[test]
+fn cli_guard_calibrate_rejects_a_bad_tau_before_doing_anything() {
+    let bin = cli_binary();
+    if !bin.exists() {
+        eprintln!(
+            "[SKIP] cli_guard_calibrate_rejects_a_bad_tau_before_doing_anything: kastellan-cli binary not built at {}",
+            bin.display(),
+        );
+        return;
+    }
+
+    for tau in ["1.5", "-0.1", "banana", "nan", "inf"] {
+        let out = Command::new(&bin)
+            .args(["guard", "calibrate", "--tau", tau])
+            .env_clear()
+            .envs(bad_args_env())
+            .output()
+            .expect("spawn cli guard calibrate --tau");
+
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`--tau {tau}` must exit 2; got {:?}\nstderr={stderr}",
+            out.status,
+        );
+        assert!(
+            stderr.contains("--tau requires a float in [0.0, 1.0]"),
+            "`--tau {tau}` must name the constraint; got: {stderr}",
+        );
+    }
+}
+
+/// A flag missing its argument is a usage error, not a silent default.
+#[test]
+fn cli_guard_calibrate_rejects_a_dangling_corpus_flag() {
+    let bin = cli_binary();
+    if !bin.exists() {
+        eprintln!(
+            "[SKIP] cli_guard_calibrate_rejects_a_dangling_corpus_flag: kastellan-cli binary not built at {}",
+            bin.display(),
+        );
+        return;
+    }
+
+    let out = Command::new(&bin)
+        .args(["guard", "calibrate", "--corpus"])
+        .env_clear()
+        .envs(bad_args_env())
+        .output()
+        .expect("spawn cli guard calibrate --corpus");
+
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(stderr.contains("--corpus requires a DIR argument"), "got: {stderr}");
+}
+
+/// An unknown flag exits 2 rather than being ignored.
+#[test]
+fn cli_guard_calibrate_rejects_an_unknown_flag() {
+    let bin = cli_binary();
+    if !bin.exists() {
+        eprintln!(
+            "[SKIP] cli_guard_calibrate_rejects_an_unknown_flag: kastellan-cli binary not built at {}",
+            bin.display(),
+        );
+        return;
+    }
+
+    let out = Command::new(&bin)
+        .args(["guard", "calibrate", "--frobnicate"])
+        .env_clear()
+        .envs(bad_args_env())
+        .output()
+        .expect("spawn cli guard calibrate --frobnicate");
+
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(stderr.contains("guard calibrate: unknown flag"), "got: {stderr}");
+}

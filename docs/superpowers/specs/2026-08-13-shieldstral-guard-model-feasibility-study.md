@@ -5,6 +5,39 @@
 **Amended 2026-08-15:** the macOS runtime changed to oMLX, which serves no logprobs; the guard model moves to llama.cpp. See the amendment under [Cross-platform inference](#cross-platform-inference--the-one-thing-that-could-sink-it).
 **Measurement 1 RUN 2026-08-15 — PASS.** llama.cpp serves logprobs and multimodal on macOS; 14/14 at τ=0.5, margin +0.796, p50 40 ms. **The go/no-go is cleared.** Biggest finding is not the pass but that the **policy prompt is load-bearing** — the same weights scored 11/14 with a *negative* margin under a naively-worded `<Instruct>`. Harness: `scripts/eval/run-shieldstral-llamacpp.sh`.
 **Re-run on Q8_0 2026-08-16 — PASS, and the harness was repaired to make it honest.** The shipping quantisation is now **Q8_0 on llama.cpp on both hosts** (vLLM ruled out with reasons below); 14/14, margin **+0.8151**, p50 43 ms. Two defects in the wrapper were found and fixed on the way, both of the "a check that cannot fail" family — see [Measurement 1, Q8 leg](#measurement-1-q8-leg-2026-08-16). **Measurement 2 (`llm-router` plumbing) is DONE.**
+> ## ⚠️ SUPERSEDED IN TWO PLACES — read before building from this document
+>
+> **Amended 2026-08-21, when slice 1 was implemented.** Two of this study's
+> conclusions did not survive contact with the code. They are corrected in
+> [`2026-08-21-shieldstral-guard-slice-1-design.md`](2026-08-21-shieldstral-guard-slice-1-design.md)
+> (findings F1 and F2), and repeated here because **this** is the document a
+> later session reaches for.
+>
+> **F1 — the `0.45–0.70` adjudication band proposed below is very nearly empty,
+> and the tier must not be built on it.** Catalogue weights are only
+> `{0.40, 0.50, 0.75}` and `screen` *sums* them, so any two rules firing already
+> totals ≥ 0.80. The reachable score set is
+> `{0, 0.40, 0.50, 0.75, 0.80, 0.90, 1.0}`, and `[0.45, 0.70)` contains **exactly
+> one value — 0.50 — reachable by two of the twenty-two patterns**
+> (`"leak the api key"`, `"open a reverse shell"`) and only when nothing else
+> fires. Built as written, the tier would sit on the dispatcher hot path and
+> essentially never fire. The value this study actually argues for lives in the
+> **catalogue miss**, which scores 0.0, so the shipped design adjudicates
+> everything **below `BLOCK_THRESHOLD`** rather than a band. The weight structure
+> is now pinned by `sub_threshold_catalogue_scores_are_exactly_three_values`, so
+> a future reweighting fails loudly instead of silently invalidating this note.
+>
+> **F2 — `kastellan-cli observation replay` cannot be measurement 3's vehicle**,
+> though this study names it. It walks `CaptureJson.plans` through
+> `ChainReviewStage` — a *plan*-level tool scoring CASSANDRA principle violations
+> — while the injection guard adjudicates *document* text via
+> `extract_scannable_text`, and the fixtures in `tests/observation/captures/`
+> contain no screened documents at all. Slice 1 built a separate vehicle
+> (`kastellan-cli guard calibrate`) and left `observation replay` untouched.
+>
+> Everything else below — the model choice, the logprob mechanism, the
+> policy-prompt finding, the measurements — stands.
+
 **Question asked:** is Mistral's Shieldstral suitable for kastellan — specifically as a
 decision gate for *whether the more expensive CASSANDRA analysis is needed*, decided at
 high confidence?
@@ -196,6 +229,14 @@ catalogue score >= 0.70   -> Block            (deterministic, unchanged)
 catalogue score 0.45-0.70 -> Shieldstral adjudicates -> Allow | Block
 catalogue score <  0.45   -> Allow            (unchanged)
 ```
+
+> ⚠️ **This band is superseded — see finding F1 in the banner at the top of this
+> file.** `[0.45, 0.70)` holds exactly one reachable catalogue score (0.50), so as
+> written this tier would almost never fire. The shipped design adjudicates
+> everything below `BLOCK_THRESHOLD`, which is where the catalogue *misses*
+> (score 0.0) live — leetspeak, narrow visible whitespace, non-English phrasing
+> and novel wording, all of which are measured at exactly 0.0 by
+> `every_evasion_case_really_is_a_catalogue_miss`.
 
 Two things this must carry:
 

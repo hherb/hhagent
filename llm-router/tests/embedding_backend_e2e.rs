@@ -150,6 +150,8 @@ fn router_pointing_at(base_url: &str) -> Router {
         embedding_model: "embedding-test".into(),
         frontier_url: None,
         frontier_model: None,
+        guard_url: None,
+        guard_model: None,
         timeout: Duration::from_secs(2),
         disable_thinking: true,
     };

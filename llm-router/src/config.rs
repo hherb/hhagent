@@ -27,6 +27,8 @@
 //! | `KASTELLAN_LLM_EMBEDDING_MODEL` | Default model name passed to the embedding backend | `embedding-default` |
 //! | `KASTELLAN_LLM_FRONTIER_URL` | Base URL of the frontier backend | unset (frontier disabled) |
 //! | `KASTELLAN_LLM_FRONTIER_MODEL` | Default model on the frontier backend | unset |
+//! | `KASTELLAN_LLM_GUARD_URL` | Base URL of the model-based guard backend (Shieldstral) | unset (guard tier disabled) |
+//! | `KASTELLAN_LLM_GUARD_MODEL` | Default model on the guard backend | unset |
 //! | `KASTELLAN_LLM_TIMEOUT_MS` | Request timeout, milliseconds | 180_000 |
 //! | `KASTELLAN_LLM_DISABLE_THINKING` | Suppress the local model's thinking block | `1` (on) |
 //!
@@ -119,6 +121,19 @@ pub struct RouterConfig {
     /// set — the policy gate lands in Phase 5.
     pub frontier_url: Option<String>,
     pub frontier_model: Option<String>,
+    /// Base URL for the model-based guard tier (Shieldstral on
+    /// llama.cpp). `None` means the tier is unconfigured.
+    ///
+    /// **Never falls back to `local_url`.** That endpoint serves the
+    /// planner model, which would answer the guard's
+    /// `<Instruct>`/`<Query>` prompt with fluent prose rather than a
+    /// calibrated yes/no logit pair — producing a number that looks
+    /// exactly like a score and means nothing. Unconfigured yields an
+    /// explicit "unmeasured", never a probability.
+    pub guard_url: Option<String>,
+    /// Model name sent to [`RouterConfig::guard_url`]. `None` means
+    /// unconfigured; both must be set for the tier to be usable.
+    pub guard_model: Option<String>,
     pub timeout: Duration,
     /// Ask the local backend's chat template to suppress the model's
     /// thinking block on every chat completion (see
@@ -145,6 +160,8 @@ impl Default for RouterConfig {
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             frontier_url: None,
             frontier_model: None,
+            guard_url: None,
+            guard_model: None,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
             disable_thinking: true,
         }
@@ -179,6 +196,8 @@ impl RouterConfig {
         }
         cfg.frontier_url = read_env("KASTELLAN_LLM_FRONTIER_URL")?;
         cfg.frontier_model = read_env("KASTELLAN_LLM_FRONTIER_MODEL")?;
+        cfg.guard_url = read_env("KASTELLAN_LLM_GUARD_URL")?;
+        cfg.guard_model = read_env("KASTELLAN_LLM_GUARD_MODEL")?;
         if let Some(v) = read_env("KASTELLAN_LLM_TIMEOUT_MS")? {
             let ms: u64 = v.parse().map_err(|_| {
                 RouterError::Config(format!(
@@ -200,6 +219,53 @@ impl RouterConfig {
             };
         }
         Ok(cfg)
+    }
+
+    /// Derive a config that talks to the **guard** endpoint.
+    ///
+    /// `Router::dispatch_local` reads `local_url`, so "reach the guard"
+    /// is expressed as a config whose `local_url` *is* the guard's.
+    /// That keeps the dispatch path and the backend enum untouched.
+    ///
+    /// Three outcomes, and the middle one is the point:
+    ///
+    /// - `Ok(None)` — **neither** key set. The operator did not ask for a
+    ///   guard. Expected, not an error.
+    /// - `Err(..)` — **exactly one** key set. That is a misconfiguration,
+    ///   not an opt-out, and it must not be reported as one. A URL
+    ///   without a model would otherwise send `local_model` to a server
+    ///   that does not serve it, and the resulting 4xx reads as an
+    ///   outage; a model without a URL would silently do nothing at all.
+    /// - `Ok(Some(cfg))` — both set, guard reachable.
+    ///
+    /// **Why this is not `Option<RouterConfig>`.** It was, and the
+    /// half-configured case collapsed into `None` — indistinguishable
+    /// from a deliberate opt-out. On a host where `kastellan-cli install`
+    /// regenerates `kastellan.env` and has been observed dropping
+    /// hand-added keys, losing `KASTELLAN_LLM_GUARD_MODEL` while keeping
+    /// the URL would turn the security tier off behind a
+    /// correct-looking "guard unconfigured" log line.
+    ///
+    /// Pure — no I/O, no env read.
+    pub fn for_guard(&self) -> Result<Option<RouterConfig>, RouterError> {
+        match (self.guard_url.as_ref(), self.guard_model.as_ref()) {
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(RouterError::Config(
+                "KASTELLAN_LLM_GUARD_URL is set but KASTELLAN_LLM_GUARD_MODEL is not; \
+                 the guard tier needs both. This is a misconfiguration, not an opt-out."
+                    .to_string(),
+            )),
+            (None, Some(_)) => Err(RouterError::Config(
+                "KASTELLAN_LLM_GUARD_MODEL is set but KASTELLAN_LLM_GUARD_URL is not; \
+                 the guard tier needs both. This is a misconfiguration, not an opt-out."
+                    .to_string(),
+            )),
+            (Some(url), Some(model)) => Ok(Some(RouterConfig {
+                local_url: url.clone(),
+                local_model: model.clone(),
+                ..self.clone()
+            })),
+        }
     }
 }
 
@@ -276,6 +342,8 @@ mod tests {
             ("KASTELLAN_LLM_EMBEDDING_MODEL", None),
             ("KASTELLAN_LLM_FRONTIER_URL", None),
             ("KASTELLAN_LLM_FRONTIER_MODEL", None),
+            ("KASTELLAN_LLM_GUARD_URL", None),
+            ("KASTELLAN_LLM_GUARD_MODEL", None),
             ("KASTELLAN_LLM_TIMEOUT_MS", None),
             ("KASTELLAN_LLM_DISABLE_THINKING", None),
         ])
@@ -525,5 +593,110 @@ mod tests {
         let cfg = RouterConfig::from_env().expect("env parse");
         assert_eq!(cfg.local_url, "http://local:8080/v1");
         assert_eq!(cfg.embedding_url, "http://local:8080/v1");
+    }
+
+    #[test]
+    fn for_guard_is_ok_none_when_neither_key_is_set() {
+        let cfg = RouterConfig::default();
+        assert!(
+            matches!(cfg.for_guard(), Ok(None)),
+            "no guard keys at all is a deliberate opt-out, not an error"
+        );
+    }
+
+    /// A half-configured guard is a MISCONFIGURATION and must not
+    /// collapse into the same answer as "no guard wanted". An installer
+    /// that drops one of the two keys would otherwise turn the security
+    /// tier off behind a correct-looking "guard unconfigured" line.
+    #[test]
+    fn for_guard_errors_when_exactly_one_key_is_set() {
+        // Struct-update form rather than field reassignment, per
+        // clippy::field_reassign_with_default.
+        let url_only = RouterConfig {
+            guard_url: Some("http://127.0.0.1:8080/v1".to_string()),
+            ..Default::default()
+        };
+        let err = url_only.for_guard().expect_err("url without model must be an error");
+        assert!(
+            err.to_string().contains("KASTELLAN_LLM_GUARD_MODEL"),
+            "the error must name the MISSING key: {err}"
+        );
+
+        let model_only = RouterConfig {
+            guard_model: Some("shieldstral".to_string()),
+            ..Default::default()
+        };
+        let err = model_only.for_guard().expect_err("model without url must be an error");
+        assert!(
+            err.to_string().contains("KASTELLAN_LLM_GUARD_URL"),
+            "the error must name the MISSING key: {err}"
+        );
+    }
+
+    /// The whole point of the seam: a configured guard must NOT inherit
+    /// the planner's endpoint. That endpoint serves a different model,
+    /// which would answer the guard prompt with prose and yield a number
+    /// that looks exactly like a score and means nothing.
+    #[test]
+    fn for_guard_overrides_local_url_and_model_and_never_falls_back() {
+        let planner_url = RouterConfig::default().local_url;
+        let cfg = RouterConfig {
+            guard_url: Some("http://127.0.0.1:8080/v1".to_string()),
+            guard_model: Some("shieldstral-1.0-3b-q8".to_string()),
+            ..Default::default()
+        };
+
+        let guard = cfg.for_guard().expect("no misconfiguration").expect("configured");
+        assert_eq!(guard.local_url, "http://127.0.0.1:8080/v1");
+        assert_eq!(guard.local_model, "shieldstral-1.0-3b-q8");
+        assert_ne!(guard.local_url, planner_url, "must not be the planner endpoint");
+        // Pins the inheritance as OBSERVED, not as endorsed. 180 s is the
+        // planner's budget; the guard's measured p50 is 30-43 ms, and on
+        // the dispatcher hot path an endpoint that is up-but-hung would
+        // stall three minutes per document. Open risk 6 in the slice-1
+        // spec owns this; a guard-specific bound belongs with the wiring
+        // slice, where the size sweep will have produced a number to
+        // derive it from. Changing this line without changing that risk
+        // would hide the gap rather than close it.
+        assert_eq!(
+            guard.timeout, cfg.timeout,
+            "timeout is inherited (see slice-1 spec, open risk 6)"
+        );
+        assert_eq!(
+            guard.disable_thinking, cfg.disable_thinking,
+            "thinking suppression is inherited: measured byte-identical on Shieldstral"
+        );
+    }
+
+    #[test]
+    fn from_env_reads_guard_url_and_model() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _scope = EnvScope::new(&[
+            ("KASTELLAN_LLM_GUARD_URL", Some("http://127.0.0.1:8080/v1")),
+            ("KASTELLAN_LLM_GUARD_MODEL", Some("shieldstral-1.0-3b-q8")),
+        ]);
+        let cfg = RouterConfig::from_env().expect("valid");
+        assert_eq!(cfg.guard_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+        assert_eq!(cfg.guard_model.as_deref(), Some("shieldstral-1.0-3b-q8"));
+    }
+
+    /// Pins that an absent guard stays absent — i.e. nothing in
+    /// `from_env` invents a default guard endpoint out of `local_url`.
+    ///
+    /// **Deliberately narrow, and named for what it pins.** It cannot
+    /// fail on the two `read_env` lines themselves: `RouterConfig::default()`
+    /// already sets both to `None`, so deleting those lines leaves this
+    /// green. `from_env_reads_guard_url_and_model` is what covers the
+    /// reads.
+    #[test]
+    fn from_env_does_not_invent_a_guard_when_the_vars_are_absent() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _scope = EnvScope::new(&[
+            ("KASTELLAN_LLM_GUARD_URL", None),
+            ("KASTELLAN_LLM_GUARD_MODEL", None),
+        ]);
+        let cfg = RouterConfig::from_env().expect("valid");
+        assert!(cfg.guard_url.is_none());
+        assert!(cfg.guard_model.is_none());
     }
 }

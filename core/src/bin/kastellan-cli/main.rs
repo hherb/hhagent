@@ -65,6 +65,10 @@
 //!   `MAX_WALK_DEPTH` = 5). Read-only — uses the runtime pool, emits no
 //!   audit row. Quarantined endpoints are tagged `[Q]`.
 //!
+//! * `guard calibrate [--corpus DIR] [--tau F]` — score a labelled
+//!   document corpus through the shipping Shieldstral adjudicator and
+//!   print a confusion matrix. Offline tooling; needs
+//!   `KASTELLAN_LLM_GUARD_URL`/`_MODEL` set.
 //! * `observation replay [--captures-dir PATH] [--model SLUG]` — re-run
 //!   captured plans through the production review chain for offline
 //!   rule iteration.
@@ -143,6 +147,7 @@
 //!   Substrees live in [`relations_kinds`] and [`relations_show`].
 //! * [`relations_kinds`] — `relations kinds {add,remove,list}`.
 //! * [`relations_show`] — `relations show <entity-id> [--depth N] [--format plain|json]`.
+//! * [`guard_calibrate`] — `guard calibrate`.
 //! * [`observation_replay`] — `observation replay`.
 //! * [`secret`] — `secret {put,list,delete}`.
 //! * [`install`] — `install [flags]` / `uninstall [--purge]`.
@@ -156,6 +161,7 @@ mod audit_tail;
 mod entities;
 mod entities_kinds;
 mod entities_reembed;
+mod guard_calibrate;
 mod inbox;
 mod install;
 mod matrix;
@@ -187,6 +193,7 @@ fn main() -> ExitCode {
         "ask"         => ask::run_ask(&args[2..]),
         "tasks"       => tasks::run_tasks(&args[2..]),
         "inbox"       => inbox::run_inbox(&args[2..]),
+        "guard"       => guard_calibrate::run_guard(&args[2..]),
         "tools"       => tools_allowlist::run_tools(&args[2..]),
         "memory"      => memory_l1::run_memory(&args[2..]),
         "entities"    => entities::run_entities(&args[2..]),
@@ -243,6 +250,7 @@ usage:
     kastellan-cli relations kinds list
     kastellan-cli relations show         <entity-id> [--depth N] [--format plain|json]
     kastellan-cli observation replay     [--captures-dir PATH] [--model SLUG]
+    kastellan-cli guard calibrate        [--corpus DIR] [--tau F]
     kastellan-cli pair issue   [--label <text>] [--ttl-mins <n>]
     kastellan-cli pair list    [--all]
     kastellan-cli pair revoke  <channel> <peer>
