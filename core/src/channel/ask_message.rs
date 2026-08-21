@@ -55,8 +55,19 @@ pub const ACK_NOT_ANSWERABLE: &str =
 /// `screen_and_classify` and gets enqueued — writing a **live** approval
 /// token verbatim into `tasks.payload` (a durable column with no DELETE
 /// grant) and handing it to the planner as an instruction.
+///
+/// **`TOKEN`, not `<token>`, and that is load-bearing (#583).** Element
+/// parses an angle-bracketed placeholder as an unknown HTML tag and drops
+/// it from the sender's own timeline. An operator who copied the old hint
+/// literally sent a two-token command that parsed, resolved nothing, and
+/// came back as the deliberately vague [`ACK_NOT_ANSWERABLE`] — while
+/// their screen showed a one-token `/approve`, which by the documented
+/// design should have produced *this* sentence instead. The reply
+/// contradicted the message they could read back, and the real cause was
+/// invisible on both ends. Pinned by
+/// `the_usage_hint_carries_no_html_metasyntax`.
 pub const ACK_MALFORMED_COMMAND: &str =
-    "Usage: /approve <token> or /deny <token> \u{2014} exactly the verb and the token, \
+    "Usage: /approve TOKEN or /deny TOKEN \u{2014} exactly the verb and the token, \
      nothing else.";
 
 /// Where an ask is delivered: the channel, peer and conversation of the
@@ -543,6 +554,30 @@ mod tests {
     fn the_malformed_ack_names_no_part_of_the_body() {
         assert!(!ACK_MALFORMED_COMMAND.contains("tok9"));
         assert!(!ACK_MALFORMED_COMMAND.to_lowercase().contains("thanks"));
+    }
+
+    /// Element parses `<token>` as an unknown HTML tag and **drops it from
+    /// the sender's own timeline**, so an operator who transcribes this
+    /// hint literally sends `/approve <token>` — two tokens, so it parses,
+    /// so it resolves nothing, so they get the deliberately vague
+    /// [`ACK_NOT_ANSWERABLE`] while their own screen shows only
+    /// `/approve`. The reply contradicts the message they can read back,
+    /// and the cause is invisible on both ends (#583).
+    ///
+    /// A plain uppercase word survives HTML rendering intact and still
+    /// reads as a placeholder. Pinned here because the failure is
+    /// invisible from inside the process: every test passes, and only a
+    /// real client shows it.
+    #[test]
+    fn the_usage_hint_carries_no_html_metasyntax() {
+        assert!(
+            !ACK_MALFORMED_COMMAND.contains('<'),
+            "a `<...>` placeholder is eaten by Matrix clients: {ACK_MALFORMED_COMMAND}"
+        );
+        assert!(!ACK_MALFORMED_COMMAND.contains('>'));
+        // Still teaches both verbs, or it is not a usage hint any more.
+        assert!(ACK_MALFORMED_COMMAND.contains("/approve"));
+        assert!(ACK_MALFORMED_COMMAND.contains("/deny"));
     }
 
     /// The two vocabularies must agree: what the wire parser produces is
