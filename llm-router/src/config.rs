@@ -221,27 +221,51 @@ impl RouterConfig {
         Ok(cfg)
     }
 
-    /// Derive a config that talks to the **guard** endpoint, or `None`
-    /// when the tier is unconfigured.
+    /// Derive a config that talks to the **guard** endpoint.
     ///
     /// `Router::dispatch_local` reads `local_url`, so "reach the guard"
     /// is expressed as a config whose `local_url` *is* the guard's.
     /// That keeps the dispatch path and the backend enum untouched.
     ///
-    /// Requires **both** `guard_url` and `guard_model`: a URL without a
-    /// model would send `local_model` to a server that does not serve
-    /// it, and the resulting 4xx would read as an outage rather than as
-    /// the misconfiguration it is.
+    /// Three outcomes, and the middle one is the point:
+    ///
+    /// - `Ok(None)` — **neither** key set. The operator did not ask for a
+    ///   guard. Expected, not an error.
+    /// - `Err(..)` — **exactly one** key set. That is a misconfiguration,
+    ///   not an opt-out, and it must not be reported as one. A URL
+    ///   without a model would otherwise send `local_model` to a server
+    ///   that does not serve it, and the resulting 4xx reads as an
+    ///   outage; a model without a URL would silently do nothing at all.
+    /// - `Ok(Some(cfg))` — both set, guard reachable.
+    ///
+    /// **Why this is not `Option<RouterConfig>`.** It was, and the
+    /// half-configured case collapsed into `None` — indistinguishable
+    /// from a deliberate opt-out. On a host where `kastellan-cli install`
+    /// regenerates `kastellan.env` and has been observed dropping
+    /// hand-added keys, losing `KASTELLAN_LLM_GUARD_MODEL` while keeping
+    /// the URL would turn the security tier off behind a
+    /// correct-looking "guard unconfigured" log line.
     ///
     /// Pure — no I/O, no env read.
-    pub fn for_guard(&self) -> Option<RouterConfig> {
-        let url = self.guard_url.as_ref()?;
-        let model = self.guard_model.as_ref()?;
-        Some(RouterConfig {
-            local_url: url.clone(),
-            local_model: model.clone(),
-            ..self.clone()
-        })
+    pub fn for_guard(&self) -> Result<Option<RouterConfig>, RouterError> {
+        match (self.guard_url.as_ref(), self.guard_model.as_ref()) {
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(RouterError::Config(
+                "KASTELLAN_LLM_GUARD_URL is set but KASTELLAN_LLM_GUARD_MODEL is not; \
+                 the guard tier needs both. This is a misconfiguration, not an opt-out."
+                    .to_string(),
+            )),
+            (None, Some(_)) => Err(RouterError::Config(
+                "KASTELLAN_LLM_GUARD_MODEL is set but KASTELLAN_LLM_GUARD_URL is not; \
+                 the guard tier needs both. This is a misconfiguration, not an opt-out."
+                    .to_string(),
+            )),
+            (Some(url), Some(model)) => Ok(Some(RouterConfig {
+                local_url: url.clone(),
+                local_model: model.clone(),
+                ..self.clone()
+            })),
+        }
     }
 }
 
@@ -572,16 +596,41 @@ mod tests {
     }
 
     #[test]
-    fn for_guard_is_none_unless_both_url_and_model_are_set() {
-        let mut cfg = RouterConfig::default();
-        assert!(cfg.for_guard().is_none(), "unconfigured must yield None");
+    fn for_guard_is_ok_none_when_neither_key_is_set() {
+        let cfg = RouterConfig::default();
+        assert!(
+            matches!(cfg.for_guard(), Ok(None)),
+            "no guard keys at all is a deliberate opt-out, not an error"
+        );
+    }
 
-        cfg.guard_url = Some("http://127.0.0.1:8080/v1".to_string());
-        assert!(cfg.for_guard().is_none(), "url alone is not enough");
+    /// A half-configured guard is a MISCONFIGURATION and must not
+    /// collapse into the same answer as "no guard wanted". An installer
+    /// that drops one of the two keys would otherwise turn the security
+    /// tier off behind a correct-looking "guard unconfigured" line.
+    #[test]
+    fn for_guard_errors_when_exactly_one_key_is_set() {
+        // Struct-update form rather than field reassignment, per
+        // clippy::field_reassign_with_default.
+        let url_only = RouterConfig {
+            guard_url: Some("http://127.0.0.1:8080/v1".to_string()),
+            ..Default::default()
+        };
+        let err = url_only.for_guard().expect_err("url without model must be an error");
+        assert!(
+            err.to_string().contains("KASTELLAN_LLM_GUARD_MODEL"),
+            "the error must name the MISSING key: {err}"
+        );
 
-        cfg.guard_url = None;
-        cfg.guard_model = Some("shieldstral".to_string());
-        assert!(cfg.for_guard().is_none(), "model alone is not enough");
+        let model_only = RouterConfig {
+            guard_model: Some("shieldstral".to_string()),
+            ..Default::default()
+        };
+        let err = model_only.for_guard().expect_err("model without url must be an error");
+        assert!(
+            err.to_string().contains("KASTELLAN_LLM_GUARD_URL"),
+            "the error must name the MISSING key: {err}"
+        );
     }
 
     /// The whole point of the seam: a configured guard must NOT inherit
@@ -590,12 +639,14 @@ mod tests {
     /// that looks exactly like a score and means nothing.
     #[test]
     fn for_guard_overrides_local_url_and_model_and_never_falls_back() {
-        let mut cfg = RouterConfig::default();
-        let planner_url = cfg.local_url.clone();
-        cfg.guard_url = Some("http://127.0.0.1:8080/v1".to_string());
-        cfg.guard_model = Some("shieldstral-1.0-3b-q8".to_string());
+        let planner_url = RouterConfig::default().local_url;
+        let cfg = RouterConfig {
+            guard_url: Some("http://127.0.0.1:8080/v1".to_string()),
+            guard_model: Some("shieldstral-1.0-3b-q8".to_string()),
+            ..Default::default()
+        };
 
-        let guard = cfg.for_guard().expect("configured");
+        let guard = cfg.for_guard().expect("no misconfiguration").expect("configured");
         assert_eq!(guard.local_url, "http://127.0.0.1:8080/v1");
         assert_eq!(guard.local_model, "shieldstral-1.0-3b-q8");
         assert_ne!(guard.local_url, planner_url, "must not be the planner endpoint");
@@ -618,8 +669,16 @@ mod tests {
         assert_eq!(cfg.guard_model.as_deref(), Some("shieldstral-1.0-3b-q8"));
     }
 
+    /// Pins that an absent guard stays absent — i.e. nothing in
+    /// `from_env` invents a default guard endpoint out of `local_url`.
+    ///
+    /// **Deliberately narrow, and named for what it pins.** It cannot
+    /// fail on the two `read_env` lines themselves: `RouterConfig::default()`
+    /// already sets both to `None`, so deleting those lines leaves this
+    /// green. `from_env_reads_guard_url_and_model` is what covers the
+    /// reads.
     #[test]
-    fn from_env_leaves_guard_unset_when_absent() {
+    fn from_env_does_not_invent_a_guard_when_the_vars_are_absent() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _scope = EnvScope::new(&[
             ("KASTELLAN_LLM_GUARD_URL", None),

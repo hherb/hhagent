@@ -107,7 +107,7 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
         }
     };
     let client = match GuardClient::from_config(&cfg) {
-        None => {
+        Ok(None) => {
             eprintln!(
                 "guard calibrate: the guard tier is unconfigured.\n\
                  Set KASTELLAN_LLM_GUARD_URL and KASTELLAN_LLM_GUARD_MODEL to a\n\
@@ -117,11 +117,16 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
             );
             return ExitCode::from(2);
         }
-        Some(Err(e)) => {
-            eprintln!("guard calibrate: cannot build guard client: {e}");
-            return ExitCode::from(1);
+        // Covers both "only one of the two keys is set" and "the HTTP
+        // client could not be built". The first is the one worth
+        // separating from Ok(None): it is a misconfiguration, not an
+        // opt-out, and reporting it as "unconfigured" is how a security
+        // tier ends up silently off.
+        Err(e) => {
+            eprintln!("guard calibrate: guard tier is misconfigured: {e}");
+            return ExitCode::from(2);
         }
-        Some(Ok(c)) => c,
+        Ok(Some(c)) => c,
     };
 
     let mut scored: Vec<ScoredCase> = Vec::with_capacity(cases.len());

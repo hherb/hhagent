@@ -29,18 +29,15 @@ pub enum GuardAdjudication {
     Unmeasured,
 }
 
-impl GuardAdjudication {
-    /// True only for [`GuardAdjudication::Flagged`].
-    ///
-    /// The tier is escalate-up only: it may turn an `Allow` into a
-    /// `Block` and never the reverse, so this is the single predicate a
-    /// wiring site needs. `Unmeasured` deliberately answers `false`
-    /// here — fail-open — but the variant survives so the caller can
-    /// still audit the distinction.
-    pub fn escalates(self) -> bool {
-        matches!(self, GuardAdjudication::Flagged)
-    }
-}
+// NOTE: there is deliberately no `escalates() -> bool` helper here, and
+// adding one back would undo this module's whole point. Such a method
+// performs the three-into-two collapse *inside* the adjudicator and
+// then reads, at a call site, as the one predicate a wiring site needs
+// — which it is not. D4 requires `Unmeasured` to be Allowed **and
+// audited**, and a caller consuming only a `bool` structurally cannot
+// audit a distinction it has already erased. Wiring sites must `match`
+// all three variants, so the compiler forces the Unmeasured branch to
+// be written and therefore reviewed.
 
 /// Map a probability to an adjudication.
 ///
@@ -91,10 +88,5 @@ mod tests {
         assert_eq!(DEFAULT_TAU, 0.5);
     }
 
-    #[test]
-    fn flagged_is_the_only_variant_that_escalates() {
-        assert!(GuardAdjudication::Flagged.escalates());
-        assert!(!GuardAdjudication::Clear.escalates());
-        assert!(!GuardAdjudication::Unmeasured.escalates());
-    }
+
 }

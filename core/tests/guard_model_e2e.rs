@@ -1,9 +1,10 @@
 //! The guard adjudicator against a canned OpenAI-style backend.
 //!
-//! Five hermetic cases, one per outcome the wiring slice must handle: a
-//! flagged document, a clear one, a response carrying neither verdict
-//! spelling (=> `Unmeasured`, NOT a pass), a transport failure, and an
-//! unconfigured guard. Plus one `#[ignore]` live test.
+//! Hermetic cases, one per outcome the wiring slice must handle: a
+//! flagged document, a clear one, the two ways a 200 can be
+//! unmeasurable (neither verdict spelling; no `logprobs` block at all),
+//! a malformed body, a transport failure, an unconfigured guard and a
+//! half-configured one. Plus one `#[ignore]` live test.
 //!
 //! The mock is the same hand-rolled one-shot HTTP/1.1 listener that
 //! `llm-router/tests/local_backend_e2e.rs` uses — bind `127.0.0.1:0`,
@@ -135,8 +136,8 @@ fn header_content_length(headers: &str) -> Option<usize> {
 async fn a_confident_yes_flags() {
     let (url, _srv) = spawn_mock(200, canned(-0.01, -5.0)).await;
     let client = GuardClient::from_config(&guard_cfg(&url))
-        .expect("configured")
-        .expect("client builds");
+        .expect("not misconfigured")
+        .expect("configured");
     let got = client.adjudicate("some document", 0.5).await.expect("ok");
     assert_eq!(got, GuardAdjudication::Flagged);
 }
@@ -145,8 +146,8 @@ async fn a_confident_yes_flags() {
 async fn a_confident_no_is_clear() {
     let (url, _srv) = spawn_mock(200, canned(-5.0, -0.01)).await;
     let client = GuardClient::from_config(&guard_cfg(&url))
-        .expect("configured")
-        .expect("client builds");
+        .expect("not misconfigured")
+        .expect("configured");
     let got = client.adjudicate("some document", 0.5).await.expect("ok");
     assert_eq!(got, GuardAdjudication::Clear);
 }
@@ -172,8 +173,8 @@ async fn neither_verdict_spelling_is_unmeasured_not_clear() {
     .to_string();
     let (url, _srv) = spawn_mock(200, body).await;
     let client = GuardClient::from_config(&guard_cfg(&url))
-        .expect("configured")
-        .expect("client builds");
+        .expect("not misconfigured")
+        .expect("configured");
     let got = client.adjudicate("some document", 0.5).await.expect("ok");
     assert_eq!(
         got,
@@ -182,19 +183,82 @@ async fn neither_verdict_spelling_is_unmeasured_not_clear() {
     );
 }
 
+/// A 200 whose body carries NO `logprobs` block at all — the realistic
+/// shape when a backend silently ignores the `logprobs` parameter.
+///
+/// This reaches the OTHER `None` source in `probability`
+/// (`first_position_alternatives` returning `None`), which no other
+/// test exercises. It must be `Unmeasured`, not `Clear`.
+#[tokio::test]
+async fn a_response_with_no_logprobs_block_is_unmeasured() {
+    let body = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "yes"}
+        }]
+    })
+    .to_string();
+    let (url, _srv) = spawn_mock(200, body).await;
+    let client = GuardClient::from_config(&guard_cfg(&url))
+        .expect("not misconfigured")
+        .expect("configured");
+    let got = client.adjudicate("some document", 0.5).await.expect("ok");
+    assert_eq!(
+        got,
+        GuardAdjudication::Unmeasured,
+        "a backend ignoring the logprobs parameter must not read as safe"
+    );
+}
+
+/// A 200 carrying unparseable JSON surfaces as an error rather than a
+/// verdict.
+#[tokio::test]
+async fn a_malformed_200_body_surfaces_rather_than_deciding() {
+    let (url, _srv) = spawn_mock(200, "{ this is not json".to_string()).await;
+    let client = GuardClient::from_config(&guard_cfg(&url))
+        .expect("not misconfigured")
+        .expect("configured");
+    assert!(
+        client.adjudicate("some document", 0.5).await.is_err(),
+        "a malformed body is a transport-layer failure, not a Clear verdict"
+    );
+}
+
 #[tokio::test]
 async fn an_http_error_surfaces_rather_than_deciding() {
     let (url, _srv) = spawn_mock(500, "upstream exploded".to_string()).await;
     let client = GuardClient::from_config(&guard_cfg(&url))
-        .expect("configured")
-        .expect("client builds");
+        .expect("not misconfigured")
+        .expect("configured");
     let got = client.adjudicate("some document", 0.5).await;
     assert!(got.is_err(), "the adjudicator reports; it never decides to allow");
 }
 
 #[test]
-fn an_unconfigured_guard_yields_none() {
-    assert!(GuardClient::from_config(&RouterConfig::default()).is_none());
+fn an_unconfigured_guard_yields_ok_none() {
+    assert!(matches!(GuardClient::from_config(&RouterConfig::default()), Ok(None)));
+}
+
+/// A guard with a URL but no model is a MISCONFIGURATION, and must not
+/// be reported as "no guard wanted". An installer that regenerates the
+/// env file and drops one key would otherwise turn the tier off behind
+/// a correct-looking "unconfigured" line.
+#[test]
+fn a_half_configured_guard_is_an_error_not_unconfigured() {
+    let cfg = RouterConfig {
+        guard_url: Some("http://127.0.0.1:9/v1".to_string()),
+        ..Default::default()
+    };
+    // `match` rather than `expect_err`: that helper needs the Ok type to
+    // be Debug, and `GuardClient` holds a `Router`, which is not.
+    match GuardClient::from_config(&cfg) {
+        Err(e) => assert!(
+            e.to_string().contains("KASTELLAN_LLM_GUARD_MODEL"),
+            "must name the missing key: {e}"
+        ),
+        Ok(None) => panic!("half-configured must NOT report as unconfigured"),
+        Ok(Some(_)) => panic!("half-configured must not build a client"),
+    }
 }
 
 /// Live test against a real llama.cpp serving Shieldstral.
@@ -216,11 +280,14 @@ fn an_unconfigured_guard_yields_none() {
 #[ignore = "needs a live Shieldstral server; see the doc comment"]
 async fn live_shieldstral_size_sweep() {
     let cfg = RouterConfig::from_env().expect("router config");
-    let Some(built) = GuardClient::from_config(&cfg) else {
-        eprintln!("[SKIP] KASTELLAN_LLM_GUARD_URL / KASTELLAN_LLM_GUARD_MODEL unset");
-        return;
+    let client = match GuardClient::from_config(&cfg) {
+        Ok(None) => {
+            eprintln!("[SKIP] KASTELLAN_LLM_GUARD_URL / KASTELLAN_LLM_GUARD_MODEL unset");
+            return;
+        }
+        Err(e) => panic!("guard tier is misconfigured: {e}"),
+        Ok(Some(c)) => c,
     };
-    let client = built.expect("guard client builds");
 
     // A known attack must flag at every size and a known benign must
     // not: the sweep measures latency but must not stop checking
@@ -263,11 +330,22 @@ async fn live_shieldstral_size_sweep() {
                 "{name} at {kib} KiB was unmeasurable — the backend is not \
                  returning both verdict spellings"
             );
+            // BOTH directions are asserted. Checking only the attack
+            // row would pass against a backend that answers "yes" to
+            // everything — which live would block every worker output
+            // at 64 KiB, a total denial of the agent's own tooling,
+            // while still reporting a clean latency number.
             if want_flagged {
                 assert_eq!(
                     got,
                     GuardAdjudication::Flagged,
                     "a plain-English override at {kib} KiB must flag"
+                );
+            } else {
+                assert_eq!(
+                    got,
+                    GuardAdjudication::Clear,
+                    "benign filler at {kib} KiB must NOT flag"
                 );
             }
         }

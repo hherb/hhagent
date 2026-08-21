@@ -460,10 +460,15 @@ const _: () = assert!(RELAXED_CHAT_TEMPLATE_WEIGHT < 0.45);
 /// multi-rule sum blocks, so the only sub-threshold scores are 0.0 and
 /// the individual weights below the threshold.
 ///
+/// The name says *sub-threshold* because that is what the body checks.
+/// The full reachable set is seven values, but the three at or above
+/// the threshold (0.80/0.90/1.0) are not enumerated here — they are
+/// irrelevant to F1, which is about which scores still reach the tier.
+///
 /// Note the band is not *empty* — 0.50 is in it — so a test asserting
 /// emptiness would be false. What this asserts is the reachable set.
 #[test]
-fn reachable_catalogue_scores_are_exactly_seven_values() {
+fn sub_threshold_catalogue_scores_are_exactly_three_values() {
     let mut weights: Vec<f32> = CATALOGUE.iter().map(|r| r.weight).collect();
     weights.sort_by(|a, b| a.partial_cmp(b).expect("no NaN weights"));
     weights.dedup();

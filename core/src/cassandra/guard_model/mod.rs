@@ -36,17 +36,20 @@ pub struct GuardClient {
 }
 
 impl GuardClient {
-    /// Build a guard client, or `None` when the tier is unconfigured.
+    /// Build a guard client.
     ///
-    /// The nested `Option<Result<..>>` separates two different facts:
-    /// `None` means the operator has not configured a guard (expected,
-    /// not an error), while `Some(Err(..))` means they did and the
-    /// client could not be built (a real misconfiguration). Flattening
-    /// them would make an unconfigured guard indistinguishable from a
-    /// broken one.
-    pub fn from_config(cfg: &RouterConfig) -> Option<Result<Self, RouterError>> {
-        let guard_cfg = cfg.for_guard()?;
-        Some(Router::new(guard_cfg).map(|router| Self { router }))
+    /// `Ok(None)` means the operator configured no guard — expected, not
+    /// an error. `Err(..)` means they configured one and it is not
+    /// usable: either only one of the two keys is set (a
+    /// misconfiguration, see [`RouterConfig::for_guard`]) or the HTTP
+    /// client could not be built. Collapsing those into one `None` would
+    /// make an unconfigured guard indistinguishable from a broken one,
+    /// which is how a security tier ends up silently off.
+    pub fn from_config(cfg: &RouterConfig) -> Result<Option<Self>, RouterError> {
+        match cfg.for_guard()? {
+            None => Ok(None),
+            Some(guard_cfg) => Router::new(guard_cfg).map(|router| Some(Self { router })),
+        }
     }
 
     /// The raw probability that the document is unsafe, before any
