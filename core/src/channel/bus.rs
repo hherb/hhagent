@@ -362,7 +362,11 @@ pub async fn handle_inbound(
                 events
                     .audit(
                         actions::ASK_ANSWER_REJECTED,
-                        serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
+                        serde_json::json!({
+                            "channel": msg.channel.0,
+                            "peer": msg.peer.0,
+                            "reason": actions::ASK_REASON_UNRESOLVABLE,
+                        }),
                     )
                     .await;
                 super::ask_message::ACK_NOT_ANSWERABLE.to_string()
@@ -376,24 +380,25 @@ pub async fn handle_inbound(
         }
     }
 
-    if super::ask_message::looks_like_ask_command(&msg.body) {
-        // Looks like an attempted answer but did not parse (extra words, a
-        // missing token, a quoted reply echoing the ask's own command
-        // lines). Must NOT fall through to `screen_and_classify`: the body
-        // can still carry a live approval token, and enqueueing it would
-        // write that token verbatim into `tasks.payload` — a durable
-        // column with no DELETE grant — and hand it to the planner as an
-        // instruction. This is the failure the whole ordering exists to
-        // prevent, arriving through the parser's strictness instead of
-        // through authorization.
-        //
-        // Deliberately OUTSIDE the `if let Some(wiring)` above: containment
-        // is a property of the inbound path, not of this bus's
-        // configuration. See the ordering doc on `handle_inbound`.
+    // Arms 2 and 3 (#582, spec D4). Containment first, so a live token in
+    // a malformed command audits the security-relevant cause; both arms
+    // return the same ack, so the peer cannot tell them apart.
+    //
+    // Deliberately OUTSIDE the `if let Some(wiring)` above: containment is
+    // a property of the inbound path, not of this bus's configuration. See
+    // the ordering doc on `handle_inbound`.
+    let refusal = containment_refusal(msg, asks).await.or_else(|| {
+        super::ask_message::is_command_shaped(&msg.body).then_some(actions::ASK_REASON_MALFORMED)
+    });
+    if let Some(reason) = refusal {
         events
             .audit(
                 actions::ASK_ANSWER_REJECTED,
-                serde_json::json!({"channel": msg.channel.0, "peer": msg.peer.0}),
+                serde_json::json!({
+                    "channel": msg.channel.0,
+                    "peer": msg.peer.0,
+                    "reason": reason,
+                }),
             )
             .await;
         return Some(OutgoingMessage {
@@ -432,6 +437,61 @@ pub async fn handle_inbound(
         }
     }
     None
+}
+
+/// The containment arm (#582, spec D5): may this body be enqueued, or does
+/// it carry a live approval token?
+///
+/// `Some(reason)` refuses; `None` means the question was asked and the
+/// answer was no. Enqueueing a live token writes it verbatim into
+/// `tasks.payload` — a durable column with no DELETE grant — and hands it
+/// to the planner as an instruction.
+///
+/// **Exact, where the old guard was a shape guess.** A quoted reply, a
+/// leading mention pill and prose around a command each carried a live
+/// token past the first version of that guess; widening it a third time
+/// only trades a false negative for a bigger false positive. This asks the
+/// real question instead, so it catches shapes nobody has thought of yet —
+/// and its complement is what lets `is_command_shaped` narrow back to the
+/// UX job it is actually good at.
+///
+/// **Three fail-closed edges** (spec D7), all reported as `unscannable`
+/// because all three mean *we could not answer*, not *we judged the
+/// syntax*: no resolver wired, more distinct tokens than the cap, and a
+/// resolver error. The last is why `any_live_nonce` returns a `Result` —
+/// `Ok(false)` enqueues and `Err` refuses, so collapsing the two into a
+/// bool would silently pick the wrong arm on every database hiccup.
+async fn containment_refusal(
+    msg: &IncomingMessage,
+    asks: Option<&AskWiring>,
+) -> Option<&'static str> {
+    // The cheap, DB-free gate (spec D3): ordinary traffic never reaches
+    // Postgres, which is what makes the exact check affordable.
+    if !super::ask_message::looks_like_ask_command(&msg.body) {
+        return None;
+    }
+    // NOT `asks?` and NOT `candidate_tokens(..)?`. Both would propagate
+    // `None`, and `None` here means ENQUEUE — the fail-open this arm
+    // exists to prevent, wearing idiomatic Rust. Written out so the
+    // refusing branch cannot be mistaken for shorthand.
+    let Some(wiring) = asks else {
+        return Some(actions::ASK_REASON_UNSCANNABLE);
+    };
+    let Some(tokens) = super::ask_message::candidate_tokens(&msg.body) else {
+        return Some(actions::ASK_REASON_UNSCANNABLE);
+    };
+    let nonces: Vec<_> = tokens.into_iter().map(kastellan_db::asks::Nonce::from_wire).collect();
+    let claimant = kastellan_db::asks::Claimant::new(msg.channel.0.clone(), msg.peer.0.clone());
+    match wiring.resolver.any_live_nonce(&nonces, &claimant).await {
+        Ok(true) => Some(actions::ASK_REASON_CARRIES_LIVE_TOKEN),
+        Ok(false) => None,
+        Err(e) => {
+            // Logged, never audited: `DbError` renders query context, and
+            // a durable operator-queried row is the wrong place for it.
+            warn!(error = %e, "ask containment check failed; refusing");
+            Some(actions::ASK_REASON_UNSCANNABLE)
+        }
+    }
 }
 
 /// Handle one completed-task id on the outbound side: load it, route it (pure),

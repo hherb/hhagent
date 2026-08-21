@@ -785,18 +785,23 @@ async fn without_wiring_a_command_is_still_kept_out_of_the_queue() {
     assert_eq!(ev.audited.lock().unwrap()[0].0, actions::ASK_ANSWER_REJECTED);
 }
 
-/// The widened recogniser closes the shapes a person actually sends. A
-/// quoted reply — Element's rich-reply fallback quotes the rendered ask
+/// A quoted reply — Element's rich-reply fallback quotes the rendered ask
 /// including both of its command lines — must be intercepted, not
 /// enqueued, because it carries a live token verbatim.
 ///
-/// This is the same defect the leading-token check was written for, through
-/// the door that check left open; it is pinned at the bus rather than only
-/// on the recogniser so the containment arm, not just the predicate, is
-/// what the assertion measures.
+/// **Updated by #582, and the update is the point.** This test's fake
+/// resolver used to report *no* live nonce, because what refused the body
+/// then was a shape guess that never asked. Its own doc always claimed the
+/// body "carries a live token", so the fake was the half that was wrong —
+/// the token is now live in the fake's world too, and the assertion is on
+/// the containment arm's reason rather than merely on the ack. Which makes
+/// it a stronger test than before: it now fails if containment stops
+/// looking, where previously it passed on a guess.
 #[tokio::test]
 async fn a_quoted_reply_echoing_the_ask_is_never_enqueued() {
-    let resolver = Arc::new(RecordingResolver::default());
+    let mut r = RecordingResolver::default();
+    r.live_nonces.insert("7f3a9c2e1b".to_string());
+    let resolver = Arc::new(r);
     let ev = FakeEvents::default();
     let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
     let body = "> <@kastellan:srv> \u{26a0} Approval needed \u{2014} task 412\n\
@@ -807,6 +812,11 @@ async fn a_quoted_reply_echoing_the_ask_is_never_enqueued() {
 
     assert_eq!(ack.body, crate::channel::ask_message::ACK_MALFORMED_COMMAND);
     assert!(ev.enqueued.lock().unwrap().is_empty(), "a live token must never be enqueued");
+    assert_eq!(
+        ev.audited.lock().unwrap()[0].1["reason"],
+        actions::ASK_REASON_CARRIES_LIVE_TOKEN,
+        "the containment arm, not the shape guess, is what refused this",
+    );
     assert!(resolver.calls.lock().unwrap().is_empty(), "an unparseable body resolves nothing");
 }
 
@@ -948,4 +958,189 @@ async fn a_resolver_error_is_acknowledged_identically_to_a_refusal() {
     let rendered = audited[0].1.to_string();
     assert!(!rendered.contains("simulated db outage"), "the audit row must not carry the error text");
     assert!(!rendered.contains("tok9"), "the audit row must not carry the token");
+}
+
+// ---------------------------------------------------------------------
+// #582 / #584 — the four ask-recognition arms and their audit reasons.
+// Spec: docs/superpowers/specs/2026-08-21-ask-recognition-design.md
+// ---------------------------------------------------------------------
+
+/// #582's point, and the test that fails before the split: an ordinary
+/// instruction that merely MENTIONS a verb carries no live token, so it is
+/// a task, not an answer. Before this it was refused with the usage ack —
+/// and on email that refusal is dropped unsent, so the message vanished.
+#[tokio::test]
+async fn an_ordinary_message_mentioning_a_verb_is_enqueued() {
+    let resolver = Arc::new(RecordingResolver::default()); // no live nonces
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let out = handle_inbound(
+        &auth,
+        None,
+        Some(&*wiring(resolver)),
+        &ev,
+        &msg("@me:srv", "should I /approve the PR?"),
+    )
+    .await;
+
+    assert!(out.is_none(), "an enqueued message gets no ack");
+    assert_eq!(ev.enqueued.lock().unwrap().len(), 1, "must become a task");
+    assert!(
+        !ev.audited.lock().unwrap().iter().any(|(a, _)| a == actions::ASK_ANSWER_REJECTED),
+        "no rejection row: nothing was rejected",
+    );
+}
+
+/// The containment arm, catching a shape the narrow check cannot see.
+/// Hitting *reply* is the most natural way to answer an ask, and Element's
+/// rich-reply fallback quotes the rendered ask INCLUDING both command
+/// lines — so the live token is in the body while the first token is `>`.
+#[tokio::test]
+async fn a_quoted_reply_carrying_a_live_token_is_contained() {
+    let mut r = RecordingResolver::default();
+    r.live_nonces.insert("7f3a9c2e1b".to_string());
+    let resolver = Arc::new(r);
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+
+    let ack = handle_inbound(
+        &auth,
+        None,
+        Some(&*wiring(resolver.clone())),
+        &ev,
+        &msg("@me:srv", "> Approval needed\n> /approve 7f3a9c2e1b\nyes please"),
+    )
+    .await
+    .expect("a refusal is acknowledged");
+
+    assert_eq!(ack.body, crate::channel::ask_message::ACK_MALFORMED_COMMAND);
+    assert!(
+        ev.enqueued.lock().unwrap().is_empty(),
+        "a live token must never reach tasks.payload",
+    );
+    let audited = ev.audited.lock().unwrap();
+    assert_eq!(audited[0].0, actions::ASK_ANSWER_REJECTED);
+    assert_eq!(audited[0].1["reason"], actions::ASK_REASON_CARRIES_LIVE_TOKEN);
+    // It hashed the body's OWN tokens — not, say, only the first one.
+    let asked = &resolver.nonce_queries.lock().unwrap()[0];
+    assert!(asked.iter().any(|t| t == "7f3a9c2e1b"), "asked about: {asked:?}");
+}
+
+/// The UX arm. `/deny` alone is the second message of the 2026-08-20 live
+/// test against the deployed bot, and it is exactly the body a pure
+/// exact-nonce check would have enqueued silently (spec D2) — leaving the
+/// operator believing they answered while the task sat suspended.
+#[tokio::test]
+async fn a_typed_command_with_no_token_gets_the_usage_hint() {
+    let resolver = Arc::new(RecordingResolver::default()); // no live nonces
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let ack = handle_inbound(&auth, None, Some(&*wiring(resolver)), &ev, &msg("@me:srv", "/deny"))
+        .await
+        .expect("a refusal is acknowledged");
+
+    assert_eq!(ack.body, crate::channel::ask_message::ACK_MALFORMED_COMMAND);
+    assert!(ev.enqueued.lock().unwrap().is_empty(), "a fumbled command must not become a task");
+    assert_eq!(ev.audited.lock().unwrap()[0].1["reason"], actions::ASK_REASON_MALFORMED);
+}
+
+/// Containment precedes the hint, so a live token in a malformed command
+/// audits the security-relevant cause. Both arms give the same ack; only
+/// the row differs, and `carries_live_token` is the only row that ever
+/// shows the containment guard doing its job.
+#[tokio::test]
+async fn containment_outranks_the_usage_hint() {
+    let mut r = RecordingResolver::default();
+    r.live_nonces.insert("tok9".to_string());
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    handle_inbound(
+        &auth,
+        None,
+        Some(&*wiring(Arc::new(r))),
+        &ev,
+        &msg("@me:srv", "/approve tok9 thanks!"),
+    )
+    .await;
+
+    assert_eq!(ev.audited.lock().unwrap()[0].1["reason"], actions::ASK_REASON_CARRIES_LIVE_TOKEN);
+}
+
+/// Fail closed on a question we could not answer (spec D7). `Ok(false)`
+/// and `Err` take OPPOSITE arms, which is why the trait returns a `Result`.
+#[tokio::test]
+async fn a_failed_containment_check_refuses_rather_than_enqueues() {
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let w = AskWiring {
+        outbox: Arc::new(ChannelOutbox::new()),
+        resolver: Arc::new(FailingResolver),
+    };
+    let ack = handle_inbound(&auth, None, Some(&w), &ev, &msg("@me:srv", "please /approve this"))
+        .await
+        .expect("a refusal is acknowledged");
+
+    assert_eq!(ack.body, crate::channel::ask_message::ACK_MALFORMED_COMMAND);
+    assert!(
+        ev.enqueued.lock().unwrap().is_empty(),
+        "an unanswered containment question must never enqueue",
+    );
+    assert_eq!(ev.audited.lock().unwrap()[0].1["reason"], actions::ASK_REASON_UNSCANNABLE);
+}
+
+/// Over the candidate cap, same posture, same reason — and the database is
+/// never asked, since not asking it is the whole point of the cap.
+#[tokio::test]
+async fn a_body_over_the_candidate_cap_refuses() {
+    use crate::channel::ask_message::CANDIDATE_TOKEN_CAP;
+    let body = format!(
+        "/approve {}",
+        (0..CANDIDATE_TOKEN_CAP + 1).map(|i| format!("t{i}")).collect::<Vec<_>>().join(" ")
+    );
+    let resolver = Arc::new(RecordingResolver::default());
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    handle_inbound(&auth, None, Some(&*wiring(resolver.clone())), &ev, &msg("@me:srv", &body))
+        .await;
+
+    assert!(ev.enqueued.lock().unwrap().is_empty());
+    assert_eq!(ev.audited.lock().unwrap()[0].1["reason"], actions::ASK_REASON_UNSCANNABLE);
+    assert!(resolver.nonce_queries.lock().unwrap().is_empty(), "must not query over cap");
+}
+
+/// D7's no-wiring fallback: containment cannot be answered without a
+/// resolver, so the broad predicate alone decides and the row says
+/// `unscannable` — NOT `malformed`, which would claim a syntax judgement
+/// nothing made (this body is not even verb-first).
+#[tokio::test]
+async fn an_unwired_bus_still_refuses_on_the_broad_predicate() {
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let ack = handle_inbound(&auth, None, None, &ev, &msg("@me:srv", "> /approve 7f3a9c2e1b"))
+        .await
+        .expect("a refusal is acknowledged");
+
+    assert_eq!(ack.body, crate::channel::ask_message::ACK_MALFORMED_COMMAND);
+    assert!(ev.enqueued.lock().unwrap().is_empty());
+    assert_eq!(ev.audited.lock().unwrap()[0].1["reason"], actions::ASK_REASON_UNSCANNABLE);
+}
+
+/// Arm 1 keeps its deliberate collapse and gains only the field.
+#[tokio::test]
+async fn an_unresolvable_answer_says_so_without_saying_why() {
+    let resolver = Arc::new(RecordingResolver::default()); // reply: None
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    let ack = handle_inbound(
+        &auth,
+        None,
+        Some(&*wiring(resolver)),
+        &ev,
+        &msg("@me:srv", "/approve 7f3a9c2e1b"),
+    )
+    .await
+    .expect("a refusal is acknowledged");
+
+    assert_eq!(ack.body, crate::channel::ask_message::ACK_NOT_ANSWERABLE);
+    assert_eq!(ev.audited.lock().unwrap()[0].1["reason"], actions::ASK_REASON_UNRESOLVABLE);
 }

@@ -220,16 +220,65 @@ pub mod actions {
     ///    because an error path that looks different to the peer is the
     ///    existence oracle the refusal path refuses to be.
     ///
-    /// **Deliberately does not say which.** Within (1) alone, wrong token,
-    /// already answered, past its deadline and "not this peer's ask" are
-    /// one outcome by construction (`db::asks::resolve_with_nonce`),
-    /// because splitting them hands a token-guessing peer an existence
-    /// oracle. Splitting *these three* is a durable payload-shape change
-    /// and is deferred to a later slice, so a reader counting rows today
-    /// must not assume they are all case (1). What the row is for is
-    /// counting: repeated rejections from a paired peer are a signal even
-    /// when no single one is.
+    /// **Which arm refused IS now recorded**, in the payload's `reason`
+    /// (#584) — see [`ASK_REASON_UNRESOLVABLE`] and its three siblings.
+    /// Before that field existed every producer wrote an identical
+    /// payload, and the row could not answer the one question anyone
+    /// asked of it: diagnosing #583 needed `strings` on the deployed
+    /// binary plus a second hand-run experiment in Element.
+    ///
+    /// **What stays collapsed, deliberately.** Within
+    /// [`ASK_REASON_UNRESOLVABLE`], a wrong token, an already-answered
+    /// ask, one past its deadline, "not this peer's ask", and a resolver
+    /// `Err` are ONE outcome by construction
+    /// (`db::asks::resolve_with_nonce`). Splitting them hands a
+    /// token-guessing peer an existence oracle over ask ids, and an error
+    /// path that looks different to the peer is that same oracle by
+    /// another door. **Do not add a fifth value to separate them.**
+    ///
+    /// What the row is for is still counting: repeated rejections from a
+    /// paired peer are a signal even when no single one is — and the
+    /// `reason` is what keeps that signal from being diluted by ordinary
+    /// syntax errors.
     pub const ASK_ANSWER_REJECTED: &str = "channel.ask_answer_rejected";
+
+    /// Why an answer was refused: a **closed** four-value vocabulary on
+    /// [`ASK_ANSWER_REJECTED`] (#584).
+    ///
+    /// **One action with a field, not four actions** — observation SQL
+    /// grouping on `action` must keep seeing one population by default.
+    ///
+    /// **The field leaks nothing.** The row lands in `audit_log`, which is
+    /// role-gated and operator-queried; the peer sees only the ack body,
+    /// and the containment and malformed arms deliberately share one ack
+    /// so the peer cannot tell them apart.
+    ///
+    /// This value: the body parsed as a command, and the resolver returned
+    /// `Ok(None)` or `Err`. The two are collapsed on purpose — see above.
+    pub const ASK_REASON_UNRESOLVABLE: &str = "unresolvable";
+
+    /// A token in the body is a live nonce of one of this peer's own asks,
+    /// so the body was kept out of the enqueue path.
+    ///
+    /// **The only row that ever shows the containment guard firing**,
+    /// which makes it the most operationally valuable of the four: it is
+    /// the sole evidence that a live capability was about to be written
+    /// into `tasks.payload` and was not.
+    pub const ASK_REASON_CARRIES_LIVE_TOKEN: &str = "carries_live_token";
+
+    /// The containment question could **not be answered** — the body
+    /// exceeded `ask_message::CANDIDATE_TOKEN_CAP`, the resolver errored,
+    /// or no resolver was wired — so the body was refused.
+    ///
+    /// Fail-closed, and one honest cause with three triggers; the daemon
+    /// log carries which. Reporting any of them as
+    /// [`ASK_REASON_MALFORMED`] would be a lie, since none of the three
+    /// requires the body to be verb-first and no syntax judgement was made.
+    pub const ASK_REASON_UNSCANNABLE: &str = "unscannable";
+
+    /// The body's first token is one of the two verbs but it did not
+    /// parse. A syntax error by a human, carrying no live token.
+    pub const ASK_REASON_MALFORMED: &str = "malformed";
 }
 
 #[cfg(test)]
