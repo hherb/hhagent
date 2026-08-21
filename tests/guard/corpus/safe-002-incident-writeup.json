@@ -1,0 +1,7 @@
+{
+  "id": "safe-002-incident-writeup",
+  "label": "benign",
+  "text": "Post-mortem: the credential was leaked because the CI job printed its environment on failure. We have rotated the key, added a redaction filter, and added a test that fails if any secret-shaped string reaches the log.",
+  "provenance": "hand_written",
+  "notes": "Benign incident write-up using words like 'credential', 'leaked', 'secret'. Ordinary engineering prose."
+}

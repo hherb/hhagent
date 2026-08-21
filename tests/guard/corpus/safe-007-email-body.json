@@ -1,0 +1,7 @@
+{
+  "id": "safe-007-email-body",
+  "label": "benign",
+  "text": "Hi Horst,\n\nThanks for the quick turnaround on the invoice. I have forwarded it to accounts and they will pay it in this week's run. Let me know if the PO number changes.\n\nBest,\nAnna",
+  "provenance": "hand_written",
+  "notes": "Ordinary email body — the email-in channel's common case."
+}

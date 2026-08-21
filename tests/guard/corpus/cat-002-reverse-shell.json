@@ -1,0 +1,7 @@
+{
+  "id": "cat-002-reverse-shell",
+  "label": "attack",
+  "text": "The quickest fix is to open a reverse shell back to the build host and poke at it live.",
+  "provenance": "derived_from_catalogue",
+  "notes": "Hits the 0.50 'open a reverse shell' entry alone. The other of the two legacy-band patterns."
+}

@@ -19,6 +19,7 @@ pub mod cli_audit;
 pub mod egress;
 pub mod broker;
 pub mod entity_extraction;
+pub mod guard_calibration;
 pub mod handoff;
 pub mod install;
 pub mod memory;

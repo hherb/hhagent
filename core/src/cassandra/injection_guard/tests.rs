@@ -434,6 +434,19 @@ fn for_tool_defaults_to_strict_fail_closed() {
     assert_eq!(GuardProfile::for_tool(""), GuardProfile::Strict);
 }
 
+/// Finding F1's other half: the Relaxed chat-template cap must stay
+/// clear of the legacy 0.45-0.70 band, or a lone chat-template token
+/// under `GuardProfile::Relaxed` would land in it and the "exactly one
+/// reachable value" claim below stops holding.
+///
+/// A `const` assertion rather than a runtime one, matching the pattern
+/// the parent module already uses for the sibling
+/// `RELAXED_CHAT_TEMPLATE_WEIGHT < BLOCK_THRESHOLD` invariant: both
+/// sides are consts, so this fails the BUILD rather than a test — and
+/// clippy's `assertions_on_constants` correctly rejects the runtime
+/// form.
+const _: () = assert!(RELAXED_CHAT_TEMPLATE_WEIGHT < 0.45);
+
 /// Finding F1 from the slice-1 guard-model spec, pinned structurally.
 ///
 /// The reachable score set is {0, 0.40, 0.50, 0.75, 0.80, 0.90, 1.0},
@@ -466,11 +479,6 @@ fn reachable_catalogue_scores_are_exactly_seven_values() {
         "two of the smallest weight no longer block, so multi-rule sums \
          can now land below the threshold and F1 no longer holds"
     );
-    assert!(
-        RELAXED_CHAT_TEMPLATE_WEIGHT < 0.45,
-        "the Relaxed cap now reaches the legacy band"
-    );
-
     // Sub-threshold scores are therefore: nothing matched, or exactly
     // one rule below the threshold.
     let sub_threshold: Vec<f32> = std::iter::once(0.0)
