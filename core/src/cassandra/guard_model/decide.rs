@@ -87,6 +87,4 @@ mod tests {
     fn default_tau_is_the_model_cards_default_and_is_not_a_fitted_threshold() {
         assert_eq!(DEFAULT_TAU, 0.5);
     }
-
-
 }
