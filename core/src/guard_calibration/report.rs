@@ -60,17 +60,25 @@ impl Confusion {
     /// over a matrix that counted nothing. That is the same empty-pass
     /// [`super::corpus::CorpusError::Empty`] exists to reject, one step
     /// further along.
+    ///
+    /// **Defined in terms of [`Confusion::invalidity`], not alongside
+    /// it.** Written as its own `unmeasured == 0 && scored() > 0`
+    /// expression the two drift: mutation-testing this pair showed
+    /// `is_valid` could be reverted to the old, weaker condition while
+    /// the CLI end-to-end test stayed green, because the CLI's exit
+    /// code is driven by `invalidity`. One predicate, one place.
     pub fn is_valid(&self) -> bool {
-        self.unmeasured == 0 && self.scored() > 0
+        self.invalidity().is_none()
     }
 
-    /// Why [`Confusion::is_valid`] is false, as an operator-facing
-    /// clause. `None` when the run is believable.
+    /// Why this run is not believable, as an operator-facing clause.
+    /// `None` when it is.
     ///
-    /// Separate from `is_valid` because the two causes need different
-    /// actions — fix the backend, versus fix the corpus — and a caller
-    /// printing one message for both sends an operator after the wrong
-    /// thing.
+    /// **This is the definition; [`Confusion::is_valid`] delegates to
+    /// it.** It returns a reason rather than a bool because the two
+    /// causes need different actions — fix the backend, versus fix the
+    /// corpus — and a caller printing one message for both sends an
+    /// operator after the wrong thing.
     pub fn invalidity(&self) -> Option<&'static str> {
         if self.unmeasured > 0 {
             Some("unmeasured cases present")
