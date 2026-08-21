@@ -22,6 +22,7 @@ pub mod plan_digest;
 pub mod review;
 pub mod types;
 
+pub use guard_model::{GuardAdjudication, GuardClient, DEFAULT_TAU};
 pub use injection_guard::{
     extract_scannable_text, screen, screen_with_profile, GuardProfile, InjectionDecision,
     InjectionVerdict, BLOCK_THRESHOLD, RELAXED_CHAT_TEMPLATE_WEIGHT, SCAN_BYTE_CAP,
