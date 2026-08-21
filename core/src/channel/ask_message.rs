@@ -248,11 +248,21 @@ pub fn parse_ask_command(body: &str) -> Option<AskCommand> {
 /// `/approve` is dropped silently. Accepted, and recorded as a residual in
 /// the slice-2 spec's "Open risks" rather than left implicit.
 ///
-/// **This whole predicate is a guess, and #582 replaces it with the exact
-/// question** — does any token in the body hash to a live nonce? Do not
-/// widen this function a third time; that only trades a false negative for
-/// a bigger false positive. If a new leaking shape turns up, add it to
-/// #582's motivation rather than to the match arm here.
+/// **Demoted, not deleted (#582, spec D3).** This predicate no longer
+/// decides anything on its own. It is the cheap, DB-free **gate** on the
+/// containment arm: when it fires, `handle_inbound` asks the exact question
+/// — does any token in the body hash to a live, peer-scoped nonce? — and
+/// that answer, not this guess, decides whether the body may be enqueued.
+///
+/// Keeping it is what makes the exact check affordable: ordinary traffic
+/// never reaches the database. And its false positive stopped costing
+/// anything, which was #582's complaint — `should I /approve the PR?` fires
+/// this gate, matches no live nonce, is not [`is_command_shaped`], and is
+/// enqueued normally.
+///
+/// **Do not delete this function** believing #582 replaced it, and do not
+/// widen it a third time. If a new *typed* shape needs recognising, widen
+/// [`is_command_shaped`] — that is the one that is safe to be wrong about.
 ///
 /// Still no *shape* check on the token — the same reason
 /// [`parse_ask_command`] does none (spec D7) applies here: this function's
@@ -264,6 +274,98 @@ pub fn looks_like_ask_command(body: &str) -> bool {
         // when the client emits no space after the marker.
         let tok = tok.trim_start_matches(['>', '|']);
         tok.eq_ignore_ascii_case("/approve") || tok.eq_ignore_ascii_case("/deny")
+    })
+}
+
+/// How much of a body the containment arm reads when collecting candidate
+/// tokens (spec D7).
+///
+/// Deliberately **not** `injection_guard::SCAN_BYTE_CAP`, even though both
+/// are 64 KiB today: that one is the guard's document budget and answers a
+/// different question, and sharing a constant would couple two caps that
+/// should be free to move independently.
+pub const CANDIDATE_BYTE_CAP: usize = 65_536;
+
+/// How many *distinct* candidate tokens the containment arm will hash
+/// before refusing to answer (spec D7).
+///
+/// An inbound body is not bounded before enqueue, so without this a large
+/// paste would hash unboundedly and ship a huge array to Postgres. Over the
+/// cap the arm fails **closed** — the alternative, scanning a prefix and
+/// enqueueing anyway, is a silent false negative on a token past the cap,
+/// and a silent miss is the failure the whole arm exists to prevent.
+pub const CANDIDATE_TOKEN_CAP: usize = 1024;
+
+/// The distinct whitespace tokens of a bounded prefix of `body`, or `None`
+/// when there are more than [`CANDIDATE_TOKEN_CAP`] of them.
+///
+/// `None` means *"the containment question cannot be answered"* and the
+/// caller must fail closed. It does **not** mean "no candidates" — that is
+/// `Some(vec![])`.
+///
+/// **No shape filter, deliberately.** Spec D7 of slice 2 bans coupling to
+/// the nonce encoding, and the argument is stronger here than there: a
+/// filter that is wrong produces a false *negative*, i.e. a live token the
+/// containment arm never hashes and therefore never catches. Tokens are
+/// hashed exactly as they arrived; the index decides.
+pub fn candidate_tokens(body: &str) -> Option<Vec<String>> {
+    let prefix = bounded_prefix(body, CANDIDATE_BYTE_CAP);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for tok in prefix.split_whitespace() {
+        if seen.insert(tok) {
+            if out.len() == CANDIDATE_TOKEN_CAP {
+                return None;
+            }
+            out.push(tok.to_string());
+        }
+    }
+    Some(out)
+}
+
+/// The largest prefix of `body` that is at most `cap` bytes and ends on a
+/// char boundary.
+///
+/// A body is arbitrary UTF-8 from a transport. Both `String::truncate` and
+/// a bare `&body[..cap]` **panic** on a non-boundary index, and a
+/// multi-byte character straddling the cap is precisely where that index
+/// lands. The straddling character is dropped whole.
+fn bounded_prefix(body: &str, cap: usize) -> &str {
+    if body.len() <= cap {
+        return body;
+    }
+    let mut end = cap;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
+}
+
+/// True when the body's **first** whitespace token is `/approve` or
+/// `/deny`, case-insensitively — i.e. when someone *typed a command*.
+///
+/// This is the narrowed successor to the UX half of
+/// [`looks_like_ask_command`], and narrowing it is only safe because
+/// containment no longer rests on it (spec D2). The two now answer
+/// different questions:
+///
+/// - [`looks_like_ask_command`] — *might this body carry a live token?*
+///   Broad, and only a **gate** on the exact check.
+/// - `is_command_shaped` — *did a human just fumble a command?* Narrow,
+///   and it decides the usage hint alone.
+///
+/// First-token-only is right for the second question because it is what a
+/// person typing a command produces. A quoted reply, a mention pill, or
+/// prose mentioning `/approve` is not someone typing a command — and the
+/// live token such a body may carry is caught by the containment arm
+/// regardless of its shape.
+///
+/// Being wrong here now costs a missing usage hint, never a leaked token.
+/// That is why widening *this* predicate is safe in a way widening the old
+/// one was not.
+pub fn is_command_shaped(body: &str) -> bool {
+    body.split_whitespace().next().is_some_and(|first| {
+        first.eq_ignore_ascii_case("/approve") || first.eq_ignore_ascii_case("/deny")
     })
 }
 
@@ -554,6 +656,84 @@ mod tests {
     fn the_malformed_ack_names_no_part_of_the_body() {
         assert!(!ACK_MALFORMED_COMMAND.contains("tok9"));
         assert!(!ACK_MALFORMED_COMMAND.to_lowercase().contains("thanks"));
+    }
+
+    /// The containment arm hashes every candidate, so the candidate set has
+    /// to be bounded — an inbound body is NOT bounded before enqueue
+    /// (`build_channel_task_payload` stores `msg.body` whole;
+    /// `SCAN_BYTE_CAP` bounds only screening).
+    #[test]
+    fn candidate_tokens_dedups_and_keeps_every_distinct_token() {
+        let got = candidate_tokens("/approve ab ab cd").expect("under cap");
+        assert_eq!(got.len(), 3, "duplicates collapse: {got:?}");
+        for t in ["/approve", "ab", "cd"] {
+            assert!(got.iter().any(|g| g == t), "missing {t}: {got:?}");
+        }
+    }
+
+    /// No shape filter on candidates. Slice-2 D7 bans coupling to the nonce
+    /// encoding, and the argument is stronger here: a wrong filter yields a
+    /// false NEGATIVE — a live token the arm never hashes and so never
+    /// catches — which is the dangerous direction.
+    #[test]
+    fn candidate_tokens_filters_nothing_by_shape() {
+        let got = candidate_tokens("> **7f3a9c2e1b**, ok?").expect("under cap");
+        assert!(
+            got.iter().any(|g| g == "**7f3a9c2e1b**,"),
+            "a token must reach the hash exactly as it arrived: {got:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_tokens_returns_none_over_the_token_cap() {
+        let body =
+            (0..CANDIDATE_TOKEN_CAP + 1).map(|i| format!("t{i}")).collect::<Vec<_>>().join(" ");
+        assert!(candidate_tokens(&body).is_none(), "over cap must fail closed");
+    }
+
+    /// A body is arbitrary UTF-8, so the prefix cut must land on a char
+    /// boundary: both `String::truncate` and `&s[..n]` PANIC on a
+    /// non-boundary index, and a multi-byte character straddling the cap is
+    /// exactly where that lands.
+    #[test]
+    fn candidate_tokens_cuts_the_prefix_on_a_char_boundary() {
+        // 2 bytes each, so the cap lands mid-character.
+        let body = "\u{00e9}".repeat(CANDIDATE_BYTE_CAP);
+        let got = candidate_tokens(&body);
+        assert!(got.is_some(), "one long token is one candidate, not over the token cap");
+        assert_eq!(got.expect("some").len(), 1);
+    }
+
+    /// The narrowed check. First token only — which is what a person TYPING
+    /// a command produces. A quoted reply or a mention pill is not someone
+    /// typing a command; containment catches the token in those regardless
+    /// of shape.
+    #[test]
+    fn is_command_shaped_matches_a_typed_command_and_nothing_else() {
+        for body in ["/approve x", "/deny x", "  /APPROVE  x  ", "/Deny", "/approve tok9 thanks!"]
+        {
+            assert!(is_command_shaped(body), "should be command-shaped: {body:?}");
+        }
+        for body in [
+            "should I /approve the PR?",
+            "> /approve 7f3a9c2e1b",
+            "kastellan: /approve 7f3a9c2e1b",
+            "",
+            "hello",
+        ] {
+            assert!(!is_command_shaped(body), "should NOT be command-shaped: {body:?}");
+        }
+    }
+
+    /// #582's whole point at the pure layer: the two predicates now
+    /// DISAGREE on the false-positive body, and the disagreement is the
+    /// fix. The broad one still gates the containment check; only the
+    /// narrow one reaches for the usage hint.
+    #[test]
+    fn the_two_predicates_disagree_exactly_on_the_false_positive() {
+        let body = "should I /approve the PR?";
+        assert!(looks_like_ask_command(body), "still gates the containment check");
+        assert!(!is_command_shaped(body), "but no longer earns the usage hint");
     }
 
     /// Element parses `<token>` as an unknown HTML tag and **drops it from
