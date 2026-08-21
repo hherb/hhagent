@@ -2436,3 +2436,155 @@ fn resolved_for_task_breaks_a_resolved_at_tie_by_higher_id() {
         }
     });
 }
+
+/// D6's agreement test, and the reason it is PG-backed rather than a unit
+/// test: the thing that can drift is the SQL, and only Postgres can say
+/// whether two `WHERE` clauses select the same rows.
+///
+/// If `any_live_nonce_for_claimant` ever became NARROWER than
+/// `resolve_with_nonce`, containment would miss a token that resolution
+/// still accepts — the fail-open the containment arm exists to prevent,
+/// reached through a copy-paste rather than through a logic error.
+#[test]
+fn containment_sees_exactly_what_resolution_accepts() {
+    let Some(h) = harness("askcnt") else {
+        return;
+    };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-containment").await;
+        let pool = &pool;
+        use kastellan_db::asks;
+        use kastellan_db::tasks::{self, Lane};
+
+        let owner = asks::Claimant::new("matrix", "@horst:kastellan.dev");
+        let stranger = asks::Claimant::new("matrix", "@mallory:kastellan.dev");
+
+        let task_id =
+            tasks::insert_pending(pool, Lane::Fast, channel_payload("@horst:kastellan.dev"))
+                .await
+                .unwrap();
+        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            pool,
+            task_id,
+            "plan_approval",
+            "approve?",
+            &serde_json::json!(["approve", "deny"]),
+            Some("digest1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            None,
+        )
+        .await
+        .unwrap();
+        let live = std::slice::from_ref(&raised.nonce);
+
+        // Seen by containment while it is live...
+        assert!(
+            asks::any_live_nonce_for_claimant(pool, live, &owner).await.unwrap(),
+            "a live nonce of this peer's own ask must be seen",
+        );
+
+        // ...and NOT seen when scoped to another peer. This is D5: an
+        // unscoped check is the existence oracle D9 and D16 refuse to be,
+        // and the nonce is five bytes.
+        assert!(
+            !asks::any_live_nonce_for_claimant(pool, live, &stranger).await.unwrap(),
+            "peer scoping must hold, or the check becomes a token-guessing oracle",
+        );
+
+        // An unissued nonce is invisible even to its would-be owner.
+        let unissued = asks::Nonce::from_wire("0".repeat(64));
+        assert!(
+            !asks::any_live_nonce_for_claimant(pool, std::slice::from_ref(&unissued), &owner)
+                .await
+                .unwrap(),
+            "an unissued nonce must not be contained",
+        );
+
+        // Resolution accepts it for the owner — the agreement half.
+        let resolved =
+            asks::resolve_with_nonce(pool, &raised.nonce, &owner, &asks::resolution("approve", None))
+                .await
+                .unwrap();
+        assert!(resolved.is_some(), "resolution must accept what containment saw");
+
+        // A SPENT token is not a capability, so containment stops seeing it
+        // and a body carrying it is free to enqueue (spec D4).
+        assert!(
+            !asks::any_live_nonce_for_claimant(pool, live, &owner).await.unwrap(),
+            "a resolved nonce is spent and must no longer be contained",
+        );
+    });
+}
+
+/// An empty candidate list must not issue a query at all, and must be
+/// `false` rather than an error or a vacuous `true`.
+#[test]
+fn containment_of_no_candidates_is_false() {
+    let Some(h) = harness("askcn0") else {
+        return;
+    };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-containment-empty").await;
+        let who = kastellan_db::asks::Claimant::new("matrix", "@horst:kastellan.dev");
+        assert!(!kastellan_db::asks::any_live_nonce_for_claimant(&pool, &[], &who).await.unwrap());
+    });
+}
+
+/// An EXPIRED ask is not live, so its token is not contained. Same
+/// `deadline_at > now()` clause resolution carries, which is the point of
+/// sharing the fragment rather than hand-copying it.
+#[test]
+fn containment_ignores_an_expired_nonce() {
+    let Some(h) = harness("askcnx") else {
+        return;
+    };
+    h.rt.block_on(async {
+        let pool = h.migrated_pool("asks-containment-expired").await;
+        let pool = &pool;
+        use kastellan_db::asks;
+        use kastellan_db::tasks::{self, Lane};
+
+        let owner = asks::Claimant::new("matrix", "@horst:kastellan.dev");
+        let task_id =
+            tasks::insert_pending(pool, Lane::Fast, channel_payload("@horst:kastellan.dev"))
+                .await
+                .unwrap();
+        tasks::claim_one(pool, Lane::Fast, 60).await.unwrap().unwrap();
+        let raised = asks::raise(
+            pool,
+            task_id,
+            "plan_approval",
+            "approve?",
+            &serde_json::json!(["approve", "deny"]),
+            Some("digest1"),
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Age the ask past its deadline rather than sleeping. BOTH
+        // timestamps move: `asks_deadline_after_created` (migration 0023)
+        // rejects a deadline before its own `created_at`, so backdating
+        // only `deadline_at` fails the CHECK rather than the test — which
+        // is the constraint doing its job.
+        sqlx::query(
+            "UPDATE asks \
+             SET created_at = now() - interval '2 hours', \
+                 deadline_at = now() - interval '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(raised.ask_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        assert!(
+            !asks::any_live_nonce_for_claimant(pool, std::slice::from_ref(&raised.nonce), &owner)
+                .await
+                .unwrap(),
+            "an expired ask's token is not a capability and must not be contained",
+        );
+    });
+}
