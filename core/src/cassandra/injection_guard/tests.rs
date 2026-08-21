@@ -433,3 +433,68 @@ fn for_tool_defaults_to_strict_fail_closed() {
     assert_eq!(GuardProfile::for_tool("shell-exec"), GuardProfile::Strict);
     assert_eq!(GuardProfile::for_tool(""), GuardProfile::Strict);
 }
+
+/// Finding F1 from the slice-1 guard-model spec, pinned structurally.
+///
+/// The reachable score set is {0, 0.40, 0.50, 0.75, 0.80, 0.90, 1.0},
+/// so `[0.45, 0.70)` — the band the feasibility study proposed for the
+/// model tier — holds exactly ONE value, 0.50, reachable by two of the
+/// twenty-two patterns. That is why the tier adjudicates everything
+/// below `BLOCK_THRESHOLD` instead of a band.
+///
+/// Asserted from the weight STRUCTURE rather than by enumerating 2^22
+/// subsets: if two of the smallest weight already block, every
+/// multi-rule sum blocks, so the only sub-threshold scores are 0.0 and
+/// the individual weights below the threshold.
+///
+/// Note the band is not *empty* — 0.50 is in it — so a test asserting
+/// emptiness would be false. What this asserts is the reachable set.
+#[test]
+fn reachable_catalogue_scores_are_exactly_seven_values() {
+    let mut weights: Vec<f32> = CATALOGUE.iter().map(|r| r.weight).collect();
+    weights.sort_by(|a, b| a.partial_cmp(b).expect("no NaN weights"));
+    weights.dedup();
+    assert_eq!(
+        weights,
+        vec![0.40, 0.50, 0.75],
+        "catalogue weight structure changed; finding F1 must be re-derived"
+    );
+
+    let smallest = weights[0];
+    assert!(
+        smallest + smallest >= BLOCK_THRESHOLD,
+        "two of the smallest weight no longer block, so multi-rule sums \
+         can now land below the threshold and F1 no longer holds"
+    );
+    assert!(
+        RELAXED_CHAT_TEMPLATE_WEIGHT < 0.45,
+        "the Relaxed cap now reaches the legacy band"
+    );
+
+    // Sub-threshold scores are therefore: nothing matched, or exactly
+    // one rule below the threshold.
+    let sub_threshold: Vec<f32> = std::iter::once(0.0)
+        .chain(weights.iter().copied().filter(|w| *w < BLOCK_THRESHOLD))
+        .collect();
+    assert_eq!(sub_threshold, vec![0.0, 0.40, 0.50]);
+
+    let in_legacy_band: Vec<f32> =
+        sub_threshold.iter().copied().filter(|s| (0.45..0.70).contains(s)).collect();
+    assert_eq!(
+        in_legacy_band,
+        vec![0.50],
+        "the legacy 0.45-0.70 band holds exactly one reachable score"
+    );
+}
+
+/// The two patterns that reach the legacy band, named so a reweighting
+/// that moves them is visible in the diff.
+#[test]
+fn exactly_two_patterns_can_reach_the_legacy_band_alone() {
+    let band: Vec<&str> = CATALOGUE
+        .iter()
+        .filter(|r| (0.45..0.70).contains(&r.weight))
+        .map(|r| r.pattern)
+        .collect();
+    assert_eq!(band, vec!["leak the api key", "open a reverse shell"]);
+}
