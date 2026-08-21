@@ -76,6 +76,22 @@ pub trait AskResolver: Send + Sync {
         choice: &str,
         claimant: &kastellan_db::asks::Claimant,
     ) -> anyhow::Result<Option<kastellan_db::asks::ResolvedAsk>>;
+
+    /// Does any of `nonces` hash to a live ask owned by `claimant`'s own
+    /// task? The containment question, asked before a body that mentions
+    /// an ask verb is allowed anywhere near `screen_and_classify`.
+    ///
+    /// On the trait rather than reached for directly because
+    /// `bus/tests.rs` is deliberately PG-free (spec D12) — and because an
+    /// `Err` here must stay distinguishable from `Ok(false)`: the two take
+    /// **opposite** arms, since an unanswered question refuses while a
+    /// definite "no" enqueues. Collapsing them into a `bool` would pick
+    /// the wrong arm on every database hiccup, silently.
+    async fn any_live_nonce(
+        &self,
+        nonces: &[kastellan_db::asks::Nonce],
+        claimant: &kastellan_db::asks::Claimant,
+    ) -> anyhow::Result<bool>;
 }
 
 /// Real DB-backed `AskResolver`.
@@ -108,6 +124,14 @@ impl AskResolver for PgAskResolver {
             &kastellan_db::asks::resolution(choice, None),
         )
         .await?)
+    }
+
+    async fn any_live_nonce(
+        &self,
+        nonces: &[kastellan_db::asks::Nonce],
+        claimant: &kastellan_db::asks::Claimant,
+    ) -> anyhow::Result<bool> {
+        Ok(kastellan_db::asks::any_live_nonce_for_claimant(&self.pool, nonces, claimant).await?)
     }
 }
 

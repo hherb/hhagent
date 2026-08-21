@@ -56,6 +56,14 @@ impl PairingService for FakePairing {
 struct RecordingResolver {
     calls: std::sync::Mutex<Vec<(String, String, String)>>, // (token, choice, attribution)
     reply: Option<kastellan_db::asks::ResolvedAsk>,
+    /// Plaintext tokens this resolver reports as live, peer-scoped nonces.
+    /// A set rather than a bool so a test can prove the containment arm
+    /// hashed the *body's own* tokens and not something else.
+    live_nonces: std::collections::HashSet<String>,
+    /// What the containment arm actually asked about, per call. Lets a
+    /// test assert the DB was **not** consulted, which is a different
+    /// claim from "it answered no".
+    nonce_queries: Mutex<Vec<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -72,6 +80,17 @@ impl AskResolver for RecordingResolver {
             claimant.attribution(),
         ));
         Ok(self.reply)
+    }
+
+    async fn any_live_nonce(
+        &self,
+        nonces: &[kastellan_db::asks::Nonce],
+        _claimant: &kastellan_db::asks::Claimant,
+    ) -> anyhow::Result<bool> {
+        let seen: Vec<String> = nonces.iter().map(|n| n.expose().to_string()).collect();
+        let hit = seen.iter().any(|t| self.live_nonces.contains(t));
+        self.nonce_queries.lock().unwrap().push(seen);
+        Ok(hit)
     }
 }
 
@@ -92,6 +111,14 @@ impl AskResolver for FailingResolver {
         _choice: &str,
         _claimant: &kastellan_db::asks::Claimant,
     ) -> anyhow::Result<Option<kastellan_db::asks::ResolvedAsk>> {
+        anyhow::bail!("simulated db outage")
+    }
+
+    async fn any_live_nonce(
+        &self,
+        _nonces: &[kastellan_db::asks::Nonce],
+        _claimant: &kastellan_db::asks::Claimant,
+    ) -> anyhow::Result<bool> {
         anyhow::bail!("simulated db outage")
     }
 }
