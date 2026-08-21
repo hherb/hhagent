@@ -172,6 +172,19 @@ jobs:
       - name: cargo test (core guard adjudicator e2e — loopback mock)
         run: "cargo test -p kastellan-core --test guard_model_e2e --locked"
 
+      # `guard calibrate`'s EXIT STATUS. The counting is covered by the
+      # unit tests above; what they cannot reach is the line that turns
+      # "this run is not believable" into a non-zero exit, whose own
+      # source comment is "a CI caller would read the zero and move on"
+      # — so a CI caller is precisely who must exercise it.
+      #
+      # Spawns the CLI as a subprocess, so cargo links the binary for
+      # this target. If it were ever absent the tests print `[SKIP]` and
+      # PASS, which would make this step a silent no-op; the DGX
+      # `--workspace` run is the cross-check that they really execute.
+      - name: cargo test (guard calibrate CLI — exit-status contract)
+        run: "cargo test -p kastellan-core --test guard_calibrate_cli_e2e --locked"
+
   # The Matrix worker's live SDK path (`workers/matrix/src/sdk_live.rs`) is
   # behind the optional `live-matrix` feature (`dep:matrix-sdk`). The `check`
   # job above builds the default `--workspace`, which deliberately excludes that

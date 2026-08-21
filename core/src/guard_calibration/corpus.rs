@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::cassandra::injection_guard::SCAN_BYTE_CAP;
+
 /// Ground truth for a case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +70,35 @@ pub struct CorpusCase {
     pub provenance: Provenance,
     #[serde(default)]
     pub notes: String,
+}
+
+/// The prefix of `text` that production would actually screen.
+///
+/// **The harness must see what the chokepoint sees.** In production a
+/// document reaches `screen` through
+/// [`crate::cassandra::injection_guard::extract_scannable_text`], which
+/// caps its output at [`SCAN_BYTE_CAP`] (64 KiB). A corpus case scored
+/// in full would therefore be scored on text the guard never sees, and
+/// the resulting τ would be fitted against a population that does not
+/// exist.
+///
+/// No case ships over the cap today, so this changes nothing yet. It
+/// matters for **measurement 3**, whose captured half is real fetched
+/// pages and real email bodies — a 200 KiB web page is ordinary, and
+/// the divergence would be silent.
+///
+/// Truncates on a char boundary, so a multi-byte character straddling
+/// the cap is dropped rather than split. `String::truncate` would panic
+/// there.
+pub fn scannable_prefix(text: &str) -> &str {
+    if text.len() <= SCAN_BYTE_CAP {
+        return text;
+    }
+    let mut end = SCAN_BYTE_CAP;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Why a corpus could not be loaded. Every variant names the offending
@@ -285,6 +316,41 @@ mod tests {
         let dir = corpus_with(&[("inj-001.json", GOOD), ("README.md", "notes")]);
         let cases = load_corpus_from_dir(dir.path()).expect("loads");
         assert_eq!(cases.len(), 1);
+    }
+
+    /// Under the cap, the text is returned untouched — the common case
+    /// and the one every shipped case takes today.
+    #[test]
+    fn scannable_prefix_leaves_a_short_document_alone() {
+        assert_eq!(scannable_prefix("hello"), "hello");
+        let exactly = "a".repeat(SCAN_BYTE_CAP);
+        assert_eq!(scannable_prefix(&exactly).len(), SCAN_BYTE_CAP);
+    }
+
+    /// Over the cap, the harness sees what the chokepoint sees. A case
+    /// scored in full would be scored on text the guard never receives.
+    #[test]
+    fn scannable_prefix_caps_a_long_document_at_the_scan_byte_cap() {
+        let long = "a".repeat(SCAN_BYTE_CAP + 5_000);
+        assert_eq!(scannable_prefix(&long).len(), SCAN_BYTE_CAP);
+    }
+
+    /// A multi-byte character straddling the cap is DROPPED, not split.
+    /// `String::truncate` panics on a non-boundary index, and slicing
+    /// `&text[..cap]` would too — so the boundary walk is load-bearing,
+    /// and a captured corpus of real web pages is exactly where a
+    /// non-ASCII byte lands on an arbitrary offset.
+    #[test]
+    fn scannable_prefix_never_splits_a_multibyte_character() {
+        // 'é' is two bytes. Pad so one straddles the cap exactly.
+        let mut doc = "a".repeat(SCAN_BYTE_CAP - 1);
+        doc.push('é');
+        doc.push_str(&"b".repeat(100));
+        let got = scannable_prefix(&doc);
+        assert_eq!(got.len(), SCAN_BYTE_CAP - 1, "the straddling char is dropped whole");
+        assert!(got.is_char_boundary(got.len()));
+        // The real proof: this must not panic and must round-trip.
+        assert_eq!(got, &doc[..SCAN_BYTE_CAP - 1]);
     }
 
     /// Path to the shipped corpus. `CARGO_MANIFEST_DIR` is `core/`, so

@@ -86,7 +86,7 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
     use kastellan_core::cassandra::guard_model::policy::policy_digest;
     use kastellan_core::cassandra::guard_model::GuardClient;
     use kastellan_core::cassandra::injection_guard::{screen, BLOCK_THRESHOLD};
-    use kastellan_core::guard_calibration::corpus::load_corpus_from_dir;
+    use kastellan_core::guard_calibration::corpus::{load_corpus_from_dir, scannable_prefix};
     use kastellan_core::guard_calibration::report::{
         confusion_at, format_report, RunMeta, ScoredCase,
     };
@@ -136,7 +136,14 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
 
     let mut scored: Vec<ScoredCase> = Vec::with_capacity(cases.len());
     for case in &cases {
-        let catalogue_score = screen(&case.text).score;
+        // What the chokepoint would actually see. Production reaches
+        // `screen` through `extract_scannable_text`, which caps at
+        // SCAN_BYTE_CAP; scoring the full text would fit tau against
+        // text the guard never receives. No shipped case is over the
+        // cap — this is for measurement 3's captured half, where a
+        // 200 KiB fetched page is ordinary.
+        let text = scannable_prefix(&case.text);
+        let catalogue_score = screen(text).score;
         // Cases the catalogue already blocks are NOT sent to the model.
         // The report excludes them, so the call could only ever be
         // discarded — and D4's reason for not consulting the model
@@ -151,7 +158,7 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
             // Sequential on purpose: this is offline tooling against one
             // local server, and a burst of concurrent requests would make
             // any latency figure taken alongside it meaningless.
-            match client.probability(&case.text).await {
+            match client.probability(text).await {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("guard calibrate: {} failed: {e}", case.id);

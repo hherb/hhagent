@@ -42,6 +42,13 @@ separate duplicate check.
 No catalogue score is stored. It is computed from the shipping `screen()`
 at report time so it cannot drift from the catalogue it describes.
 
+`text` is capped at `SCAN_BYTE_CAP` (64 KiB) before both `screen()` and
+the guard call, because that is what production sees: a document reaches
+the chokepoint through `extract_scannable_text`, which truncates there.
+Scoring a case in full would fit τ against text the guard never receives.
+No case here is over the cap — this matters for **measurement 3**, whose
+captured half is real fetched pages, where 200 KiB is ordinary.
+
 A malformed case **aborts** the load rather than being skipped: a silently
 skipped case shrinks a confusion matrix's denominator, so a corpus of 100
 with 12 unparseable files would report a clean matrix over 88 and call it
