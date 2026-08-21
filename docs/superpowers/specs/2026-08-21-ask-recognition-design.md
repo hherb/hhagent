@@ -210,9 +210,16 @@ Hash every token; let the index decide.
 ```
 unresolvable       arm 1: parse succeeded, resolve returned Ok(None) or Err
 carries_live_token arm 2: a token in the body is a live nonce of this peer's
-unscannable        arm 2: the body exceeded the candidate cap, or the DB errored
+unscannable        arm 2: the containment question could NOT be answered —
+                          over the candidate cap, a DB error, or no wiring
 malformed          arm 3: verb-first but did not parse
 ```
+
+`unscannable` covers all three of D7's fail-closed edges, including the
+no-wiring fallback. Reporting that one as `malformed` would be a lie: the body
+need not be verb-first to reach it, and the row would claim a syntax judgement
+nothing made. "We refused because we could not answer" is one honest cause with
+three triggers, and the daemon log carries which.
 
 `Ok(None)` and `Err` stay collapsed into `unresolvable`, exactly as today. That
 collapse is load-bearing — a DB error and a refused answer must look identical
