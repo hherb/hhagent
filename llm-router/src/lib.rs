@@ -267,8 +267,6 @@ impl Router {
         Ok(decoded)
     }
 
-    /// Dispatch a request to the local backend.
-    ///
     /// Fetch llama.cpp's `/props` from the configured local backend.
     ///
     /// Returned as a raw [`serde_json::Value`] rather than a typed
@@ -286,8 +284,9 @@ impl Router {
     /// egress; putting a `reqwest` call in `core` to do it would breach
     /// that invariant.
     ///
-    /// Note this addresses the server **root** ([`props_url`]), not the
-    /// OpenAI-compat prefix that [`Router::send`] uses.
+    /// Note this addresses the server **root** (see the private
+    /// `props_url` helper), not the OpenAI-compat prefix that
+    /// [`Router::send`] uses.
     pub async fn props(&self) -> Result<serde_json::Value, RouterError> {
         let url = props_url(&self.config.local_url);
         tracing::debug!(
@@ -318,6 +317,8 @@ impl Router {
         })
     }
 
+    /// Dispatch a request to the local backend.
+    ///
     /// Pure HTTP: POST to `<local_url>/chat/completions` with the
     /// JSON-encoded [`ChatRequest`]. On 2xx, decode as
     /// [`ChatResponse`]; on non-2xx, capture a truncated body and

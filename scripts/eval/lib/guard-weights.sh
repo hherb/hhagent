@@ -31,7 +31,7 @@
 # The Rust half, and why the sum is written down twice
 # ---------------------------------------------------------------------
 #
-# `core/src/cassandra/guard_model/weights_pin.rs` carries the same sum
+# `core/src/cassandra/guard_model/weights_pin/mod.rs` carries the same sum
 # and does the check `guard calibrate` performs automatically, by asking
 # llama-server's /props which file it opened and hashing that.
 #
@@ -60,7 +60,7 @@
 
 # sha256 of upstream's Shieldstral-1.0-3B-Q8_0.gguf.
 #
-# Must equal PINNED_SHA256 in core/src/cassandra/guard_model/weights_pin.rs.
+# Must equal PINNED_SHA256 in core/src/cassandra/guard_model/weights_pin/mod.rs.
 # Bump both together, in the same deliberate step as the model change,
 # and re-run measurement 3 — a tau fitted on other weights does not
 # transfer. Never "fix" a mismatch by pasting in whatever a failure
@@ -80,17 +80,30 @@ KASTELLAN_GUARD_WEIGHTS_SOURCE="https://huggingface.co/noctrex/Shieldstral-1.0-3
 #
 # `sha256sum` is GNU (Linux); `shasum -a 256` is what macOS ships. Both
 # hosts are first-class here, so neither is assumed — the same
-# portability rule the rest of the tree follows.
+# portability rule the rest of the tree follows. `shasum` WITHOUT
+# `-a 256` is SHA-1, so the flag is not optional.
+#
+# The hasher's output is captured and its status checked rather than
+# piped into `cut`. A pipeline's status is its LAST command's, so
+# `sha256sum "$f" | cut …` returns 0 even when the hash never happened
+# — and this file is meant to be `source`d, so it cannot rely on the
+# caller having set `pipefail`. Found in review: with an unreadable
+# file the caller's `|| return 1` was dead code, `$actual` came back
+# empty, and the mismatch branch confidently reported "a different file
+# altogether" for what was a read error. It failed closed only because
+# the empty string is not the pin.
 _kastellan_sha256_of() {
-    local target="$1"
+    local target="${1:-}" line
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$target" | cut -d' ' -f1
+        line="$(sha256sum "$target")" || return 1
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$target" | cut -d' ' -f1
+        line="$(shasum -a 256 "$target")" || return 1
     else
         echo "guard-weights: neither sha256sum nor shasum is available" >&2
         return 1
     fi
+    # Both tools print "<sum>  <path>"; strip at the first space.
+    printf '%s\n' "${line%% *}"
 }
 
 # Verify that "$1" is the pinned guard-model file.
@@ -98,10 +111,22 @@ _kastellan_sha256_of() {
 # VERIFY ONLY: never downloads, never repairs. Returns 0 when the file
 # matches and non-zero otherwise, printing what to do about it.
 require_guard_weights() {
-    local target="$1"
+    # `${1:-}` rather than `$1`: under a caller's `set -u` a bare `$1`
+    # aborts the shell before the "no path given" branch below can
+    # explain itself, turning a documented rc=2 into an unbound-variable
+    # trace. It still fails closed either way; this makes it diagnosable.
+    local target="${1:-}"
 
     if [ -z "$target" ]; then
         echo "require_guard_weights: no path given" >&2
+        return 2
+    fi
+    # The one shape that would fail OPEN: an empty pin makes the
+    # comparison below `[ "$actual" = "" ]`, which succeeds for a file
+    # that was never hashed. Reachable if a caller overrides the
+    # variable, or defines this function without sourcing the file.
+    if [ -z "$KASTELLAN_GUARD_WEIGHTS_SHA256" ]; then
+        echo "require_guard_weights: the pin constant is empty -- was this file sourced?" >&2
         return 2
     fi
     if [ ! -f "$target" ]; then
@@ -111,7 +136,16 @@ require_guard_weights() {
     fi
 
     local actual
-    actual="$(_kastellan_sha256_of "$target")" || return 1
+    actual="$(_kastellan_sha256_of "$target")" || {
+        echo "require_guard_weights: could not hash $target" >&2
+        echo "  This is a READ failure, not a wrong-model finding -- check" >&2
+        echo "  permissions and the device before hunting for the right file." >&2
+        return 1
+    }
+    if [ -z "$actual" ]; then
+        echo "require_guard_weights: the hasher produced no output for $target" >&2
+        return 1
+    fi
 
     if [ "$actual" = "$KASTELLAN_GUARD_WEIGHTS_SHA256" ]; then
         return 0
@@ -132,7 +166,7 @@ require_guard_weights() {
     fi
     echo "  Fetch the pinned file from $KASTELLAN_GUARD_WEIGHTS_SOURCE" >&2
     echo "  If the model was changed on purpose, update BOTH this file and" >&2
-    echo "  core/src/cassandra/guard_model/weights_pin.rs, and re-run" >&2
+    echo "  core/src/cassandra/guard_model/weights_pin/mod.rs, and re-run" >&2
     echo "  measurement 3. See issue #592." >&2
     return 1
 }

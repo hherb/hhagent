@@ -26,7 +26,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use kastellan_tests_common::cli_binary;
@@ -37,7 +37,22 @@ struct RoutingBackend {
     base_url: String,
     origin: String,
     stop: Arc<AtomicBool>,
+    /// How many NON-`/props` requests the backend served.
+    ///
+    /// The weights check is a *precondition*, and "nothing was scored"
+    /// used to be asserted through stdout (`!contains("guard
+    /// calibration report")`) — which an implementation that scores all
+    /// ~100 cases and refuses afterwards also satisfies. Counting the
+    /// adjudication requests pins the ordering the code actually
+    /// claims, rather than a downstream symptom of it.
+    chat_requests: Arc<AtomicUsize>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RoutingBackend {
+    fn chat_requests(&self) -> usize {
+        self.chat_requests.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for RoutingBackend {
@@ -64,6 +79,8 @@ fn spawn_routing_backend(
     let base_url = format!("{origin}/v1");
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
+    let chat_requests = Arc::new(AtomicUsize::new(0));
+    let chat_thread = Arc::clone(&chat_requests);
 
     let handle = std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -79,6 +96,7 @@ fn spawn_routing_backend(
             let (status, body) = if is_props {
                 (props_status, props.clone())
             } else {
+                chat_thread.fetch_add(1, Ordering::SeqCst);
                 ("HTTP/1.1 200 OK", chat.clone())
             };
             let resp = format!(
@@ -91,7 +109,7 @@ fn spawn_routing_backend(
         }
     });
 
-    RoutingBackend { base_url, origin, stop, handle: Some(handle) }
+    RoutingBackend { base_url, origin, stop, chat_requests, handle: Some(handle) }
 }
 
 /// A chat body whose position-0 alternatives carry both verdict
@@ -203,6 +221,38 @@ fn a_run_against_unpinned_weights_is_refused() {
     // no report was printed. A refusal that still emits a report would
     // leave a tau on screen that the same run just said not to trust.
     assert!(!stdout.contains("guard calibration report"), "must not score: {stdout}");
+    assert_eq!(
+        backend.chat_requests(),
+        0,
+        "the refusal must precede every adjudication, not follow them"
+    );
+}
+
+/// A relative `model_path` is refused rather than resolved against the
+/// CLI's working directory.
+///
+/// This is a fail-OPEN if resolved, not merely a bad diagnosis: a copy
+/// of the pinned file at the same relative path under the tool's cwd
+/// would hash as pinned while the server served other bytes -- #592's
+/// own shape, reached through the fix for #592.
+#[test]
+fn a_run_whose_props_names_a_relative_path_is_refused() {
+    if skip_if_unbuilt("a_run_whose_props_names_a_relative_path_is_refused") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_valid_corpus(dir.path());
+    let props = serde_json::json!({"model_path": "models/Shieldstral-1.0-3B-Q8_0.gguf"})
+        .to_string();
+
+    let backend = spawn_routing_backend("HTTP/1.1 200 OK", props, canned_verdict());
+    let out = run_calibrate(dir.path(), &backend.base_url, &[]);
+
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(1), "must refuse: {stderr}");
+    assert!(stderr.contains("RELATIVE model_path"), "{stderr}");
+    assert!(stderr.contains("working directory"), "must explain the hazard: {stderr}");
+    assert_eq!(backend.chat_requests(), 0, "nothing may be scored: {stderr}");
 }
 
 #[test]
@@ -313,7 +363,12 @@ fn weights_unpinned_still_reports_the_actual_hash() {
     let out = run_calibrate(dir.path(), &backend.base_url, &["--weights-unpinned"]);
 
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(0), "must proceed\nstdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains(expected), "must hash even when unpinned: {stdout}");
+    // The path too: without it an unpinned report names bytes but not
+    // which file they came from, so it is not reproducible from itself.
+    assert!(stdout.contains("candidate.gguf"), "must name the file it hashed: {stdout}");
 }
 
 /// The opt-out on a run where the weights could not be hashed AT ALL.
@@ -355,6 +410,14 @@ fn weights_unpinned_with_no_hashable_file_stamps_a_single_line() {
         weights_line.len() < 200,
         "the weights field must stay one short line, got {} chars: {weights_line}",
         weights_line.len()
+    );
+    // No fabricated measurement. The version review caught rendered
+    // `<unverified: props-unreachable> (0 bytes)` -- a byte count, in
+    // the field position a real streamed count occupies, for a file
+    // that was never opened.
+    assert!(
+        !weights_line.contains("bytes"),
+        "must not report a size it never measured: {weights_line}"
     );
     // The explanation is not lost -- it goes where multi-line prose
     // belongs.

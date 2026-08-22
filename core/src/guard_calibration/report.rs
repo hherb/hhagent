@@ -553,8 +553,19 @@ fn render_distribution(cases: &[ScoredCase]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cassandra::guard_model::weights_pin as kastellan_guard_pin;
     use crate::cassandra::guard_model::weights_pin::FileDigest;
+    use std::path::PathBuf;
+
+    /// sha256 of the 5 bytes `hello`, from the standard test vectors.
+    ///
+    /// Deliberately NOT `PINNED_SHA256`: a pinned header must report the
+    /// hash it MEASURED, so a fixture that reuses the constant makes
+    /// `contains(PINNED_SHA256)` true no matter what the code does.
+    const SHA256_HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    fn digest(sha256: &str, size_bytes: u64) -> FileDigest {
+        FileDigest::from_hex(sha256, size_bytes).expect("fixture hash is 64 lowercase hex")
+    }
 
     /// A stand-in run header. The fields are asserted individually by
     /// `the_report_header_records_what_produced_it`; every other test
@@ -565,7 +576,10 @@ mod tests {
             model: "shieldstral-test".to_string(),
             policy_digest: "342e3d9661b2cbe2".to_string(),
             profile: "Strict",
-            weights: WeightsProvenance::Pinned,
+            weights: WeightsProvenance::Pinned {
+                path: PathBuf::from("/models/shieldstral/Shieldstral-1.0-3B-Q8_0.gguf"),
+                digest: digest(SHA256_HELLO, 5),
+            },
         }
     }
 
@@ -573,11 +587,11 @@ mod tests {
     fn meta_unpinned() -> RunMeta {
         RunMeta {
             weights: WeightsProvenance::Unpinned {
-                digest: FileDigest {
-                    sha256: "5cee57a981fefa688ba91825a0a9933d238d4b9147476275b3eac0afbeaf40f5"
-                        .to_string(),
-                    size_bytes: 3_651_679_008,
-                },
+                path: PathBuf::from("/models/shieldstral/candidate.gguf"),
+                digest: digest(
+                    "5cee57a981fefa688ba91825a0a9933d238d4b9147476275b3eac0afbeaf40f5",
+                    3_651_679_008,
+                ),
             },
             ..meta()
         }
@@ -895,8 +909,12 @@ mod tests {
         assert!(out.contains("342e3d9661b2cbe2"), "must name the policy digest: {out}");
         assert!(out.contains("guard profile: Strict"), "must name the profile: {out}");
         assert!(
-            out.contains(kastellan_guard_pin::PINNED_SHA256),
-            "must name the weights that produced the scores: {out}"
+            out.contains(SHA256_HELLO),
+            "must name the weights hash the run MEASURED, not the pin constant: {out}"
+        );
+        assert!(
+            out.contains("Shieldstral-1.0-3B-Q8_0.gguf"),
+            "must name the weights file it hashed: {out}"
         );
     }
 

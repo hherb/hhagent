@@ -21,8 +21,13 @@ use tokio::sync::oneshot;
 /// Bind a one-shot HTTP/1.1 GET mock on an ephemeral port.
 ///
 /// Returns the server's base origin and a receiver that fires with the
-/// request path the mock actually saw — which is the assertion for
-/// "we addressed the server root, not the OpenAI-compat prefix".
+/// whole **request line** the mock actually saw — method included.
+///
+/// The method matters and was once dropped here: capturing only the
+/// path let `self.http.get(..)` become `.post(..)` while every test in
+/// this file still passed, against a real llama-server that answers
+/// `/props` with 405 for anything but GET. The mock answers whatever
+/// verb it is sent, so nothing else in this file would notice.
 async fn spawn_get_mock(status_line: &'static str, body: String) -> (String, oneshot::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
     let port = listener.local_addr().expect("local_addr").port();
@@ -46,15 +51,8 @@ async fn spawn_get_mock(status_line: &'static str, body: String) -> (String, one
             }
         }
         let head = String::from_utf8_lossy(&buf).to_string();
-        let path = head
-            .lines()
-            .next()
-            .unwrap_or("")
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("")
-            .to_string();
-        let _ = tx.send(path);
+        let request_line = head.lines().next().unwrap_or("").trim().to_string();
+        let _ = tx.send(request_line);
 
         let resp = format!(
             "{status_line}\r\nContent-Type: application/json\r\n\
@@ -115,7 +113,7 @@ async fn props_addresses_the_server_root_not_the_compat_prefix() {
 
     router.props().await.expect("props must succeed");
 
-    assert_eq!(served.await.expect("mock served a request"), "/props");
+    assert_eq!(served.await.expect("mock served a request"), "GET /props HTTP/1.1");
 }
 
 #[tokio::test]

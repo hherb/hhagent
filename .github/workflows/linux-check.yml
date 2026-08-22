@@ -196,6 +196,16 @@ jobs:
       - name: cargo test (guard weights pin CLI — refusal contract)
         run: "cargo test -p kastellan-core --test guard_weights_pin_cli_e2e --locked"
 
+      # The CLI binary's OWN unit tests. `--lib guard` above covers the
+      # library half; nothing covered `kastellan-cli`'s `#[cfg(test)]`
+      # modules, and `apply_opt_out` — which decides whether a run may
+      # proceed on unverified weights — lives there. Its accepting arm
+      # is the one no fixture can reach through the CLI (no test can
+      # produce the pinned 3.6 GB file), so this is the only gate that
+      # stops "refuse unconditionally" passing the suite.
+      - name: cargo test (kastellan-cli binary — weights opt-out policy)
+        run: "cargo test -p kastellan-core --bin kastellan-cli --locked"
+
       # `/props` is how the weights pin learns which file llama-server
       # opened — llama.cpp reports an empty `digest`, so the path is the
       # only thing the endpoint can tell us. The URL derivation is the

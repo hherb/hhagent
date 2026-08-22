@@ -42,6 +42,14 @@
 //!     was *never* the pinned one, which is the case that actually
 //!     occurred.
 //!
+//! A third hazard is **not** left as a limitation, because it is a
+//! fail-open rather than a gap: a *relative* `model_path` resolves
+//! against **this** process's working directory, not the server's, so a
+//! copy of the pinned file sitting at the same relative path under the
+//! CLI's cwd would hash as `Pinned` while the server served other
+//! bytes. [`WeightsPinError::RelativePath`] refuses instead — the same
+//! rule `SandboxPolicy.fs_read` follows.
+//!
 //! # Cost
 //!
 //! Hashing the 3.6 GB file measured **1.65 s** on the DGX, twice, warm
@@ -101,6 +109,17 @@ pub const PINNED_SOURCE: &str =
 /// small enough that a unit test can cross the boundary cheaply.
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Is `s` exactly 64 lowercase hex digits — the shape [`digest_file`]
+/// emits and the only shape [`FileDigest`] may hold?
+///
+/// Lowercase specifically, not merely hex: [`hash_matches`] compares
+/// byte-for-byte, so admitting uppercase would make two spellings of
+/// one hash unequal. Rejecting it at construction is what lets the
+/// comparison stay a plain `==`.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// A hashed file: what it is, and how big it was.
 ///
 /// Size rides along because it is free to count while streaming and it
@@ -108,21 +127,42 @@ const HASH_CHUNK_BYTES: usize = 64 * 1024;
 /// model" from "wrong file" — see [`PINNED_SIZE_BYTES`]. Taking it from
 /// the same read as the hash also avoids a second `stat` that could
 /// describe a different file.
+///
+/// **The fields are private, and that is load-bearing.** The first
+/// version of the CLI's opt-out path needed a "we never hashed
+/// anything" state, `WeightsProvenance` had no variant for it, so it
+/// synthesised a `FileDigest` holding `"<unverified: …>"` and
+/// `size_bytes: 0` — putting a fabricated byte count into the operator
+/// artefact this module exists to make trustworthy. With no public
+/// constructor that shortcut does not compile, and the missing state
+/// had to become [`WeightsProvenance::Unverified`], which is what it
+/// always was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDigest {
-    pub sha256: String,
-    pub size_bytes: u64,
+    sha256: String,
+    size_bytes: u64,
 }
 
-/// Whether a hash is the pinned one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WeightsVerdict {
-    /// Matches [`PINNED_SHA256`].
-    Pinned,
-    /// Does not match. Carries the actual hash so the caller can name it
-    /// — in a refusal, or in the report stamp when the operator passed
-    /// `--weights-unpinned`.
-    Unpinned { actual: String },
+impl FileDigest {
+    /// The lowercase hex sha256. 64 chars, guaranteed by construction.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Bytes read while hashing — a count, never a `stat`.
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    /// Build one from a hash that was computed elsewhere — a fixture, or
+    /// a sum parsed out of the bash pin.
+    ///
+    /// `None` for anything that is not 64 lowercase hex digits, so the
+    /// invariant [`digest_file`] establishes cannot be bypassed by the
+    /// one other way in.
+    pub fn from_hex(sha256: &str, size_bytes: u64) -> Option<Self> {
+        is_sha256_hex(sha256).then(|| Self { sha256: sha256.to_string(), size_bytes })
+    }
 }
 
 /// What the report and `RunMeta` record about the weights behind a run.
@@ -131,30 +171,58 @@ pub enum WeightsVerdict {
 /// report's τ is only meaningful against known bytes, so the bytes
 /// travel *with* the number rather than depending on an operator
 /// remembering which server was up.
+///
+/// Three variants, not two, because "we hashed it and it differs" and
+/// "we never hashed anything" are different claims and a report that
+/// conflates them is wrong about what it did. Both non-pinned variants
+/// carry the word `UNPINNED` so one grep finds every untrustworthy run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WeightsProvenance {
-    /// Hashed, and it is the pinned file.
-    Pinned,
+    /// Hashed, and it matched. Carries the digest it *measured* rather
+    /// than letting the header recite [`PINNED_SHA256`] back — the
+    /// point of the field is that a reader can tell a computed hash
+    /// from a quoted constant.
+    Pinned { path: PathBuf, digest: FileDigest },
     /// Hashed, and it is **not** the pinned file. The run proceeded only
     /// because `--weights-unpinned` was passed.
-    Unpinned { digest: FileDigest },
+    Unpinned { path: PathBuf, digest: FileDigest },
+    /// **Nothing was hashed** — `/props` was unreachable, named no
+    /// path, named a relative one, or named a file we could not read —
+    /// and `--weights-unpinned` let the run proceed anyway. `kind` is
+    /// [`WeightsPinError::kind`], which is already constrained to be
+    /// short and whitespace-free so the header stays one field.
+    Unverified { kind: &'static str },
 }
 
 impl WeightsProvenance {
-    /// The `weights:` line for the report header.
+    /// The `weights:` block for the report header.
     ///
-    /// The unpinned rendering states the consequence, not just the fact:
-    /// a reader who sees only a hash has to know what it means, and the
-    /// person most likely to read this report is the one who will paste
-    /// its τ into production.
+    /// Every non-pinned rendering states the consequence, not just the
+    /// fact: a reader who sees only a hash has to know what it means,
+    /// and the person most likely to read this report is the one who
+    /// will paste its τ into production.
     pub fn header_line(&self) -> String {
         match self {
-            Self::Pinned => format!("weights:       {PINNED_SHA256} (pinned)"),
-            Self::Unpinned { digest } => format!(
+            Self::Pinned { path, digest } => format!(
+                "weights:       {} ({} bytes) pinned\n\
+                 \x20              {}",
+                digest.sha256(),
+                digest.size_bytes(),
+                path.display()
+            ),
+            Self::Unpinned { path, digest } => format!(
                 "weights:       {} ({} bytes) UNPINNED\n\
+                 \x20              {}\n\
                  \x20              expected {PINNED_SHA256}\n\
                  \x20              This run CANNOT support the cross-host tau comparison.",
-                digest.sha256, digest.size_bytes
+                digest.sha256(),
+                digest.size_bytes(),
+                path.display()
+            ),
+            Self::Unverified { kind } => format!(
+                "weights:       <unverified: {kind}> UNPINNED -- nothing was hashed\n\
+                 \x20              expected {PINNED_SHA256}\n\
+                 \x20              This run CANNOT support the cross-host tau comparison."
             ),
         }
     }
@@ -164,15 +232,20 @@ impl WeightsProvenance {
 ///
 /// Every variant is fatal unless the operator passed
 /// `--weights-unpinned`. They are kept **separate** rather than collapsed
-/// into one "weights bad" string because they call for four different
-/// actions: fix the server, upgrade the server, fix the path, or treat
-/// it as an incident.
+/// into one "weights bad" string because they call for different
+/// actions: fix the server, upgrade the server, restart it with an
+/// absolute path, run somewhere else, or treat it as an incident.
 #[derive(Debug)]
 pub enum WeightsPinError {
     /// `/props` could not be fetched or parsed.
     PropsUnavailable(String),
     /// `/props` parsed but carried no usable `model_path`.
     NoModelPath,
+    /// `model_path` was relative. Refused rather than resolved — see the
+    /// module doc: a relative path is interpreted against *this*
+    /// process's cwd, so it can hash a different file than the server
+    /// opened, and do it silently.
+    RelativePath(PathBuf),
     /// `model_path` named a file we cannot read — the ordinary case
     /// being that the server runs on a different host from this tool.
     Unreadable(PathBuf, std::io::Error),
@@ -194,6 +267,7 @@ impl WeightsPinError {
         match self {
             Self::PropsUnavailable(_) => "props-unreachable",
             Self::NoModelPath => "no-model-path",
+            Self::RelativePath(_) => "relative-path",
             Self::Unreadable(..) => "unreadable",
             Self::Mismatch { .. } => "mismatch",
         }
@@ -217,6 +291,17 @@ impl fmt::Display for WeightsPinError {
                  file to hash. Re-run with --weights-unpinned to proceed on an \
                  explicitly unverified run."
             ),
+            Self::RelativePath(path) => write!(
+                f,
+                "the guard backend reported a RELATIVE model_path ({}), which cannot \
+                 be verified.\n\
+                 A relative path resolves against THIS tool's working directory, not \
+                 the server's, so hashing it could silently hash a different file \
+                 that happens to sit at the same relative path -- and report it as \
+                 pinned. Restart llama-server with an absolute -m path, or re-run \
+                 with --weights-unpinned to proceed on an explicitly unverified run.",
+                path.display()
+            ),
             Self::Unreadable(path, e) => write!(
                 f,
                 "the guard backend loaded {} but this tool cannot read it: {e}\n\
@@ -237,15 +322,15 @@ impl fmt::Display for WeightsPinError {
                  actual:   {} ({} bytes)\n  {}\n\
                  Fetch the pinned file from {PINNED_SOURCE}. If the model was changed \
                  on purpose, update PINNED_SHA256 in \
-                 core/src/cassandra/guard_model/weights_pin.rs AND \
+                 core/src/cassandra/guard_model/weights_pin/mod.rs AND \
                  KASTELLAN_GUARD_WEIGHTS_SHA256 in scripts/eval/lib/guard-weights.sh \
                  together, and re-run measurement 3 -- a tau fitted on other weights \
                  does not transfer. To calibrate a CANDIDATE model without changing \
                  the pin, re-run with --weights-unpinned. See issue #592.",
                 path.display(),
-                actual.sha256,
-                actual.size_bytes,
-                if actual.size_bytes == PINNED_SIZE_BYTES {
+                actual.sha256(),
+                actual.size_bytes(),
+                if actual.size_bytes() == PINNED_SIZE_BYTES {
                     "Same size as the pinned file, so this is a DIFFERENT QUANTISER RUN \
                      of the right model -- not corruption, and not the wrong model."
                 } else {
@@ -261,12 +346,15 @@ impl std::error::Error for WeightsPinError {}
 
 /// Extract `model_path` from a llama.cpp `/props` body.
 ///
-/// Pure — no IO, no HTTP. `None` for every shape that is not a string at
-/// the top-level `model_path` key, so a server that reports the field as
-/// `null`, a number, or an object is treated as "did not tell us" rather
-/// than coerced into a path.
+/// Pure — no IO, no HTTP. `None` for every shape that is not a
+/// **non-empty** string at the top-level `model_path` key, so a server
+/// that reports the field as `null`, a number, an object, or `""` is
+/// treated as "did not tell us" rather than coerced into a path. The
+/// empty case matters because `PathBuf::from("")` opens as `ENOENT`,
+/// which would misdiagnose a silent server as an unreachable filesystem
+/// and send the operator to re-run on another host.
 pub fn model_path_from_props(props: &serde_json::Value) -> Option<&str> {
-    props.get("model_path")?.as_str()
+    props.get("model_path")?.as_str().filter(|s| !s.is_empty())
 }
 
 /// Is `sha256` the `expected` hash?
@@ -277,16 +365,11 @@ pub fn model_path_from_props(props: &serde_json::Value) -> Option<&str> {
 /// exercised by a 3.6 GB fixture, so an implementation that always
 /// rejected would pass every test that could be written.
 ///
-/// The comparison is **case-sensitive** on purpose: [`digest_file`]
-/// always emits lowercase, and the constant's casing is pinned by
-/// `pinned_sha256_is_64_lowercase_hex`. Accepting either case would
-/// tolerate a pin that the shape test is there to reject loudly.
-pub fn classify(sha256: &str, expected: &str) -> WeightsVerdict {
-    if sha256 == expected {
-        WeightsVerdict::Pinned
-    } else {
-        WeightsVerdict::Unpinned { actual: sha256.to_string() }
-    }
+/// A plain `==` is sufficient because [`FileDigest`] can only hold 64
+/// lowercase hex digits — see [`is_sha256_hex`]. Casing is not a
+/// tolerance question here; it is unrepresentable.
+pub fn hash_matches(sha256: &str, expected: &str) -> bool {
+    sha256 == expected
 }
 
 /// Hash `path`, streaming it, and count its bytes on the same pass.
@@ -309,33 +392,36 @@ pub fn digest_file(path: &Path) -> std::io::Result<FileDigest> {
     Ok(FileDigest { sha256, size_bytes })
 }
 
-/// Hash the file at `path` and say whether it matches `expected`.
+/// Hash the file at `path` and require that it matches `expected`.
 ///
-/// `Ok(Pinned)` / `Ok(Unpinned{..})` both mean "we successfully found
-/// out". Deciding what an `Unpinned` *costs* is the caller's job,
-/// because that differs between the calibration harness (refuse unless
-/// the operator opted out) and any future consumer.
+/// `Ok(digest)` is the single success: the file was absolute, readable,
+/// and its bytes are the ones asked for. **Every** other outcome is a
+/// [`WeightsPinError`] naming which one, because there is no caller for
+/// whom "these are not the weights you asked for" is a value rather
+/// than a problem — the calibration harness's `--weights-unpinned` is a
+/// decision applied to the *error*, which keeps that policy in one
+/// place instead of splitting it across a `Result` and an enum.
 ///
-/// Takes `expected` so both arms are reachable from a unit test with a
-/// small fixture — see [`classify`].
-pub fn verify_weights_against(
-    path: &Path,
-    expected: &str,
-) -> Result<WeightsProvenance, WeightsPinError> {
+/// Takes `expected` so the accepting arm is reachable from a unit test
+/// with a small fixture — see [`hash_matches`].
+pub fn verify_weights_against(path: &Path, expected: &str) -> Result<FileDigest, WeightsPinError> {
+    if !path.is_absolute() {
+        return Err(WeightsPinError::RelativePath(path.to_path_buf()));
+    }
     let digest =
         digest_file(path).map_err(|e| WeightsPinError::Unreadable(path.to_path_buf(), e))?;
-    match classify(&digest.sha256, expected) {
-        WeightsVerdict::Pinned => Ok(WeightsProvenance::Pinned),
-        WeightsVerdict::Unpinned { .. } => Ok(WeightsProvenance::Unpinned { digest }),
+    if hash_matches(digest.sha256(), expected) {
+        Ok(digest)
+    } else {
+        Err(WeightsPinError::Mismatch { path: path.to_path_buf(), actual: digest })
     }
 }
 
 /// [`verify_weights_against`] with the in-repo pin. The thin wrapper
 /// production uses; the logic lives in the parameterised form above.
-pub fn verify_weights_at(path: &Path) -> Result<WeightsProvenance, WeightsPinError> {
+pub fn verify_weights_at(path: &Path) -> Result<FileDigest, WeightsPinError> {
     verify_weights_against(path, PINNED_SHA256)
 }
-
 
 #[cfg(test)]
 mod tests;

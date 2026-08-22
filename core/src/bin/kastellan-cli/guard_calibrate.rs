@@ -1,5 +1,6 @@
-//! `guard calibrate [--corpus DIR] [--tau F]` — score a labelled corpus
-//! through the shipping guard adjudicator and print a confusion matrix.
+//! `guard calibrate [--corpus DIR] [--tau F] [--weights-unpinned]` — score
+//! a labelled corpus through the shipping guard adjudicator and print a
+//! confusion matrix.
 //!
 //! Offline tooling. Nothing here runs in the daemon.
 
@@ -240,18 +241,92 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32, weights_unpinned: bool) -
     }
 }
 
-/// Ask the guard backend which weights it loaded, hash them, and decide
-/// whether this run may proceed.
+/// Ask the guard backend which weights it loaded, and hash them.
 ///
-/// Split out of [`guard_calibrate_async`] so the policy is legible in
-/// one place: **every** way of not knowing is fatal unless the operator
-/// opted out. That symmetry is the point — "we could not check" and
-/// "we checked and it was wrong" are different diagnoses, and the
-/// [`weights_pin::WeightsPinError`] variants keep them distinct in the
-/// message, but they have the same consequence for the run.
+/// The IO half, and only that. Returns the file the server named
+/// together with its digest, or the refusal that stopped us — deciding
+/// what a refusal *costs* is [`apply_opt_out`]'s job, kept separate so
+/// that decision is exercisable without a server.
+async fn probe_weights(
+    client: &kastellan_core::cassandra::guard_model::GuardClient,
+) -> Result<
+    (
+        std::path::PathBuf,
+        kastellan_core::cassandra::guard_model::weights_pin::FileDigest,
+    ),
+    kastellan_core::cassandra::guard_model::weights_pin::WeightsPinError,
+> {
+    use kastellan_core::cassandra::guard_model::weights_pin::{
+        model_path_from_props, verify_weights_at, WeightsPinError,
+    };
+
+    let props = client
+        .props()
+        .await
+        .map_err(|e| WeightsPinError::PropsUnavailable(e.to_string()))?;
+    let path = model_path_from_props(&props).ok_or(WeightsPinError::NoModelPath)?;
+    let path = std::path::PathBuf::from(path);
+    let digest = verify_weights_at(&path)?;
+    Ok((path, digest))
+}
+
+/// Turn a probe outcome plus the operator's flag into the provenance
+/// this run records, or the refusal that ends it.
 ///
-/// `Ok(WeightsProvenance::Unpinned{..})` is reachable only via the
-/// opt-out; without it an unpinned file becomes a `Mismatch` error.
+/// Pure and synchronous, and that is the point. The policy here is one
+/// sentence — **every** way of not knowing is fatal unless the operator
+/// opted out — but for a while nothing exercised the *accepting* arm:
+/// every fixture in the tree is deliberately not the pinned file, and
+/// no test can produce one without a 3.6 GB artefact, so an
+/// implementation that refused unconditionally passed the whole suite.
+/// Split out here, `Ok(..) -> Pinned` is reachable from a unit test in
+/// this file, under both settings of the flag.
+///
+/// `Ok(WeightsProvenance::Unpinned{..})` and `Unverified{..}` are
+/// reachable only via the opt-out; without it every refusal stays a
+/// refusal. The two are kept apart because "we hashed it and it
+/// differed" and "we never hashed anything" are different claims, and
+/// a report that conflates them is wrong about what it did.
+fn apply_opt_out(
+    probed: Result<
+        (
+            std::path::PathBuf,
+            kastellan_core::cassandra::guard_model::weights_pin::FileDigest,
+        ),
+        kastellan_core::cassandra::guard_model::weights_pin::WeightsPinError,
+    >,
+    weights_unpinned: bool,
+) -> Result<
+    kastellan_core::cassandra::guard_model::weights_pin::WeightsProvenance,
+    kastellan_core::cassandra::guard_model::weights_pin::WeightsPinError,
+> {
+    use kastellan_core::cassandra::guard_model::weights_pin::{WeightsPinError, WeightsProvenance};
+
+    match probed {
+        Ok((path, digest)) => Ok(WeightsProvenance::Pinned { path, digest }),
+        // The opt-out accepts the ANSWER; it never skips the work.
+        // Where we managed to hash the file we keep that digest and the
+        // path, so the report still names the bytes and an unpinned run
+        // stays reproducible. Where we could not hash at all there is
+        // nothing to name — and rather than fabricate a digest for a
+        // file that was never opened, the provenance says so.
+        Err(e) if weights_unpinned => Ok(match e {
+            WeightsPinError::Mismatch { path, actual } => {
+                WeightsProvenance::Unpinned { path, digest: actual }
+            }
+            other => WeightsProvenance::Unverified { kind: other.kind() },
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+/// Probe, then apply the operator's decision.
+///
+/// The `eprintln!` sits between the two halves because it needs the
+/// error by reference before [`apply_opt_out`] consumes it. stderr is
+/// where the multi-line `Display` paragraph belongs; the report header
+/// gets `kind()`, a short token — putting the paragraph there rendered
+/// several lines of prose wearing a field label.
 async fn resolve_weights(
     client: &kastellan_core::cassandra::guard_model::GuardClient,
     weights_unpinned: bool,
@@ -259,56 +334,120 @@ async fn resolve_weights(
     kastellan_core::cassandra::guard_model::weights_pin::WeightsProvenance,
     kastellan_core::cassandra::guard_model::weights_pin::WeightsPinError,
 > {
-    use kastellan_core::cassandra::guard_model::weights_pin::{
-        model_path_from_props, verify_weights_at, WeightsPinError, WeightsProvenance,
-    };
+    let probed = probe_weights(client).await;
+    if weights_unpinned {
+        if let Err(e) = &probed {
+            eprintln!("guard calibrate: proceeding on UNVERIFIED weights -- {e}");
+        }
+    }
+    apply_opt_out(probed, weights_unpinned)
+}
 
-    let outcome = async {
-        let props = client
-            .props()
-            .await
-            .map_err(|e| WeightsPinError::PropsUnavailable(e.to_string()))?;
-        let path = model_path_from_props(&props).ok_or(WeightsPinError::NoModelPath)?;
-        let path = std::path::PathBuf::from(path);
-        match verify_weights_at(&path)? {
-            WeightsProvenance::Pinned => Ok(WeightsProvenance::Pinned),
-            // Reported as an ERROR rather than returned as a value:
-            // proceeding on unpinned weights is the operator's call,
-            // and `resolve_weights` is where that call is applied.
-            WeightsProvenance::Unpinned { digest } => {
-                Err(WeightsPinError::Mismatch { path, actual: digest })
+#[cfg(test)]
+mod tests {
+    use super::apply_opt_out;
+    use kastellan_core::cassandra::guard_model::weights_pin::{
+        FileDigest, WeightsPinError, WeightsProvenance, PINNED_SIZE_BYTES,
+    };
+    use std::path::PathBuf;
+
+    const SHA256_HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    fn digest(sha256: &str, size: u64) -> FileDigest {
+        FileDigest::from_hex(sha256, size).expect("fixture hash is 64 lowercase hex")
+    }
+
+    fn refusals() -> Vec<WeightsPinError> {
+        vec![
+            WeightsPinError::PropsUnavailable("connection refused".to_string()),
+            WeightsPinError::NoModelPath,
+            WeightsPinError::RelativePath(PathBuf::from("models/w.gguf")),
+            WeightsPinError::Unreadable(
+                PathBuf::from("/m/w.gguf"),
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            ),
+        ]
+    }
+
+    /// **The gap this whole split exists to close.** Every weights
+    /// fixture in the tree is deliberately NOT the pinned file — no
+    /// test can produce one without a 3.6 GB artefact — so before this,
+    /// an implementation that refused unconditionally passed the entire
+    /// suite. The consequence would have been the inverse of #592:
+    /// `guard calibrate` refusing on a correctly-provisioned host, the
+    /// operator reaching for `--weights-unpinned` to get unstuck, and
+    /// every measurement-3 report stamped as untrustworthy.
+    #[test]
+    fn a_successful_probe_is_accepted_whatever_the_flag_says() {
+        for unpinned in [false, true] {
+            let probed = Ok((PathBuf::from("/m/w.gguf"), digest(SHA256_HELLO, 5)));
+            match apply_opt_out(probed, unpinned) {
+                Ok(WeightsProvenance::Pinned { path, digest: d }) => {
+                    assert_eq!(path, PathBuf::from("/m/w.gguf"));
+                    assert_eq!(d.sha256(), SHA256_HELLO);
+                    assert_eq!(d.size_bytes(), 5);
+                }
+                other => panic!("--weights-unpinned={unpinned} must not downgrade a \
+                                 verified run, got {other:?}"),
             }
         }
     }
-    .await;
 
-    match outcome {
-        Ok(pinned) => Ok(pinned),
-        Err(e) if weights_unpinned => {
-            // The opt-out accepts the ANSWER; it never skips the work.
-            // Where we managed to hash the file we keep that digest, so
-            // the report still names the bytes and an unpinned run stays
-            // reproducible.
-            //
-            // Where we could not hash at all there is nothing to name,
-            // and the header carries `kind()` — a short token — rather
-            // than the `Display` paragraph. The paragraph goes to stderr
-            // instead, where a multi-line explanation belongs; putting it
-            // in the header rendered several lines of prose wearing a
-            // field label.
-            eprintln!("guard calibrate: proceeding on UNVERIFIED weights -- {e}");
-            Ok(match e {
-                WeightsPinError::Mismatch { actual, .. } => {
-                    WeightsProvenance::Unpinned { digest: actual }
-                }
-                other => WeightsProvenance::Unpinned {
-                    digest: kastellan_core::cassandra::guard_model::weights_pin::FileDigest {
-                        sha256: format!("<unverified: {}>", other.kind()),
-                        size_bytes: 0,
-                    },
-                },
-            })
+    #[test]
+    fn every_refusal_is_fatal_without_the_opt_out() {
+        for e in refusals() {
+            let kind = e.kind();
+            let out = apply_opt_out(Err(e), false);
+            match out {
+                Err(got) => assert_eq!(got.kind(), kind, "the refusal must survive unchanged"),
+                Ok(p) => panic!("{kind} was not fatal: {p:?}"),
+            }
         }
-        Err(e) => Err(e),
+        let out = apply_opt_out(
+            Err(WeightsPinError::Mismatch {
+                path: PathBuf::from("/m/w.gguf"),
+                actual: digest(SHA256_HELLO, 5),
+            }),
+            false,
+        );
+        assert!(matches!(out, Err(WeightsPinError::Mismatch { .. })), "{out:?}");
+    }
+
+    /// The opt-out on a real file keeps the measurement: the report has
+    /// to name the actual bytes, or an unpinned run is not reproducible
+    /// from its own artefact.
+    #[test]
+    fn the_opt_out_on_a_mismatch_keeps_the_path_and_the_digest() {
+        let out = apply_opt_out(
+            Err(WeightsPinError::Mismatch {
+                path: PathBuf::from("/m/candidate.gguf"),
+                actual: digest(SHA256_HELLO, PINNED_SIZE_BYTES),
+            }),
+            true,
+        );
+        match out {
+            Ok(WeightsProvenance::Unpinned { path, digest: d }) => {
+                assert_eq!(path, PathBuf::from("/m/candidate.gguf"));
+                assert_eq!(d.sha256(), SHA256_HELLO);
+                assert_eq!(d.size_bytes(), PINNED_SIZE_BYTES);
+            }
+            other => panic!("expected Unpinned, got {other:?}"),
+        }
+    }
+
+    /// The three-and-a-bit refusals where nothing was hashed must NOT
+    /// come back wearing a digest. The version review caught fabricated
+    /// `FileDigest{sha256: "<unverified: ...>", size_bytes: 0}` — a byte
+    /// count for a file that was never opened, in the operator artefact
+    /// this module exists to make trustworthy.
+    #[test]
+    fn the_opt_out_without_a_hash_reports_the_kind_and_invents_no_digest() {
+        for e in refusals() {
+            let kind = e.kind();
+            match apply_opt_out(Err(e), true) {
+                Ok(WeightsProvenance::Unverified { kind: got }) => assert_eq!(got, kind),
+                other => panic!("{kind} must be Unverified, got {other:?}"),
+            }
+        }
     }
 }

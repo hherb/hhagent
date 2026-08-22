@@ -101,7 +101,7 @@ source "$HOME/.cargo/env"
 #    file the server opened and hashing it, so this is only for verifying a
 #    fresh download, or on a host where the tool is not built.
 source scripts/eval/lib/guard-weights.sh
-require_guard_weights ~/models/shieldstral/upstream/Shieldstral-1.0-3B-Q8_0.gguf
+require_guard_weights ~/models/shieldstral/upstream/Shieldstral-1.0-3B-Q8_0.gguf || exit 1
 
 # 1. verify the manifest round-trips (fetches, fails closed on drift)
 ./target/debug/kastellan-cli guard capture \
@@ -130,16 +130,29 @@ Server: `llama-server -m ~/models/shieldstral/upstream/Shieldstral-1.0-3B-Q8_0.g
 
 **Step 3 now verifies the weights before it scores anything.** It GETs `/props`,
 takes `model_path`, hashes that file, and refuses on a mismatch — or on an
-unreadable path, an absent `model_path`, or an unreachable `/props`. Each says
-which of the four fired. Two consequences worth knowing before you hit them:
+unreadable path, an absent `model_path`, a **relative** `model_path`, or an
+unreachable `/props`. Each says which of the five fired. Two consequences worth
+knowing before you hit them, plus one server requirement:
+
+* **start `llama-server` with an ABSOLUTE `-m` path.** A relative one is
+  reported verbatim by `/props` and would resolve against the *calibration
+  tool's* working directory, not the server's — so a copy of the pinned file
+  sitting at the same relative path under your cwd would hash as pinned while
+  the server served something else. That is #592's own shape, so it is refused
+  rather than resolved;
 
 * **the calibration must run on the host serving the model**, because the check
   hashes a local file. Pointing it at a remote `llama-server` refuses with
   *"share a filesystem"* rather than silently trusting the endpoint;
 * **`--weights-unpinned`** proceeds anyway, for calibrating a *candidate* guard
-  model. It accepts the answer; it never skips the hashing, so the report still
-  names the actual bytes — stamped `UNPINNED`, saying the run cannot support the
-  cross-host τ comparison. Do not use it for measurement 3 itself.
+  model. It accepts the answer; it never skips the hashing **where there is a
+  file to hash** — on a mismatch the report names the actual bytes and the path,
+  so the run stays reproducible from its own artefact. Where `/props` could not
+  be reached, named no path, named a relative one, or named a file this tool
+  cannot read, **nothing is hashed** and the header says so
+  (`<unverified: …> UNPINNED -- nothing was hashed`) rather than inventing a
+  digest. Either way the stamp says the run cannot support the cross-host τ
+  comparison. Do not use it for measurement 3 itself.
 
 ## What changed after the review of #593
 
