@@ -1142,7 +1142,11 @@ fn fetch_through_worker(url: &str) -> Result<serde_json::Value, String> {
 }
 ```
 
-> **Implementer note:** `dispatch_one_shot` does **not** exist yet. Before writing the body above, grep for how `core/tests/web_fetch_e2e.rs` spawns and drives the worker (`spawn_worker` + `dispatch_with_sink` + a `WorkerSpec`) and lift that into a small helper on `tool_host`. If that turns out to need more than ~40 lines, stop and split it into its own task rather than growing this one — the deliverable here is the record/verify contract, not a new dispatch API.
+> **CORRECTION, 2026-08-22 — two architectural facts found while implementing, both of which change this task.**
+>
+> **1. `dispatch` SUBSTITUTES A PLACEHOLDER on a catalogue block, and capturing that would silently corrupt the corpus.** When the catalogue screen returns `Block`, `post_process::finalize` replaces the worker's result with `injection_blocked_placeholder(..)` — `{injection_blocked: true, note: "[tool output withheld: …]", score, reason_codes}`. Store that as a corpus case and you get a *benign-looking* document that the catalogue does **not** block, so it enters the adjudicated population and gets scored — a page recorded as the opposite of what it is. The fix is **not** to bypass the screen: cases the catalogue blocks are `excluded_already_blocked` and contribute nothing to τ anyway, so nothing is lost. `guard capture` must **detect the placeholder** (`result["injection_blocked"] == true`) and **refuse** that entry with a message saying the catalogue already blocks it. A silent corruption becomes a loud refusal.
+>
+> **2. There is no `dispatch_one_shot`, and there must not be.** `WorkerCommand::new` is deliberately module-private — its doc calls editing `tool_host` "the reviewable opt-out for the dispatcher chokepoint", and CLAUDE.md forbids adding a spawn-unsandboxed escape hatch. So capture goes through the **existing** `dispatch_with_sink`, which is already `pub`. Postgres is avoided by passing a null `AuditSink` (the trait is public and has one method) rather than by avoiding the chokepoint. No new dispatch API is added, and this task no longer needs the stop-and-split escape clause.
 
 **Routing — verified against the tree, not guessed.** `main.rs` dispatches the whole `guard` namespace in one arm (`"guard" => guard_calibrate::run_guard(&args[2..])` at `main.rs:196`), and the sub-subcommand match lives in `run_guard` at `guard_calibrate.rs:16`. So the change is:
 
@@ -1261,13 +1265,24 @@ Re-run **without** `--record`; every entry must print `OK`. Then hand-edit one m
 
 - [ ] **Step 6: Fit τ on the DGX**
 
+**Both corpora, not just the materialised one.** Fitting against
+`tests/guard/corpus-materialised` alone makes D7's budget scope a **no-op**: every
+materialised case is `captured`, so `OnlyProvenance(Captured)` and `AllBenign` are
+identical, the per-stratum sections collapse to a single stratum, and D5's authored-24
+stratum is absent from the report entirely — leaving the whole scope mechanism untested in
+the one run that matters. Copy the authored cases in first:
+
 ```sh
 source "$HOME/.cargo/env"
+cp tests/guard/corpus/*.json tests/guard/corpus-materialised/
 KASTELLAN_LLM_GUARD_URL=http://127.0.0.1:8081/v1 \
 KASTELLAN_LLM_GUARD_MODEL=shieldstral \
 ./target/debug/kastellan-cli guard calibrate \
   --corpus tests/guard/corpus-materialised | tee docs/devel/runbooks/guard-calibration-dgx.txt
 ```
+
+Verify the report shows **more than one provenance section** before trusting the operating
+point; a single-stratum report means the copy did not happen.
 
 **A run with any `Unmeasured` case is invalid, not merely poor** — so is a captured stratum under 50 cases, or a τ at a boundary of the swept range. Read the `operating point (FP budget 1)` line, not just the margin-maximising τ.
 
