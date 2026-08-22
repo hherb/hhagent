@@ -703,5 +703,33 @@ async fn containment_holds_end_to_end_against_real_postgres() {
         sqlx::query_scalar("SELECT count(*) FROM tasks").fetch_one(&pool).await.expect("count");
     assert_eq!(after, before + 1, "#582: no live token, so it is a task");
 
+    // (c) The same live token with a full stop stuck to it, in prose that is
+    // not verb-first. Whitespace tokenisation alone hashes `<token>.`, which
+    // is not the nonce, so the first version of this arm answered "no live
+    // token" and ENQUEUED — the exact leak the arm exists to prevent, and one
+    // `main` did not have (its broad predicate refused every body it matched).
+    // Driven through the REAL resolver because a fake that agrees with a wrong
+    // candidate set proves nothing about the candidate set.
+    let punctuated = deliver(format!("ok, /approve {token}."));
+    let ack = handle_inbound(&authorizer, None, Some(&wiring), &events, &punctuated)
+        .await
+        .expect("a refusal is acknowledged");
+    assert_eq!(ack.body, kastellan_core::channel::ask_message::ACK_MALFORMED_COMMAND);
+
+    let audits = kastellan_db::audit::fetch_since(&pool, 0, 500).await.expect("audit fetch");
+    let row = audits
+        .iter()
+        .rev()
+        .find(|r| r.action == actions::ASK_ANSWER_REJECTED)
+        .expect("a rejection row");
+    assert_eq!(row.payload["reason"], actions::ASK_REASON_CARRIES_LIVE_TOKEN);
+
+    let leaked: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE payload::text LIKE $1")
+        .bind(format!("%{token}%"))
+        .fetch_one(&pool)
+        .await
+        .expect("scan tasks");
+    assert_eq!(leaked, 0, "punctuation must not carry a live token past containment");
+
     pool.close().await;
 }

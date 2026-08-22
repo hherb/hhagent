@@ -85,8 +85,9 @@ pub trait AskResolver: Send + Sync {
     /// `bus/tests.rs` is deliberately PG-free (spec D12) — and because an
     /// `Err` here must stay distinguishable from `Ok(false)`: the two take
     /// **opposite** arms, since an unanswered question refuses while a
-    /// definite "no" enqueues. Collapsing them into a `bool` would pick
-    /// the wrong arm on every database hiccup, silently.
+    /// definite "no" lets the body continue to the remaining arms (where
+    /// `is_command_shaped` may still refuse it). Collapsing them into a
+    /// `bool` would pick the wrong arm on every database hiccup, silently.
     async fn any_live_nonce(
         &self,
         nonces: &[kastellan_db::asks::Nonce],
@@ -137,8 +138,11 @@ impl AskResolver for PgAskResolver {
 
 /// Everything a bus needs to take part in the operator-ask loop: the
 /// registry it publishes its outbound queue into, and the resolver it hands
-/// answers to. `None` at `spawn` means this bus does neither, and behaves
-/// exactly as it did before #564 slice 2.
+/// answers to. `None` at `spawn` means this bus does neither — but
+/// containment still applies: without a resolver the exact question cannot
+/// be asked, so D7's no-wiring fallback refuses every body the broad
+/// predicate matches, audited `unscannable`. That is deliberately NOT the
+/// pre-#564-slice-2 behaviour; see `containment_refusal`.
 pub struct AskWiring {
     pub outbox: Arc<super::outbox::ChannelOutbox>,
     pub resolver: Arc<dyn AskResolver>,
@@ -236,13 +240,29 @@ impl CompletedTasks for PgCompletedTasks {
 ///      screen to protect, and a false positive would block the one action
 ///      this whole path exists to enable.
 ///
-///      A body that only *looks* like an attempt — it carries an
-///      `/approve`/`/deny` token somewhere but does not parse — also does
-///      not fall through to step 3. It gets the plain usage ack instead,
-///      never the enqueue path: falling through would write a live token
-///      verbatim into `tasks.payload` (durable, no DELETE grant) and hand
-///      it to the planner. `/approve tok9 thanks!` and a quoted reply that
-///      echoes the ask's own command lines are both this shape.
+///      **A body that does not parse is then split three ways (#582, spec
+///      D4)**, and the split replaced a single guess that refused all
+///      three:
+///
+///      - **carries a live token** — some candidate in the body hashes to a
+///        live nonce of *this peer's own* ask. Refused, never enqueued:
+///        enqueueing would write a live token verbatim into `tasks.payload`
+///        (durable, no DELETE grant) and hand it to the planner. A quoted
+///        reply echoing the ask's own command lines is this shape, and so
+///        is `/approve tok9 thanks!` when `tok9` is live.
+///      - **could not be answered** — no resolver wired, the body is over
+///        the candidate caps, or the resolver errored. Also refused; an
+///        unanswered question must never enqueue.
+///      - **verb-first but unparseable** — a human fumbled the syntax
+///        (`/deny` alone). Refused with the usage hint.
+///
+///      Anything else — including an ordinary instruction that merely
+///      *mentions* a verb, such as `should I /approve the PR?` — **does**
+///      fall through to step 3 and is enqueued. That is #582's fix: the old
+///      guess refused it, and on email the refusal could not even be sent,
+///      so the message vanished. The first two arms share one ack so the
+///      All three refusal arms send the *same* ack, so the peer cannot tell
+///      them apart; only the audit `reason` differs.
 ///
 ///      **This containment arm runs whether or not `asks` is wired.** The
 ///      wiring decides whether an answer can be *resolved*; it must not
@@ -442,7 +462,8 @@ pub async fn handle_inbound(
 /// The containment arm (#582, spec D5): may this body be enqueued, or does
 /// it carry a live approval token?
 ///
-/// `Some(reason)` refuses; `None` means the question was asked and the
+/// `Some(reason)` refuses. `None` means there is nothing here to refuse —
+/// either the cheap gate never fired, or the question was asked and the
 /// answer was no. Enqueueing a live token writes it verbatim into
 /// `tasks.payload` — a durable column with no DELETE grant — and hands it
 /// to the planner as an instruction.
@@ -451,14 +472,17 @@ pub async fn handle_inbound(
 /// leading mention pill and prose around a command each carried a live
 /// token past the first version of that guess; widening it a third time
 /// only trades a false negative for a bigger false positive. This asks the
-/// real question instead, so it catches shapes nobody has thought of yet —
+/// real question instead, so it catches command shapes nobody has thought
+/// of yet — within the gate's reach, which is bodies that mention a verb
+/// somewhere (spec Open risk 3) —
 /// and its complement is what lets `is_command_shaped` narrow back to the
 /// UX job it is actually good at.
 ///
-/// **Three fail-closed edges** (spec D7), all reported as `unscannable`
-/// because all three mean *we could not answer*, not *we judged the
-/// syntax*: no resolver wired, more distinct tokens than the cap, and a
-/// resolver error. The last is why `any_live_nonce` returns a `Result` —
+/// **Four fail-closed edges** (spec D7), all reported as `unscannable`
+/// because all of them mean *we could not answer*, not *we judged the
+/// syntax*: no resolver wired, a body larger than `CANDIDATE_BYTE_CAP`,
+/// more distinct candidates than `CANDIDATE_TOKEN_CAP`, and a resolver
+/// error. The last is why `any_live_nonce` returns a `Result` —
 /// `Ok(false)` enqueues and `Err` refuses, so collapsing the two into a
 /// bool would silently pick the wrong arm on every database hiccup.
 async fn containment_refusal(
@@ -474,10 +498,23 @@ async fn containment_refusal(
     // `None`, and `None` here means ENQUEUE — the fail-open this arm
     // exists to prevent, wearing idiomatic Rust. Written out so the
     // refusing branch cannot be mistaken for shorthand.
+    // Three code sites, four triggers (the `candidate_tokens` site covers
+    // both caps). All of them audit the same `unscannable` reason — that
+    // collapse is deliberate (the peer must not learn which) — so the
+    // daemon log is the ONLY place the trigger is recoverable. Two of these
+    // were silent, which made a bus that had lost its wiring (refusing
+    // every verb-mentioning message, indefinitely) indistinguishable from a
+    // large paste and from a DB outage whose log had rotated.
     let Some(wiring) = asks else {
+        warn!(channel = %msg.channel.0, "ask containment: no resolver wired; refusing");
         return Some(actions::ASK_REASON_UNSCANNABLE);
     };
     let Some(tokens) = super::ask_message::candidate_tokens(&msg.body) else {
+        warn!(
+            channel = %msg.channel.0,
+            body_len = msg.body.len(),
+            "ask containment: body exceeds the candidate caps; refusing",
+        );
         return Some(actions::ASK_REASON_UNSCANNABLE);
     };
     let nonces: Vec<_> = tokens.into_iter().map(kastellan_db::asks::Nonce::from_wire).collect();

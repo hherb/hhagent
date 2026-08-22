@@ -208,17 +208,28 @@ pub mod actions {
     /// 2). Carries the channel + peer only — never the token, never the
     /// body.
     ///
-    /// **Three distinct producers write this one action:**
-    /// 1. a well-formed `/approve`/`/deny` whose token resolved nothing;
-    /// 2. a *malformed* attempt — the body's first token is one of the two
-    ///    verbs but the rest does not parse (`/approve tok9 thanks!`),
-    ///    which gets [`super::ask_message::ACK_MALFORMED_COMMAND`] and is
-    ///    kept out of the enqueue path so a live token never lands in
-    ///    `tasks.payload`;
-    /// 3. the resolver returning `Err` — e.g. a DB outage — which
-    ///    `handle_inbound` deliberately collapses into the same arm as (1),
-    ///    because an error path that looks different to the peer is the
-    ///    existence oracle the refusal path refuses to be.
+    /// **Four distinct producers write this one action** — one per arm of
+    /// `handle_inbound`'s split (#582, spec D4), each naming itself in the
+    /// `reason` field:
+    /// 1. a well-formed `/approve`/`/deny` whose token resolved nothing, or
+    ///    whose resolver returned `Err` — e.g. a DB outage. The two are
+    ///    deliberately collapsed into one arm, because an error path that
+    ///    looks different to the peer is the existence oracle the refusal
+    ///    path refuses to be. [`ASK_REASON_UNRESOLVABLE`];
+    /// 2. **containment** — a candidate in the body hashes to a live nonce
+    ///    of this peer's own ask, so the body is kept out of the enqueue
+    ///    path and the live token never lands in `tasks.payload`. This is
+    ///    the arm that carries that security property.
+    ///    [`ASK_REASON_CARRIES_LIVE_TOKEN`];
+    /// 3. the containment question could not be *answered* at all — no
+    ///    wiring, over the candidate caps, or a resolver `Err`. Refused,
+    ///    because an unanswered question must never enqueue.
+    ///    [`ASK_REASON_UNSCANNABLE`];
+    /// 4. a *malformed* attempt — the body's first token is one of the two
+    ///    verbs but the rest does not parse (`/deny` alone), which gets
+    ///    [`super::ask_message::ACK_MALFORMED_COMMAND`]. By construction
+    ///    this arm carries **no** live token: arm 2 runs first.
+    ///    [`ASK_REASON_MALFORMED`].
     ///
     /// **Which arm refused IS now recorded**, in the payload's `reason`
     /// (#584) — see [`ASK_REASON_UNRESOLVABLE`] and its three siblings.
@@ -260,19 +271,24 @@ pub mod actions {
     /// A token in the body is a live nonce of one of this peer's own asks,
     /// so the body was kept out of the enqueue path.
     ///
-    /// **The only row that ever shows the containment guard firing**,
-    /// which makes it the most operationally valuable of the four: it is
-    /// the sole evidence that a live capability was about to be written
-    /// into `tasks.payload` and was not.
+    /// **The sole evidence that a live capability was about to be written
+    /// into `tasks.payload` and was not**, which makes it the most
+    /// operationally valuable of the four. (`unscannable` also comes from
+    /// the containment arm, but records that the question could not be
+    /// answered — not that a token was caught.)
     pub const ASK_REASON_CARRIES_LIVE_TOKEN: &str = "carries_live_token";
 
-    /// The containment question could **not be answered** — the body
-    /// exceeded `ask_message::CANDIDATE_TOKEN_CAP`, the resolver errored,
-    /// or no resolver was wired — so the body was refused.
+    /// The containment question could **not be answered** — the body was
+    /// larger than `ask_message::CANDIDATE_BYTE_CAP`, carried more distinct
+    /// candidates than `ask_message::CANDIDATE_TOKEN_CAP`, the resolver
+    /// errored, or no resolver was wired — so the body was refused.
     ///
-    /// Fail-closed, and one honest cause with three triggers; the daemon
-    /// log carries which. Reporting any of them as
-    /// [`ASK_REASON_MALFORMED`] would be a lie, since none of the three
+    /// Fail-closed, and one honest cause with four triggers. The peer must
+    /// not learn which, so the row does not say; the daemon log carries it,
+    /// and every trigger writes one (two of them did not, which left a bus
+    /// that had lost its wiring indistinguishable from a large paste).
+    /// Reporting any of them as
+    /// [`ASK_REASON_MALFORMED`] would be a lie, since none of the four
     /// requires the body to be verb-first and no syntax judgement was made.
     pub const ASK_REASON_UNSCANNABLE: &str = "unscannable";
 
@@ -284,6 +300,41 @@ pub mod actions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four `reason` values are a durable operator interface: observation
+    /// SQL groups on them and they are already in `audit_log` rows on the
+    /// deployed host. Every other test compares against the CONSTANT, so a
+    /// value change — `ASK_REASON_MALFORMED = "unscannable"` is the plausible
+    /// copy-paste when adding a fifth — keeps the whole suite green while
+    /// silently collapsing the vocabulary. Pinned literally here, the way
+    /// `ask_message::the_wire_verbs_are_the_stored_choices` pins the verbs.
+    #[test]
+    fn the_ask_rejection_reasons_are_a_closed_four_value_vocabulary() {
+        use actions::*;
+        assert_eq!(ASK_REASON_UNRESOLVABLE, "unresolvable");
+        assert_eq!(ASK_REASON_CARRIES_LIVE_TOKEN, "carries_live_token");
+        assert_eq!(ASK_REASON_UNSCANNABLE, "unscannable");
+        assert_eq!(ASK_REASON_MALFORMED, "malformed");
+
+        let all = [
+            ASK_REASON_UNRESOLVABLE,
+            ASK_REASON_CARRIES_LIVE_TOKEN,
+            ASK_REASON_UNSCANNABLE,
+            ASK_REASON_MALFORMED,
+        ];
+        let mut sorted = all.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "the four reasons must stay distinct: {all:?}");
+
+        // A reason is a payload FIELD, never an action name. Nothing in the
+        // type system says so — every `actions::*` constant is `&'static str`
+        // — so it is asserted instead.
+        assert!(
+            all.iter().all(|r| !r.contains('.')),
+            "an action name is dotted (`channel.received`); a reason is not: {all:?}",
+        );
+    }
 
     /// `PeerEvidence`'s `Debug` must never render the token. Asserted here
     /// rather than trusted, because the failure mode is silent: a `?evidence`

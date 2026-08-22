@@ -56,6 +56,13 @@ pub const ACK_NOT_ANSWERABLE: &str =
 /// token verbatim into `tasks.payload` (a durable column with no DELETE
 /// grant) and handing it to the planner as an instruction.
 ///
+/// **Shared by the containment arm and the malformed arm, deliberately
+/// (spec D4).** The two refuse for very different reasons — one caught a
+/// live capability, the other saw a typo — and send the *same* sentence, so
+/// the peer cannot tell them apart. Only the audit `reason` differs. Do not
+/// "improve" this by giving containment its own wording: that would hand a
+/// token-guessing peer the oracle the whole path refuses to be.
+///
 /// **`TOKEN`, not `<token>`, and that is load-bearing (#583).** Element
 /// parses an angle-bracketed placeholder as an unknown HTML tag and drops
 /// it from the sender's own timeline. An operator who copied the old hint
@@ -170,13 +177,22 @@ impl std::fmt::Debug for AskCommand {
 /// Recognise `/approve <token>` or `/deny <token>`, or `None` for anything
 /// else.
 ///
-/// `None` does **not** mean "ordinary message". It splits in two, and
-/// [`looks_like_ask_command`] is what tells the halves apart: a body whose
-/// first token is one of the two verbs is a malformed *attempt* and gets
-/// [`ACK_MALFORMED_COMMAND`] without ever reaching the enqueue path
-/// (enqueueing `/approve tok9 thanks!` would write a live token into
-/// `tasks.payload`); everything else is an ordinary message and takes the
-/// normal screen-and-enqueue path. `handle_inbound` applies that split.
+/// `None` does **not** mean "ordinary message". `handle_inbound` splits it
+/// three ways (#582, spec D4), using two different predicates for two
+/// different questions:
+///
+/// - **containment** decides whether the body may be enqueued at all — an
+///   exact, peer-scoped live-nonce lookup over [`candidate_tokens`], gated
+///   by [`looks_like_ask_command`] (which matches an ask verb in *any*
+///   position, and is only a gate). A body carrying a live token is refused
+///   here whatever its *command* shape — provided it mentions a verb at
+///   all, which is what the gate requires; see spec Open risk 3. Enqueueing
+///   it would write that token into `tasks.payload`.
+/// - [`is_command_shaped`] — **first token only** — decides whether a body
+///   that carries no live token nonetheless earns the usage hint, i.e.
+///   whether a human just fumbled a command.
+/// - everything else is an ordinary message and takes the normal
+///   screen-and-enqueue path, including one that merely *mentions* a verb.
 ///
 /// **Strict: the trimmed body must be exactly two whitespace-separated
 /// tokens.** Accepting a trailing tail would let one message both resolve
@@ -233,20 +249,19 @@ pub fn parse_ask_command(body: &str) -> Option<AskCommand> {
 ///   command is a certain trigger.
 /// - **Prose around the command**: `should I /approve 7f3a9c2e1b ?`
 ///
-/// The cost is a false positive: an ordinary instruction that happens to
-/// contain a bare `/approve` token is now refused with
-/// [`ACK_MALFORMED_COMMAND`] instead of being enqueued. That is the right
-/// side to err on — such a message carries no live token, so the refusal
-/// costs one rephrase, while the miss costs a durable secret. The refusal
-/// is visible and self-explaining, which the old fall-through was not: an
-/// enqueued "answer" got no acknowledgement at all, so the operator
-/// believed they had approved while the task sat suspended until it
-/// expired.
+/// **Its false positive used to cost a refusal; since #582 it costs
+/// nothing.** While this predicate decided on its own, an ordinary
+/// instruction that merely contained a bare `/approve` was refused with
+/// [`ACK_MALFORMED_COMMAND`] instead of being enqueued — and on email that
+/// refusal could not even be sent, so the message was dropped silently.
+/// That was #582's complaint. Now the gate only opens the *question*, and a
+/// body with no live token is enqueued normally on a wired bus.
 ///
-/// On email the refusal is *not* visible, because `EmailChannel::send`
-/// still bails unconditionally — so a quoting thread reply that mentions
-/// `/approve` is dropped silently. Accepted, and recorded as a residual in
-/// the slice-2 spec's "Open risks" rather than left implicit.
+/// The email residual is correspondingly smaller but not gone: a body this
+/// gate matches that *is* refused — it carries a live token, or could not
+/// be scanned — still gets an ack `EmailChannel::send` bails on, so the
+/// peer sees nothing. Recorded in the slice-2 spec's "Open risks" rather
+/// than left implicit.
 ///
 /// **Demoted, not deleted (#582, spec D3).** This predicate no longer
 /// decides anything on its own. It is the cheap, DB-free **gate** on the
@@ -255,10 +270,16 @@ pub fn parse_ask_command(body: &str) -> Option<AskCommand> {
 /// that answer, not this guess, decides whether the body may be enqueued.
 ///
 /// Keeping it is what makes the exact check affordable: ordinary traffic
-/// never reaches the database. And its false positive stopped costing
-/// anything, which was #582's complaint — `should I /approve the PR?` fires
-/// this gate, matches no live nonce, is not [`is_command_shaped`], and is
-/// enqueued normally.
+/// never reaches the database (pinned by
+/// `bus::tests::ordinary_traffic_never_reaches_the_database`). And its
+/// false positive stopped costing anything, which was #582's complaint —
+/// `should I /approve the PR?` fires this gate, matches no live nonce, is
+/// not [`is_command_shaped`], and is enqueued normally.
+///
+/// **On a *wired* bus.** Without a resolver the exact question cannot be
+/// asked, so D7's no-wiring fallback leaves this predicate as the sole
+/// decider and the same body is still refused, audited `unscannable`. Both
+/// production buses wire it; an unwired bus is a test-only shape.
 ///
 /// **Do not delete this function** believing #582 replaced it, and do not
 /// widen it a third time. If a new *typed* shape needs recognising, widen
@@ -277,8 +298,17 @@ pub fn looks_like_ask_command(body: &str) -> bool {
     })
 }
 
-/// How much of a body the containment arm reads when collecting candidate
-/// tokens (spec D7).
+/// The largest body the containment arm will scan (spec D7). Over it, the
+/// arm refuses rather than reading a prefix.
+///
+/// **It bounds what we will answer, not how much we read.** The first
+/// version read a 64 KiB prefix and returned an answer for the whole body,
+/// which is the fail-OPEN this arm exists to prevent: `looks_like_ask_command`
+/// scans the *whole* body, so the gate fired on a far-away verb while only
+/// the prefix was hashed, and a live token past the cap was enqueued with
+/// no audit row and no log line. Refusing is the posture
+/// [`CANDIDATE_TOKEN_CAP`] already took, and the one the spec's Open risk 2
+/// says was chosen.
 ///
 /// Deliberately **not** `injection_guard::SCAN_BYTE_CAP`, even though both
 /// are 64 KiB today: that one is the guard's document budget and answers a
@@ -291,29 +321,52 @@ pub const CANDIDATE_BYTE_CAP: usize = 65_536;
 ///
 /// An inbound body is not bounded before enqueue, so without this a large
 /// paste would hash unboundedly and ship a huge array to Postgres. Over the
-/// cap the arm fails **closed** — the alternative, scanning a prefix and
-/// enqueueing anyway, is a silent false negative on a token past the cap,
-/// and a silent miss is the failure the whole arm exists to prevent.
+/// cap the arm fails **closed** — the alternative, scanning part of the body
+/// and enqueueing anyway, is a silent false negative on a token we never
+/// hashed, and a silent miss is the failure the whole arm exists to prevent.
+/// [`CANDIDATE_BYTE_CAP`] takes the same posture for the same reason.
 pub const CANDIDATE_TOKEN_CAP: usize = 1024;
 
-/// The distinct whitespace tokens of a bounded prefix of `body`, or `None`
-/// when there are more than [`CANDIDATE_TOKEN_CAP`] of them.
+/// Every distinct candidate hash-input in `body`, or `None` when the
+/// question cannot be answered.
 ///
 /// `None` means *"the containment question cannot be answered"* and the
-/// caller must fail closed. It does **not** mean "no candidates" — that is
-/// `Some(vec![])`.
+/// caller must fail closed — the body is larger than [`CANDIDATE_BYTE_CAP`],
+/// or carries more than [`CANDIDATE_TOKEN_CAP`] distinct candidates. It does
+/// **not** mean "no candidates"; that is `Some(vec![])`.
 ///
-/// **No shape filter, deliberately.** Spec D7 of slice 2 bans coupling to
-/// the nonce encoding, and the argument is stronger here than there: a
-/// filter that is wrong produces a false *negative*, i.e. a live token the
-/// containment arm never hashes and therefore never catches. Tokens are
-/// hashed exactly as they arrived; the index decides.
+/// **Up to two candidates per whitespace token: the token as it arrived,
+/// and the token with leading/trailing non-alphanumerics trimmed** (one
+/// when the two coincide, which is the common case). The raw form
+/// alone is not enough — a live token is one whitespace token only when the
+/// operator typed no punctuation against it, and `ok, /approve 7f3a9c2e1b.`
+/// hashes `7f3a9c2e1b.`, which is not the nonce. `main` refused every body
+/// the broad predicate matched, so that class was contained there; making an
+/// exact hash the decider re-opened it, and `is_command_shaped` cannot see it
+/// because the first token is prose.
+///
+/// **This ADDS candidates, it never drops one — which is what makes it safe
+/// under D7.** Spec D7 of slice 2 bans coupling to the nonce *encoding*, and
+/// the argument is about *filters*: a filter that is wrong yields a false
+/// negative, i.e. a live token never hashed and therefore never caught. A
+/// trimmed *variant* alongside the raw token can only ever cause a false
+/// positive — a refusal — so being wrong about it costs a rephrase, not a
+/// leaked capability. The index still decides; nothing here judges shape.
 pub fn candidate_tokens(body: &str) -> Option<Vec<String>> {
-    let prefix = bounded_prefix(body, CANDIDATE_BYTE_CAP);
+    // Refuse rather than read a prefix: a partial scan returns an answer for
+    // a body we did not read, and the caller reads `Some` as "asked and
+    // answered". This also means no truncation, hence no char-boundary cut.
+    if body.len() > CANDIDATE_BYTE_CAP {
+        return None;
+    }
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for tok in prefix.split_whitespace() {
-        if seen.insert(tok) {
+    for raw in body.split_whitespace() {
+        let trimmed = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        for tok in [raw, trimmed] {
+            if tok.is_empty() || !seen.insert(tok) {
+                continue;
+            }
             if out.len() == CANDIDATE_TOKEN_CAP {
                 return None;
             }
@@ -321,24 +374,6 @@ pub fn candidate_tokens(body: &str) -> Option<Vec<String>> {
         }
     }
     Some(out)
-}
-
-/// The largest prefix of `body` that is at most `cap` bytes and ends on a
-/// char boundary.
-///
-/// A body is arbitrary UTF-8 from a transport. Both `String::truncate` and
-/// a bare `&body[..cap]` **panic** on a non-boundary index, and a
-/// multi-byte character straddling the cap is precisely where that index
-/// lands. The straddling character is dropped whole.
-fn bounded_prefix(body: &str, cap: usize) -> &str {
-    if body.len() <= cap {
-        return body;
-    }
-    let mut end = cap;
-    while end > 0 && !body.is_char_boundary(end) {
-        end -= 1;
-    }
-    &body[..end]
 }
 
 /// True when the body's **first** whitespace token is `/approve` or
@@ -350,7 +385,8 @@ fn bounded_prefix(body: &str, cap: usize) -> &str {
 /// different questions:
 ///
 /// - [`looks_like_ask_command`] — *might this body carry a live token?*
-///   Broad, and only a **gate** on the exact check.
+///   Broad, and only a **gate** on the exact check — but a gate, so a body
+///   with no verb at all never reaches that check (spec Open risk 3).
 /// - `is_command_shaped` — *did a human just fumble a command?* Narrow,
 ///   and it decides the usage hint alone.
 ///
@@ -358,7 +394,8 @@ fn bounded_prefix(body: &str, cap: usize) -> &str {
 /// person typing a command produces. A quoted reply, a mention pill, or
 /// prose mentioning `/approve` is not someone typing a command — and the
 /// live token such a body may carry is caught by the containment arm
-/// regardless of its shape.
+/// whatever its command shape, so long as a verb appears somewhere (that
+/// is the gate's limit, spec Open risk 3).
 ///
 /// Being wrong here now costs a missing usage hint, never a leaked token.
 /// That is why widening *this* predicate is safe in a way widening the old
@@ -576,10 +613,12 @@ mod tests {
         }
     }
 
-    /// Bodies whose FIRST token is `/approve`/`/deny` must be recognised as
-    /// an attempt even when they do not parse — this is the distinction
-    /// `handle_inbound` uses to keep a malformed attempt out of the
-    /// enqueue path. Case-insensitive, same as `parse_ask_command`.
+    /// Bodies containing an ask verb in ANY position must fire this gate
+    /// even when they do not parse — it is the cheap precondition on the
+    /// containment arm, not the thing that decides enqueue (that is the
+    /// exact live-nonce lookup) and not the thing that decides the usage
+    /// hint (that is `is_command_shaped`, which is first-token-only).
+    /// Case-insensitive, same as `parse_ask_command`.
     #[test]
     fn a_malformed_attempt_still_looks_like_a_command() {
         for body in [
@@ -662,13 +701,27 @@ mod tests {
     /// to be bounded — an inbound body is NOT bounded before enqueue
     /// (`build_channel_task_payload` stores `msg.body` whole;
     /// `SCAN_BYTE_CAP` bounds only screening).
+    ///
+    /// Asserts the dedup PROPERTY rather than a total. The total was `3`
+    /// while a token produced exactly one candidate; it now produces up to
+    /// two (raw + punctuation-trimmed), so a count here would pin an
+    /// incidental fact about the variant set instead of the invariant the
+    /// test is named for.
     #[test]
     fn candidate_tokens_dedups_and_keeps_every_distinct_token() {
         let got = candidate_tokens("/approve ab ab cd").expect("under cap");
-        assert_eq!(got.len(), 3, "duplicates collapse: {got:?}");
+        assert_eq!(
+            got.iter().filter(|g| *g == "ab").count(),
+            1,
+            "a repeated token must be hashed once: {got:?}",
+        );
         for t in ["/approve", "ab", "cd"] {
             assert!(got.iter().any(|g| g == t), "missing {t}: {got:?}");
         }
+        let mut sorted = got.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), got.len(), "the candidate set must carry no duplicates: {got:?}");
     }
 
     /// No shape filter on candidates. Slice-2 D7 bans coupling to the nonce
@@ -691,17 +744,88 @@ mod tests {
         assert!(candidate_tokens(&body).is_none(), "over cap must fail closed");
     }
 
-    /// A body is arbitrary UTF-8, so the prefix cut must land on a char
-    /// boundary: both `String::truncate` and `&s[..n]` PANIC on a
-    /// non-boundary index, and a multi-byte character straddling the cap is
-    /// exactly where that lands.
+    /// A body larger than [`CANDIDATE_BYTE_CAP`] cannot be scanned, so the
+    /// containment question cannot be answered and the arm must fail
+    /// CLOSED — the same posture [`CANDIDATE_TOKEN_CAP`] already takes.
+    ///
+    /// The previous implementation read a 64 KiB prefix and returned
+    /// `Some`, which the caller reads as "asked and answered": a live token
+    /// past the cap was never hashed and the body was ENQUEUED. That is
+    /// verbatim the alternative this module's own doc rejects ("scanning a
+    /// prefix and enqueueing anyway ... a silent miss is the failure the
+    /// whole arm exists to prevent") and which the spec's Open risk 2
+    /// records as chosen against.
+    ///
+    /// Note the asymmetry that made it reachable: `looks_like_ask_command`
+    /// scans the WHOLE body, so the gate fires on a far-away verb while
+    /// only the prefix was ever hashed.
     #[test]
-    fn candidate_tokens_cuts_the_prefix_on_a_char_boundary() {
-        // 2 bytes each, so the cap lands mid-character.
-        let body = "\u{00e9}".repeat(CANDIDATE_BYTE_CAP);
-        let got = candidate_tokens(&body);
-        assert!(got.is_some(), "one long token is one candidate, not over the token cap");
-        assert_eq!(got.expect("some").len(), 1);
+    fn candidate_tokens_refuses_a_body_over_the_byte_cap() {
+        // Low-entropy padding: far under the TOKEN cap, so only the BYTE
+        // cap can refuse this.
+        let mut body = "aa ".repeat(CANDIDATE_BYTE_CAP / 2);
+        assert!(body.len() > CANDIDATE_BYTE_CAP);
+        body.push_str("/approve 7f3a9c2e1b");
+        assert!(
+            candidate_tokens(&body).is_none(),
+            "a body we cannot scan whole must fail closed, not return a partial answer",
+        );
+    }
+
+    /// Exactly at the byte cap is still answerable — the refusal starts one
+    /// byte later. Pins the boundary so a `>=` slip is caught.
+    #[test]
+    fn candidate_tokens_accepts_a_body_exactly_at_the_byte_cap() {
+        let body = "a".repeat(CANDIDATE_BYTE_CAP);
+        assert_eq!(body.len(), CANDIDATE_BYTE_CAP);
+        assert_eq!(candidate_tokens(&body).expect("at the cap is answerable").len(), 1);
+    }
+
+    /// Exactly [`CANDIDATE_TOKEN_CAP`] distinct candidates is answerable;
+    /// the refusal starts at CAP+1. The sibling test pins CAP+1, so this
+    /// pair brackets the boundary and catches a check moved after the push.
+    #[test]
+    fn candidate_tokens_accepts_exactly_the_token_cap() {
+        let body = (0..CANDIDATE_TOKEN_CAP).map(|i| format!("t{i}")).collect::<Vec<_>>().join(" ");
+        let got = candidate_tokens(&body).expect("exactly at the cap is answerable");
+        assert_eq!(got.len(), CANDIDATE_TOKEN_CAP);
+    }
+
+    /// #582's containment arm hashes whitespace tokens EXACTLY as they
+    /// arrive, so a live token with a comma or full stop stuck to it hashes
+    /// to something else and is not contained. `main` refused every body
+    /// the broad predicate matched, so this class was safe there; narrowing
+    /// the decider to an exact hash match re-opened it.
+    ///
+    /// The fix ADDS a punctuation-trimmed variant beside the raw token —
+    /// never replaces it — so no candidate is ever dropped and D7's ban on
+    /// coupling to the nonce encoding is respected: a wrong guess here can
+    /// only cause a false positive (a refusal), never a miss.
+    #[test]
+    fn candidate_tokens_also_offers_a_punctuation_trimmed_variant() {
+        for body in [
+            "ok, /approve 7f3a9c2e1b.",
+            "yes please /approve 7f3a9c2e1b!",
+            "> **7f3a9c2e1b**, ok?",
+            "is it \"7f3a9c2e1b\"?",
+            "(/approve 7f3a9c2e1b)",
+        ] {
+            let got = candidate_tokens(body).expect("under cap");
+            assert!(
+                got.iter().any(|g| g == "7f3a9c2e1b"),
+                "the bare token must reach the hash for {body:?}: {got:?}",
+            );
+        }
+    }
+
+    /// The raw token survives alongside the trimmed one. Dropping it would
+    /// be a shape FILTER, which D7 bans for the right reason: a nonce is
+    /// opaque and a filter that is wrong yields a false negative.
+    #[test]
+    fn candidate_tokens_keeps_the_raw_token_beside_the_trimmed_one() {
+        let got = candidate_tokens("**7f3a9c2e1b**,").expect("under cap");
+        assert!(got.iter().any(|g| g == "**7f3a9c2e1b**,"), "raw token dropped: {got:?}");
+        assert!(got.iter().any(|g| g == "7f3a9c2e1b"), "trimmed token missing: {got:?}");
     }
 
     /// The narrowed check. First token only — which is what a person TYPING
@@ -750,11 +874,25 @@ mod tests {
     /// real client shows it.
     #[test]
     fn the_usage_hint_carries_no_html_metasyntax() {
-        assert!(
-            !ACK_MALFORMED_COMMAND.contains('<'),
-            "a `<...>` placeholder is eaten by Matrix clients: {ACK_MALFORMED_COMMAND}"
-        );
-        assert!(!ACK_MALFORMED_COMMAND.contains('>'));
+        // #583 is a CLASS of defect, not one string: every operator-facing
+        // body we send is eaten the same way. Looping over the siblings is a
+        // free regression guard against the next author reaching for
+        // `<placeholder>` in a different one.
+        // `<` is the actual trigger: it opens what Element parses as an
+        // unknown tag and drops. A bare `>` is not — `render_ask` puts one
+        // at the start of the fenced concern line ON PURPOSE, and Matrix
+        // renders that as a quote, which is what `fence` exists to do.
+        for (name, body) in [
+            ("ACK_MALFORMED_COMMAND", ACK_MALFORMED_COMMAND),
+            ("ACK_NOT_ANSWERABLE", ACK_NOT_ANSWERABLE),
+            ("PAIRED_ACK_BODY", crate::channel::bus::PAIRED_ACK_BODY),
+            ("render_ask", &render_ask(7, "a concern", "tok9", deadline())),
+        ] {
+            assert!(!body.contains('<'), "a `<...>` placeholder is eaten by Matrix: {name}: {body}");
+        }
+        // The usage hint carries no angle bracket of either kind: it is one
+        // line of literal syntax to copy, with nothing to quote.
+        assert!(!ACK_MALFORMED_COMMAND.contains('>'), "{ACK_MALFORMED_COMMAND}");
         // Still teaches both verbs, or it is not a usage hint any more.
         assert!(ACK_MALFORMED_COMMAND.contains("/approve"));
         assert!(ACK_MALFORMED_COMMAND.contains("/deny"));

@@ -867,13 +867,15 @@ async fn the_bus_registers_its_channel_and_deregisters_on_shutdown() {
     );
 }
 
-/// A body that only *looks* like an attempted answer — first token
-/// `/approve`/`/deny`, but it does not parse — must not fall through to
-/// screening + enqueue. Without this arm, `/approve tok9 thanks!` (exactly
-/// what a person types) would be written verbatim into `tasks.payload`,
-/// carrying the LIVE approval token into a durable, no-DELETE-grant column
-/// and handing it to the planner as an instruction — a capability leak,
-/// not a cosmetic one.
+/// The UX arm on a body whose token is **dead**: first token
+/// `/approve`/`/deny`, does not parse, and hashes to no live nonce. It gets
+/// the usage hint and is not enqueued.
+///
+/// Note what this test does NOT pin, since the doc used to claim it: with
+/// no live nonce in the fake, containment answers "no" and what refuses
+/// here is the `malformed` arm, which by construction carries no live
+/// token. The capability-leak case — the same body with `tok9` live — is
+/// `containment_outranks_the_usage_hint`.
 #[tokio::test]
 async fn a_malformed_command_is_not_enqueued_and_gets_a_usage_hint() {
     let resolver = Arc::new(RecordingResolver::default());
@@ -893,7 +895,11 @@ async fn a_malformed_command_is_not_enqueued_and_gets_a_usage_hint() {
     assert!(ev.enqueued.lock().unwrap().is_empty(), "a malformed command must never become a task");
     assert!(
         resolver.calls.lock().unwrap().is_empty(),
-        "a malformed command never resolves to anything — the resolver must not be consulted"
+        "a malformed command never resolves to anything — `resolve` must not be consulted",
+    );
+    assert!(
+        !resolver.nonce_queries.lock().unwrap().is_empty(),
+        "containment runs first and DOES consult the resolver, even here",
     );
     let audited = ev.audited.lock().unwrap();
     assert_eq!(audited[0].0, actions::ASK_ANSWER_REJECTED);
@@ -958,6 +964,12 @@ async fn a_resolver_error_is_acknowledged_identically_to_a_refusal() {
     let rendered = audited[0].1.to_string();
     assert!(!rendered.contains("simulated db outage"), "the audit row must not carry the error text");
     assert!(!rendered.contains("tok9"), "the audit row must not carry the token");
+    assert_eq!(
+        audited[0].1["reason"],
+        actions::ASK_REASON_UNRESOLVABLE,
+        "a resolver Err must collapse into arm 1's reason, not get one of its own — \
+         `mod.rs` spends a paragraph on why, and nothing pinned it",
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -1064,6 +1076,10 @@ async fn containment_outranks_the_usage_hint() {
     .await;
 
     assert_eq!(ev.audited.lock().unwrap()[0].1["reason"], actions::ASK_REASON_CARRIES_LIVE_TOKEN);
+    assert!(
+        ev.enqueued.lock().unwrap().is_empty(),
+        "the reason is the diagnostic; NOT enqueuing is the security property",
+    );
 }
 
 /// Fail closed on a question we could not answer (spec D7). `Ok(false)`
@@ -1123,6 +1139,93 @@ async fn an_unwired_bus_still_refuses_on_the_broad_predicate() {
     assert_eq!(ack.body, crate::channel::ask_message::ACK_MALFORMED_COMMAND);
     assert!(ev.enqueued.lock().unwrap().is_empty());
     assert_eq!(ev.audited.lock().unwrap()[0].1["reason"], actions::ASK_REASON_UNSCANNABLE);
+}
+
+/// C1, the regression this PR introduced against `main`: a live token with
+/// a full stop stuck to it. `main` refused every body the broad predicate
+/// matched, so this was contained there; narrowing the decider to an exact
+/// hash match re-opened it, and `is_command_shaped` cannot catch it because
+/// the first token is ordinary prose.
+///
+/// The end state without the fix is the exact failure the arm exists to
+/// prevent: the live token written verbatim into `tasks.payload`.
+#[tokio::test]
+async fn a_live_token_with_trailing_punctuation_is_contained() {
+    for body in ["ok, /approve 7f3a9c2e1b.", "yes please /approve 7f3a9c2e1b!"] {
+        let mut r = RecordingResolver::default();
+        r.live_nonces.insert("7f3a9c2e1b".to_string());
+        let ev = FakeEvents::default();
+        let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+        let ack = handle_inbound(&auth, None, Some(&*wiring(Arc::new(r))), &ev, &msg("@me:srv", body))
+            .await
+            .expect("a refusal is acknowledged");
+
+        assert_eq!(ack.body, crate::channel::ask_message::ACK_MALFORMED_COMMAND, "{body:?}");
+        assert!(
+            ev.enqueued.lock().unwrap().is_empty(),
+            "a live token must never reach tasks.payload: {body:?}",
+        );
+        assert_eq!(
+            ev.audited.lock().unwrap()[0].1["reason"],
+            actions::ASK_REASON_CARRIES_LIVE_TOKEN,
+            "{body:?}",
+        );
+    }
+}
+
+/// C2: a body too large to scan cannot answer the containment question, so
+/// it must be refused `unscannable` rather than enqueued on a partial read.
+///
+/// The padding is deliberately low-entropy so the TOKEN cap cannot fire —
+/// only the BYTE cap can refuse this. Before the fix the arm hashed a
+/// 64 KiB prefix, missed the token past it, and enqueued.
+#[tokio::test]
+async fn a_body_over_the_byte_cap_refuses_rather_than_scanning_a_prefix() {
+    use crate::channel::ask_message::CANDIDATE_BYTE_CAP;
+    let mut body = "aa ".repeat(CANDIDATE_BYTE_CAP / 2);
+    body.push_str("/approve 7f3a9c2e1b");
+    let mut r = RecordingResolver::default();
+    r.live_nonces.insert("7f3a9c2e1b".to_string());
+    let resolver = Arc::new(r);
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    handle_inbound(&auth, None, Some(&*wiring(resolver.clone())), &ev, &msg("@me:srv", &body)).await;
+
+    assert!(
+        ev.enqueued.lock().unwrap().is_empty(),
+        "a body we could not scan whole must never be enqueued",
+    );
+    assert_eq!(ev.audited.lock().unwrap()[0].1["reason"], actions::ASK_REASON_UNSCANNABLE);
+    assert!(
+        resolver.nonce_queries.lock().unwrap().is_empty(),
+        "an unscannable body must not reach the database",
+    );
+}
+
+/// The cheap DB-free gate is what makes the exact check affordable
+/// (`ask_message::looks_like_ask_command`'s doc: "ordinary traffic never
+/// reaches the database"). That claim was unpinned — deleting the gate's
+/// early return left every test green while every inbound message started
+/// hitting Postgres.
+#[tokio::test]
+async fn ordinary_traffic_never_reaches_the_database() {
+    let resolver = Arc::new(RecordingResolver::default());
+    let ev = FakeEvents::default();
+    let auth = StaticPairings::from_peers([PeerId("@me:srv".into())]);
+    handle_inbound(
+        &auth,
+        None,
+        Some(&*wiring(resolver.clone())),
+        &ev,
+        &msg("@me:srv", "what is my flight's GST?"),
+    )
+    .await;
+
+    assert_eq!(ev.enqueued.lock().unwrap().len(), 1);
+    assert!(
+        resolver.nonce_queries.lock().unwrap().is_empty(),
+        "the DB-free gate must short-circuit before the containment query",
+    );
 }
 
 /// Arm 1 keeps its deliberate collapse and gains only the field.

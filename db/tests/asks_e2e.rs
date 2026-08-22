@@ -2517,8 +2517,20 @@ fn containment_sees_exactly_what_resolution_accepts() {
     });
 }
 
-/// An empty candidate list must not issue a query at all, and must be
-/// `false` rather than an error or a vacuous `true`.
+/// An empty candidate list must be `false` rather than an error or a
+/// vacuous `true`.
+///
+/// The "issues no query" half is **unpinned**, and deliberately so: a
+/// `PgPool` does not count statements, and the bus test that asserts
+/// `RecordingResolver::nonce_queries` is empty pins the BUS declining to
+/// call the resolver — a different property, which stays green if this
+/// function's `is_empty()` short-circuit is deleted.
+///
+/// It is also unreachable from the bus: the gate only fires when a verb
+/// token matched, and that token is always itself a candidate, so
+/// `any_live_nonce_for_claimant` never sees an empty slice in production.
+/// The guard is defence for a future caller, and this test pins only the
+/// value it returns.
 #[test]
 fn containment_of_no_candidates_is_false() {
     let Some(h) = harness("askcn0") else {
