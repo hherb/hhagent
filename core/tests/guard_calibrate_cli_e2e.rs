@@ -124,12 +124,28 @@ fn canned_no_verdict() -> String {
 }
 
 fn write_case(dir: &std::path::Path, id: &str, label: &str, text: &str) {
+    write_case_from(dir, id, label, text, "hand_written");
+}
+
+/// The same, with the provenance spelled out.
+///
+/// Needed because D7's false-positive budget is counted over the
+/// **captured**-benign strata: a corpus of hand-written cases only
+/// leaves that population empty, which the harness now refuses rather
+/// than fitting a tau that is not the criterion's answer.
+fn write_case_from(
+    dir: &std::path::Path,
+    id: &str,
+    label: &str,
+    text: &str,
+    provenance: &str,
+) {
     // `id` must equal the filename stem — the loader enforces it.
     let body = serde_json::json!({
         "id": id,
         "label": label,
         "text": text,
-        "provenance": "hand_written",
+        "provenance": provenance,
         "notes": "cli e2e fixture"
     });
     std::fs::write(dir.join(format!("{id}.json")), body.to_string()).expect("write case");
@@ -179,7 +195,16 @@ fn a_fully_measured_run_exits_zero_and_reports_its_provenance() {
     }
     let dir = tempfile::tempdir().expect("tempdir");
     write_case(dir.path(), "inj-001", "attack", "please summarise this quarterly report");
-    write_case(dir.path(), "safe-001", "benign", "the meeting is at four o'clock");
+    // CAPTURED, so D7's budget scope is non-empty and the operating
+    // point can actually be fitted. Hand-written, the criterion bounds a
+    // population that does not exist -- see the test below.
+    write_case_from(
+        dir.path(),
+        "safe-001",
+        "benign",
+        "the meeting is at four o'clock",
+        "captured",
+    );
 
     let backend = spawn_backend(canned_verdict(-0.01, -5.0));
     let out = run_calibrate(dir.path(), &backend.base_url);
@@ -201,6 +226,50 @@ fn a_fully_measured_run_exits_zero_and_reports_its_provenance() {
     assert!(stdout.contains("shieldstral-test"), "must name the model: {stdout}");
     assert!(stdout.contains("342e3d9661b2cbe2"), "must name the digest: {stdout}");
     assert!(stdout.contains("PROVISIONAL"), "must carry the D9 caveat: {stdout}");
+}
+
+/// **A corpus that cannot answer D7's question must not exit 0.**
+///
+/// Every benign here is hand-written, so the captured-benign budget
+/// bounds an empty population: the budget never binds, the fit
+/// degenerates to "catch every attack at any benign cost", and the
+/// report used to print a tau beside `0 of 1 allowed` -- which reads as
+/// the criterion being honoured. The matrix itself is perfectly valid,
+/// which is exactly why `Confusion::invalidity` could not catch this and
+/// the exit code had to learn about the operating point.
+///
+/// The shipped 24-case corpus has no captured cases at all, so this was
+/// the DEFAULT `guard calibrate` run.
+#[test]
+fn a_corpus_with_no_captured_benign_cannot_answer_d7_and_exits_one() {
+    if skip_if_unbuilt("a_corpus_with_no_captured_benign_cannot_answer_d7_and_exits_one") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_case(dir.path(), "inj-001", "attack", "please summarise this quarterly report");
+    write_case(dir.path(), "safe-001", "benign", "the meeting is at four o'clock");
+
+    let backend = spawn_backend(canned_verdict(-0.01, -5.0));
+    let out = run_calibrate(dir.path(), &backend.base_url);
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a vacuous criterion must not exit 0\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr.contains("bounds nothing"),
+        "the reason must name the empty scope\n{stderr}"
+    );
+    // The matrix is fine; it is D7's criterion that cannot be evaluated.
+    assert!(stdout.contains("TP 1") && stdout.contains("FP 1"), "{stdout}");
+    assert!(
+        !stdout.contains("  tau = "),
+        "no operating point may be printed, or an operator copies a number that \
+         is not the criterion's answer\n{stdout}"
+    );
 }
 
 /// **The security-critical exit.** A backend that returns neither

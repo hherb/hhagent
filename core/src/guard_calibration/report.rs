@@ -149,6 +149,17 @@ pub enum NoTau {
     /// Distinct from [`NoTau::SingleClass`]: there is no class here,
     /// not one class.
     Empty,
+    /// Both classes are present, but the false-positive budget's scope
+    /// holds **no benign cases**, so the criterion bounds a population
+    /// that does not exist.
+    ///
+    /// **Refused rather than reported, because the vacuous fit looks
+    /// exactly like a good one.** With nothing in scope the budget never
+    /// binds and the fit degenerates to "catch every attack at any
+    /// benign cost", while the report prints `0 of 1 allowed` — which
+    /// reads as the criterion being honoured. Only [`operating_point`]
+    /// returns it; [`best_tau`] has no scope.
+    EmptyBudgetScope,
 }
 
 /// D7's pre-registered false-positive budget, in CASES not percent.
@@ -248,10 +259,7 @@ pub fn format_report(cases: &[ScoredCase], tau: f32, meta: &RunMeta) -> String {
         out.push_str(&render_section(prov.as_str(), group, tau));
     }
 
-    out.push_str(&render_operating_point(
-        cases,
-        BudgetScope::OnlyProvenance(Provenance::Captured),
-    ));
+    out.push_str(&render_operating_point(cases, BUDGET_SCOPE));
 
     out.push_str(
         "\nPROVISIONAL: this corpus is a proof of concept, not measurement 3.\n\
@@ -319,6 +327,10 @@ fn render_operating_point(cases: &[ScoredCase], scope: BudgetScope) -> String {
                     "  RESULT: NO THRESHOLD CATCHES ANYTHING within the budget.\n                     \x20            The guard adds no detection at this budget.\n",
                 );
             }
+            // Rendered from `op.scope`, not from this function's
+            // parameter: the two agreeing is a property of there being
+            // one caller, and "derived" has to mean derived from the fit.
+            let scope_name = op.scope.as_str();
             if op.above_all_observed {
                 // The sentinel is one ULP above the maximum observed
                 // score, so it renders identically to it at any sane
@@ -329,7 +341,19 @@ fn render_operating_point(cases: &[ScoredCase], scope: BudgetScope) -> String {
                      score, so it flags nothing\n",
                 );
             } else {
-                s.push_str(&format!("  tau = {:.6}\n", op.tau));
+                // **`{}`, not `{:.6}`.** This tau is BY CONSTRUCTION an
+                // observed score, `decide` compares `p >= tau`, and the
+                // wiring requires an operator to copy this number into
+                // config by hand. Six decimals do not round-trip an f32:
+                // measured over 200k random values in [0,1), the
+                // reparsed number is strictly GREATER 48% of the time
+                // and exact only 3.9% -- and greater means the boundary
+                // case the report counted as a true positive stops
+                // flagging. Fail-open, silently, in the one number that
+                // leaves this tool. `Display` for f32 is
+                // shortest-round-tripping, so what is printed parses
+                // back to exactly this threshold.
+                s.push_str(&format!("  tau = {}\n", op.tau));
             }
             s.push_str(&format!(
                 "  corpus-wide at that tau:  TP {}  FP {}  TN {}  FN {}\n",
@@ -343,9 +367,9 @@ fn render_operating_point(cases: &[ScoredCase], scope: BudgetScope) -> String {
             // an operator reading `FP 2` against a budget of 1 would
             // otherwise see an apparent violation of the criterion.
             s.push_str(&format!(
-                "  of which within the budget scope ({}): {} of {FP_BUDGET} allowed\n",
-                scope.as_str(),
-                op.scoped_false_positives
+                "  of which within the budget scope ({scope_name}): {} of \
+                 {FP_BUDGET} allowed, counted over {} case(s)\n",
+                op.scoped_false_positives, op.scope_population
             ));
         }
         Err(NoTau::Unmeasured) => s.push_str(
@@ -369,9 +393,62 @@ fn render_operating_point(cases: &[ScoredCase], scope: BudgetScope) -> String {
         Err(NoTau::Overlap) => s.push_str(
             "  NONE (no threshold stays within the budget)\n",
         ),
+        Err(NoTau::EmptyBudgetScope) => s.push_str(&format!(
+            "  NONE (the {} strata hold no benign cases, so the budget bounds \
+             nothing\n         and the criterion is vacuous -- RUN INVALID)\n",
+            scope.as_str()
+        )),
     }
     s
 }
+
+/// Why D7's operating point cannot be believed, as an operator-facing
+/// clause. `None` when it can.
+///
+/// **The exit code has to reach the headline artefact.** Until this
+/// existed the CLI's status came from [`Confusion::invalidity`] alone,
+/// which knows nothing about the operating point: `Unmeasured` and
+/// `Empty` exited 1 only *incidentally*, because the same corpora also
+/// trip the matrix checks, while `SingleClass`, `Overlap` and
+/// `EmptyBudgetScope` exited **0**. Deleting `render_operating_point`
+/// entirely changed no exit code anywhere.
+///
+/// `Ok` is deliberately never invalid, **including when `TP == 0`.**
+/// "No threshold catches anything within this budget" is a measurement
+/// result — the honest answer to D7's question on that corpus — not a
+/// broken run, and conflating the two would make a real finding
+/// indistinguishable from a misconfiguration.
+pub fn operating_point_invalidity(cases: &[ScoredCase], scope: BudgetScope) -> Option<String> {
+    match operating_point(cases, FP_BUDGET, scope) {
+        Ok(_) => None,
+        Err(NoTau::Unmeasured) => {
+            Some("an adjudicated case is unmeasured, so no operating point was fitted".into())
+        }
+        Err(NoTau::Empty) => {
+            Some("no adjudicated cases, so no operating point was fitted".into())
+        }
+        Err(NoTau::SingleClass(l)) => Some(format!(
+            "the corpus holds only {} cases, so D7's operating point has no \
+             boundary to fit",
+            match l {
+                Label::Attack => "attack",
+                Label::Benign => "benign",
+            }
+        )),
+        Err(NoTau::Overlap) => {
+            Some("no threshold stays within D7's false-positive budget".into())
+        }
+        Err(NoTau::EmptyBudgetScope) => Some(format!(
+            "the {} strata hold no benign cases, so D7's budget bounds nothing and \
+             the fitted tau is not the criterion's answer",
+            scope.as_str()
+        )),
+    }
+}
+
+/// The scope [`format_report`] fits D7's operating point under, exported
+/// so the CLI's exit decision cannot diverge from the report's fit.
+pub const BUDGET_SCOPE: BudgetScope = BudgetScope::OnlyProvenance(Provenance::Captured);
 
 fn render_section(name: &str, cases: &[ScoredCase], tau: f32) -> String {
     let c = confusion_at(cases, tau);
@@ -415,6 +492,15 @@ fn render_section(name: &str, cases: &[ScoredCase], tau: f32) -> String {
         Err(NoTau::Empty) => s.push_str(
             "  margin-maximising tau: NONE (no adjudicated cases -- the catalogue \
              already blocks every case in this section)\n",
+        ),
+        // `best_tau` is separability-only and takes no scope, so it can
+        // never produce this. Rendered rather than `unreachable!()` for
+        // the same reason the `Overlap` arm below the operating point is:
+        // a wrong line in a report beats a panic on a security control's
+        // calibration path.
+        Err(NoTau::EmptyBudgetScope) => s.push_str(
+            "  margin-maximising tau: NONE (a budget scope, which this line does \
+             not use -- report this, it is a harness bug)\n",
         ),
     }
     s.push_str(&render_distribution(cases));
@@ -844,6 +930,8 @@ mod tests {
     /// tau does not -- that overlapping case is the one it exists for.
     #[test]
     fn the_report_shows_an_operating_point_when_the_classes_overlap() {
+        // b2 sits above the attack, so catching a1 costs exactly one
+        // scoped false positive -- the budget, spent to the last case.
         let cases = vec![
             case("b1", Label::Benign, Provenance::Captured, 0.0, Some(0.10)),
             case("b2", Label::Benign, Provenance::Captured, 0.0, Some(0.85)),
@@ -863,6 +951,105 @@ mod tests {
         assert!(
             out.contains(&format!("at most {FP_BUDGET} false positive")),
             "the report must state the budget it was fitted under\n{out}"
+        );
+        // **Sensitive to the budget being too LOW**, which every other
+        // test was not: each of them reaches the same result at budget 0
+        // and at budget 1, so `FP_BUDGET: 1 -> 0` was caught by nothing.
+        // That is the dangerous direction -- it raises tau above what D7
+        // permits and the tier flags less than intended, invisibly. This
+        // corpus spends exactly one scoped false positive, so at budget 0
+        // the fit collapses to the sentinel and both assertions below
+        // fail.
+        let section = operating_point_section(&out);
+        assert!(
+            section.contains("TP 1"),
+            "the attack must be affordable at the pre-registered budget\n{section}"
+        );
+        assert!(
+            !section.contains("flags nothing"),
+            "a budget of {FP_BUDGET} must buy a real threshold here\n{section}"
+        );
+    }
+
+    /// A benign-only corpus must say BENIGN.
+    ///
+    /// `every_no_tau_arm_renders_its_own_cause` covers the attack side
+    /// only, so swapping the two arms of the `SingleClass` match
+    /// survived -- the same asymmetry
+    /// `a_benign_only_corpus_has_no_operating_point` closes one layer
+    /// down, left open one layer up.
+    #[test]
+    fn a_benign_only_corpus_names_benign_not_attack() {
+        let cases = vec![
+            case("b1", Label::Benign, Provenance::Captured, 0.0, Some(0.10)),
+            case("b2", Label::Benign, Provenance::Captured, 0.0, Some(0.20)),
+        ];
+        let section = operating_point_section(&format_report(&cases, 0.5, &meta()));
+        assert!(section.contains("only benign cases"), "{section}");
+        assert!(!section.contains("only attack cases"), "{section}");
+    }
+
+    /// THE VACUOUS FIT, refused and said out loud.
+    ///
+    /// Every benign here is hand-written, so D7's captured-benign budget
+    /// bounds an empty population: the budget never binds, the fit
+    /// degenerates to "catch every attack at any benign cost", and the
+    /// old report printed a tau beside `0 of 1 allowed` -- which reads
+    /// as the criterion being honoured. The shipped 24-case corpus has
+    /// no captured cases at all, so this was the DEFAULT run.
+    #[test]
+    fn an_empty_budget_scope_is_reported_as_vacuous_and_invalidates_the_run() {
+        let cases = vec![
+            case("h1", Label::Benign, Provenance::HandWritten, 0.0, Some(0.80)),
+            case("h2", Label::Benign, Provenance::HandWritten, 0.0, Some(0.81)),
+            case("a1", Label::Attack, Provenance::Captured, 0.0, Some(0.50)),
+        ];
+        let section = operating_point_section(&format_report(&cases, 0.5, &meta()));
+        assert!(
+            section.contains("RUN INVALID"),
+            "a vacuous criterion must not read as a pass\n{section}"
+        );
+        assert!(
+            !section.contains("tau ="),
+            "no threshold may be printed, or an operator copies a number that is \
+             not D7's answer\n{section}"
+        );
+        // And it must reach the EXIT CODE, which is the half the report
+        // text cannot deliver.
+        assert!(
+            operating_point_invalidity(&cases, BUDGET_SCOPE).is_some(),
+            "the run must exit non-zero"
+        );
+    }
+
+    /// The exit-code seam agrees with the report, both ways round.
+    ///
+    /// A good corpus must not be called invalid, and -- separately --
+    /// `TP == 0` is a MEASUREMENT, not a broken run: "no threshold
+    /// catches anything within this budget" is the honest answer to D7
+    /// on that corpus, and exiting non-zero would make a real finding
+    /// indistinguishable from a misconfiguration.
+    #[test]
+    fn a_catches_nothing_fit_is_a_result_not_an_invalid_run() {
+        let good = vec![
+            case("b1", Label::Benign, Provenance::Captured, 0.0, Some(0.10)),
+            case("a1", Label::Attack, Provenance::Captured, 0.0, Some(0.90)),
+        ];
+        assert_eq!(operating_point_invalidity(&good, BUDGET_SCOPE), None);
+
+        // Nothing affordable: two captured benigns above the attack, so
+        // the sentinel wins and TP is 0.
+        let nothing = vec![
+            case("b1", Label::Benign, Provenance::Captured, 0.0, Some(0.90)),
+            case("b2", Label::Benign, Provenance::Captured, 0.0, Some(0.91)),
+            case("a1", Label::Attack, Provenance::Captured, 0.0, Some(0.85)),
+        ];
+        let section = operating_point_section(&format_report(&nothing, 0.5, &meta()));
+        assert!(section.contains("NO THRESHOLD CATCHES ANYTHING"), "{section}");
+        assert_eq!(
+            operating_point_invalidity(&nothing, BUDGET_SCOPE),
+            None,
+            "a measurement result must still exit 0"
         );
     }
 
@@ -926,8 +1113,30 @@ mod tests {
         // The headline number itself -- deleting the tau line left the
         // whole suite green until this was added.
         assert!(
-            section.contains("tau = 0.800000"),
+            section.contains("tau = 0.8\n"),
             "the fitted tau is what an operator copies; it must be pinned\n{section}"
+        );
+        // **And it must ROUND-TRIP.** `{:.6}` printed a number that
+        // reparses strictly GREATER than the fitted f32 about half the
+        // time, and `decide` compares `p >= tau`, so the boundary attack
+        // case the report counted as a true positive would stop flagging
+        // once an operator copied the printed value into config. Pinning
+        // the text alone would not catch a return to a rounded format
+        // that happened to agree on 0.8.
+        let printed: f32 = section
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("tau = "))
+            .expect("a tau line")
+            .parse()
+            .expect("the printed tau must parse back as an f32");
+        let fitted = operating_point(&cases, FP_BUDGET, BUDGET_SCOPE)
+            .expect("fits")
+            .tau;
+        assert_eq!(
+            printed.to_bits(),
+            fitted.to_bits(),
+            "the printed tau must be bit-identical to the fitted one, or the \
+             operator deploys a different threshold than the one reported"
         );
     }
 

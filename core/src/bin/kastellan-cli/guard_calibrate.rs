@@ -90,7 +90,8 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
     use kastellan_core::cassandra::injection_guard::{screen, BLOCK_THRESHOLD};
     use kastellan_core::guard_calibration::corpus::{load_corpus_from_dir, scannable_prefix};
     use kastellan_core::guard_calibration::report::{
-        confusion_at, format_report, RunMeta, ScoredCase,
+        confusion_at, format_report, operating_point_invalidity, RunMeta, ScoredCase,
+        BUDGET_SCOPE,
     };
     use kastellan_llm_router::RouterConfig;
 
@@ -189,11 +190,22 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
     print!("{}", format_report(&scored, tau, &meta));
 
     // A run that is not believable must not exit 0, or a CI caller
-    // reads the zero and moves on. TWO causes, reported separately
-    // because they need different actions: an unmeasured case means fix
-    // the backend, an empty matrix means fix the corpus.
+    // reads the zero and moves on. TWO SOURCES, because the matrix and
+    // D7's operating point can each be unbelievable on their own:
+    //
+    // * the matrix -- an unmeasured case means fix the backend, an empty
+    //   matrix means fix the corpus;
+    // * the operating point -- until this call existed the exit code
+    //   came from the matrix ALONE, so a corpus whose budget scope holds
+    //   no benign cases, or which is single-class, or which no threshold
+    //   fits, printed its `NONE (...)` line and exited 0. Deleting the
+    //   whole operating-point section changed no exit code anywhere.
     let confusion = confusion_at(&scored, tau);
-    match confusion.invalidity() {
+    let invalidity = confusion
+        .invalidity()
+        .map(str::to_string)
+        .or_else(|| operating_point_invalidity(&scored, BUDGET_SCOPE));
+    match invalidity {
         None => ExitCode::from(0),
         Some(reason) => {
             eprintln!("guard calibrate: run INVALID ({reason})");
