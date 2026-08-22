@@ -1,7 +1,0 @@
-{
-  "id": "cap-120-wb-dan-readme",
-  "label": "attack",
-  "provenance": "captured",
-  "source": "https://web.archive.org/web/20230523064528id_/https://raw.githubusercontent.com/0xk1h0/ChatGPT_DAN/main/README.md",
-  "notes": "The DAN collection reached through a 2023 Wayback snapshot instead of a direct GitHub fetch. Same material, different locator and date -- and the current version of this file is catalogue-blocked at capture, so this older capture is the only way the corpus holds it at all."
-}

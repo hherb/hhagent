@@ -3,5 +3,6 @@
   "label": "attack",
   "provenance": "captured",
   "source": "https://web.archive.org/web/20260411015103id_/https://www.reddit.com/r/ChatGPT/comments/10tevu1/new_jailbreak_proudly_unveiling_the_tried_and/",
-  "notes": "OVER-CAP (~98 KB): a forum thread carrying a jailbreak prompt inside hundreds of comments. The payload is a small fraction of the document and sits an unknown distance in -- the case that asks whether truncation at the cap loses the attack entirely."
+  "notes": "OVER-CAP (~98 KB): a forum thread carrying a jailbreak prompt inside hundreds of comments. The payload is a small fraction of the document and sits an unknown distance in -- the case that asks whether truncation at the cap loses the attack entirely.",
+  "sha256": "99d837b708e68611e9b4baf19a8d4861e2190071ab9db90712673bc41f7dfee5"
 }
