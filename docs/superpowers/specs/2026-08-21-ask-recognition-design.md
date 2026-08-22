@@ -169,8 +169,10 @@ implicit, which was the previous narrowing's sin.
 have accepted — the fail-open this whole arm exists to prevent, reached through
 a copy-paste.
 
-Both therefore bind one shared `const` SQL fragment rather than two hand-typed
-predicates. This is the same drift the guard slice already paid for twice:
+Both therefore bind one shared SQL fragment rather than two hand-typed
+predicates. (Implemented as a `macro_rules!`, not a `const`: `concat!` accepts
+only literals, so a `const` would have to be spliced with `format!` and waved
+past `SqlSafeStr`'s `&'static str` bound with `AssertSqlSafe`.) This is the same drift the guard slice already paid for twice:
 `Confusion::is_valid` vs `invalidity`, and `confusion_at` re-writing `p >= tau`
 instead of calling `decide`. A test asserts a live nonce that `resolve_with_nonce`
 accepts is also seen by `any_live_nonce_for_claimant`, and that one scoped to a
@@ -195,15 +197,30 @@ different peer is seen by neither.
   Two new `ask_message` consts, deliberately **not** reusing `SCAN_BYTE_CAP`
   (that is the injection guard's document budget and answers a different
   question; sharing it would couple two caps that should move independently):
-  `CANDIDATE_BYTE_CAP = 65_536` and `CANDIDATE_TOKEN_CAP = 1024`. The prefix is
-  cut on a **char boundary**, since a body is arbitrary UTF-8 and both
-  `String::truncate` and `&s[..n]` panic on a non-boundary index — the same
-  trap `corpus::scannable_prefix` hit in the guard slice.
+  `CANDIDATE_BYTE_CAP = 65_536` and `CANDIDATE_TOKEN_CAP = 1024`.
 
-**No shape filter on candidates.** D7-of-slice-2 bans coupling to the nonce
-encoding, and here the failure mode is worse than there: a wrong filter yields a
-false *negative* — an uncaught live token — which is the dangerous direction.
-Hash every token; let the index decide.
+  **Both caps refuse; neither reads a prefix.** The first implementation read a
+  64 KiB prefix and returned an answer for the whole body, which is a
+  fail-**open**: `looks_like_ask_command` scans the *entire* body, so the gate
+  fired on a far-away verb while only the prefix was hashed, and a live token
+  past the cap was enqueued with no audit row and no log line — verbatim the
+  alternative Open risk 2 below says was chosen against. Refusing over the byte
+  cap means there is no truncation at all, so the char-boundary cut (and with it
+  the `corpus::scannable_prefix` trap it was copied from) does not arise.
+
+**No shape filter on candidates, but two candidates per token.** D7-of-slice-2
+bans coupling to the nonce encoding, and here the failure mode is worse than
+there: a wrong *filter* yields a false negative — an uncaught live token — which
+is the dangerous direction. So nothing is ever dropped.
+
+But whitespace tokenisation alone is not enough either. A live token with a
+comma or full stop against it (`ok, /approve <token>.`) is not the nonce once
+hashed, so the exact check answers "no" and the body is enqueued — a leak `main`
+did **not** have, because its broad predicate refused every body it matched.
+Each whitespace token therefore contributes **two** candidates: the token as it
+arrived, and the token with leading/trailing non-alphanumerics trimmed. That is
+additive, never subtractive, so being wrong about it can only cause a false
+positive (a refusal), never a miss. The index still decides.
 
 ### D8 — `reason` is four values, and the deliberate collapse is preserved
 
@@ -337,13 +354,28 @@ the bus or the DB already lives.
 
 1. **Another peer's pasted token is not contained** (D5). Inert under D16, but
    still a live secret written to a DELETE-less column.
-2. **A body over the candidate cap is refused**, so a very large paste that
+2. **A body over either candidate cap is refused**, so a very large paste that
    happens to mention `/approve` costs a rephrase. Chosen over the alternative,
-   which is a silent false negative on a token past the cap.
-3. **`is_command_shaped` is still a guess**, just a much cheaper one to be wrong
+   which is a silent false negative on a token we never hashed. Both caps now
+   take this posture; the first implementation's byte cap did not, and D7
+   records why.
+3. **The exact check runs only behind a shape gate, so containment is exact
+   *given* the gate — not unconditional.** `looks_like_ask_command` must match an
+   ask verb somewhere in the body before any candidate is hashed, so a body
+   carrying a live token and **no verb at all** — the operator replying with the
+   bare token, or `here you go: <token>` — never reaches the exact question and
+   is enqueued. Unchanged from `main`, so not a regression, but it qualifies D2's
+   argument that shape cannot answer the containment question: shape still
+   decides whether the question gets asked. Removing the gate would put every
+   inbound message on a Postgres round trip, which is the cost D3 exists to
+   avoid, so this is accepted rather than fixed. **Do not describe containment
+   as catching "any shape" — it catches any shape that mentions a verb.**
+4. **`is_command_shaped` is still a guess**, just a much cheaper one to be wrong
    about: being wrong now costs a missing usage hint, never a leaked token. If a
    new *typed* shape turns up, widening it is safe in a way widening the old
    predicate was not.
-4. **The two SQL predicates could still drift** if someone edits the const's
-   consumer rather than the const. D6's agreement test is the guard; it must be
-   PG-backed to mean anything.
+5. **The two SQL predicates could still drift** if someone edits the macro's
+   consumer rather than the macro. D6's agreement test is the guard; it must be
+   PG-backed to mean anything — and it is `harness()`-gated skip-as-pass, so on a
+   host without a usable `pg_bin_dir` there is no enforcement at all and the run
+   is still green.
