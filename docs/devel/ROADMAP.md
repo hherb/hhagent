@@ -451,7 +451,21 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   - **Why it is a prerequisite and not a nicety:** without it, a recurring task raises the same approval every run, the operator approves reflexively, and the gate has negative value — it trains the habit it exists to prevent while still costing a round trip.
 - [ ] Policy gate: per-tool, per-task, per-data-classification routing decision
 - [ ] Frontier escalation through egress proxy (Anthropic / OpenAI)
-- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); the WIRING slice remains.**
+- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 then the WIRING slice remain, both specced 2026-08-22 on `feat/guard-wiring-slice`.**
+  **M1 (slice 1's Open risk 1) DISCHARGED 2026-08-22** — six DGX runs of `live_shieldstral_size_sweep`: at `SCAN_BYTE_CAP`
+  (64 KiB = 10,062 prompt tokens) the tier costs a **p50 3,215 ms / 3,558 ms**, ~85× measurement 1's 30–43 ms, which was
+  taken on ~26-token strings. Cost is **entirely prompt processing and linear** (decode is 1 token at 0.00 ms; prompt eval
+  4,039–6,660 tok/s), so any host's cost follows from its throughput — a CPU-only host would need ~50 s. Specs:
+  [`2026-08-22-guard-measurement-3-corpus-design.md`](../superpowers/specs/2026-08-22-guard-measurement-3-corpus-design.md)
+  (**do this FIRST** — ≥120 cases, captured half, third-party text never committed: a manifest + fetch script sha256-verifies
+  into a gitignored dir, dissolving both the licensing and the privacy problem, with **no loader change** needed) and
+  [`2026-08-22-shieldstral-guard-wiring-design.md`](../superpowers/specs/2026-08-22-shieldstral-guard-wiring-design.md)
+  (τ **required, no default**, so slice 1's D9 becomes a property of the code; a **derived** 15 s timeout closing
+  [#586](https://github.com/hherb/kastellan/issues/586); `p` recorded on every adjudicated dispatch so production becomes
+  measurement 3's own score source). **[#592](https://github.com/hherb/kastellan/issues/592) blocks the two-host τ
+  comparison:** the hosts run different Q8_0 builds (HF LFS oid `35b755be…` vs the DGX's `5cee57a9…` at identical byte
+  length) — pinning a quantisation LABEL is not pinning the bytes.
+
   Spec + plan `docs/superpowers/{specs,plans}/2026-08-21-shieldstral-guard-slice-1*`. Slice 1 lands the guard endpoint
   seam (`RouterConfig::{guard_url,guard_model}` + the pure `for_guard`), the adjudicator
   (`cassandra::guard_model` — a digest-pinned prompt artefact, a pure three-valued `decide`, and a thin async shell
