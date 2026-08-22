@@ -462,8 +462,8 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   [`2026-08-22-shieldstral-guard-wiring-design.md`](../superpowers/specs/2026-08-22-shieldstral-guard-wiring-design.md)
   (τ **required, no default**, so slice 1's D9 becomes a property of the code; a **derived** 15 s timeout closing
   [#586](https://github.com/hherb/kastellan/issues/586); `p` recorded on every adjudicated dispatch so production becomes
-  measurement 3's own score source). **Measurement 3 Tasks 1–4 BUILT 2026-08-22** on
-  `feat/guard-wiring-slice` (DGX gate **3668 / 0 / 54**, +42 reconciling exactly): D7's
+  measurement 3's own score source). **Measurement 3 Tasks 1–4 MERGED 2026-08-22**
+  (`b58edc77`, [#593](https://github.com/hherb/kastellan/pull/593); DGX gate **3668 / 0 / 54**, +42 reconciling exactly): D7's
   `operating_point` + `BudgetScope` — needed because `best_tau` is separability-only and
   would return `Err(Overlap)` on any corpus with real captured content; the operating point
   rendered **once, corpus-wide**; a `manifest` module carrying metadata and never text; and
@@ -472,8 +472,12 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   document in place of the page, which then gets scored). **Task 5 PILOTED LIVE 2026-08-22** (runbook
   `docs/devel/runbooks/2026-08-22-guard-calibration-campaign.md`): 4 entries captured through the
   real sandboxed worker, record→verify→tamper-refuse all proved, calibration over 3 strata with
-  zero `Unmeasured` — `best_tau` 0.336 (midpoint) vs operating point **τ = 0.566605** (boundary),
-  both correct and differing exactly as D7 predicts. **Still a PILOT, not measurement 3:** 4
+  zero `Unmeasured` — `best_tau` 0.336 (midpoint) vs operating point **τ ≈ 0.5666** (boundary),
+  both correct and differing exactly as D7 predicts. (The `0.566605` every earlier document
+  quotes is the `{:.6}`-**rounded** value; six decimals do not round-trip an f32, and since
+  this τ is by construction an observed score against a `p >= tau` comparison, the rounded
+  number is a *different, weaker* threshold about half the time. Fixed below; a re-run prints
+  the exact value.) **Still a PILOT, not measurement 3:** 4
   captured cases, all benign, against a ≥100-with-a-captured-half requirement; ~35 captured
   attacks and ≥8 over-cap documents are the main gaps. Two plan claims were corrected by running
   it — `guard capture` needs **no** allowlist row and no daemon restart (it derives its own,
@@ -481,6 +485,25 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   **[#592](https://github.com/hherb/kastellan/issues/592) blocks the two-host τ
   comparison:** the hosts run different Q8_0 builds (HF LFS oid `35b755be…` vs the DGX's `5cee57a9…` at identical byte
   length) — pinning a quantisation LABEL is not pinning the bytes.
+
+  **The review ran AFTER the merge and found four fail-opens** — `fix/guard-capture-review-593`.
+  Each could produce a corpus or a threshold that *looked verified and was not*, and none was
+  reachable by any existing test: (1) **`--record` disabled every hash check**, including on
+  already-recorded entries, so the campaign's next step — ~85 new entries, recorded by running
+  `--record` over the whole directory — would have silently re-pinned any source that had
+  drifted; (2) **an empty budget scope made D7's criterion vacuous**, and the shipped corpus has
+  zero captured cases, so that was the *default* `guard calibrate` run, printing `0 of 1 allowed`
+  over a population that does not exist; (3) **τ printed at `{:.6}`** reparses strictly greater
+  48% of the time (200k samples), so an operator copying it deploys a threshold at which the
+  boundary case the report counted as a true positive stops flagging; (4) **the HTTP status was
+  never checked**, so a vanished snapshot's 404 page was hashed and pinned wearing the label of
+  the page it replaced — Open risk 2 failing *open*, which the spec assumed impossible. The exit
+  code also could not see the operating point at all, so `SingleClass`/`Overlap`/the new
+  `EmptyBudgetScope` exited 0. **+18 tests**, including the `guard_capture_cli_e2e` exit-status
+  file the sibling command already had. Deferred: [#594](https://github.com/hherb/kastellan/issues/594)
+  (capture has no egress proxy, so a *hostname* resolving into a denied range is unchecked — the
+  IP-literal half is closed), [#595](https://github.com/hherb/kastellan/issues/595) (manifest
+  content bounds are loader conventions, not type invariants).
 
   Spec + plan `docs/superpowers/{specs,plans}/2026-08-21-shieldstral-guard-slice-1*`. Slice 1 lands the guard endpoint
   seam (`RouterConfig::{guard_url,guard_model}` + the pure `for_guard`), the adjudicator

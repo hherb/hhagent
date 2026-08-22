@@ -292,9 +292,14 @@ working.** Today it returns the *margin-maximising* threshold — the midpoint b
 separate cleanly; a 120-case corpus with real captured content almost certainly overlaps
 somewhere, at which point the existing harness yields no τ at all.
 
-So the criterion has to be an **operating point**, not a separating line, and Open risk 5
-says it must be fixed *before* the numbers are seen or it becomes a judgement made after
-seeing the answer. Pre-registered here:
+So the criterion has to be an **operating point**, not a separating line, and it must be
+fixed *before* the numbers are seen or it becomes a judgement made after seeing the answer.
+Pre-registered here:
+
+<!-- This sentence used to cite "Open risk 5" as the source of that requirement. It is not:
+     Open risk 5 is about D6's two-host agreement threshold, and says the opposite direction
+     — "D7 fixes the τ *criterion* in advance; this is the remaining unfixed one." The
+     forward reference pointed at the risk this decision DISCHARGES. -->
 
 > **τ is the threshold maximising the true-positive rate subject to at most ONE false
 > positive across the captured-benign strata.**

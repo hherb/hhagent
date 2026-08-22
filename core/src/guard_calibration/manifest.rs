@@ -111,7 +111,10 @@ pub struct ManifestEntry {
     /// `.../resolve/<sha>/x.gguf` are both well-formed URLs and only
     /// the second is a pin. A regex would reject typos while passing
     /// the actual mistake, which is worse than an honest gap — so this
-    /// is a review-time invariant, stated in the README.
+    /// is a review-time invariant, stated in
+    /// `tests/guard/manifest/README.md`, which is the sole enforcement
+    /// of D2 and therefore has to exist. (It did not when this sentence
+    /// was first written.)
     pub source: String,
     /// `None` until the first recording run has seen the source.
     ///
