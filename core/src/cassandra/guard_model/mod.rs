@@ -14,6 +14,7 @@
 
 pub mod decide;
 pub mod policy;
+pub mod weights_pin;
 
 pub use decide::{decide, GuardAdjudication, DEFAULT_TAU};
 
@@ -50,6 +51,17 @@ impl GuardClient {
             None => Ok(None),
             Some(guard_cfg) => Router::new(guard_cfg).map(|router| Some(Self { router })),
         }
+    }
+
+    /// llama.cpp's `/props` for the guard backend.
+    ///
+    /// Delegates to [`Router::props`] so there is one HTTP path to the
+    /// guard, not two. Its consumer is [`weights_pin`], which reads
+    /// `model_path` to learn which file the server opened — the only
+    /// thing the endpoint can tell us, since llama.cpp reports an empty
+    /// `digest` (issue #592).
+    pub async fn props(&self) -> Result<serde_json::Value, RouterError> {
+        self.router.props().await
     }
 
     /// The raw probability that the document is unsafe, before any

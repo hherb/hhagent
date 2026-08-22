@@ -169,8 +169,21 @@ fn run_calibrate(corpus_dir: &std::path::Path, guard_url: &str) -> std::process:
     if let Some(home) = std::env::var_os("HOME") {
         env.push(("HOME".to_string(), home.to_string_lossy().into_owned()));
     }
+    // `--weights-unpinned` because the mock is not a llama.cpp server:
+    // it has no `/props` naming a real GGUF, so the guard-weights pin
+    // (issue #592) would refuse every run here. These tests pin the
+    // EXIT STATUS of an unbelievable run, which is a different property
+    // — the weights check has its own file,
+    // `guard_weights_pin_cli_e2e.rs`, where the refusal is the subject
+    // rather than an obstacle.
     Command::new(&bin)
-        .args(["guard", "calibrate", "--corpus", &corpus_dir.to_string_lossy()])
+        .args([
+            "guard",
+            "calibrate",
+            "--corpus",
+            &corpus_dir.to_string_lossy(),
+            "--weights-unpinned",
+        ])
         .env_clear()
         .envs(env)
         .output()
@@ -352,10 +365,23 @@ fn a_run_that_adjudicated_nothing_exits_one_rather_than_reporting_a_clean_matrix
     );
     assert!(stdout.contains("TP 0") && stdout.contains("FN 0"), "{stdout}");
     assert!(stderr.contains("no adjudicated cases"), "{stderr}");
-    assert!(
-        !stderr.contains("failed"),
-        "an excluded case must never be sent to the model: {stderr}"
-    );
+    // The scoring loop reports a failed adjudication as
+    // `guard calibrate: <case id> failed: <err>`, so naming the case
+    // ids is what actually proves no case was sent to the model.
+    //
+    // This used to be a bare `!stderr.contains("failed")`, which was a
+    // loose proxy for the same property: it also matched any OTHER line
+    // containing the word. The guard-weights preflight (#592) now emits
+    // one — `[connection failed]` from its `/props` GET, which is
+    // expected here because port 9 answers nothing — and tripped it.
+    // A proxy assertion that breaks on an unrelated message was never
+    // pinning what its own comment claimed.
+    for id in ["cat-001", "cat-002"] {
+        assert!(
+            !stderr.contains(&format!("{id} failed")),
+            "an excluded case must never be sent to the model: {stderr}"
+        );
+    }
 }
 
 /// An unconfigured guard is a usage error (exit 2), and distinct from

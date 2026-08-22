@@ -482,11 +482,55 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   attacks and ≥8 over-cap documents are the main gaps. Two plan claims were corrected by running
   it — `guard capture` needs **no** allowlist row and no daemon restart (it derives its own,
   per-fetch), and Wayback pinning collapses the campaign's egress to one domain.
-  **[#592](https://github.com/hherb/kastellan/issues/592) blocks the two-host τ
-  comparison:** the hosts run different Q8_0 builds (HF LFS oid `35b755be…` vs the DGX's `5cee57a9…` at identical byte
+  **[#592](https://github.com/hherb/kastellan/issues/592) blocked the two-host τ
+  comparison:** the hosts ran different Q8_0 builds (HF LFS oid `35b755be…` vs the DGX's `5cee57a9…` at identical byte
   length) — pinning a quantisation LABEL is not pinning the bytes.
+  **FIXED — the pin is now checked at use, so Task 5 Step 7 is unblocked** (`fix/592-guard-weights-pin`).
+  kastellan never opens the GGUF, and llama.cpp's `/v1/models` reports an **empty** `digest` while the fields it
+  *does* report (`ftype`, `size`, `n_params`) are exactly the shape facts two Q8_0 builds share — so the endpoint
+  cannot prove which bytes it loaded. What it can do is **name the file**: `guard calibrate` now GETs `/props`,
+  takes `model_path`, hashes that file itself, and **refuses before scoring anything** on a mismatch, an
+  unreadable path, an absent `model_path`, a **relative** `model_path`, or an unreachable `/props`.
+  `--weights-unpinned` keeps a *candidate* model calibratable, and stamps the report — the marking rides on
+  the number rather than on the operator remembering. `RunMeta` gained a `weights` field beside
+  `policy_digest`, for the same reason: τ is only meaningful against known inputs, and the weights are an
+  input. Sum duplicated into `scripts/eval/lib/guard-weights.sh` for operator pre-flight and CI-enforced by
+  `rust_and_bash_guard_pins_agree`, copying the guest-kernel precedent. Live-verified on the DGX against the
+  real 3.6 GB files: upstream passes, the #592 original is refused naming it a *different quantiser run of
+  the right model*.
+  **Limits documented rather than sold around:** it trusts the server's self-report of `model_path`, and it is
+  TOCTOU — the same posture `guest_kernel_pin` carries. **The projector is a second instance, still open —
+  [#597](https://github.com/hherb/kastellan/issues/597).**
 
-  **The review ran AFTER the merge and found four fail-opens** — [#596](https://github.com/hherb/kastellan/pull/596), `fix/guard-capture-review-593`.
+  **A five-agent review of the branch found three defects the branch's own tests could not reach, and the
+  most important one is the shape this project keeps paying for.** (1) **Nothing pinned the ACCEPT path.**
+  Every weights fixture in the tree is deliberately not the pinned file, and none can be — the real one is
+  3.6 GB — so an implementation that refused *unconditionally* passed the entire suite. The consequence
+  would have been #592 inverted: `guard calibrate` refusing on a correctly-provisioned host, the operator
+  reaching for `--weights-unpinned` to get unstuck, and every measurement-3 report stamped untrustworthy.
+  Fixed by splitting the IO probe from a pure `apply_opt_out`, whose accepting arm is now unit-tested under
+  both settings of the flag — **mutation-proved:** force it to refuse and exactly that test fails.
+  (2) **A relative `model_path` was resolved against the CLI's cwd, not the server's** — so a copy of the
+  pinned file at the same relative path under the tool's working directory would hash as pinned while the
+  server served other bytes. A fail-open in #592's own shape, reached through the fix for #592; now
+  `WeightsPinError::RelativePath`, refused rather than resolved, per the repo's `fs_read`-must-be-absolute
+  rule. (3) **The opt-out fabricated a measurement**, rendering `<unverified: …> (0 bytes)` — a byte count,
+  in the field position a real streamed count occupies, for a file that was never opened. `WeightsProvenance`
+  gained the third state it always had (`Unverified{kind}`), `FileDigest`'s fields went private so the
+  shortcut no longer compiles, and `Pinned` now carries the digest it *measured* instead of reciting
+  `PINNED_SHA256` back. Also: the bash pre-flight's `sha256sum | cut` masked hasher failures (a pipeline's
+  status is its last command's), so its `|| return 1` was dead code and a permissions error was reported as
+  "a different file altogether"; the bash half is now **executed** by `tests-common` via a ported
+  `bash_with_pin`, not grepped — **mutation-proved**, flip the mismatch branch's `return 1` to `return 0`
+  and the reject test fails. Two items were filed rather than folded in:
+  [#599](https://github.com/hherb/kastellan/issues/599) (an unpinned run still exits 0, so nothing
+  machine-readable separates it from a verified one) and
+  [#600](https://github.com/hherb/kastellan/issues/600) (`run-shieldstral-llamacpp.sh`, the one script that
+  *launches* a Shieldstral server, still never hashes `$MODEL`). **Re-gated on the DGX at `f46c67cf`: 3749 / 0 / 54
+  across 174 suites, `TEST_EXIT=0`, `CLIPPY_EXIT=0` zero warnings**, reconciling exactly as the pin's original +42
+  plus the review's +21.
+
+  **The review ran AFTER the merge and found four fail-opens** — [#596](https://github.com/hherb/kastellan/pull/596), merged 2026-08-22 as `2ab6612c`.
   Each could produce a corpus or a threshold that *looked verified and was not*, and none was
   reachable by any existing test: (1) **`--record` disabled every hash check**, including on
   already-recorded entries, so the campaign's next step — ~85 new entries, recorded by running
@@ -588,7 +632,15 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   against the FIXED harness; the Q4 numbers predate it and were re-read as sound (all 14 calls had both forms
   present, so none was a floor artefact).
   **Runtime + quantisation PINNED 2026-08-16: llama.cpp + `Shieldstral-1.0-3B-Q8_0` + `mmproj-BF16` on BOTH
-  hosts** — same bits, same template, so one fitted τ transfers instead of needing a per-host story. Both
+  hosts** — same bits, same template, so one fitted τ transfers instead of needing a per-host story.
+  ⚠️ **That sentence was FALSE for the six days after it was written, and the "same bits" half is now
+  enforced rather than asserted** — see [#592](https://github.com/hherb/kastellan/issues/592) and the
+  weights-pin entry below. **The projector half is still false and is NOT pinned:** the Mac holds
+  `mmproj-F16.gguf` (840,297,024 B, `765ad52b…`) and the DGX holds `mmproj-Shieldstral-1.0-3b-BF16.gguf`
+  (849,889,888 B, `c272a7f1…`) — different name, precision *and size*, so not even a re-quantise of the same
+  tensors. Inert today (llama-server runs `vision:false`, so the guard tier is text-only and no measurement
+  since M1 has loaded either file), which is why it is recorded rather than fixed here; measurement 2's
+  multimodal verdict was taken on the DGX's. Tracked as [#597](https://github.com/hherb/kastellan/issues/597). Both
   alternatives were measured and rejected: **vLLM** is not arch-blocked (the model declares
   `Mistral3ForConditionalGeneration`, present in the DGX container's registry) but that container ships
   **0.15.1** against a card asking **≥ 0.26.0**, and vLLM's GGUF path is an experimental single-file out-of-tree

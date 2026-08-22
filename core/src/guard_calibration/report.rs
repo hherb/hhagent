@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::cassandra::guard_model::weights_pin::WeightsProvenance;
 use crate::cassandra::guard_model::{decide, GuardAdjudication};
 use crate::cassandra::injection_guard::BLOCK_THRESHOLD;
 use crate::guard_calibration::corpus::{Label, Provenance};
@@ -235,6 +236,15 @@ pub struct RunMeta {
     pub model: String,
     pub policy_digest: String,
     pub profile: &'static str,
+    /// Which model weights produced these scores (issue #592).
+    ///
+    /// Carried in the header for the same reason `policy_digest` is:
+    /// a tau is only meaningful against the inputs that produced it,
+    /// and the weights are an input. It is recorded rather than merely
+    /// checked because the artefact outlives the run -- the failure
+    /// #592 documents is precisely a claim about weights that nobody
+    /// could re-check from what was written down.
+    pub weights: WeightsProvenance,
 }
 
 /// Render the operator-facing report.
@@ -246,6 +256,8 @@ pub fn format_report(cases: &[ScoredCase], tau: f32, meta: &RunMeta) -> String {
     out.push_str(&format!("model:         {}\n", meta.model));
     out.push_str(&format!("policy digest: {}\n", meta.policy_digest));
     out.push_str(&format!("guard profile: {}\n", meta.profile));
+    out.push_str(&meta.weights.header_line());
+    out.push('\n');
     out.push_str(&format!("cases loaded: {}\n", cases.len()));
     out.push_str(&render_section("ALL", cases, tau));
 
@@ -541,6 +553,19 @@ fn render_distribution(cases: &[ScoredCase]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cassandra::guard_model::weights_pin::FileDigest;
+    use std::path::PathBuf;
+
+    /// sha256 of the 5 bytes `hello`, from the standard test vectors.
+    ///
+    /// Deliberately NOT `PINNED_SHA256`: a pinned header must report the
+    /// hash it MEASURED, so a fixture that reuses the constant makes
+    /// `contains(PINNED_SHA256)` true no matter what the code does.
+    const SHA256_HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    fn digest(sha256: &str, size_bytes: u64) -> FileDigest {
+        FileDigest::from_hex(sha256, size_bytes).expect("fixture hash is 64 lowercase hex")
+    }
 
     /// A stand-in run header. The fields are asserted individually by
     /// `the_report_header_records_what_produced_it`; every other test
@@ -551,6 +576,24 @@ mod tests {
             model: "shieldstral-test".to_string(),
             policy_digest: "342e3d9661b2cbe2".to_string(),
             profile: "Strict",
+            weights: WeightsProvenance::Pinned {
+                path: PathBuf::from("/models/shieldstral/Shieldstral-1.0-3B-Q8_0.gguf"),
+                digest: digest(SHA256_HELLO, 5),
+            },
+        }
+    }
+
+    /// The same header with weights the run could not vouch for.
+    fn meta_unpinned() -> RunMeta {
+        RunMeta {
+            weights: WeightsProvenance::Unpinned {
+                path: PathBuf::from("/models/shieldstral/candidate.gguf"),
+                digest: digest(
+                    "5cee57a981fefa688ba91825a0a9933d238d4b9147476275b3eac0afbeaf40f5",
+                    3_651_679_008,
+                ),
+            },
+            ..meta()
         }
     }
 
@@ -865,6 +908,43 @@ mod tests {
         assert!(out.contains("shieldstral-test"), "must name the model: {out}");
         assert!(out.contains("342e3d9661b2cbe2"), "must name the policy digest: {out}");
         assert!(out.contains("guard profile: Strict"), "must name the profile: {out}");
+        assert!(
+            out.contains(SHA256_HELLO),
+            "must name the weights hash the run MEASURED, not the pin constant: {out}"
+        );
+        assert!(
+            out.contains("Shieldstral-1.0-3B-Q8_0.gguf"),
+            "must name the weights file it hashed: {out}"
+        );
+    }
+
+    /// #592: a tau is only meaningful against known bytes, so an
+    /// unverified run must say so **in the artefact**. Relying on the
+    /// operator to remember which server was up is exactly the step
+    /// that failed -- the two hosts ran different Q8_0 builds for six
+    /// days while every document said they matched.
+    #[test]
+    fn an_unpinned_run_is_stamped_in_the_report_header() {
+        let cases = vec![case("a", Label::Attack, Provenance::HandWritten, 0.0, Some(0.9))];
+        let out = format_report(&cases, 0.5, &meta_unpinned());
+        assert!(out.contains("UNPINNED"), "must mark the run unpinned: {out}");
+        assert!(
+            out.contains("5cee57a981fefa688ba91825a0a9933d238d4b9147476275b3eac0afbeaf40f5"),
+            "must name the actual hash: {out}"
+        );
+        assert!(
+            out.contains("CANNOT"),
+            "must state the consequence, not just the hash: {out}"
+        );
+    }
+
+    /// The mirror of the above, and the one that stops the stamp being
+    /// unconditional prose: a pinned run must NOT carry the warning.
+    #[test]
+    fn a_pinned_run_carries_no_unpinned_warning() {
+        let cases = vec![case("a", Label::Attack, Provenance::HandWritten, 0.0, Some(0.9))];
+        let out = format_report(&cases, 0.5, &meta());
+        assert!(!out.contains("UNPINNED"), "pinned run must not be stamped: {out}");
     }
 
     /// D8 asks for the score distribution alongside the matrix: a
