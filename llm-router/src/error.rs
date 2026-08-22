@@ -85,6 +85,20 @@ pub enum RouterError {
         body: String,
     },
 
+    /// `/props` answered, but not with JSON.
+    ///
+    /// Separate from [`RouterError::DecodeResponse`] because that one
+    /// names `ChatResponse`, and reusing it here would misdescribe the
+    /// failure. The realistic cause is different too: a `/props` that
+    /// returns HTML means the endpoint is not a llama.cpp server at
+    /// all, where a bad `ChatResponse` means a backend protocol skew.
+    #[error("failed to decode /props as JSON: {source}; raw body: {body}")]
+    DecodeProps {
+        #[source]
+        source: serde_json::Error,
+        body: String,
+    },
+
     #[error("policy denied escalation to frontier backend: {0}")]
     PolicyDeniedFrontier(String),
 

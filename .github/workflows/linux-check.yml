@@ -185,6 +185,27 @@ jobs:
       - name: cargo test (guard calibrate CLI — exit-status contract)
         run: "cargo test -p kastellan-core --test guard_calibrate_cli_e2e --locked"
 
+      # The guard-weights pin's REFUSAL (#592). The pure halves are
+      # covered by `--lib guard` above and by the llm-router step below;
+      # what neither reaches is the wiring that turns "these are not the
+      # pinned weights" into a non-zero exit before any case is scored.
+      #
+      # Same `[SKIP]`-passes-silently caveat as the step above: these
+      # spawn the CLI, so cargo links it for this target, and the DGX
+      # `--workspace` run is the cross-check that they really execute.
+      - name: cargo test (guard weights pin CLI — refusal contract)
+        run: "cargo test -p kastellan-core --test guard_weights_pin_cli_e2e --locked"
+
+      # `/props` is how the weights pin learns which file llama-server
+      # opened — llama.cpp reports an empty `digest`, so the path is the
+      # only thing the endpoint can tell us. The URL derivation is the
+      # subtle half (it strips the OpenAI-compat segment where every
+      # other route appends to it), so both it and the fetch are gated.
+      - name: cargo test (llm-router /props — guard-weights provenance)
+        run: |
+          cargo test -p kastellan-llm-router --lib props_url --locked
+          cargo test -p kastellan-llm-router --test props_e2e --locked
+
   # The Matrix worker's live SDK path (`workers/matrix/src/sdk_live.rs`) is
   # behind the optional `live-matrix` feature (`dep:matrix-sdk`). The `check`
   # job above builds the default `--workspace`, which deliberately excludes that

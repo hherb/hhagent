@@ -60,6 +60,7 @@ pub mod embedding;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod egress_forcing;
 pub mod env;
+pub mod guard_pin;
 pub mod guards;
 pub mod installable;
 pub mod microvm;

@@ -75,6 +75,12 @@ use error::{truncate_for_error, ERROR_BODY_CAP};
 /// backend uses this exact path.
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
+/// llama.cpp's server-properties endpoint, at the server **root** rather
+/// than under the OpenAI-compat prefix. Used by the guard-weights pin to
+/// learn which file the server actually loaded — see
+/// [`Router::props`].
+const PROPS_PATH: &str = "/props";
+
 /// The OpenAI-compatible embeddings sub-path appended to every
 /// backend's base URL. Same pinning rationale as
 /// [`CHAT_COMPLETIONS_PATH`].
@@ -263,6 +269,55 @@ impl Router {
 
     /// Dispatch a request to the local backend.
     ///
+    /// Fetch llama.cpp's `/props` from the configured local backend.
+    ///
+    /// Returned as a raw [`serde_json::Value`] rather than a typed
+    /// struct on purpose: `/props` is a large, version-dependent grab
+    /// bag (sampler defaults, the whole chat template, modality flags)
+    /// and we want exactly one field from it. A typed mirror would be a
+    /// standing maintenance cost that breaks on llama.cpp upgrades
+    /// which do not affect us.
+    ///
+    /// Its one consumer today is the guard-weights pin (issue #592),
+    /// which reads `model_path` to learn which file the server opened
+    /// — see `kastellan_core::cassandra::guard_model::weights_pin`. It
+    /// lives here rather than in `core` because `llm-router` is the sole
+    /// core-side model egress, and a GET to the model server is model
+    /// egress; putting a `reqwest` call in `core` to do it would breach
+    /// that invariant.
+    ///
+    /// Note this addresses the server **root** ([`props_url`]), not the
+    /// OpenAI-compat prefix that [`Router::send`] uses.
+    pub async fn props(&self) -> Result<serde_json::Value, RouterError> {
+        let url = props_url(&self.config.local_url);
+        tracing::debug!(
+            target: "kastellan::llm_router",
+            backend = "local",
+            url = %url,
+            "fetching /props"
+        );
+
+        let resp = self.http.get(&url).send().await?;
+        let status = resp.status();
+
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<error body could not be read as UTF-8 text>".to_string());
+            return Err(RouterError::HttpStatus {
+                status: status.as_u16(),
+                body: truncate_for_error(&body, ERROR_BODY_CAP),
+            });
+        }
+
+        let body = resp.text().await?;
+        serde_json::from_str(&body).map_err(|source| RouterError::DecodeProps {
+            source,
+            body: truncate_for_error(&body, ERROR_BODY_CAP),
+        })
+    }
+
     /// Pure HTTP: POST to `<local_url>/chat/completions` with the
     /// JSON-encoded [`ChatRequest`]. On 2xx, decode as
     /// [`ChatResponse`]; on non-2xx, capture a truncated body and
@@ -333,6 +388,28 @@ fn compose_url(base: &str, path: &str) -> String {
     }
 }
 
+/// The llama.cpp `/props` URL for a backend configured at `base`.
+///
+/// Pure. Kept beside [`compose_url`] because it is the same class of
+/// helper, but it cannot *be* `compose_url`: `/chat/completions` lives
+/// **under** the OpenAI-compat prefix and `/props` lives at the server
+/// **root**, so this has to remove a segment where `compose_url` only
+/// ever appends one.
+///
+/// Two ways to get this wrong, each pinned by its own unit test:
+///
+/// * stripping a bare `v1` rather than the `/v1` segment would rewrite
+///   a base that merely *ends* in those two characters
+///   (`…/apiv1` → `…/api`), addressing a different server entirely;
+/// * `trim_end_matches` **repeats**, so a base ending `/v1/v1` would
+///   lose both. `strip_suffix` removes at most one, which is what
+///   "strip the compat segment" means.
+fn props_url(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    compose_url(root, PROPS_PATH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +442,40 @@ mod tests {
     fn chat_completions_path_is_pinned() {
         // Wire-shape pin shared with every OpenAI-compatible backend.
         assert_eq!(CHAT_COMPLETIONS_PATH, "/chat/completions");
+    }
+
+    #[test]
+    fn props_url_strips_the_openai_compat_segment() {
+        // llama.cpp serves /props at the SERVER ROOT, not under /v1 —
+        // so this cannot go through `compose_url` on the configured
+        // base the way `/chat/completions` does.
+        assert_eq!(props_url("http://127.0.0.1:8081/v1"), "http://127.0.0.1:8081/props");
+        assert_eq!(props_url("http://127.0.0.1:8081/v1/"), "http://127.0.0.1:8081/props");
+        assert_eq!(props_url("http://127.0.0.1:8081/v1//"), "http://127.0.0.1:8081/props");
+    }
+
+    #[test]
+    fn props_url_leaves_a_base_that_has_no_compat_segment() {
+        assert_eq!(props_url("http://127.0.0.1:8081"), "http://127.0.0.1:8081/props");
+        assert_eq!(props_url("http://127.0.0.1:8081/"), "http://127.0.0.1:8081/props");
+    }
+
+    #[test]
+    fn props_url_strips_only_a_whole_path_segment() {
+        // The failure this pins: stripping a bare `v1` (no slash)
+        // would eat the tail of a base that merely *ends* in those
+        // two characters, silently addressing a different server.
+        // Only a complete `/v1` path segment may be removed.
+        assert_eq!(props_url("http://127.0.0.1:8081/apiv1"), "http://127.0.0.1:8081/apiv1/props");
+        assert_eq!(props_url("http://127.0.0.1:8081/openai/v1"), "http://127.0.0.1:8081/openai/props");
+    }
+
+    #[test]
+    fn props_url_strips_at_most_one_compat_segment() {
+        // `trim_end_matches` repeats; `strip_suffix` does not. A base
+        // ending `/v1/v1` is a misconfiguration, but eating both
+        // segments would silently address a different server root.
+        assert_eq!(props_url("http://127.0.0.1:8081/v1/v1"), "http://127.0.0.1:8081/v1/props");
     }
 
     #[test]

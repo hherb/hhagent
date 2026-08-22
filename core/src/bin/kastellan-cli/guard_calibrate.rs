@@ -10,7 +10,10 @@ use crate::common::with_runtime;
 
 pub(crate) fn run_guard(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: kastellan-cli guard calibrate [--corpus DIR] [--tau F]");
+        eprintln!(
+            "usage: kastellan-cli guard calibrate [--corpus DIR] [--tau F] \
+             [--weights-unpinned]"
+        );
         eprintln!("       kastellan-cli guard capture --manifest DIR --out DIR [--record]");
         return ExitCode::from(2);
     }
@@ -27,6 +30,12 @@ pub(crate) fn run_guard(args: &[String]) -> ExitCode {
 fn run_guard_calibrate(args: &[String]) -> ExitCode {
     let mut corpus_dir: Option<PathBuf> = None;
     let mut tau = kastellan_core::cassandra::guard_model::DEFAULT_TAU;
+    // Opt out of the guard-weights pin (issue #592). Default is
+    // fail-closed; this exists so a CANDIDATE guard model can still be
+    // calibrated, which editing the pin for every exploratory run would
+    // make needlessly painful. The cost is paid in the artefact: an
+    // unpinned run is stamped in its own report header.
+    let mut weights_unpinned = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -50,6 +59,7 @@ fn run_guard_calibrate(args: &[String]) -> ExitCode {
                     }
                 }
             }
+            "--weights-unpinned" => weights_unpinned = true,
             other => {
                 eprintln!("guard calibrate: unknown flag {other}");
                 return ExitCode::from(2);
@@ -61,7 +71,7 @@ fn run_guard_calibrate(args: &[String]) -> ExitCode {
     // Runtime construction deferred until here (all args parsed and
     // validated above) so a parse error never pays for a runtime it
     // won't use — the same posture the other CLI dispatchers take.
-    with_runtime("guard calibrate", guard_calibrate_async(dir, tau))
+    with_runtime("guard calibrate", guard_calibrate_async(dir, tau, weights_unpinned))
 }
 
 /// Mirrors `observation_replay::default_captures_dir`: under `cargo run`
@@ -84,7 +94,7 @@ fn default_corpus_dir() -> PathBuf {
     PathBuf::from("tests/guard/corpus")
 }
 
-async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
+async fn guard_calibrate_async(dir: PathBuf, tau: f32, weights_unpinned: bool) -> ExitCode {
     use kastellan_core::cassandra::guard_model::policy::policy_digest;
     use kastellan_core::cassandra::guard_model::GuardClient;
     use kastellan_core::cassandra::injection_guard::{screen, BLOCK_THRESHOLD};
@@ -137,6 +147,21 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
         Ok(Some(c)) => c,
     };
 
+    // Verify the weights BEFORE scoring anything (issue #592).
+    //
+    // A precondition, not a postscript: a run against unknown bytes
+    // produces a tau nobody can interpret, so there is no point paying
+    // for the adjudications first -- and a refusal that had already
+    // printed a report would leave that tau on screen next to the
+    // sentence saying not to trust it.
+    let weights = match resolve_weights(&client, weights_unpinned).await {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("guard calibrate: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
     let mut scored: Vec<ScoredCase> = Vec::with_capacity(cases.len());
     for case in &cases {
         // What the chokepoint would actually see. Production reaches
@@ -186,6 +211,7 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
         // `GuardProfile::for_tool` returns Relaxed for the web tools, so
         // production adjudicates some cases this report excludes.
         profile: "Strict (web-fetch/web-search run Relaxed; not modelled here)",
+        weights,
     };
     print!("{}", format_report(&scored, tau, &meta));
 
@@ -211,5 +237,78 @@ async fn guard_calibrate_async(dir: PathBuf, tau: f32) -> ExitCode {
             eprintln!("guard calibrate: run INVALID ({reason})");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Ask the guard backend which weights it loaded, hash them, and decide
+/// whether this run may proceed.
+///
+/// Split out of [`guard_calibrate_async`] so the policy is legible in
+/// one place: **every** way of not knowing is fatal unless the operator
+/// opted out. That symmetry is the point — "we could not check" and
+/// "we checked and it was wrong" are different diagnoses, and the
+/// [`weights_pin::WeightsPinError`] variants keep them distinct in the
+/// message, but they have the same consequence for the run.
+///
+/// `Ok(WeightsProvenance::Unpinned{..})` is reachable only via the
+/// opt-out; without it an unpinned file becomes a `Mismatch` error.
+async fn resolve_weights(
+    client: &kastellan_core::cassandra::guard_model::GuardClient,
+    weights_unpinned: bool,
+) -> Result<
+    kastellan_core::cassandra::guard_model::weights_pin::WeightsProvenance,
+    kastellan_core::cassandra::guard_model::weights_pin::WeightsPinError,
+> {
+    use kastellan_core::cassandra::guard_model::weights_pin::{
+        model_path_from_props, verify_weights_at, WeightsPinError, WeightsProvenance,
+    };
+
+    let outcome = async {
+        let props = client
+            .props()
+            .await
+            .map_err(|e| WeightsPinError::PropsUnavailable(e.to_string()))?;
+        let path = model_path_from_props(&props).ok_or(WeightsPinError::NoModelPath)?;
+        let path = std::path::PathBuf::from(path);
+        match verify_weights_at(&path)? {
+            WeightsProvenance::Pinned => Ok(WeightsProvenance::Pinned),
+            // Reported as an ERROR rather than returned as a value:
+            // proceeding on unpinned weights is the operator's call,
+            // and `resolve_weights` is where that call is applied.
+            WeightsProvenance::Unpinned { digest } => {
+                Err(WeightsPinError::Mismatch { path, actual: digest })
+            }
+        }
+    }
+    .await;
+
+    match outcome {
+        Ok(pinned) => Ok(pinned),
+        Err(e) if weights_unpinned => {
+            // The opt-out accepts the ANSWER; it never skips the work.
+            // Where we managed to hash the file we keep that digest, so
+            // the report still names the bytes and an unpinned run stays
+            // reproducible.
+            //
+            // Where we could not hash at all there is nothing to name,
+            // and the header carries `kind()` — a short token — rather
+            // than the `Display` paragraph. The paragraph goes to stderr
+            // instead, where a multi-line explanation belongs; putting it
+            // in the header rendered several lines of prose wearing a
+            // field label.
+            eprintln!("guard calibrate: proceeding on UNVERIFIED weights -- {e}");
+            Ok(match e {
+                WeightsPinError::Mismatch { actual, .. } => {
+                    WeightsProvenance::Unpinned { digest: actual }
+                }
+                other => WeightsProvenance::Unpinned {
+                    digest: kastellan_core::cassandra::guard_model::weights_pin::FileDigest {
+                        sha256: format!("<unverified: {}>", other.kind()),
+                        size_bytes: 0,
+                    },
+                },
+            })
+        }
+        Err(e) => Err(e),
     }
 }
