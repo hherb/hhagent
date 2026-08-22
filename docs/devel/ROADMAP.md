@@ -486,7 +486,7 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   comparison:** the hosts run different Q8_0 builds (HF LFS oid `35b755be…` vs the DGX's `5cee57a9…` at identical byte
   length) — pinning a quantisation LABEL is not pinning the bytes.
 
-  **The review ran AFTER the merge and found four fail-opens** — `fix/guard-capture-review-593`.
+  **The review ran AFTER the merge and found four fail-opens** — [#596](https://github.com/hherb/kastellan/pull/596), `fix/guard-capture-review-593`.
   Each could produce a corpus or a threshold that *looked verified and was not*, and none was
   reachable by any existing test: (1) **`--record` disabled every hash check**, including on
   already-recorded entries, so the campaign's next step — ~85 new entries, recorded by running

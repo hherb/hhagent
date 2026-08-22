@@ -7,13 +7,13 @@
 > [`archive/handover_20260821_pre-prune.md`](archive/handover_20260821_pre-prune.md),
 > which holds the verbose pre-prune version of everything summarised here.
 
-**Last updated:** 2026-08-22 · **`main` HEAD:** `b58edc77` ([#593](https://github.com/hherb/kastellan/pull/593), measurement-3 Tasks 1–4 + the live pilot, merged 2026-08-22) · **`main` baseline: 3668 / 0 / 54** DGX · **ONE OPEN BRANCH: `fix/guard-capture-review-593` — four fail-opens the post-merge review found; Mac `core --lib` 1838 / 0 / 1, DGX gate NOT YET RUN.**
+**Last updated:** 2026-08-22 · **`main` HEAD:** `b58edc77` ([#593](https://github.com/hherb/kastellan/pull/593), measurement-3 Tasks 1–4 + the live pilot, merged 2026-08-22) · **`main` baseline: 3668 / 0 / 54** DGX · **ONE OPEN BRANCH: [`fix/guard-capture-review-593`](https://github.com/hherb/kastellan/pull/596) — four fail-opens the post-merge review found; Mac `core --lib` 1838 / 0 / 1, DGX gate NOT YET RUN.**
 
 ---
 
 ## Current state
 
-### OPEN BRANCH `fix/guard-capture-review-593` — the review ran after the merge, and found four fail-opens
+### OPEN BRANCH `fix/guard-capture-review-593` ([#596](https://github.com/hherb/kastellan/pull/596)) — the review ran after the merge, and found four fail-opens
 
 **#593 was merged before its review completed**, so these land as a follow-up. A five-agent review over the merged code found four defects that could each produce a corpus or a threshold that **looked verified and was not**, plus three tests that could not fail. None of the four was reachable by any existing test.
 
