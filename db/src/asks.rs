@@ -484,6 +484,87 @@ pub async fn resolve(
     finish_resolve(tx, resolved_ask_id, task_id).await
 }
 
+/// The `WHERE` tail shared by [`resolve_with_nonce`] and
+/// [`any_live_nonce_for_claimant`]: the ask is live, and its task belongs to
+/// the claimant's own `(channel, peer)`.
+///
+/// **One fragment bound twice, never two hand-typed copies.** If
+/// containment's predicate drifted *narrower* than resolution's, a token
+/// resolution still accepts would stop being contained — the fail-open the
+/// containment arm exists to prevent, arriving through a copy-paste rather
+/// than through a logic error. This repo has already paid for that exact
+/// shape twice in one month (`Confusion::is_valid` vs `invalidity`;
+/// `confusion_at` re-writing `p >= tau` instead of calling `decide`).
+///
+/// **Both consumers must bind the claimant's channel to `$2` and peer to
+/// `$3`.** That is why `resolve_with_nonce`'s other parameters start at
+/// `$4`; do not renumber one without the other.
+///
+/// **A `macro_rules!` rather than a `const`, forced by `sqlx` 0.9 and a
+/// better fit anyway.** `sqlx::query` takes `impl SqlSafeStr`, which is
+/// implemented for `&'static str` and not for a runtime `String`, so a
+/// `const` would have to be spliced with `format!` and then waved past that
+/// bound with `AssertSqlSafe`. Expanding inside `concat!` instead keeps
+/// every statement a compile-time literal — which is exactly what
+/// `SqlSafeStr` exists to guarantee — at no runtime cost.
+macro_rules! live_ask_for_claimant {
+    () => {
+        "state = 'pending' AND deadline_at > now() \
+         AND EXISTS (SELECT 1 FROM tasks t \
+                      WHERE t.id = asks.task_id \
+                        AND t.payload->>'kind' = 'channel' \
+                        AND t.payload->>'channel' = $2 \
+                        AND t.payload->>'peer' = $3)"
+    };
+}
+
+/// Does any of `nonces` hash to a **live** ask belonging to `claimant`'s own
+/// task?
+///
+/// The containment question the channel bus asks before enqueueing a body
+/// that mentions an ask verb (#582, spec D5). One indexed `SELECT EXISTS`
+/// over `asks.nonce_sha256`.
+///
+/// **Peer-scoped, and that is not an optimisation.** An unscoped existence
+/// check is exactly the oracle D9 and D16 refuse to be: a paired peer could
+/// probe five-byte token guesses and read the answer off whether their
+/// message was refused or enqueued. The scope reuses [`resolve_with_nonce`]'s
+/// own predicate — see `live_ask_for_claimant!` for why it is one fragment
+/// and not two.
+///
+/// **The residual, accepted:** another peer's token pasted into a body is
+/// not caught here and lands in `tasks.payload`. It is a leaked-but-inert
+/// secret, because D16 means a token without its owning peer confers no
+/// authority — nobody, including the paster, can resolve with it.
+///
+/// Returns `false` for an empty slice without touching the database. A
+/// **spent** or **expired** nonce is not live and therefore not contained,
+/// which is deliberate: neither is a capability.
+pub async fn any_live_nonce_for_claimant(
+    pool: &PgPool,
+    nonces: &[Nonce],
+    claimant: &Claimant,
+) -> Result<bool, DbError> {
+    if nonces.is_empty() {
+        return Ok(false);
+    }
+    let hashes: Vec<String> = nonces.iter().map(|n| sha256_hex(n.expose())).collect();
+
+    let found: bool = sqlx::query_scalar(concat!(
+        "SELECT EXISTS (SELECT 1 FROM asks WHERE nonce_sha256 = ANY($1) AND ",
+        live_ask_for_claimant!(),
+        ")"
+    ))
+    .bind(&hashes)
+    .bind(claimant.channel())
+    .bind(claimant.peer())
+    .fetch_one(pool)
+    .await
+    .map_err(|e| DbError::Query(format!("asks any_live_nonce_for_claimant: {e}")))?;
+
+    Ok(found)
+}
+
 /// Resolve a pending ask found by its correlation **nonce**, and return its
 /// task to the queue.
 ///
@@ -538,6 +619,10 @@ pub async fn resolve(
 /// resolution. In the guard it is atomic, fail-closed, and inherits the
 /// no-existence-oracle property — a wrong peer is indistinguishable from a
 /// wrong nonce.
+///
+/// Binds the claimant's channel to `$2` and peer to `$3` so it can share
+/// `live_ask_for_claimant!` with [`any_live_nonce_for_claimant`]; its own
+/// parameters therefore start at `$4`.
 pub async fn resolve_with_nonce(
     pool: &PgPool,
     nonce: &Nonce,
@@ -551,25 +636,21 @@ pub async fn resolve_with_nonce(
         .await
         .map_err(|e| DbError::Query(format!("asks resolve_with_nonce begin: {e}")))?;
 
-    let row = sqlx::query(
+    let row = sqlx::query(concat!(
         "UPDATE asks \
          SET state = 'resolved', \
              resolved_at = now(), \
-             resolved_by = $2, \
-             resolution = $3 \
-         WHERE nonce_sha256 = $1 AND state = 'pending' AND deadline_at > now() \
-           AND EXISTS (SELECT 1 FROM tasks t \
-                        WHERE t.id = asks.task_id \
-                          AND t.payload->>'kind' = 'channel' \
-                          AND t.payload->>'channel' = $4 \
-                          AND t.payload->>'peer' = $5) \
-         RETURNING id, task_id, options",
-    )
+             resolved_by = $4, \
+             resolution = $5 \
+         WHERE nonce_sha256 = $1 AND ",
+        live_ask_for_claimant!(),
+        " RETURNING id, task_id, options"
+    ))
     .bind(&nonce_hash)
-    .bind(claimant.attribution())
-    .bind(resolution)
     .bind(claimant.channel())
     .bind(claimant.peer())
+    .bind(claimant.attribution())
+    .bind(resolution)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| DbError::Query(format!("asks resolve_with_nonce: {e}")))?;

@@ -598,3 +598,138 @@ async fn a_paired_peer_who_does_not_own_the_task_cannot_answer_its_ask() {
 
     pool.close().await;
 }
+
+/// The #582 slice through the **real** resolver against real Postgres.
+///
+/// `bus/tests.rs` drives these arms against a fake, so this is the only leg
+/// where `PgAskResolver`, the shared `live_ask_for_claimant!` predicate and
+/// the four arms actually meet. A fake that agrees with a wrong query
+/// proves nothing about the query.
+#[tokio::test]
+async fn containment_holds_end_to_end_against_real_postgres() {
+    if skip_if_no_supervisor() {
+        return;
+    }
+    let Some(bin_dir) = pg_bin_dir_or_skip() else {
+        return; // skip-as-pass
+    };
+    let suffix = unique_suffix();
+    let cluster = bring_up_pg_cluster(
+        &bin_dir,
+        "ac-d",
+        "ac-l",
+        &format!("kastellan-supervisor-test-pg-ac-{suffix}"),
+    );
+    let pool = probe_and_pool(&cluster.conn_spec).await;
+
+    let channel = ChannelId("matrix".into());
+    let owner = PeerId("@me:srv".into());
+    let conversation = ConversationId("!room:srv".into());
+    let payload = build_channel_task_payload(&IncomingMessage {
+        channel: channel.clone(),
+        peer: owner.clone(),
+        conversation: conversation.clone(),
+        body: "book the flight".into(),
+        evidence: None,
+    });
+    let task_id = tasks::insert_pending(&pool, Lane::Fast, payload).await.expect("insert");
+    tasks::claim_one(&pool, Lane::Fast, 60).await.expect("claim").expect("a task");
+
+    let raised = kastellan_db::asks::raise(
+        &pool,
+        task_id,
+        "plan_approval",
+        "sends money to a stranger",
+        &serde_json::json!(["approve", "deny"]),
+        Some("digest"),
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+        None,
+    )
+    .await
+    .expect("raise");
+    let token = raised.nonce.expose().to_string();
+
+    let events = PgChannelEvents::new(pool.clone());
+    let authorizer = StaticPairings::from_peers([owner.clone()]);
+    let wiring = AskWiring {
+        outbox: std::sync::Arc::new(ChannelOutbox::new()),
+        resolver: std::sync::Arc::new(PgAskResolver::new(pool.clone())),
+    };
+    let deliver = |body: String| IncomingMessage {
+        channel: channel.clone(),
+        peer: owner.clone(),
+        conversation: conversation.clone(),
+        body,
+        evidence: None,
+    };
+
+    // (a) A quoted reply carrying the LIVE token. Its first token is `>`,
+    // so the narrow shape check cannot see it — only the exact check can.
+    let quoted = deliver(format!("> Approval needed\n> /approve {token}\nyes, go ahead"));
+    let ack = handle_inbound(&authorizer, None, Some(&wiring), &events, &quoted)
+        .await
+        .expect("a refusal is acknowledged");
+    assert_eq!(ack.body, kastellan_core::channel::ask_message::ACK_MALFORMED_COMMAND);
+
+    let audits = kastellan_db::audit::fetch_since(&pool, 0, 500).await.expect("audit fetch");
+    let row = audits
+        .iter()
+        .rev()
+        .find(|r| r.action == actions::ASK_ANSWER_REJECTED)
+        .expect("a rejection row");
+    assert_eq!(
+        row.payload["reason"], actions::ASK_REASON_CARRIES_LIVE_TOKEN,
+        "the only row that ever shows the containment guard firing",
+    );
+
+    // The token must appear nowhere in `tasks` — the durable, DELETE-less
+    // column this whole arm exists to keep it out of.
+    let leaked: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE payload::text LIKE $1")
+        .bind(format!("%{token}%"))
+        .fetch_one(&pool)
+        .await
+        .expect("scan tasks");
+    assert_eq!(leaked, 0, "a live token must never reach tasks.payload");
+
+    // (b) #582: an ordinary message that merely MENTIONS a verb carries no
+    // live token, so it is a task. This is the arm that was refused before
+    // the split — and on email, dropped unsent.
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM tasks").fetch_one(&pool).await.expect("count");
+    let ordinary = deliver("should I /approve the PR?".to_string());
+    let out = handle_inbound(&authorizer, None, Some(&wiring), &events, &ordinary).await;
+    assert!(out.is_none(), "an enqueued message gets no ack");
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM tasks").fetch_one(&pool).await.expect("count");
+    assert_eq!(after, before + 1, "#582: no live token, so it is a task");
+
+    // (c) The same live token with a full stop stuck to it, in prose that is
+    // not verb-first. Whitespace tokenisation alone hashes `<token>.`, which
+    // is not the nonce, so the first version of this arm answered "no live
+    // token" and ENQUEUED — the exact leak the arm exists to prevent, and one
+    // `main` did not have (its broad predicate refused every body it matched).
+    // Driven through the REAL resolver because a fake that agrees with a wrong
+    // candidate set proves nothing about the candidate set.
+    let punctuated = deliver(format!("ok, /approve {token}."));
+    let ack = handle_inbound(&authorizer, None, Some(&wiring), &events, &punctuated)
+        .await
+        .expect("a refusal is acknowledged");
+    assert_eq!(ack.body, kastellan_core::channel::ask_message::ACK_MALFORMED_COMMAND);
+
+    let audits = kastellan_db::audit::fetch_since(&pool, 0, 500).await.expect("audit fetch");
+    let row = audits
+        .iter()
+        .rev()
+        .find(|r| r.action == actions::ASK_ANSWER_REJECTED)
+        .expect("a rejection row");
+    assert_eq!(row.payload["reason"], actions::ASK_REASON_CARRIES_LIVE_TOKEN);
+
+    let leaked: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE payload::text LIKE $1")
+        .bind(format!("%{token}%"))
+        .fetch_one(&pool)
+        .await
+        .expect("scan tasks");
+    assert_eq!(leaked, 0, "punctuation must not carry a live token past containment");
+
+    pool.close().await;
+}
