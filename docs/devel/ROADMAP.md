@@ -462,7 +462,16 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   [`2026-08-22-shieldstral-guard-wiring-design.md`](../superpowers/specs/2026-08-22-shieldstral-guard-wiring-design.md)
   (τ **required, no default**, so slice 1's D9 becomes a property of the code; a **derived** 15 s timeout closing
   [#586](https://github.com/hherb/kastellan/issues/586); `p` recorded on every adjudicated dispatch so production becomes
-  measurement 3's own score source). **[#592](https://github.com/hherb/kastellan/issues/592) blocks the two-host τ
+  measurement 3's own score source). **Measurement 3 Tasks 1–4 BUILT 2026-08-22** on
+  `feat/guard-wiring-slice` (DGX gate **3668 / 0 / 54**, +42 reconciling exactly): D7's
+  `operating_point` + `BudgetScope` — needed because `best_tau` is separability-only and
+  would return `Err(Overlap)` on any corpus with real captured content; the operating point
+  rendered **once, corpus-wide**; a `manifest` module carrying metadata and never text; and
+  `kastellan-cli guard capture`, which drives the **real** chokepoint and refuses a result
+  that came back as the injection placeholder (storing it would record a benign-looking
+  document in place of the page, which then gets scored). **Task 5 — the capture campaign and
+  the τ fit — is the remaining operator step.**
+  **[#592](https://github.com/hherb/kastellan/issues/592) blocks the two-host τ
   comparison:** the hosts run different Q8_0 builds (HF LFS oid `35b755be…` vs the DGX's `5cee57a9…` at identical byte
   length) — pinning a quantisation LABEL is not pinning the bytes.
 
