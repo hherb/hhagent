@@ -5,6 +5,10 @@
 **Blocks:** [`2026-08-22-shieldstral-guard-wiring-design.md`](2026-08-22-shieldstral-guard-wiring-design.md) — that slice's D1 makes τ a
 required operator input precisely because this measurement does not exist yet.
 
+**Approved by the operator 2026-08-22.** Kastellan targets **high-risk environments such as
+healthcare**, and its hardware floor is M-series or DGX-class by design — which is what
+makes the tier's measured cost affordable, and what shapes D7's operating point.
+
 Slice 1 shipped a 24-case corpus labelled, in four separate places, a **proof of
 concept**. This spec designs the thing that replaces it: ≥100 labelled cases, half of them
 captured rather than imagined, and a τ fitted against them on both hosts.
@@ -279,6 +283,47 @@ a discrepancy to average away** — it would mean quantisation-identical hosts s
 and the cross-platform claim the whole design rests on would need re-examining before any
 τ ships at all.
 
+### D7 — The τ selection criterion, pre-registered before the run
+
+**`best_tau` will probably return `NoTau::Overlap` on this corpus, and that is the corpus
+working.** Today it returns the *margin-maximising* threshold — the midpoint between
+`min(attack)` and `max(benign)` — and errors when `margin <= 0`. That is a
+**separability-only** criterion. It succeeds on 24 hand-picked cases precisely because they
+separate cleanly; a 120-case corpus with real captured content almost certainly overlaps
+somewhere, at which point the existing harness yields no τ at all.
+
+So the criterion has to be an **operating point**, not a separating line, and Open risk 5
+says it must be fixed *before* the numbers are seen or it becomes a judgement made after
+seeing the answer. Pre-registered here:
+
+> **τ is the threshold maximising the true-positive rate subject to at most ONE false
+> positive across the captured-benign strata.**
+
+The asymmetry comes from what each error actually costs, and it is not the asymmetry a
+high-risk setting first suggests:
+
+- **A false negative is not a regression.** The tier is escalate-up only and fails open, so a
+  missed attack leaves exactly today's catalogue-only behaviour. The tier can only improve on
+  the status quo, never worsen it — and the sandbox and egress allowlist, not this, are the
+  boundary.
+- **A false positive is a live capability loss.** A withheld document is one the planner
+  cannot read, and under D4 the expensive stratum is security and technical prose — the
+  material the agent reads most. A guard that blocks it has not become safer; it has become
+  unable to read about security.
+
+**"At most one" rather than a percentage, because the corpus cannot resolve a percentage.**
+With ~50 captured-benign cases the finest expressible bound is 2%; writing "FP ≤ 1%" would
+be a number the sample size cannot support. Stating the count says exactly what is being
+required.
+
+**The full ROC is reported regardless**, so the choice is inspectable and a different
+operating point can be read off without re-running. The margin-maximising τ is still
+reported when it exists, for continuity with slice 1.
+
+This needs a companion to `best_tau` in `guard_calibration/report.rs` — the existing
+function is not wrong, it answers a different question, and both answers belong in the
+report.
+
 ---
 
 ## What this spec deliberately excludes
@@ -304,7 +349,7 @@ and the cross-platform claim the whole design rests on would need re-examining b
    and still not a number to promote to a default without saying what it was fitted on.
 5. **The two-host comparison in D6 has no pre-registered agreement threshold.** "Do they
    agree" needs a number before the run, or it becomes a judgement made after seeing the
-   answer.
+   answer. D7 fixes the τ *criterion* in advance; this is the remaining unfixed one.
 6. **F4 was found by checking one premise. Nothing has audited the others.** "Same runtime"
    (llama.cpp build/version) and "same prompt" (`policy_digest`) are asserted across hosts
    on the same basis "same weights" was — which turned out to be none. The digest at least

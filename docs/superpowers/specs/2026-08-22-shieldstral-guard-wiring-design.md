@@ -5,6 +5,12 @@
 (merged as [#585](https://github.com/hherb/kastellan/pull/585), `f90631da`)
 **Closes:** [#586](https://github.com/hherb/kastellan/issues/586)
 
+**Approved by the operator 2026-08-22**, together with the measurement-3 spec, and with
+three constraints recorded that resolve two of the open risks below: the ~3.5 s cost is
+acceptable, the 15 s bound is realistic, and GPU sharing is acceptable because kastellan's
+hardware floor is **M-series or DGX-class by design**. The tier's purpose is what buys that
+budget: kastellan targets **high-risk environments such as healthcare**.
+
 Slice 1 landed the guard endpoint seam, the adjudicator and the calibration harness, and
 deliberately shipped **no production wiring** — five chokepoint files were verified
 byte-identical to `main` as a merge gate. This slice puts the tier on the dispatcher path.
@@ -115,11 +121,16 @@ inheriting `timeout` through the `..self.clone()`.
 than the GB10 at a full 64 KiB document, plus the GPU-contention headroom Open risk 3 says
 is unmeasured.
 
-**It deliberately does not cover a CPU-only host** (~50 s by M1's linearity). There, the
-right behaviour is to time out and fail open to catalogue-only screening — which is
-today's behaviour — rather than stall every single dispatch for the better part of a minute.
-A timeout that accommodated the slowest conceivable host would defeat the purpose of having
-one.
+**It deliberately does not cover a CPU-only host** (~50 s by M1's linearity), and that is a
+**system requirement, not a shortfall**. Kastellan's floor is M-series or DGX-class hardware
+by design (operator, 2026-08-22); it is not built for lightweight machines. On a host below
+that floor the right behaviour is to time out and fail open to catalogue-only screening —
+today's behaviour — rather than stall every dispatch for the better part of a minute. A
+timeout stretched to accommodate the slowest conceivable host would defeat the purpose of
+having one.
+
+**15 s is confirmed realistic by the operator**, as is the ~3.5 s per-document cost at the
+cap.
 
 This closes #586. The existing `for_guard` test asserting `guard.timeout == cfg.timeout`
 **changes**, and that is the intended outcome: its own doc records the inheritance as
@@ -302,13 +313,17 @@ be corrected.
 1. **τ is unfitted, and this slice makes a tier that runs on one.** D1 contains it by
    refusing to supply the number, but an operator can still supply a bad one. Mitigated only
    by the range check and by measurement 3 remaining visibly owed.
-2. **3.5 s per document at the cap is a real cost on the dispatcher path, and it is
-   serial.** A task making ten large-document tool calls adds ~35 s. The tier is opt-in, so
-   nobody pays this without asking for it, but the number belongs in the operator's decision
-   and not only in this spec.
-3. **The planner and the guard share one GPU on a single-host deployment, and M1 measured an
-   idle one.** Contention makes both slower by an unmeasured amount. This is the strongest
-   argument for D2's 4× headroom and the most likely reason a future session revisits it.
+2. ~~**3.5 s per document at the cap is a real cost.**~~ **ACCEPTED by the operator
+   2026-08-22.** A task making ten large-document tool calls adds ~35 s. Recorded rather
+   than deleted, because the number still belongs in a deploying user's decision — and
+   because the acceptance is grounded in what the tier is *for*: the target is
+   **high-risk environments such as healthcare**, where 3.5 s of screening against a
+   document the agent is about to act on is cheap relative to the failure it prevents.
+3. ~~**The planner and the guard share one GPU.**~~ **ACCEPTED by the operator
+   2026-08-22.** Contention makes both slower by an unmeasured amount, and kastellan will
+   support multi-tenancy, at which point the hardware investment is the deploying user's to
+   make. Still the most likely reason a future session revisits D2's 4× headroom — accepted
+   is not the same as measured.
 4. **`p` recorded per dispatch is a new, long-lived column of model output.** It is a float
    and carries no document content, but it is a behavioural fingerprint of what the agent
    read, retained for as long as `audit_log` rows are.
