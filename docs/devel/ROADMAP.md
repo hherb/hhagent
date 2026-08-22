@@ -485,7 +485,7 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   **[#592](https://github.com/hherb/kastellan/issues/592) blocked the two-host τ
   comparison:** the hosts ran different Q8_0 builds (HF LFS oid `35b755be…` vs the DGX's `5cee57a9…` at identical byte
   length) — pinning a quantisation LABEL is not pinning the bytes.
-  **FIXED — the pin is now checked at use, so Task 5 Step 7 is unblocked** (`fix/592-guard-weights-pin`).
+  **FIXED — the pin is now checked at use, so Task 5 Step 7 is unblocked** (2026-08-22, `abb3d3a7`, [#598](https://github.com/hherb/kastellan/pull/598); closes [#592](https://github.com/hherb/kastellan/issues/592)).
   kastellan never opens the GGUF, and llama.cpp's `/v1/models` reports an **empty** `digest` while the fields it
   *does* report (`ftype`, `size`, `n_params`) are exactly the shape facts two Q8_0 builds share — so the endpoint
   cannot prove which bytes it loaded. What it can do is **name the file**: `guard calibrate` now GETs `/props`,
