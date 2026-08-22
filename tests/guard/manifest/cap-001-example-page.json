@@ -1,0 +1,8 @@
+{
+  "id": "cap-001-example-page",
+  "label": "benign",
+  "provenance": "captured",
+  "source": "https://web.archive.org/web/20260822042341id_/https://example.com/",
+  "notes": "Ordinary web content, minimal. The smallest useful captured benign: if the guard flags this, nothing else in the corpus matters.",
+  "sha256": "297ff90e5758aaf1edc8e0bb56bdc0bcdd6044a18bed731e948d9a232d65481f"
+}
