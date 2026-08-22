@@ -19,6 +19,11 @@ Three findings below were measured while scoping it, and two of them changed the
 production history looked like a ready-made capture source. It is not. Measured
 2026-08-22 against the live DGX cluster:
 
+Counts below are of rows that carry a `result` key; not every `tool:*` row does, and the
+totals per action are larger (e.g. `mail.search` has 72 rows, 7 with `result` and 8 with
+`err`), which is worth knowing before anyone re-derives these numbers from a plain
+`count(*)`.
+
 | actor / action | rows | **distinct results** | avg len | max len |
 | --- | --- | --- | --- | --- |
 | `tool:shell-exec` / `shell.exec` | 58 | **16** | 116 B | 1,371 B |
@@ -28,8 +33,14 @@ production history looked like a ready-made capture source. It is not. Measured
 **~70 distinct documents, of which perhaps 35 are substantive** — and three problems that
 the row counts hide:
 
-1. **There are no `tool:web-fetch` rows at all.** Fetched pages are the material the corpus
-   README names first for the captured half, and the live bot has never produced one.
+1. **`web-fetch` has been attempted five times and has succeeded zero times.** Fetched
+   pages are the material the corpus README names first for the captured half, and the
+   live bot has never produced one. The reason is not a defect: all five rows carry
+   `-32001: host "…" not on allowlist` (`theguardian.com`, `abc.net.au`, `thelocal.de`,
+   …), i.e. containment working exactly as designed against a host whose `web-fetch`
+   `tool_allowlists` row covers none of those domains. `web-research` (0/3) and
+   `web.search_batch` (0/3) are the same story. **This is a prerequisite for D3, not a
+   curiosity** — see there.
 2. **Nothing exceeds 4 KB, against a 64 KiB cap.** The README explicitly anticipates that
    "captured half is real fetched pages, where 200 KiB is ordinary" — so this material would
    never exercise the `SCAN_BYTE_CAP` truncation that production applies.
@@ -151,6 +162,17 @@ warns about for the byte cap, generalised one level up.
 **Deliberately over-cap material is included.** F1's third problem is that nothing captured
 so far approaches 64 KiB; the campaign must include pages that exceed it, so the corpus
 exercises truncation rather than assuming it away.
+
+**Operational prerequisite, which F1 discovered the hard way on the daemon's behalf: every
+domain in the campaign's URL list needs a `web-fetch` `tool_allowlists` row before the
+campaign starts.** Without one, every single fetch returns `-32001: host … not on
+allowlist` — which is what all five of the deployed host's web-fetch attempts did — and a
+campaign that fails uniformly on its first step reads like a broken worker rather than a
+missing config row. This repo has already paid for that specific confusion once
+([[web-research-e2e-endpoint-must-be-allowlisted]]). Allowlist entries are bare hosts, so
+per [[bare-host-net-allowlist-is-all-port-grant]] they must be mapped through
+`allowlist_to_net_entries`, and the daemon loads the allowlist **once at startup**, so it
+needs a restart to pick them up.
 
 ### D4 — Labelling: discussion is benign, a directed payload is an attack
 
