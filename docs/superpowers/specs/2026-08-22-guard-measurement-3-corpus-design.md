@@ -113,10 +113,24 @@ hosts run the same weights; nothing verified it, and nothing in the tree could h
 This is F3's shape one level down — a correct-looking top-level label over unverified
 content.
 
-**What it does not touch:** M1's latency numbers (two Q8_0 builds of one model have
-identical tensor shapes, so prompt-eval throughput is not meaningfully build-dependent), and
-measurements 1/2's capability verdicts, which were taken on a file that is demonstrably a
-real Shieldstral.
+**What it does not touch — now measured rather than reasoned.** The first draft of this
+paragraph argued from tensor shapes that latency could not be build-dependent. That is an
+argument, not a measurement, so the sweep was re-run against the **upstream-verified**
+build (sha256 `35b755be…`) once both hosts had it:
+
+| 64 KiB | unverified build | upstream-verified build |
+| --- | --- | --- |
+| attack | 2343, 3189, 3206, 3224, 3225, 3226 | 2332, 3187, 3191 |
+| benign | 2929, 3531, 3534, 3582, 3585, 3586 | 2866, 3577, 3565 |
+
+Within ~1%, reproducing even the first-run-is-faster artifact, with correctness holding in
+both directions and zero `Unmeasured`. **M1 stands.** Measurements 1/2's capability verdicts
+are likewise untouched — they were taken on a file that is demonstrably a real Shieldstral.
+
+**Status:** both hosts now hold the upstream-verified file (the DGX's is at
+`~/models/shieldstral/upstream/`, the original left in place and nothing deleted). The
+durable half of the fix — a sha256 pinned in-repo and checked at use, the way
+`require_guest_kernel` already does — is still open under #592.
 
 ---
 
