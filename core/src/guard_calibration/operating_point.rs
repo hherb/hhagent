@@ -22,6 +22,7 @@
 //! Reported *alongside* `best_tau`, never instead of it: on a corpus
 //! that does separate, the margin-maximising answer is the better one.
 
+use crate::cassandra::guard_model::{decide, GuardAdjudication};
 use crate::guard_calibration::corpus::{Label, Provenance};
 use crate::guard_calibration::report::{confusion_at, Confusion, NoTau, ScoredCase};
 
@@ -82,6 +83,17 @@ pub struct OperatingPoint {
     /// because a report showing only the full-corpus count would let a
     /// reader check the budget against the wrong number.
     pub scoped_false_positives: u32,
+    /// The scope the budget was counted over, **carried on the result
+    /// so a report renders it from the fit rather than from its own
+    /// parameter.** Rendering the caller's copy made the "derived, never
+    /// written beside it" property true only for as long as there was
+    /// exactly one caller passing the same value twice; fitting under
+    /// one scope and printing another type-checked.
+    pub scope: BudgetScope,
+    /// How many benign cases the budget was counted over. Printed beside
+    /// the count, because `0 of 1 allowed` over an empty population
+    /// looks identical to a real pass.
+    pub scope_population: u32,
     /// `true` when the chosen `tau` sits above every observed score, so
     /// the tier flags nothing at all.
     ///
@@ -102,8 +114,18 @@ pub struct OperatingPoint {
 ///
 /// For a finite non-negative float the IEEE-754 bit pattern increases
 /// monotonically with the value, so incrementing it steps to the next
-/// representable float. Every candidate here is exactly that: the loop
-/// above refuses non-finite scores, and a probability is non-negative.
+/// representable float. Every candidate is exactly that, and both halves
+/// are **enforced** rather than assumed: [`operating_point`]'s candidate
+/// loop refuses a score that is not finite *or* is negative, and returns
+/// [`NoTau::Unmeasured`] for it.
+///
+/// The negative half used to be a `debug_assert!` over a producer's
+/// property (`binary_token_probability` is a sigmoid). That is the
+/// consumer trusting the producer across a `pub` boundary, checked only
+/// where the code does not ship: incrementing the bit pattern of a
+/// negative float steps *away* from zero, so the sentinel would land
+/// below the maximum, flag the cases it exists to exclude, and still
+/// report `above_all_observed`.
 fn next_above(x: f32) -> f32 {
     debug_assert!(
         x.is_finite() && x >= 0.0,
@@ -112,16 +134,36 @@ fn next_above(x: f32) -> f32 {
     f32::from_bits(x.to_bits() + 1)
 }
 
+/// Benign cases the budget applies to, whatever `tau`.
+///
+/// **Zero here makes D7's criterion vacuous**, which is why
+/// [`operating_point`] refuses rather than reporting a threshold: the
+/// budget bounds a population that does not exist, so `scoped > budget`
+/// is never true and the fit degenerates to "catch every attack at any
+/// benign cost" — while the report still prints `0 of 1 allowed`, which
+/// reads as the criterion being honoured. The shipped 24-case corpus
+/// has no captured cases at all, so this is the default run, not a
+/// corner.
+fn scope_population(cases: &[ScoredCase], scope: BudgetScope) -> u32 {
+    cases
+        .iter()
+        .filter(|c| c.is_adjudicated() && c.label == Label::Benign && scope.counts(c))
+        .count() as u32
+}
+
 /// False positives at `tau`, counted only over cases the budget applies
 /// to.
+///
+/// **Delegates to the shipping [`decide`]** for the same reason
+/// [`confusion_at`] does, and it matters more here: this is the count
+/// the *budget* is checked against, so an inline `p >= tau` that drifted
+/// from the adjudicator would admit a τ violating D7 under the real
+/// thing while the report said otherwise.
 fn scoped_false_positives(cases: &[ScoredCase], tau: f32, scope: BudgetScope) -> u32 {
     cases
         .iter()
         .filter(|c| c.is_adjudicated() && c.label == Label::Benign && scope.counts(c))
-        .filter(|c| match c.probability {
-            Some(p) if p.is_finite() => p >= tau,
-            _ => false,
-        })
+        .filter(|c| matches!(decide(c.probability, tau), GuardAdjudication::Flagged))
         .count() as u32
 }
 
@@ -144,10 +186,14 @@ fn scoped_false_positives(cases: &[ScoredCase], tau: f32, scope: BudgetScope) ->
 /// budget 1 returned `Err` outright while a feasible point existed.
 ///
 /// **Ordering: more true positives wins; on equal recall, fewer scoped
-/// false positives wins.** There is deliberately no third tie-break,
-/// because a third tie is unreachable — see the comment on the
-/// comparison. An earlier draft had one, guarded by a test that turned
-/// out to be tautological.
+/// false positives wins; on equal both, fewer false positives overall.**
+/// The third key is load-bearing and its absence was a live bug — see
+/// the comment on the comparison for the worked counterexample.
+/// (This paragraph used to say there was deliberately no third key,
+/// "because a third tie is unreachable". That was true before
+/// [`BudgetScope`] existed and was left standing when the fix landed one
+/// commit later, pointing the reader at an inline comment that by then
+/// argued the opposite.)
 ///
 /// Short-circuits on an unmeasured or non-finite probability for the
 /// same reason [`super::report::best_tau`] does: fitting a threshold
@@ -165,7 +211,14 @@ pub fn operating_point(
     let mut saw_benign = false;
 
     for case in cases.iter().filter(|c| c.is_adjudicated()) {
-        let Some(p) = case.probability.filter(|p| p.is_finite()) else {
+        // `>= 0.0` alongside `is_finite()`, because `next_above` is
+        // correct only for non-negative input: incrementing the bit
+        // pattern of a negative float steps AWAY from zero, so the
+        // "sentinel" would land below the maximum, flag what it was
+        // built to exclude, and report `above_all_observed` for a
+        // threshold that flags things. It was a `debug_assert!`, which
+        // is compiled out exactly where a security control ships.
+        let Some(p) = case.probability.filter(|p| p.is_finite() && *p >= 0.0) else {
             return Err(NoTau::Unmeasured);
         };
         match case.label {
@@ -180,6 +233,16 @@ pub fn operating_point(
         (true, false) => return Err(NoTau::SingleClass(Label::Attack)),
         (false, true) => return Err(NoTau::SingleClass(Label::Benign)),
         (true, true) => {}
+    }
+
+    // Checked AFTER the class check so a single-class corpus still
+    // reports the cause an operator can act on. Under `AllBenign` this
+    // is unreachable -- `saw_benign` implies a population -- so it fires
+    // only where D7's scope actually restricts, which is where it
+    // matters.
+    let population = scope_population(cases, scope);
+    if population == 0 {
+        return Err(NoTau::EmptyBudgetScope);
     }
 
     // `total_cmp` because every candidate is already known finite (the
@@ -255,6 +318,8 @@ pub fn operating_point(
                 tau,
                 confusion,
                 scoped_false_positives: scoped,
+                scope,
+                scope_population: population,
                 above_all_observed: tau == sentinel,
             });
         }
@@ -276,10 +341,16 @@ mod tests {
     /// Build an adjudicated case (catalogue score 0.0 keeps it below
     /// BLOCK_THRESHOLD, so `is_adjudicated()` is true).
     fn case(id: &str, label: Label, p: f32) -> ScoredCase {
+        case_with(id, label, Provenance::Captured, p)
+    }
+
+    /// The same, with the provenance spelled out — needed by anything
+    /// that must render or fit under a scope narrower than `AllBenign`.
+    fn case_with(id: &str, label: Label, provenance: Provenance, p: f32) -> ScoredCase {
         ScoredCase {
             id: id.to_string(),
             label,
-            provenance: Provenance::Captured,
+            provenance,
             catalogue_score: 0.0,
             probability: Some(p),
         }
@@ -615,11 +686,26 @@ mod tests {
             BudgetScope::OnlyProvenance(Provenance::Captured).as_str(),
             "captured-benign"
         );
-        assert_ne!(
-            BudgetScope::OnlyProvenance(Provenance::HandWritten).as_str(),
-            BudgetScope::OnlyProvenance(Provenance::Captured).as_str(),
-            "two scopes must not share a name, or a report cannot distinguish them"
-        );
+        // PAIRWISE, over ALL FOUR. Checking one pair left the
+        // `DerivedFromCatalogue` arm free to return "captured-benign"
+        // with the suite green -- which is precisely the property this
+        // test's own rationale says must not hold.
+        let all = [
+            BudgetScope::AllBenign,
+            BudgetScope::OnlyProvenance(Provenance::Captured),
+            BudgetScope::OnlyProvenance(Provenance::HandWritten),
+            BudgetScope::OnlyProvenance(Provenance::DerivedFromCatalogue),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(
+                    a.as_str(),
+                    b.as_str(),
+                    "two scopes must not share a name, or a report cannot \
+                     distinguish them: {a:?} vs {b:?}"
+                );
+            }
+        }
     }
 
     /// Pins the equivalence that makes the report's TP-vs-sentinel
@@ -631,6 +717,14 @@ mod tests {
     /// `FP >= 1`, and the sentinel then dominates on the full-corpus
     /// key. Remove that key and this breaks, which is the point of
     /// pinning it here rather than leaving it as a comment.
+    ///
+    /// **The scoped leg below is what makes that last sentence true.**
+    /// Every corpus here once ran under `AllBenign` only -- where the
+    /// scoped count is *identically* `confusion.false_positive`, so keys
+    /// 2 and 3 hold the same value and deleting key 3 cannot change a
+    /// single comparison the test makes. The doc claimed the test pinned
+    /// a key it could not reach. Under a narrower scope the two counts
+    /// come apart, and the mutation fails here.
     #[test]
     fn catches_nothing_iff_the_sentinel_won() {
         let corpora: Vec<Vec<ScoredCase>> = vec![
@@ -667,5 +761,80 @@ mod tests {
                 );
             }
         }
+
+        // The scoped leg. At budget 1 the admissible candidates are
+        // tau=0.91 (scoped 1, FP 2), tau=0.95 (scoped 0, FP 1) and the
+        // sentinel (scoped 0, FP 0). All three catch nothing, so ONLY
+        // the third key separates 0.95 from the sentinel -- and with the
+        // key deleted 0.95 is encountered first and wins, leaving
+        // `TP == 0` with `above_all_observed == false`.
+        let mixed = vec![
+            case_with("hw1", Label::Benign, Provenance::HandWritten, 0.95),
+            case_with("c1", Label::Benign, Provenance::Captured, 0.90),
+            case_with("c2", Label::Benign, Provenance::Captured, 0.91),
+            case_with("a1", Label::Attack, Provenance::Captured, 0.85),
+        ];
+        let got = operating_point(&mixed, 1, BudgetScope::OnlyProvenance(Provenance::Captured))
+            .expect("the sentinel is always affordable");
+        assert_eq!(got.confusion.true_positive, 0, "nothing is affordable here");
+        assert!(
+            got.above_all_observed,
+            "with TP 0 the free sentinel must win on the third key, not a \
+             threshold that pays a full-corpus false positive for nothing"
+        );
+    }
+
+    /// The result states the scope it was fitted under, so a report
+    /// cannot render one scope over a fit made under another.
+    #[test]
+    fn the_fit_carries_its_own_scope_and_population() {
+        let cases = vec![
+            case_with("hw1", Label::Benign, Provenance::HandWritten, 0.10),
+            case_with("c1", Label::Benign, Provenance::Captured, 0.20),
+            case_with("a1", Label::Attack, Provenance::Captured, 0.90),
+        ];
+        let scoped = BudgetScope::OnlyProvenance(Provenance::Captured);
+        let got = operating_point(&cases, 0, scoped).expect("separable");
+        assert_eq!(got.scope, scoped);
+        assert_eq!(got.scope_population, 1, "one captured benign is in scope");
+
+        let all = operating_point(&cases, 0, BudgetScope::AllBenign).expect("separable");
+        assert_eq!(all.scope, BudgetScope::AllBenign);
+        assert_eq!(all.scope_population, 2, "both benigns are in scope");
+    }
+
+    /// **A budget over an empty population is not a criterion.**
+    ///
+    /// With no benign case in scope the budget never binds, so the fit
+    /// degenerates to "catch every attack at any benign cost" -- and the
+    /// report would print `0 of 1 allowed`, which reads as the criterion
+    /// being honoured. The shipped 24-case corpus has NO captured cases,
+    /// so this is what a default `guard calibrate` run does.
+    #[test]
+    fn an_empty_budget_scope_is_refused_rather_than_fitted_vacuously() {
+        let cases = vec![
+            case_with("hw1", Label::Benign, Provenance::HandWritten, 0.80),
+            case_with("hw2", Label::Benign, Provenance::HandWritten, 0.81),
+            case_with("a1", Label::Attack, Provenance::Captured, 0.50),
+        ];
+        assert_eq!(
+            operating_point(&cases, 1, BudgetScope::OnlyProvenance(Provenance::Captured)),
+            Err(NoTau::EmptyBudgetScope),
+            "no captured benign means D7's budget bounds nothing"
+        );
+        // The very same corpus under a scope that DOES hold benigns
+        // fits, so the refusal is about the scope and not the corpus.
+        assert!(operating_point(&cases, 1, BudgetScope::AllBenign).is_ok());
+    }
+
+    /// A single-class corpus reports THAT, not the empty scope: the
+    /// cause an operator can act on comes first.
+    #[test]
+    fn a_single_class_corpus_reports_its_class_not_its_empty_scope() {
+        let cases = vec![case_with("a1", Label::Attack, Provenance::Captured, 0.9)];
+        assert_eq!(
+            operating_point(&cases, 1, BudgetScope::OnlyProvenance(Provenance::Captured)),
+            Err(NoTau::SingleClass(Label::Attack))
+        );
     }
 }
