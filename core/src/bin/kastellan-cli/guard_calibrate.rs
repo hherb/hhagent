@@ -11,10 +11,12 @@ use crate::common::with_runtime;
 pub(crate) fn run_guard(args: &[String]) -> ExitCode {
     if args.is_empty() {
         eprintln!("usage: kastellan-cli guard calibrate [--corpus DIR] [--tau F]");
+        eprintln!("       kastellan-cli guard capture --manifest DIR --out DIR [--record]");
         return ExitCode::from(2);
     }
     match args[0].as_str() {
         "calibrate" => run_guard_calibrate(&args[1..]),
+        "capture" => crate::guard_capture::run(&args[1..]),
         other => {
             eprintln!("guard: unknown subcommand {other}");
             ExitCode::from(2)

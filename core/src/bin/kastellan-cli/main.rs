@@ -162,6 +162,7 @@ mod entities;
 mod entities_kinds;
 mod entities_reembed;
 mod guard_calibrate;
+mod guard_capture;
 mod inbox;
 mod install;
 mod matrix;
@@ -251,6 +252,7 @@ usage:
     kastellan-cli relations show         <entity-id> [--depth N] [--format plain|json]
     kastellan-cli observation replay     [--captures-dir PATH] [--model SLUG]
     kastellan-cli guard calibrate        [--corpus DIR] [--tau F]
+    kastellan-cli guard capture          --manifest DIR --out DIR [--record]
     kastellan-cli pair issue   [--label <text>] [--ttl-mins <n>]
     kastellan-cli pair list    [--all]
     kastellan-cli pair revoke  <channel> <peer>

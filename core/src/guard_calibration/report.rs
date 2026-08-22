@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use crate::cassandra::guard_model::{decide, GuardAdjudication};
 use crate::cassandra::injection_guard::BLOCK_THRESHOLD;
 use crate::guard_calibration::corpus::{Label, Provenance};
+use crate::guard_calibration::operating_point::{operating_point, BudgetScope};
 
 /// One case after the adjudicator has run over it.
 #[derive(Debug, Clone)]
@@ -150,6 +151,14 @@ pub enum NoTau {
     Empty,
 }
 
+/// D7's pre-registered false-positive budget, in CASES not percent.
+///
+/// A percentage would claim a resolution the sample size cannot
+/// support: with ~50 captured-benign cases the finest expressible bound
+/// is 2%, so "FP <= 1%" would be a number the corpus cannot deliver.
+/// Stating the count says exactly what is being required.
+pub const FP_BUDGET: u32 = 1;
+
 /// The margin-maximising threshold, or why there isn't one.
 ///
 /// `Ok((tau, margin))` where `margin = min(attack) - max(benign)` and
@@ -239,6 +248,11 @@ pub fn format_report(cases: &[ScoredCase], tau: f32, meta: &RunMeta) -> String {
         out.push_str(&render_section(prov.as_str(), group, tau));
     }
 
+    out.push_str(&render_operating_point(
+        cases,
+        BudgetScope::OnlyProvenance(Provenance::Captured),
+    ));
+
     out.push_str(
         "\nPROVISIONAL: this corpus is a proof of concept, not measurement 3.\n\
          Any tau above is provisional and must NOT be promoted to a production\n\
@@ -246,6 +260,117 @@ pub fn format_report(cases: &[ScoredCase], tau: f32, meta: &RunMeta) -> String {
          half comes from real worker output.\n",
     );
     out
+}
+
+/// D7's operating point — **once, corpus-wide, never per stratum.**
+///
+/// The criterion needs *all* attacks with false positives restricted to
+/// the captured-benign strata, and neither of `format_report`'s section
+/// shapes gives that: a per-provenance call sees no attacks at all in
+/// the benign-heavy strata, and the `ALL` section counts every benign
+/// including the hand-written ones. Emitting it per section would print
+/// several numbers, not one of which is D7's — so it is emitted here,
+/// against the whole corpus, with the scope stated in the output.
+/// `scope` is a parameter rather than a local constant **so a test can
+/// vary it and prove the header follows.** As a local it was derived in
+/// name only: hard-coding the header text back left every test green,
+/// because nothing could render this section under a different scope.
+fn render_operating_point(cases: &[ScoredCase], scope: BudgetScope) -> String {
+    let mut s = String::from("\n-- OPERATING POINT (D7) --\n");
+    // The scope text is DERIVED from `scope`, never written beside it.
+    // As two independent facts, the report could state one scope in its
+    // pre-registration line while another was actually used -- a false
+    // claim in a security control's calibration artefact.
+    s.push_str(&format!(
+        "  criterion: maximise true positives subject to at most {FP_BUDGET} \
+         false positive\n             counted over the {} strata \
+         (pre-registered before the run)\n",
+        scope.as_str()
+    ));
+    // The report carries TWO taus: the per-stratum matrices above are
+    // at the tau this run was invoked with, the fitted one is below.
+    // An operator adopting the fitted tau otherwise has no per-stratum
+    // breakdown at it -- and D5's whole point is that strata are never
+    // pooled.
+    s.push_str(
+        "  NOTE: the per-stratum matrices above are at the tau this run was \
+         INVOKED with,\n        not the fitted tau below.\n",
+    );
+    match operating_point(cases, FP_BUDGET, scope) {
+        Ok(op) => {
+            // **Keyed on TP, and that is deliberate even though the
+            // two predicates are currently equivalent.** With the third
+            // tie-break in place `TP == 0` and `above_all_observed`
+            // imply each other: any observed candidate flags the case
+            // at its own score, so `TP == 0` forces `FP >= 1`, and the
+            // sentinel (TP 0, FP 0) then dominates on the third key.
+            // Checked over 20k random corpora, and pinned by
+            // `catches_nothing_iff_the_sentinel_won` in
+            // `operating_point`.
+            //
+            // Keying on TP is still right: it states the property an
+            // operator cares about directly, rather than depending on
+            // that equivalence argument holding after the next edit.
+            // Swapping the two is an EQUIVALENT MUTANT, not a coverage
+            // gap -- recorded so a later reader does not read the
+            // surviving mutation as a weak test.
+            if op.confusion.true_positive == 0 {
+                s.push_str(
+                    "  RESULT: NO THRESHOLD CATCHES ANYTHING within the budget.\n                     \x20            The guard adds no detection at this budget.\n",
+                );
+            }
+            if op.above_all_observed {
+                // The sentinel is one ULP above the maximum observed
+                // score, so it renders identically to it at any sane
+                // precision. Printing the number would be actively
+                // misleading, so this says in words what it cannot.
+                s.push_str(
+                    "  the best available threshold sits above every observed \
+                     score, so it flags nothing\n",
+                );
+            } else {
+                s.push_str(&format!("  tau = {:.6}\n", op.tau));
+            }
+            s.push_str(&format!(
+                "  corpus-wide at that tau:  TP {}  FP {}  TN {}  FN {}\n",
+                op.confusion.true_positive,
+                op.confusion.false_positive,
+                op.confusion.true_negative,
+                op.confusion.false_negative,
+            ));
+            // Adjacent to the corpus-wide line in BOTH shapes, and
+            // labelled, because the two counts legitimately disagree:
+            // an operator reading `FP 2` against a budget of 1 would
+            // otherwise see an apparent violation of the criterion.
+            s.push_str(&format!(
+                "  of which within the budget scope ({}): {} of {FP_BUDGET} allowed\n",
+                scope.as_str(),
+                op.scoped_false_positives
+            ));
+        }
+        Err(NoTau::Unmeasured) => s.push_str(
+            "  NONE (an adjudicated case is unmeasured -- RUN INVALID)\n",
+        ),
+        Err(NoTau::SingleClass(l)) => s.push_str(&format!(
+            "  NONE (the corpus has only {} cases, so there is no boundary to fit)\n",
+            match l {
+                Label::Attack => "attack",
+                Label::Benign => "benign",
+            }
+        )),
+        Err(NoTau::Empty) => s.push_str(
+            "  NONE (no adjudicated cases -- the catalogue already blocks every \
+             case)\n",
+        ),
+        // Unreachable while the flags-nothing sentinel is a candidate:
+        // it costs zero and so fits every budget. Rendered rather than
+        // unwrapped so a future change that removes the sentinel
+        // degrades to a message instead of a panic.
+        Err(NoTau::Overlap) => s.push_str(
+            "  NONE (no threshold stays within the budget)\n",
+        ),
+    }
+    s
 }
 
 fn render_section(name: &str, cases: &[ScoredCase], tau: f32) -> String {
@@ -696,5 +821,217 @@ mod tests {
         assert!(out.contains("an adjudicated case is unmeasured"), "{out}");
         assert!(!out.contains("classes overlap"), "must not blame overlap: {out}");
         assert!(out.contains("RUN INVALID"), "{out}");
+    }
+
+    // ---- D7 operating point (Task 2) ----
+
+    /// Just the OPERATING POINT section.
+    ///
+    /// Asserting bare substrings against the whole report is unsound:
+    /// `TP 1` appears in the ALL section at the caller-supplied tau too,
+    /// which is exactly how a mutation switching the budget scope
+    /// survived a round of mutation testing.
+    fn operating_point_section(out: &str) -> String {
+        let start = out
+            .find("-- OPERATING POINT (D7) --")
+            .unwrap_or_else(|| panic!("no operating point section in:\n{out}"));
+        let rest = &out[start..];
+        let end = rest.find("\nPROVISIONAL").unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    /// The operating point must appear EVEN WHEN the margin-maximising
+    /// tau does not -- that overlapping case is the one it exists for.
+    #[test]
+    fn the_report_shows_an_operating_point_when_the_classes_overlap() {
+        let cases = vec![
+            case("b1", Label::Benign, Provenance::Captured, 0.0, Some(0.10)),
+            case("b2", Label::Benign, Provenance::Captured, 0.0, Some(0.85)),
+            case("a1", Label::Attack, Provenance::Captured, 0.0, Some(0.80)),
+        ];
+        let out = format_report(&cases, 0.5, &meta());
+        assert!(
+            out.contains("margin-maximising tau: NONE"),
+            "precondition: these classes overlap\n{out}"
+        );
+        assert!(out.contains("OPERATING POINT"), "must be reported\n{out}");
+        // Catches TEXT drift -- editing the criterion line to say a
+        // different number while FP_BUDGET stays put. It cannot catch a
+        // deliberate change to the constant, since both sides read it;
+        // that is a change, not drift, and other tests cover its
+        // behavioural effect.
+        assert!(
+            out.contains(&format!("at most {FP_BUDGET} false positive")),
+            "the report must state the budget it was fitted under\n{out}"
+        );
+    }
+
+    /// REPORTED ONCE, CORPUS-WIDE -- not per stratum.
+    ///
+    /// D7's criterion needs ALL attacks with false positives restricted
+    /// to captured benigns. A per-stratum call gives neither shape: the
+    /// benign-heavy strata contain no attacks at all, and an `ALL`
+    /// section counts the wrong benigns. Emitting it per section would
+    /// print several numbers, none of which is D7's.
+    #[test]
+    fn the_operating_point_is_reported_once_not_per_stratum() {
+        let cases = vec![
+            case("b1", Label::Benign, Provenance::Captured, 0.0, Some(0.10)),
+            case("h1", Label::Benign, Provenance::HandWritten, 0.0, Some(0.20)),
+            case("a1", Label::Attack, Provenance::Captured, 0.0, Some(0.80)),
+        ];
+        let out = format_report(&cases, 0.5, &meta());
+        assert_eq!(
+            out.matches("OPERATING POINT").count(),
+            1,
+            "exactly one operating point, corpus-wide\n{out}"
+        );
+    }
+
+    /// The budget is spent on CAPTURED benigns only. A hand-written
+    /// benign scoring above the attack must not consume it -- doing so
+    /// raises tau and the tier flags less than D7 permits.
+    #[test]
+    fn the_operating_point_budget_counts_captured_benign_only() {
+        // TWO hand-written benigns above the attack. With one, a budget
+        // of 1 absorbs it under either scope and the corpus cannot tell
+        // the two apart -- which is how the scope mutation survived.
+        // With two, AllBenign can no longer afford tau=0.80 and falls
+        // back to flagging nothing, while captured-only still catches
+        // the attack for free.
+        let cases = vec![
+            case("h1", Label::Benign, Provenance::HandWritten, 0.0, Some(0.85)),
+            case("h2", Label::Benign, Provenance::HandWritten, 0.0, Some(0.86)),
+            case("b1", Label::Benign, Provenance::Captured, 0.0, Some(0.10)),
+            case("a1", Label::Attack, Provenance::Captured, 0.0, Some(0.80)),
+        ];
+        let section = operating_point_section(&format_report(&cases, 0.5, &meta()));
+        assert!(
+            section.contains("TP 1"),
+            "the attack must be affordable -- both hand-written FPs are out of \
+             scope\n{section}"
+        );
+        assert!(
+            !section.contains("flags nothing"),
+            "captured-only scope must still find a useful threshold\n{section}"
+        );
+        // Re-pointed at the SCOPED line: the criterion header also
+        // contains "captured-benign", so asserting the bare substring
+        // was satisfied by a literal that is not derived from the scope
+        // in use, and could not fail.
+        assert!(
+            section.contains("budget scope (captured-benign)"),
+            "the scoped count must name the scope it was counted over\n{section}"
+        );
+        // The headline number itself -- deleting the tau line left the
+        // whole suite green until this was added.
+        assert!(
+            section.contains("tau = 0.800000"),
+            "the fitted tau is what an operator copies; it must be pinned\n{section}"
+        );
+    }
+
+    /// The four `NoTau` arms, none of which had coverage. The
+    /// `Unmeasured` one carries RUN INVALID, which is D5's invalidity
+    /// signal -- and the pre-existing RUN INVALID assertion elsewhere is
+    /// satisfied by `render_section`, so deleting this arm kept
+    /// everything green.
+    #[test]
+    fn every_no_tau_arm_renders_its_own_cause() {
+        let unmeasured = vec![
+            case("b1", Label::Benign, Provenance::Captured, 0.0, Some(0.10)),
+            case("a1", Label::Attack, Provenance::Captured, 0.0, None),
+        ];
+        let sec = operating_point_section(&format_report(&unmeasured, 0.5, &meta()));
+        assert!(sec.contains("RUN INVALID"), "{sec}");
+
+        let single = vec![
+            case("a1", Label::Attack, Provenance::Captured, 0.0, Some(0.80)),
+            case("a2", Label::Attack, Provenance::Captured, 0.0, Some(0.90)),
+        ];
+        let sec = operating_point_section(&format_report(&single, 0.5, &meta()));
+        assert!(sec.contains("only attack"), "must name the class present\n{sec}");
+
+        let blocked = vec![case(
+            "a1",
+            Label::Attack,
+            Provenance::Captured,
+            1.0, // >= BLOCK_THRESHOLD: excluded, so nothing is adjudicated
+            Some(0.90),
+        )];
+        let sec = operating_point_section(&format_report(&blocked, 0.5, &meta()));
+        assert!(sec.contains("no adjudicated cases"), "{sec}");
+    }
+
+    /// A catches-nothing result must say so loudly. The corpus is the
+    /// one from the third-tie regression: tau=0.91 would cost a scoped
+    /// FP for TP 0, and the sentinel beats it on the full-corpus count.
+    #[test]
+    fn a_catches_nothing_result_says_so_however_it_arose() {
+        let cases = vec![
+            case("h1", Label::Benign, Provenance::HandWritten, 0.0, Some(0.95)),
+            case("b1", Label::Benign, Provenance::Captured, 0.0, Some(0.90)),
+            case("b2", Label::Benign, Provenance::Captured, 0.0, Some(0.91)),
+            case("a1", Label::Attack, Provenance::Captured, 0.0, Some(0.85)),
+        ];
+        let sec = operating_point_section(&format_report(&cases, 0.5, &meta()));
+        assert!(
+            sec.contains("NO THRESHOLD CATCHES ANYTHING"),
+            "a TP-of-zero result must say so loudly\n{sec}"
+        );
+        assert!(sec.contains("TP 0"), "{sec}");
+    }
+
+    /// THE DISPLAY TRAP. The flags-nothing sentinel is one ULP above the
+    /// maximum observed score, so it renders identically at any sane
+    /// precision. A report printing `tau=0.900` for both a threshold
+    /// that flags the top case and one that flags nothing would be
+    /// actively misleading, so the flags-nothing case must say so in
+    /// words.
+    #[test]
+    fn a_flags_nothing_operating_point_says_so_instead_of_a_lookalike_tau() {
+        let cases = vec![
+            case("b1", Label::Benign, Provenance::Captured, 0.0, Some(0.90)),
+            case("b2", Label::Benign, Provenance::Captured, 0.0, Some(0.90)),
+            case("a1", Label::Attack, Provenance::Captured, 0.0, Some(0.80)),
+        ];
+        let out = format_report(&cases, 0.5, &meta());
+        let section = operating_point_section(&out);
+        assert!(
+            section.contains("flags nothing"),
+            "a tau above every observed score must say so in words\n{section}"
+        );
+        assert!(
+            section.contains("TP 0"),
+            "and must show that it catches nothing\n{section}"
+        );
+        // THE ASSERTION THE TEST IS NAMED FOR. Without it, restoring the
+        // `tau = {:.6}` line into this arm leaves the suite green with
+        // the misleading number back: next_above(0.90) renders as
+        // `0.900000`, byte-identical to 0.90.
+        assert!(
+            !section.contains("tau ="),
+            "the flags-nothing arm must NOT print a lookalike tau\n{section}"
+        );
+    }
+
+    /// The header must be DERIVED from the scope in use. Hard-coding it
+    /// back survived a mutation round, because with the scope as a
+    /// local no test could render this section under a different one.
+    #[test]
+    fn the_criterion_header_names_the_scope_actually_used() {
+        let cases = vec![
+            case("b1", Label::Benign, Provenance::Captured, 0.0, Some(0.10)),
+            case("a1", Label::Attack, Provenance::Captured, 0.0, Some(0.80)),
+        ];
+        let captured =
+            render_operating_point(&cases, BudgetScope::OnlyProvenance(Provenance::Captured));
+        let all = render_operating_point(&cases, BudgetScope::AllBenign);
+        assert!(captured.contains("counted over the captured-benign strata"), "{captured}");
+        assert!(all.contains("counted over the all benign strata"), "{all}");
+        assert!(
+            !all.contains("captured-benign"),
+            "an AllBenign run must not claim the captured-benign scope anywhere\n{all}"
+        );
     }
 }
