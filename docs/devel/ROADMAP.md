@@ -454,7 +454,7 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
 - [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 then the WIRING slice remain, both specced 2026-08-22 on `feat/guard-wiring-slice`.**
   **MEASUREMENT 3 DONE 2026-08-23** (branch `feat/guard-measurement-3-campaign`) — plan Task 5
   complete. **133 cases, 109 captured** through the real `web.fetch` path (D5 floor: ≥100 with a
-  captured half), 18 at or over `SCAN_BYTE_CAP` on both labels, **zero `Unmeasured`**, weights
+  captured half), 24 truncated at `SCAN_BYTE_CAP` on both labels, **zero `Unmeasured`**, weights
   hashed against the pin at use on both hosts so D6's comparison is *enforced*.
   **τ = 0.79552656**, the lower of the two hosts' operating points, verified FP-0 on both; the
   hosts agree to **0.1%** with identical confusion counts. `best_tau` returns **NONE — the

@@ -19,7 +19,7 @@ This is the real thing: **133 cases, 109 of them captured** through the producti
 | captured — third-party payloads | `captured` | attack | 41 |
 | **total** | | **57 attack / 76 benign** | **133** |
 
-**18 cases sit at or over `SCAN_BYTE_CAP`** (D5 asks for ≥8) — 15 benign, 3 attack.
+**24 cases are truncated at `SCAN_BYTE_CAP`** (D5 asks for ≥8) — 20 benign, 4 attack.
 Truncation is exercised on both sides of the label, which matters: if only attacks
 were truncated, a threshold could learn "truncated ⇒ attack".
 
@@ -80,8 +80,13 @@ cp tests/guard/corpus/*.json tests/guard/corpus-materialised/
 # 3. fit -- ON THE HOST SERVING THE MODEL (the pin hashes a local file)
 KASTELLAN_LLM_GUARD_URL=http://127.0.0.1:8081/v1 \
 KASTELLAN_LLM_GUARD_MODEL=shieldstral \
-./target/debug/kastellan-cli guard calibrate --corpus tests/guard/corpus-materialised
+./target/debug/kastellan-cli guard calibrate --corpus tests/guard/corpus-materialised --per-case
 ```
+
+`--per-case` adds one line per case, ascending by score, so the misses
+(lowest-scoring **attacks**) and the false positives (highest-scoring **benigns**)
+sit at the two ends. Without it the report gives aggregates only, and Findings A
+and B below are unreachable from the artefact.
 
 **Server — note the context size, which is not the pilot's:**
 
@@ -101,6 +106,10 @@ rather than resolving it against the wrong directory (#598).
 
 Full report, including the per-case section, is committed beside this file:
 [`guard-calibration-2026-08-23-dgx.txt`](guard-calibration-2026-08-23-dgx.txt).
+
+**Every one of the 109 manifest entries has round-tripped** — re-fetched without
+`--record` and matched its pinned hash. One entry (`cap-085-debian-home`) needed
+re-recording first, for the reason in Finding 3.
 
 **Run validity, against D5's conditions:** 133 cases loaded, **109 captured**
 (floor 50), **zero `Unmeasured`**, weights `35b755be…` **pinned** and hashed at
@@ -284,7 +293,7 @@ needs before it starts.
 
 ### 1. The catalogue blocks security documentation, under the production profile
 
-**15 of 124 attempted captures were refused** because `dispatch` returned the
+**15 of 121 attempted captures were refused** because `dispatch` returned the
 withheld-injection placeholder rather than the page — meaning the deterministic
 catalogue blocked the document before the guard model was ever consulted.
 
