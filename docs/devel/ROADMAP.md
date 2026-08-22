@@ -469,8 +469,15 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   rendered **once, corpus-wide**; a `manifest` module carrying metadata and never text; and
   `kastellan-cli guard capture`, which drives the **real** chokepoint and refuses a result
   that came back as the injection placeholder (storing it would record a benign-looking
-  document in place of the page, which then gets scored). **Task 5 — the capture campaign and
-  the τ fit — is the remaining operator step.**
+  document in place of the page, which then gets scored). **Task 5 PILOTED LIVE 2026-08-22** (runbook
+  `docs/devel/runbooks/2026-08-22-guard-calibration-campaign.md`): 4 entries captured through the
+  real sandboxed worker, record→verify→tamper-refuse all proved, calibration over 3 strata with
+  zero `Unmeasured` — `best_tau` 0.336 (midpoint) vs operating point **τ = 0.566605** (boundary),
+  both correct and differing exactly as D7 predicts. **Still a PILOT, not measurement 3:** 4
+  captured cases, all benign, against a ≥100-with-a-captured-half requirement; ~35 captured
+  attacks and ≥8 over-cap documents are the main gaps. Two plan claims were corrected by running
+  it — `guard capture` needs **no** allowlist row and no daemon restart (it derives its own,
+  per-fetch), and Wayback pinning collapses the campaign's egress to one domain.
   **[#592](https://github.com/hherb/kastellan/issues/592) blocks the two-host τ
   comparison:** the hosts run different Q8_0 builds (HF LFS oid `35b755be…` vs the DGX's `5cee57a9…` at identical byte
   length) — pinning a quantisation LABEL is not pinning the bytes.
