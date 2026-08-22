@@ -526,7 +526,9 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   [#599](https://github.com/hherb/kastellan/issues/599) (an unpinned run still exits 0, so nothing
   machine-readable separates it from a verified one) and
   [#600](https://github.com/hherb/kastellan/issues/600) (`run-shieldstral-llamacpp.sh`, the one script that
-  *launches* a Shieldstral server, still never hashes `$MODEL`).
+  *launches* a Shieldstral server, still never hashes `$MODEL`). **Re-gated on the DGX at `f46c67cf`: 3749 / 0 / 54
+  across 174 suites, `TEST_EXIT=0`, `CLIPPY_EXIT=0` zero warnings**, reconciling exactly as the pin's original +42
+  plus the review's +21.
 
   **The review ran AFTER the merge and found four fail-opens** — [#596](https://github.com/hherb/kastellan/pull/596), merged 2026-08-22 as `2ab6612c`.
   Each could produce a corpus or a threshold that *looked verified and was not*, and none was
