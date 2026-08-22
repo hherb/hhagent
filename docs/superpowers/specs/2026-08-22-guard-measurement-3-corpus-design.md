@@ -9,7 +9,7 @@ Slice 1 shipped a 24-case corpus labelled, in four separate places, a **proof of
 concept**. This spec designs the thing that replaces it: ≥100 labelled cases, half of them
 captured rather than imagined, and a τ fitted against them on both hosts.
 
-Three findings below were measured while scoping it, and two of them changed the design.
+Four findings below were measured while scoping it, and three of them changed the design.
 
 ---
 
@@ -88,6 +88,35 @@ thing — `apache-2.0` in `cardData` and `cc-by-4.0` in `dataset_info`, disagree
 itself.
 
 **D1 exists to make this irrelevant rather than to adjudicate it.**
+
+## F4 — The two hosts run different Q8_0 builds, so "pinned" pinned a label
+
+Filed as [#592](https://github.com/hherb/kastellan/issues/592). Measured 2026-08-22:
+
+| | sha256 | size |
+| --- | --- | --- |
+| HF `noctrex/…/Shieldstral-1.0-3B-Q8_0.gguf` (canonical LFS oid) | `35b755be…` | 3,651,679,008 |
+| **Mac** | `35b755be…` ✅ | 3,651,679,008 |
+| **DGX** | `5cee57a9…` ❌ | 3,651,679,008 |
+
+The DGX's file is **not corrupt**, which is what makes it subtle: its GGUF header is
+well-formed (`mistral3`, `Mistralai Shieldstral 1.0 3B`, `apache-2.0`), it loads, it serves,
+and M1's sweep passed on it in both directions at every size. Identical byte length with
+different content and a valid header is the signature of the **same quantisation from a
+different quantiser run** — Q8_0's size follows from tensor shapes, so two independent
+conversions agree on size and differ in metadata or tensor order. The DGX's sibling
+projector is also named differently from upstream's, and its model dir has no fetch script
+and no cache, so there is no provenance record at all.
+
+**Pinning a quantisation label is not pinning the bytes.** Every document asserts the two
+hosts run the same weights; nothing verified it, and nothing in the tree could have.
+This is F3's shape one level down — a correct-looking top-level label over unverified
+content.
+
+**What it does not touch:** M1's latency numbers (two Q8_0 builds of one model have
+identical tensor shapes, so prompt-eval throughput is not meaningfully build-dependent), and
+measurements 1/2's capability verdicts, which were taken on a file that is demonstrably a
+real Shieldstral.
 
 ---
 
@@ -218,9 +247,17 @@ which means the sweep did not bracket the optimum.
 
 ### D6 — τ is fitted on both hosts and the two are compared, not averaged
 
-The DGX and the Mac run the same weights, the same quantisation and the same runtime, so a
-τ fitted on one should transfer. **Should** is a hypothesis, and this is the measurement that
-can test it.
+**Precondition, from F4: both hosts must first be verified to run byte-identical weights,
+and the sha256 must be pinned in-repo and checked at use** — the way
+`require_guest_kernel` already checks the Firecracker guest kernel. Until that holds, this
+comparison cannot run: it would be measuring two different builds while believing them
+identical, and *either* outcome would be uninterpretable — agreement reading as vindication
+of a premise that is false, disagreement as a platform problem that is really a file
+problem.
+
+Given that, the DGX and the Mac run the same weights, the same quantisation and the same
+runtime, so a τ fitted on one should transfer. **Should** is a hypothesis, and this is the
+measurement that can test it.
 
 Both hosts fit independently and both reports are committed. If the two τ agree, the pinning
 decision is vindicated and the shared value ships. **If they disagree, that is a finding, not
@@ -254,3 +291,7 @@ and the cross-platform claim the whole design rests on would need re-examining b
 5. **The two-host comparison in D6 has no pre-registered agreement threshold.** "Do they
    agree" needs a number before the run, or it becomes a judgement made after seeing the
    answer.
+6. **F4 was found by checking one premise. Nothing has audited the others.** "Same runtime"
+   (llama.cpp build/version) and "same prompt" (`policy_digest`) are asserted across hosts
+   on the same basis "same weights" was — which turned out to be none. The digest at least
+   has a mechanism; the llama.cpp version does not.
