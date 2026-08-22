@@ -87,6 +87,11 @@ one can never change.
 > fast host on benign prose. "Pass it through on error" would fail open on exactly the
 > documents most likely to be attacks.
 
+**Host state left behind:** the DGX `llama-server` is UP on `:8081` with **`-c 131072`**,
+not the pilot's `-c 32768` — the larger context is required, not a preference (#604). Kill it
+if the host is needed. The Mac's server was stopped after its fit. Both hosts hold the
+upstream-verified `Shieldstral-1.0-3B-Q8_0.gguf` and both pass `require_guard_weights`.
+
 **Code shipped with the campaign:** `render_per_case` + `--per-case`, because every
 existing section reports aggregates and none could say *which* 19 attacks were missed
 (5 tests; all three interesting mutations killed, each by exactly one test); and
