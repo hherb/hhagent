@@ -96,6 +96,13 @@ should either model `Relaxed` for captured web cases or state the divergence in 
 
 ```sh
 source "$HOME/.cargo/env"
+# 0. OPTIONAL pre-flight: confirm the weights BEFORE starting llama-server.
+#    `guard calibrate` checks this itself (step 3) by asking /props which
+#    file the server opened and hashing it, so this is only for verifying a
+#    fresh download, or on a host where the tool is not built.
+source scripts/eval/lib/guard-weights.sh
+require_guard_weights ~/models/shieldstral/upstream/Shieldstral-1.0-3B-Q8_0.gguf
+
 # 1. verify the manifest round-trips (fetches, fails closed on drift)
 ./target/debug/kastellan-cli guard capture \
   --manifest tests/guard/manifest \
@@ -120,6 +127,19 @@ KASTELLAN_LLM_GUARD_MODEL=shieldstral \
 Server: `llama-server -m ~/models/shieldstral/upstream/Shieldstral-1.0-3B-Q8_0.gguf
 --alias shieldstral --port 8081 --host 127.0.0.1 -c 32768 -ngl 99 --no-webui`
 (sha256 `35b755be…`, the upstream-verified build — see #592).
+
+**Step 3 now verifies the weights before it scores anything.** It GETs `/props`,
+takes `model_path`, hashes that file, and refuses on a mismatch — or on an
+unreadable path, an absent `model_path`, or an unreachable `/props`. Each says
+which of the four fired. Two consequences worth knowing before you hit them:
+
+* **the calibration must run on the host serving the model**, because the check
+  hashes a local file. Pointing it at a remote `llama-server` refuses with
+  *"share a filesystem"* rather than silently trusting the endpoint;
+* **`--weights-unpinned`** proceeds anyway, for calibrating a *candidate* guard
+  model. It accepts the answer; it never skips the hashing, so the report still
+  names the actual bytes — stamped `UNPINNED`, saying the run cannot support the
+  cross-host τ comparison. Do not use it for measurement 3 itself.
 
 ## What changed after the review of #593
 
