@@ -51,3 +51,6 @@ audit-*.jsonl
 .dev.vars*
 !.dev.vars.example
 docs/essay-medium-draft.md
+
+# Materialised guard-calibration corpus: third-party text, never committed (spec D1).
+tests/guard/corpus-materialised/
