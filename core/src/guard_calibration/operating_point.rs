@@ -48,6 +48,20 @@ pub enum BudgetScope {
 }
 
 impl BudgetScope {
+    /// How this scope reads in a report, so the artefact's statement of
+    /// its own scope is DERIVED from the scope actually used rather
+    /// than written beside it as an independent literal.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BudgetScope::AllBenign => "all benign",
+            BudgetScope::OnlyProvenance(Provenance::Captured) => "captured-benign",
+            BudgetScope::OnlyProvenance(Provenance::HandWritten) => "hand-written-benign",
+            BudgetScope::OnlyProvenance(Provenance::DerivedFromCatalogue) => {
+                "catalogue-derived-benign"
+            }
+        }
+    }
+
     fn counts(&self, case: &ScoredCase) -> bool {
         match self {
             BudgetScope::AllBenign => true,
@@ -193,22 +207,48 @@ pub fn operating_point(
         if scoped > max_false_positives {
             continue;
         }
-        // Maximise recall, then minimise cost. `Reverse` on the scoped
-        // false positives makes "fewer is better" part of the tuple
-        // order, so the whole comparison is one expression.
+        // Maximise recall, then minimise the cost the budget bounds,
+        // then minimise cost overall.
         //
-        // **No third tie-break, because a third tie cannot happen —
-        // and the load-bearing word is ADJUDICATED, not "observed".**
-        // Between two adjacent deduped candidates there is at least one
-        // *adjudicated* case sitting at the lower one, flagged there and
-        // not above it, which moves TP or FP. That argument depends on
-        // this loop's `is_adjudicated` filter matching the one inside
-        // `confusion_at`; drop it here alone and two candidates could
-        // differ only by excluded cases, making a third tie reachable.
-        let key = (confusion.true_positive, std::cmp::Reverse(scoped));
+        // **The third key is not belt-and-braces — it was a live bug.**
+        // An earlier version stopped at `(TP, Reverse(scoped))` and
+        // carried a comment arguing a third tie was unreachable. That
+        // argument was true when the count was over *every* benign
+        // (between adjacent candidates some case un-flags, moving TP or
+        // FP) and it silently became FALSE when `BudgetScope` was
+        // added: if the case that un-flags is OUT of scope, the scoped
+        // count does not move and neither does TP.
+        //
+        // Worked counterexample, at budget 1: hand-written benign 0.95,
+        // captured benigns 0.90 and 0.91, captured attack 0.85. Both
+        // τ=0.95 and the sentinel score `(TP 0, scoped 0)`; the first
+        // encountered wins, and that is τ=0.95, which carries a
+        // full-corpus false positive the sentinel does not. Strictly
+        // worse, for free.
+        //
+        // With `false_positive` as the final key the ordering is total:
+        // between two adjacent candidates at least one adjudicated case
+        // un-flags, and it is either an attack (TP moves) or a benign
+        // (`false_positive` moves), so no two candidates agree on all
+        // three.
+        //
+        // The lesson generalises past this function: adding a filter to
+        // one input of a comparison invalidates arguments made about
+        // the comparison, and nothing re-checks them for you.
+        let key = (
+            confusion.true_positive,
+            std::cmp::Reverse(scoped),
+            std::cmp::Reverse(confusion.false_positive),
+        );
         let better = match &best {
             None => true,
-            Some(b) => key > (b.confusion.true_positive, std::cmp::Reverse(b.scoped_false_positives)),
+            Some(b) => {
+                key > (
+                    b.confusion.true_positive,
+                    std::cmp::Reverse(b.scoped_false_positives),
+                    std::cmp::Reverse(b.confusion.false_positive),
+                )
+            }
         };
         if better {
             best = Some(OperatingPoint {
@@ -531,6 +571,101 @@ mod tests {
                 x,
                 "nothing representable may sit between {x} and {up}"
             );
+        }
+    }
+
+    /// REGRESSION, found by review. Introducing [`BudgetScope`] made a
+    /// third tie reachable and invalidated the comment claiming it was
+    /// not: when the case that un-flags between two adjacent candidates
+    /// is OUT of scope, neither the scoped count nor TP moves.
+    ///
+    /// Here tau=0.95 and the sentinel both score (TP 0, scoped 0), but
+    /// tau=0.95 flags the out-of-scope hand-written benign and the
+    /// sentinel flags nothing. Without a third key the first candidate
+    /// encountered wins -- tau=0.95 -- taking a full-corpus false
+    /// positive for no gain whatsoever.
+    #[test]
+    fn an_out_of_scope_false_positive_is_never_taken_for_free() {
+        let mut hand = case("h1", Label::Benign, 0.95);
+        hand.provenance = Provenance::HandWritten;
+        let cases = vec![
+            hand,
+            case("b1", Label::Benign, 0.90),
+            case("b2", Label::Benign, 0.91),
+            case("a1", Label::Attack, 0.85),
+        ];
+        let got =
+            operating_point(&cases, 1, BudgetScope::OnlyProvenance(Provenance::Captured))
+                .expect("the sentinel is always affordable");
+        assert_eq!(got.confusion.true_positive, 0, "no attack is affordable here");
+        assert_eq!(got.scoped_false_positives, 0);
+        assert_eq!(
+            got.confusion.false_positive, 0,
+            "must not flag the out-of-scope benign for zero gain"
+        );
+        assert!(got.above_all_observed, "the free choice is the sentinel");
+    }
+
+    /// The scope's report text is derived from the scope, so an artefact
+    /// cannot state one scope while another was used.
+    #[test]
+    fn every_budget_scope_names_itself() {
+        assert_eq!(BudgetScope::AllBenign.as_str(), "all benign");
+        assert_eq!(
+            BudgetScope::OnlyProvenance(Provenance::Captured).as_str(),
+            "captured-benign"
+        );
+        assert_ne!(
+            BudgetScope::OnlyProvenance(Provenance::HandWritten).as_str(),
+            BudgetScope::OnlyProvenance(Provenance::Captured).as_str(),
+            "two scopes must not share a name, or a report cannot distinguish them"
+        );
+    }
+
+    /// Pins the equivalence that makes the report's TP-vs-sentinel
+    /// keying a free choice: a catches-nothing result and a sentinel
+    /// win imply each other.
+    ///
+    /// It holds only because of the third tie-break -- any observed
+    /// candidate flags the case at its own score, so `TP == 0` forces
+    /// `FP >= 1`, and the sentinel then dominates on the full-corpus
+    /// key. Remove that key and this breaks, which is the point of
+    /// pinning it here rather than leaving it as a comment.
+    #[test]
+    fn catches_nothing_iff_the_sentinel_won() {
+        let corpora: Vec<Vec<ScoredCase>> = vec![
+            // Separable: catches everything, sentinel does not win.
+            vec![
+                case("b1", Label::Benign, 0.10),
+                case("a1", Label::Attack, 0.90),
+            ],
+            // Nothing affordable: sentinel wins, TP 0.
+            vec![
+                case("b1", Label::Benign, 0.90),
+                case("b2", Label::Benign, 0.91),
+                case("a1", Label::Attack, 0.85),
+            ],
+            // The third-tie corpus.
+            vec![
+                case("b1", Label::Benign, 0.90),
+                case("b2", Label::Benign, 0.91),
+                case("a1", Label::Attack, 0.85),
+                case("a2", Label::Attack, 0.99),
+            ],
+        ];
+        for (i, cases) in corpora.iter().enumerate() {
+            for budget in 0..=2u32 {
+                let got = operating_point(cases, budget, BudgetScope::AllBenign)
+                    .expect("the sentinel is always affordable");
+                assert_eq!(
+                    got.confusion.true_positive == 0,
+                    got.above_all_observed,
+                    "corpus {i} budget {budget}: TP==0 and above_all_observed must \
+                     imply each other, got TP={} above={}",
+                    got.confusion.true_positive,
+                    got.above_all_observed
+                );
+            }
         }
     }
 }

@@ -12,9 +12,21 @@
 //! The same mechanism keeps operator-private material — a real mail
 //! body — out of a public repo while still letting a case point at it.
 //!
-//! `deny_unknown_fields` turns a stray `"text"` key into a load error
-//! rather than a silently ignored one: the constraint is enforced, not
-//! merely documented.
+//! **What is actually enforced, stated precisely.** `deny_unknown_fields`
+//! rejects a key *named* `text`; on its own that is a guarantee about
+//! key names, not about content, and describing it as "D1 is enforced"
+//! would be exactly the F3/F4 shape this spec spends two findings
+//! warning about — a correct-looking top-level claim over an unchecked
+//! interior. Content can walk in through the *known* fields, so both
+//! are bounded too: `notes` is capped at [`NOTES_MAX_BYTES`] because it
+//! is a human annotation and not a document, and `source` must be
+//! `https`, which refuses a `data:` URI carrying a payload inline.
+//!
+//! Provenance is likewise unrepresentable rather than checked: a
+//! manifest entry is captured **by construction** (anything authored
+//! here has its text committed and needs no `source`), so
+//! [`ManifestProvenance`] has one variant and a typo'd
+//! `"hand_written"` is a parse error.
 
 use std::path::{Path, PathBuf};
 
@@ -22,13 +34,41 @@ use serde::Deserialize;
 
 use crate::guard_calibration::corpus::{CorpusError, Label, Provenance};
 
+/// Cap on `notes`. It is a one-line human annotation explaining why a
+/// case exists; a document does not fit and must not.
+pub const NOTES_MAX_BYTES: usize = 512;
+
+/// A manifest entry's provenance, which has exactly one legal value.
+///
+/// **Unrepresentable rather than validated.** Under D1 a manifest entry
+/// is captured by construction: anything authored here (hand-written,
+/// or derived from our own catalogue) has its text committed directly
+/// and needs no `source` to fetch or hash to pin. Accepting the other
+/// two variants would not merely be untidy — `render_operating_point`
+/// scopes D7's false-positive budget on exactly this field, so an entry
+/// typo'd to `hand_written` would materialise into a case sitting
+/// OUTSIDE the budget scope, letting a genuine captured false positive
+/// stop consuming the budget and τ fall below what the criterion
+/// permits, with the report still looking reasonable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestProvenance {
+    Captured,
+}
+
+impl From<ManifestProvenance> for Provenance {
+    fn from(_: ManifestProvenance) -> Self {
+        Provenance::Captured
+    }
+}
+
 /// One case, by reference.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestEntry {
     pub id: String,
     pub label: Label,
-    pub provenance: Provenance,
+    pub provenance: ManifestProvenance,
     /// An **immutable** locator: a HuggingFace URL pinned by dataset
     /// revision, or a Wayback Machine snapshot. Never `main`, never a
     /// live page — a sha256 over a live page is a hash of whatever it
@@ -50,15 +90,40 @@ pub struct ManifestEntry {
     /// passing it.
     #[serde(default)]
     pub sha256: Option<String>,
+    /// A one-line human annotation. Bounded at [`NOTES_MAX_BYTES`];
+    /// see the module doc for why an unbounded string here would
+    /// undo D1 through the front door.
     #[serde(default)]
     pub notes: String,
 }
 
 impl ManifestEntry {
-    /// The recorded hash, or `None` if this entry has never been
-    /// recorded.
-    pub fn recorded_sha256(&self) -> Option<&str> {
-        self.sha256.as_deref()
+    /// The recorded hash, **validated and normalised to lowercase** —
+    /// the only way to obtain it.
+    ///
+    /// There is deliberately no raw accessor. A comparator that could
+    /// reach the field directly could compare a hash nothing checked,
+    /// and would compare it case-sensitively against a lowercase digest
+    /// — so an uppercase-but-correct manifest entry would report
+    /// MISMATCH and send an operator hunting a source drift that never
+    /// happened. That is the precise failure the two-armed
+    /// [`verify_requirement`] exists to prevent, and leaving the raw
+    /// field reachable would have created it instead.
+    ///
+    /// `Err` carries the same operator-facing clause
+    /// [`verify_requirement`] returns.
+    pub fn verified_sha256(&self) -> Result<String, String> {
+        match verify_requirement(self) {
+            Some(reason) => Err(reason),
+            // Unreachable-with-`None`: `verify_requirement` returns
+            // `None` only on the `Some(h)` arm that passed the shape
+            // check.
+            None => Ok(self
+                .sha256
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()),
+        }
     }
 }
 
@@ -83,8 +148,10 @@ impl ManifestEntry {
 /// an operator to fix a manifest that is correct.
 ///
 /// Pure.
+#[must_use = "the refusal decides whether this case may be trusted; \
+              dropping it silently admits unverified content"]
 pub fn verify_requirement(entry: &ManifestEntry) -> Option<String> {
-    match entry.recorded_sha256() {
+    match entry.sha256.as_deref() {
         Some(h) if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) => None,
         Some(h) => Some(format!(
             "case {}: recorded sha256 {h:?} is not 64 hex characters, so it cannot \
@@ -134,6 +201,26 @@ pub fn load_manifest_from_dir(dir: &Path) -> Result<Vec<ManifestEntry>, CorpusEr
                 path: path.clone(),
                 source,
             })?;
+        if item.notes.len() > NOTES_MAX_BYTES {
+            return Err(CorpusError::Parse {
+                path: path.clone(),
+                source: serde::de::Error::custom(format!(
+                    "notes is {} bytes, over the {NOTES_MAX_BYTES}-byte cap: notes is \
+                     a one-line annotation, not a place to carry the document",
+                    item.notes.len()
+                )),
+            });
+        }
+        if !item.source.starts_with("https://") {
+            return Err(CorpusError::Parse {
+                path: path.clone(),
+                source: serde::de::Error::custom(format!(
+                    "source {:?} is not https: a manifest references content, and a \
+                     data: or file: URI would carry it inline",
+                    item.source
+                )),
+            });
+        }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
         if item.id != stem {
             return Err(CorpusError::IdStemMismatch {
@@ -226,6 +313,12 @@ mod tests {
         assert!(
             matches!(err, CorpusError::Parse { .. }),
             "expected a parse error, got {err}"
+        );
+        // The variant alone would be satisfied by any future required
+        // field going missing -- the right reason must be named.
+        assert!(
+            err.to_string().contains("text"),
+            "the error must name the offending key: {err}"
         );
     }
 
@@ -376,5 +469,120 @@ mod tests {
         );
         let entries = load_manifest_from_dir(d.path()).expect("loads");
         assert_eq!(verify_requirement(&entries[0]), None);
+    }
+
+    /// Content walks in through the KNOWN fields if nothing bounds
+    /// them. `deny_unknown_fields` rejects a key named `text` and says
+    /// nothing about a 200 KiB `notes`.
+    #[test]
+    fn an_oversized_notes_field_is_rejected_as_a_document_in_disguise() {
+        let d = tempfile::tempdir().expect("tempdir");
+        write(
+            d.path(),
+            "cap-020-fat.json",
+            &format!(
+                r#"{{
+            "id": "cap-020-fat", "label": "benign", "provenance": "captured",
+            "source": "https://example.com/x", "notes": "{}"
+        }}"#,
+                "A".repeat(NOTES_MAX_BYTES + 1)
+            ),
+        );
+        let err = load_manifest_from_dir(d.path()).expect_err("must reject");
+        assert!(err.to_string().contains("notes"), "must name the field: {err}");
+    }
+
+    /// A `data:` URI is a well-formed URL that carries the payload
+    /// inline, which is D1's constraint defeated through the front
+    /// door. Only https references content rather than embedding it.
+    #[test]
+    fn a_non_https_source_is_rejected_because_it_can_embed_the_content() {
+        let d = tempfile::tempdir().expect("tempdir");
+        for (name, src) in [
+            ("cap-021-data", "data:text/plain;base64,SWdub3JlIGFsbA=="),
+            ("cap-022-file", "file:///etc/passwd"),
+            ("cap-023-http", "http://example.com/x"),
+        ] {
+            write(
+                d.path(),
+                &format!("{name}.json"),
+                &format!(
+                    r#"{{
+                "id": "{name}", "label": "attack", "provenance": "captured",
+                "source": "{src}"
+            }}"#
+                ),
+            );
+        }
+        let err = load_manifest_from_dir(d.path()).expect_err("must reject");
+        assert!(err.to_string().contains("https"), "must say why: {err}");
+    }
+
+    /// A typo'd provenance must not load. It would materialise a case
+    /// sitting outside D7's budget scope, so a genuine captured false
+    /// positive would stop consuming the budget and tau could fall
+    /// below what the criterion permits -- with the report still
+    /// looking reasonable.
+    #[test]
+    fn a_non_captured_provenance_does_not_parse() {
+        let d = tempfile::tempdir().expect("tempdir");
+        write(
+            d.path(),
+            "cap-024-wrong.json",
+            r#"{
+            "id": "cap-024-wrong", "label": "benign", "provenance": "hand_written",
+            "source": "https://example.com/x"
+        }"#,
+        );
+        let err = load_manifest_from_dir(d.path()).expect_err("must reject");
+        assert!(matches!(err, CorpusError::Parse { .. }), "got {err}");
+    }
+
+    /// The ONLY way to obtain a hash normalises it, so a comparator
+    /// cannot compare an unchecked or differently-spelled digest.
+    #[test]
+    fn verified_sha256_is_the_only_accessor_and_it_lowercases() {
+        let d = tempfile::tempdir().expect("tempdir");
+        write(
+            d.path(),
+            "cap-025-upper.json",
+            &format!(
+                r#"{{
+            "id": "cap-025-upper", "label": "benign", "provenance": "captured",
+            "source": "https://example.com/x", "sha256": "{}"
+        }}"#,
+                "AB".repeat(32)
+            ),
+        );
+        let entries = load_manifest_from_dir(d.path()).expect("loads");
+        let got = entries[0].verified_sha256().expect("well-formed");
+        assert_eq!(got, "ab".repeat(32), "must normalise to lowercase");
+    }
+
+    /// An unrecorded or malformed hash cannot be obtained at all --
+    /// the refusal is returned in place of a value, so a comparator has
+    /// nothing to compare rather than something unchecked.
+    #[test]
+    fn verified_sha256_refuses_rather_than_returning_something_uncheckable() {
+        let d = tempfile::tempdir().expect("tempdir");
+        write(
+            d.path(),
+            "cap-026-none.json",
+            r#"{
+            "id": "cap-026-none", "label": "benign", "provenance": "captured",
+            "source": "https://example.com/x"
+        }"#,
+        );
+        write(
+            d.path(),
+            "cap-027-bad.json",
+            r#"{
+            "id": "cap-027-bad", "label": "benign", "provenance": "captured",
+            "source": "https://example.com/x", "sha256": "nope"
+        }"#,
+        );
+        let entries = load_manifest_from_dir(d.path()).expect("loads");
+        assert!(entries[0].verified_sha256().is_err(), "unrecorded must refuse");
+        assert!(entries[1].verified_sha256().is_err(), "malformed must refuse");
     }
 }
