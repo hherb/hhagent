@@ -464,7 +464,9 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   not a guess, because Shieldstral's tokeniser is byte-level BPE. **D9:** the timeout is
   derived from a boot **throughput probe** and clamped to `[15 s, 120 s]`; D2's constant
   was wrong by 40x on the Mac, and too short a guard timeout does not error, it fails
-  open. **M2** measured the probe first: a nonce **prefix** defeats the prefix cache
+  open. **M2** measured the probe first: a **cache-buster prefix** defeats the prefix cache
+  (deliberately *not* called a nonce — it is not secret and authenticates nothing, and CodeQL's
+  `rust/hard-coded-cryptographic-value` rule reads the parameter NAME)
   (`cached_tokens: 0`, two cold samples within 3%, inside M1's band), the contaminated
   repeat reads **21 094 tok/s** against a true ~5 000 unless `cached_tokens` is subtracted,
   and 1024 dense bytes tokenise at **1.26 bytes/token**. **D10:** the tier ships as
@@ -474,11 +476,29 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   catalogue-selected. **DGX gate `69834357` (branch tip): 3823 / 0 / 54**, `TEST_EXIT=0`, 175 suites,
   reconciling exactly against `main` 3759 **+64**; 8 `[SKIP]` all gliner-relex, *not* the
   bwrap-userns skip. Mac: `guard_tier_e2e` 13/0 with zero `[SKIP]` under real PG; clippy
-  `-D warnings` exit 0 over **213** `Checking` lines from a cold target dir. **13 mutants,
+  `-D warnings` exit 0 over **218** `Checking` lines from a cold target dir. **13 mutants,
   12 killed, 1 equivalent** — `is_timeout` had no coverage at all and its always-false mutant
   left the whole workspace green while handing the slowest hosts the shortest guard timeout;
   killed by a pure `probe_error_outcome` plus a layer-2 case against a mock that accepts and
   never answers.
+  **A five-agent PR review then produced ELEVEN more fixes, and they clustered where m13 did — the
+  boot-time IO glue, one call frame further out than the mutation set reached.** The worst:
+  **the derived timeout was never proven to reach the HTTP client** (`from_config(cfg,
+  timeout.timeout)` → `probe_budget` left the whole workspace green, because `tier.timeout()` reads
+  the *struct*, not the client's budget — #586's entire payload, untested); **`is_timeout` was wrong
+  in both directions** (a *connect* timeout also sets `is_timeout()`, so a 5 s connect stall derived
+  the 120 s ceiling; and a budget expiry while reading a non-2xx error body became `HttpStatus`, not
+  `Transport`, taking the **floor** — a fail-open, fixed in `llm-router` at all three swallow sites);
+  and **the model was consulted on results with no text at all**, where the verdict on an empty
+  `<Document>` is undefined and a `p >= tau` would withhold a result containing nothing to inject
+  (now the named door `Unadjudicated::NoScannableText`). Also: `GuardReport.p` could be `Some(NaN)`;
+  the `Saturated` basis reported a fabricated 12.8 tok/s and a post-clamp `derived_ms`; a failed boot
+  probe discarded its error text and logged at `info!`; `truncated`/`body_byte_len` now ride the
+  Allow half; and `KASTELLAN_REQUIRE_GUARD=1` closes the gap that the hazard D6 argues from — an
+  `install` that drops **all three** keys lands on the one non-fatal arm. All eleven mutation-proven.
+  Post-review Mac sweep **3712 / 0 / 24**, `TEST_EXIT=0`, 175 suites, clippy 0 over **218** cold
+  `Checking` lines; `guard_tier_e2e` **17 / 0**. **DGX re-gate outstanding.** Deferred:
+  [#608](https://github.com/hherb/kastellan/issues/608)–[#611](https://github.com/hherb/kastellan/issues/611).
   **MEASUREMENT 3 MERGED 2026-08-23** (`d51c9b20`, PR [#606](https://github.com/hherb/kastellan/pull/606)) — plan Task 5
   complete. **133 cases, 109 captured** through the real `web.fetch` path (D5 floor: ≥100 with a
   captured half), 24 truncated at `SCAN_BYTE_CAP` on both labels, **zero `Unmeasured`**, weights

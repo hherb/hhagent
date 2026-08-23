@@ -57,7 +57,16 @@ use std::time::Duration;
 
 use super::context_pin::REQUIRED_GUARD_N_CTX;
 
+pub mod basis;
+
+pub use basis::{Clamped, GuardTimeout, TimeoutBasis, UnprobedReason};
+
 /// Bytes of dense text in the boot probe.
+///
+/// **Descriptive, not a parameter.** [`PROBE_BODY`] is a committed
+/// literal and nothing resizes it from this constant; the two are tied
+/// together by `probe_body_is_exactly_probe_bytes` instead. Changing
+/// this number alone changes no behaviour.
 ///
 /// Measured (M2): 1024 dense bytes tokenise to **810 tokens**, which
 /// takes ~160 ms on the DGX and would take ~8 s on a 100 tok/s host —
@@ -177,72 +186,27 @@ pub enum ProbeOutcome {
     Failed { why: String },
 }
 
-/// Whether the derived value hit a bound, and which one.
-///
-/// The two are not symmetric and must not be reported as if they were.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Clamped {
-    /// The derivation landed inside the band.
-    No,
-    /// A fast host derived less than [`TIMEOUT_FLOOR_MS`]. Unremarkable.
-    ToFloor,
-    /// The host cannot adjudicate a worst-case document inside
-    /// [`TIMEOUT_CEILING_MS`]. **A finding**: large dense documents on
-    /// this host will time out and fail open to catalogue-only
-    /// screening.
-    ToCeiling,
-}
-
-/// Where a guard timeout came from, in enough detail to log it.
-#[derive(Debug, Clone, PartialEq)]
-pub enum TimeoutBasis {
-    /// `KASTELLAN_LLM_GUARD_TIMEOUT_MS`. No probe was run.
-    Operator,
-    /// Derived from a boot probe.
-    Probed { tok_per_s: f32, derived_ms: u64, clamped: Clamped },
-    /// The probe could not produce a usable sample. Carries the short
-    /// reason so a boot line can say which.
-    Unprobed { why: &'static str },
-}
-
-impl TimeoutBasis {
-    /// A short, stable, whitespace-free token for a log field.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Operator => "operator",
-            Self::Probed { .. } => "probed",
-            Self::Unprobed { why } => why,
-        }
-    }
-
-    /// Does this basis warrant a `warn!` rather than an `info!`?
-    ///
-    /// True only for [`Clamped::ToCeiling`], which is the one basis
-    /// that reports a **reduction in coverage**: on this host large
-    /// documents will not be adjudicated at all. Every other basis is
-    /// routine, and warning about routine things is how the one that
-    /// matters gets scrolled past.
-    pub fn is_coverage_finding(&self) -> bool {
-        matches!(self, Self::Probed { clamped: Clamped::ToCeiling, .. })
-    }
-}
-
-/// A guard timeout together with how it was arrived at.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GuardTimeout {
-    pub timeout: Duration,
-    pub basis: TimeoutBasis,
-}
-
 /// The probe document: a per-boot `cache_buster` followed by
 /// [`PROBE_BODY`].
 ///
-/// **The cache-buster goes first, and that is the whole mechanism.** A
-/// prefix cache matches from position 0, so a varying prefix guarantees
-/// the sample is cold; a varying *suffix* would leave the body cached
-/// and reproduce M2's 4x over-estimate. Measured: consecutive cold runs
-/// with different prefixes both reported `cached_tokens: 0` and agreed
-/// within 3%.
+/// **The cache-buster goes before the body, and that ordering is the
+/// mechanism.** A prefix cache matches from position 0 forward, so a
+/// varying string ahead of the body guarantees the *body* is never
+/// served from cache; a varying *suffix* would leave it cached and
+/// reproduce M2's 4x over-estimate. Measured: consecutive cold runs with
+/// different busters both reported `cached_tokens: 0` and agreed within
+/// 3%.
+///
+/// **It is not at position 0 of what is actually sent, and the
+/// difference matters.** `GuardClient::timed_probe` wraps this string in
+/// `policy::build_messages`, which prepends a system message and an
+/// `"<Instruct>: … <Query>: … <Document>: "` preamble — roughly 140
+/// tokens that are byte-identical on every boot and therefore genuinely
+/// cacheable. M2 measured a bare 1024-byte body at 810 prompt tokens,
+/// i.e. without that envelope, so production's probe reports more
+/// tokens than M2 did and a slice of them may be cache hits. That is
+/// handled by subtracting `cached_tokens`, not by this ordering — see
+/// [`probe_sample`], and the backend caveat recorded there.
 ///
 /// **Deliberately not called a "nonce".** It is not secret, not
 /// authenticating anything, and not protecting against replay — it
@@ -266,13 +230,22 @@ pub fn probe_document(cache_buster: &str) -> String {
 /// * a non-positive wall clock -> also `TooFewUncachedTokens`, because
 ///   dividing by it is the same mistake wearing a different hat.
 ///
-/// **`cached_tokens` is subtracted, not ignored.** An absent block
-/// means the backend reports no cache and is treated as zero cached —
-/// which is safe only because the uncached-token floor still applies to
-/// the result, and because the varying prefix makes a cache hit unlikely
-/// in the first place. Saturating subtraction, so a backend reporting
-/// more cached than prompt tokens yields zero rather than wrapping to
-/// four billion.
+/// **`cached_tokens` is subtracted, not ignored.** Saturating
+/// subtraction, so a backend reporting more cached than prompt tokens
+/// yields zero rather than wrapping to four billion.
+///
+/// **An absent block is treated as zero cached, and the uncached-token
+/// floor does NOT make that safe.** The floor only bites when the cache
+/// *is* reported (M2's contaminated row: 810 − 809 = 1, far below 256).
+/// A backend that serves from cache and reports no `cached_tokens` still
+/// reports the full `prompt_tokens`, which sails past the floor and
+/// inflates throughput — exactly M2's failure, deriving a timeout too
+/// short, which is a fail-open. The only defence in that case is the
+/// cache-buster in [`probe_document`]; the floor is a defence against a
+/// *thin* sample, not against an unreported cache. (An earlier version
+/// of this paragraph named the floor as the protection, which is worse
+/// than naming none. Carrying the reported/absent distinction into the
+/// basis so the boot row can be read later is issue #608.)
 pub fn probe_sample(reading: ProbeReading) -> ProbeOutcome {
     let Some(prompt_tokens) = reading.prompt_tokens else {
         return ProbeOutcome::NoTokenCount;
@@ -342,9 +315,9 @@ fn clamp_derived(derived_ms: u64) -> (u64, Clamped) {
 ///
 /// Pure.
 pub fn derive_guard_timeout(outcome: &ProbeOutcome) -> GuardTimeout {
-    let floor = |why| GuardTimeout {
+    let floor = |reason| GuardTimeout {
         timeout: Duration::from_millis(TIMEOUT_FLOOR_MS),
-        basis: TimeoutBasis::Unprobed { why },
+        basis: TimeoutBasis::Unprobed { reason },
     };
     match outcome {
         ProbeOutcome::Measured { uncached_tokens, elapsed_ms } => {
@@ -355,7 +328,7 @@ pub fn derive_guard_timeout(outcome: &ProbeOutcome) -> GuardTimeout {
             // this is a security control, and "unreachable" is a
             // property of another function.
             if !tok_per_s.is_finite() || tok_per_s <= 0.0 {
-                return floor("probe-nonsensical");
+                return floor(UnprobedReason::Nonsensical);
             }
             let derived = WORST_CASE_TOKENS as f64 / tok_per_s
                 * 1000.0
@@ -374,21 +347,16 @@ pub fn derive_guard_timeout(outcome: &ProbeOutcome) -> GuardTimeout {
                 basis: TimeoutBasis::Probed { tok_per_s: tok_per_s as f32, derived_ms, clamped },
             }
         }
-        // An upper bound on throughput IS a measurement of slowness.
-        ProbeOutcome::Saturated { budget_ms } => {
-            let tok_per_s = f64::from(MIN_UNCACHED_PROBE_TOKENS) / (*budget_ms as f64 / 1000.0);
-            GuardTimeout {
-                timeout: Duration::from_millis(TIMEOUT_CEILING_MS),
-                basis: TimeoutBasis::Probed {
-                    tok_per_s: tok_per_s as f32,
-                    derived_ms: TIMEOUT_CEILING_MS,
-                    clamped: Clamped::ToCeiling,
-                },
-            }
-        }
-        ProbeOutcome::TooFewUncachedTokens { .. } => floor("probe-too-few-uncached-tokens"),
-        ProbeOutcome::NoTokenCount => floor("probe-no-token-count"),
-        ProbeOutcome::Failed { .. } => floor("probe-failed"),
+        // An overrun budget IS a measurement of slowness, so it takes the
+        // CEILING and not the floor. But it measures no THROUGHPUT, so it
+        // reports none: see `TimeoutBasis::Saturated`.
+        ProbeOutcome::Saturated { budget_ms } => GuardTimeout {
+            timeout: Duration::from_millis(TIMEOUT_CEILING_MS),
+            basis: TimeoutBasis::Saturated { budget_ms: *budget_ms },
+        },
+        ProbeOutcome::TooFewUncachedTokens { .. } => floor(UnprobedReason::TooFewUncachedTokens),
+        ProbeOutcome::NoTokenCount => floor(UnprobedReason::NoTokenCount),
+        ProbeOutcome::Failed { .. } => floor(UnprobedReason::Failed),
     }
 }
 

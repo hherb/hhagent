@@ -258,10 +258,13 @@ pub struct PromptTokensDetails {
 /// Token-accounting envelope returned by the backend.
 ///
 /// Phase 0 forwards this through unchanged; Phase 1+ will read it for
-/// budgeting decisions in the scheduler's context-manager. Every field
-/// is `Option` because Ollama and some llama.cpp builds omit the
-/// `usage` block entirely when the request was a non-streaming
-/// completion.
+/// budgeting decisions in the scheduler's context-manager.
+///
+/// Every field is `Option` because backends report the block
+/// **partially** — a count they track and one they do not. (The
+/// separate case of Ollama and some llama.cpp builds omitting `usage`
+/// altogether is why the containing field on [`ChatResponse`] is an
+/// `Option`, not why these are.)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,10 +274,14 @@ pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u32>,
     /// Absent on every backend that does not report a prefix cache.
-    /// Absence means "we do not know", never "nothing was cached" —
-    /// which is why the guard probe treats a missing block as zero
-    /// cached tokens only after its own uncached-token floor has had a
-    /// chance to reject the sample.
+    /// Absence means "we do not know", never "nothing was cached".
+    ///
+    /// The guard probe collapses a missing block to zero cached tokens
+    /// and its uncached-token floor does **not** rescue that case: the
+    /// subtraction happens first, and an unreported cache leaves
+    /// `prompt_tokens` intact and well above the floor. The defence
+    /// there is the probe's cache-buster, not the floor — see
+    /// `kastellan_core::cassandra::guard_model::timeout::probe_sample`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }

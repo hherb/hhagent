@@ -125,8 +125,8 @@ fn flagged_is_the_only_reading_that_can_withhold_a_document() {
     }
 }
 
-/// Every state token is distinct and log-field shaped, so the three
-/// fail-open doors are countable in the audit log.
+/// Every state token is distinct and log-field shaped, so every
+/// fail-open door is countable in the audit log.
 #[test]
 fn every_guard_state_token_is_distinct_and_log_shaped() {
     let outcomes = [
@@ -135,6 +135,7 @@ fn every_guard_state_token_is_distinct_and_log_shaped() {
         GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::NotConfigured },
         GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::Unmeasured },
         GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::RouterError },
+        GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::NoScannableText },
     ];
     let mut seen = std::collections::BTreeSet::new();
     for o in outcomes {
@@ -143,7 +144,36 @@ fn every_guard_state_token_is_distinct_and_log_shaped() {
         assert!(!s.chars().any(char::is_whitespace), "not a log token: {s:?}");
         assert!(seen.insert(s), "duplicate guard.state token {s:?} -- the doors stop being countable");
     }
-    assert_eq!(seen.len(), 5);
+    assert_eq!(seen.len(), 6);
+}
+
+/// `KASTELLAN_REQUIRE_GUARD` is the ONLY thing that makes an
+/// *unconfigured* tier fatal, and it must not disturb the other arms.
+///
+/// The hazard D6 argues from — `kastellan-cli install` regenerating
+/// `kastellan.env` — drops every hand-added key, not one of a pair, so
+/// the realistic outcome is all three guard keys gone. That lands on
+/// `from_router_config`'s `Ok(None)`, which is deliberately the one
+/// non-fatal arm. Without this flag the threat model's own worked
+/// example walks straight through the door: daemon boots clean, one
+/// `info!` line, catalogue-only screening, no error anywhere.
+#[test]
+fn require_tier_refuses_only_an_unconfigured_tier_and_only_when_demanded() {
+    use super::boot::{require_tier, GuardTierError};
+
+    assert!(
+        matches!(require_tier(None, true), Err(GuardTierError::Required)),
+        "demanding a tier and having none must stop the daemon"
+    );
+    assert!(
+        require_tier(None, false).is_ok(),
+        "unconfigured is a deliberate opt-out unless the operator says otherwise"
+    );
+    let msg = GuardTierError::Required.to_string();
+    assert!(
+        msg.contains("KASTELLAN_REQUIRE_GUARD") && msg.contains("KASTELLAN_LLM_GUARD_URL"),
+        "the error must name both the flag and the way to satisfy it: {msg}"
+    );
 }
 
 // ── validate_tau: both ends are silent failures ─────────────────────
@@ -224,4 +254,58 @@ fn every_tau_refusal_is_actionable() {
         assert!(msg.contains("KASTELLAN_LLM_GUARD_TAU"), "must name the key: {msg}");
         assert!(msg.contains("0.79552656"), "must name the fitted value: {msg}");
     }
+}
+
+// ── the score/outcome biconditional ─────────────────────────────────
+
+/// `p` is present exactly when the model actually adjudicated.
+///
+/// The pairing `GuardReport` documents and `post_process`'s
+/// `unwrap_or(1.0)` backstops, stated as a property over every input
+/// rather than as a sentence in a doc comment.
+#[test]
+fn score_is_present_exactly_when_the_model_adjudicated() {
+    let tau = 0.795_526_56_f32;
+    let inputs = [None, Some(0.0), Some(0.5), Some(tau), Some(1.0)];
+    for raw in inputs {
+        let (outcome, p) = super::outcome_and_score(raw, tau);
+        assert_eq!(
+            p.is_some(),
+            !matches!(outcome, GuardOutcome::AllowUnadjudicated { .. }),
+            "raw={raw:?} broke the pairing: outcome={outcome:?}, p={p:?}"
+        );
+    }
+}
+
+/// A **non-finite** score reaches the `Unmeasured` door carrying NO `p`.
+///
+/// `decide` routes `Some(NaN)` to `Unmeasured` — every comparison
+/// against a NaN is false, so without that guard it would fall through
+/// into `Clear`, which is the fail-open the enum exists to prevent. But
+/// the score was then forwarded verbatim, so the report said
+/// "unadjudicated" while carrying `Some(NaN)`. Nothing failed, because
+/// `serde_json` happens to render a non-finite float as `null` — the
+/// audit shape was correct by accident, resting on an undocumented
+/// behaviour of a dependency's serialiser.
+#[test]
+fn a_non_finite_score_is_unmeasured_and_carries_no_probability() {
+    let tau = 0.795_526_56_f32;
+    for raw in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let (outcome, p) = super::outcome_and_score(Some(raw), tau);
+        assert_eq!(
+            outcome,
+            GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::Unmeasured },
+            "{raw} must not read as a verdict"
+        );
+        assert_eq!(p, None, "{raw} is not a probability and must not be recorded as one");
+    }
+}
+
+/// The no-text door allows, is never `Clear`, and names itself.
+#[test]
+fn no_scannable_text_allows_but_is_never_reported_as_clear() {
+    let out = GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::NoScannableText };
+    assert!(!out.blocks(), "an empty result must pass through");
+    assert_ne!(out, GuardOutcome::Allow, "the model did not clear it -- it was never asked");
+    assert_eq!(out.as_str(), "no_scannable_text");
 }

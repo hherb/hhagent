@@ -68,9 +68,22 @@ enum Verdict {
     /// Only one spelling present — `binary_token_probability` returns `None`,
     /// so the tier reads `Unmeasured`. NOT a pass.
     Unmeasurable,
-    /// HTTP 500. Stands in for every way the call itself can fail, including
-    /// the attacker-reachable HTTP 400 of #604 and the timeout of #586.
+    /// HTTP 500. Stands in for a call that fails with a STATUS.
+    ///
+    /// Deliberately no longer described as standing in for the timeout of
+    /// #586: an HTTP 500 and a client-budget expiry take different routes
+    /// through `RouterError` (`HttpStatus` vs `Transport`), and the boot
+    /// probe's floor-vs-ceiling split turns on exactly that difference.
+    /// The timeout has its own cases below, against a mock that keeps the
+    /// socket open and never answers.
     ServerError,
+    /// A 200 whose `usage` reports almost everything served from the prefix
+    /// cache — M2's contaminated row, verbatim.
+    ///
+    /// Exists so the probe's `cached_tokens` subtraction is exercised with a
+    /// NON-ZERO value. Every other verdict sends `cached_tokens: 0`, under
+    /// which dropping the extraction entirely changes nothing observable.
+    CacheHit,
 }
 
 /// A multi-request mock: serves `/props` and any number of chat completions,
@@ -123,6 +136,7 @@ impl MockGuardServer {
                             Verdict::Clear => (200, canned(-9.0, -0.001)),
                             Verdict::Unmeasurable => (200, canned_single_spelling()),
                             Verdict::ServerError => (500, "{\"error\":\"boom\"}".to_string()),
+                            Verdict::CacheHit => (200, canned_cache_hit()),
                         }
                     };
                     let line = if status == 200 {
@@ -219,6 +233,32 @@ fn canned(yes_logprob: f64, no_logprob: f64) -> String {
             "completion_tokens": 1,
             "total_tokens": 811,
             "prompt_tokens_details": {"cached_tokens": 0}
+        }
+    })
+    .to_string()
+}
+
+/// M2's contaminated repeat: 810 prompt tokens of which 809 were served
+/// from the prefix cache, so only ONE token was genuinely processed.
+fn canned_cache_hit() -> String {
+    serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "no"},
+            "logprobs": {"content": [{
+                "token": "no",
+                "logprob": -0.001,
+                "top_logprobs": [
+                    {"token": "no",  "logprob": -0.001},
+                    {"token": "yes", "logprob": -9.0}
+                ]
+            }]}
+        }],
+        "usage": {
+            "prompt_tokens": 810,
+            "completion_tokens": 1,
+            "total_tokens": 811,
+            "prompt_tokens_details": {"cached_tokens": 809}
         }
     })
     .to_string()
@@ -391,6 +431,22 @@ async fn a_flagged_document_is_withheld_and_the_block_row_names_the_guard_tier()
         "the row must carry the threshold p was compared against"
     );
     assert_eq!(mock.completions(), 1, "exactly one adjudication");
+
+    // The TOOL row carries the guard sub-object on a Block too, and
+    // `"flagged"` is the one `guard.state` token nothing else asserts as a
+    // literal -- renaming it would silently break every forensic query
+    // counting withheld documents.
+    let tool_row = last_tool_row(&pool).await;
+    assert_eq!(tool_row["guard"]["state"], "flagged");
+    assert!(tool_row["guard"]["p"].is_number(), "the block's p rides the tool row too");
+    assert_eq!(
+        tool_row["guard"]["truncated"], false,
+        "a short document is not truncated, and the row must say so rather than omit it"
+    );
+    assert!(
+        tool_row["guard"]["body_byte_len"].as_u64().expect("byte len") > 0,
+        "a score is uninterpretable without the size of what was scored"
+    );
 }
 
 /// **Clear**: the document passes, and `p` is recorded anyway.
@@ -425,7 +481,23 @@ async fn a_cleared_document_passes_through_and_still_records_its_probability() {
         p < FITTED_TAU as f64,
         "a cleared document scored below tau by construction, got {p}"
     );
-    assert!(guard["ms"].is_number(), "the row carries the adjudication cost");
+    // The mock sleeps 10 ms before answering, so a hardcoded `ms: 0` is
+    // distinguishable from a real measurement -- `is_number()` alone is not.
+    assert!(
+        guard["ms"].as_u64().expect("ms is a number") >= 10,
+        "the row must carry the REAL adjudication cost, got {}",
+        guard["ms"]
+    );
+    // `tau` is written by `GuardReport::audit_value`, which is a different
+    // construction site from the block row's -- dropping the key there
+    // survives every other assertion in this file.
+    assert_eq!(
+        guard["tau"].as_f64().expect("tau is recorded") as f32,
+        FITTED_TAU,
+        "a score without the threshold it was compared against cannot be re-read later"
+    );
+    assert_eq!(guard["truncated"], false);
+    assert!(guard["body_byte_len"].as_u64().expect("byte len") > 0);
 }
 
 /// **Unmeasured**: the call succeeded but produced no usable verdict pair.
@@ -516,7 +588,7 @@ async fn a_catalogue_block_short_circuits_and_the_model_is_never_asked() {
     let row = last_block_row(&pool).await.expect("a block row was written");
     assert_eq!(row["tier"], "catalogue");
     assert!(
-        row["p"].is_null() || row.get("p").is_none(),
+        row["p"].is_null(),
         "the catalogue arm has no probability to report: {row}"
     );
     assert!(
@@ -713,7 +785,7 @@ async fn with_no_override_the_boot_probe_runs_and_derives_a_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
     use kastellan_core::cassandra::guard_model::timeout::{
-        Clamped, TimeoutBasis, TIMEOUT_CEILING_MS,
+        TimeoutBasis, PROBE_BUDGET_MS, TIMEOUT_CEILING_MS,
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -755,12 +827,14 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
         TIMEOUT_CEILING_MS,
         "an overrun probe is an upper bound on throughput, not a missing measurement"
     );
-    match budget.basis {
-        TimeoutBasis::Probed { clamped, .. } => assert_eq!(clamped, Clamped::ToCeiling),
-        ref other => panic!("expected a probed basis reporting the ceiling, got {other:?}"),
-    }
+    assert_eq!(
+        budget.basis,
+        TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS },
+        "an overrun probe reports the budget it exceeded and NO throughput -- \
+         reporting `Probed` forced a fabricated tok_per_s into guard_tier.boot"
+    );
     assert!(
-        budget.basis.is_coverage_finding(),
+        budget.basis.coverage_finding().is_some(),
         "a host this slow is a finding, not a routine value"
     );
     handle.abort();
@@ -781,4 +855,187 @@ async fn an_operator_pinned_timeout_skips_the_probe() {
     );
     assert_eq!(tier.timeout().basis, TimeoutBasis::Operator);
     assert_eq!(tier.timeout().timeout.as_millis() as u64, 5_000);
+}
+
+// ── the boot seams the mutation set did not reach ───────────────────
+
+/// **The derived budget must be the one the client SPENDS**, not merely the
+/// one it records.
+///
+/// The single highest-value case in this file, and it exists because the
+/// mutation set stopped one frame short of it: swapping `timeout.timeout`
+/// for the in-scope `probe_budget` in `GuardTier::from_router_config` left
+/// the entire workspace green. `tier.timeout()` reads the `GuardTimeout`
+/// STRUCT, and every existing assertion reads that struct — so a client
+/// built at the wrong budget is invisible to all of them.
+///
+/// Live, the mutant means a host whose probe derived 120 s (or an operator
+/// who pinned 300 s) silently spends 20 s instead, converting adjudications
+/// into fail-open timeouts on exactly the large dense documents the tier
+/// exists for. That is issue #586's whole payload.
+///
+/// The mock answers `/props` and then holds the completion socket open
+/// forever, so the ONLY thing that can end the call is the client's own
+/// budget. Keeping the socket alive is the mechanism: dropping it yields a
+/// transport error that is not a timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pinned_budget_is_what_the_adjudication_client_actually_spends() {
+    const PINNED_MS: u64 = 1_500;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let Some((head, _body)) = read_request(&mut sock).await else { return };
+                if head.starts_with("GET") && head.contains("/props") {
+                    let payload = props_body();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {len}\r\nConnection: close\r\n\r\n{payload}",
+                        len = payload.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return;
+                }
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let cfg = RouterConfig {
+        guard_timeout_ms: Some(PINNED_MS),
+        ..pinned_cfg(&format!("http://127.0.0.1:{port}/v1"))
+    };
+    let tier = build_tier(&cfg).await;
+
+    let started = std::time::Instant::now();
+    let report = tier.adjudicate_document("a document the backend will never answer", false).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        report.outcome.as_str(),
+        "router_error",
+        "a budget expiry must take the fail-open door, not appear as a verdict"
+    );
+    assert!(report.p.is_none(), "a call that never answered has no score");
+    // The bound is what pins the mutant: `PROBE_BUDGET_MS` is 20 s, so a
+    // client built at the probe budget cannot come back in under 3 s.
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the adjudication client must spend the PINNED {PINNED_MS} ms, not the probe \
+         budget -- took {elapsed:?}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(PINNED_MS / 2),
+        "it must actually wait for its budget rather than failing instantly: {elapsed:?}"
+    );
+    handle.abort();
+}
+
+/// A probe whose sample is almost entirely CACHED is rejected, not divided by.
+///
+/// M2's contaminated row: 810 prompt tokens, 809 of them cache hits. A naive
+/// `prompt_tokens / elapsed` reads ~21,000 tok/s against the same server's
+/// true ~5,000 — a 4x over-estimate deriving a timeout 4x too short, which
+/// turns real adjudications into fail-open timeouts.
+///
+/// This is the only case that exercises `timed_probe`'s `cached_tokens`
+/// extraction with a non-zero value; every other mock answer sends 0, under
+/// which deleting those three lines changes nothing observable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cache_contaminated_probe_is_rejected_rather_than_believed() {
+    use kastellan_core::cassandra::guard_model::timeout::{TimeoutBasis, UnprobedReason};
+
+    let mock = MockGuardServer::spawn(Verdict::CacheHit).await;
+    let cfg = RouterConfig { guard_timeout_ms: None, ..pinned_cfg(&mock.base_url) };
+    let tier = build_tier(&cfg).await;
+
+    assert_eq!(
+        tier.timeout().basis,
+        TimeoutBasis::Unprobed { reason: UnprobedReason::TooFewUncachedTokens },
+        "810 tokens with 809 cached is ONE token of real work -- far below the floor"
+    );
+    assert!(
+        !matches!(tier.timeout().basis, TimeoutBasis::Probed { .. }),
+        "believing this sample derives a timeout 4x too short"
+    );
+}
+
+/// A probe that FAILS (rather than times out) is not fatal, takes the floor,
+/// and is reported as a coverage finding.
+///
+/// D9's central claim is that the probe never stops a boot. The `Saturated`
+/// arm proved it; the far more common arm — `/props` answers while the
+/// completion is refused — was pinned only at the pure layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_probe_is_not_fatal_and_says_the_tier_will_fail_open() {
+    use kastellan_core::cassandra::guard_model::timeout::{
+        TimeoutBasis, UnprobedReason, TIMEOUT_FLOOR_MS,
+    };
+
+    let mock = MockGuardServer::spawn(Verdict::ServerError).await;
+    let cfg = RouterConfig { guard_timeout_ms: None, ..pinned_cfg(&mock.base_url) };
+    // `build_tier` unwraps: a probe failure reaching this line at all is the
+    // assertion that it did not stop the boot.
+    let tier = build_tier(&cfg).await;
+
+    assert_eq!(
+        tier.timeout().basis,
+        TimeoutBasis::Unprobed { reason: UnprobedReason::Failed }
+    );
+    assert_eq!(tier.timeout().timeout.as_millis() as u64, TIMEOUT_FLOOR_MS);
+    assert!(
+        tier.timeout().basis.coverage_finding().is_some(),
+        "/props answered, so the call that just failed is the call EVERY dispatch \
+         makes -- reporting that at info! alongside \"guard tier configured\" is how \
+         a totally fail-open tier looks healthy"
+    );
+}
+
+/// A result with **no scannable text** is not sent to the model at all.
+///
+/// `extract_scannable_text` emits string leaves only, so a worker result made
+/// of numbers and booleans arrives at the tier as `""`. Three things go wrong
+/// if it is adjudicated anyway: a model round trip is paid on every such
+/// dispatch (the ordinary shape for `kv.*` and most structured replies), the
+/// model is asked to judge an empty `<Document>` whose verdict is undefined —
+/// a `p >= tau` there withholds a result that contained nothing to inject —
+/// and D5's score distribution is seeded with scores for empty documents.
+///
+/// Proved by a request COUNT, like the catalogue short-circuit, and the door
+/// is asserted to be NAMED: returning no guard object would spell this the
+/// same way as an unconfigured host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_result_with_no_scannable_text_is_never_sent_to_the_model() {
+    let Some(rig) = bootstrap("notext") else { return };
+    let pool = probe_and_pool(&rig.cluster.conn_spec).await;
+    // Flagged on purpose: if the short-circuit breaks, the failure is a
+    // withheld result rather than an extra request nobody notices.
+    let mock = MockGuardServer::spawn(Verdict::Flagged).await;
+    let tier = build_tier(&pinned_cfg(&mock.base_url)).await;
+    let before = mock.completions();
+
+    // `printf ''` produces an empty stdout, so every string leaf is empty and
+    // `extract_scannable_text` yields "".
+    let result = dispatch_printf(&pool, &rig, Some(&tier), "").await;
+
+    assert_eq!(
+        mock.completions(),
+        before,
+        "the model must not be asked about a result with no text in it"
+    );
+    assert!(
+        result.get("injection_blocked").is_none(),
+        "an empty result must pass through untouched, got {result}"
+    );
+    let guard = &last_tool_row(&pool).await["guard"];
+    assert_eq!(
+        guard["state"], "no_scannable_text",
+        "the door must be named, not spelled as an absent guard object"
+    );
+    assert!(guard["p"].is_null(), "nothing was adjudicated, so there is no score");
+    assert_eq!(guard["ms"], 0, "no call was made");
 }

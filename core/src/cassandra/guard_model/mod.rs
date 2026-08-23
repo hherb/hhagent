@@ -4,13 +4,20 @@
 //! never the reverse, so a guard-model failure can only ever be as
 //! permissive as today's catalogue-only behaviour.
 //!
-//! **This module reports; it never decides to allow.** Fail-open on a
-//! router error is the documented posture (the sandbox and the egress
-//! allowlist are the boundary, not this), but it is applied at the
-//! wiring site so the whole security posture is legible in one place.
+//! Fail-open on a router error is the documented posture — the sandbox
+//! and the egress allowlist are the boundary, not this — and since the
+//! wiring slice it is **decided inside this module**, by
+//! [`tier::resolve`]. (It used to be applied at the wiring site, and
+//! this paragraph used to say so; the chokepoint now only reads
+//! `report.outcome.blocks()`, so looking for the fail-open in
+//! `tool_host` finds nothing.)
 //!
-//! Not wired into the chokepoint yet — see
-//! `docs/superpowers/specs/2026-08-21-shieldstral-guard-slice-1-design.md`.
+//! **Wired into the chokepoint** as of the wiring slice
+//! ([#586](https://github.com/hherb/kastellan/issues/586)): the tier
+//! runs in `tool_host::post_process::screen_result` on every tool result
+//! the deterministic catalogue allowed. Slice-1 design:
+//! `docs/superpowers/specs/2026-08-21-shieldstral-guard-slice-1-design.md`;
+//! wiring design: `docs/superpowers/specs/2026-08-22-shieldstral-guard-wiring-design.md`.
 
 pub mod context_pin;
 pub mod decide;
@@ -106,8 +113,8 @@ impl GuardClient {
     /// One adjudication, timed, reporting the backend's own token
     /// accounting alongside the wall clock.
     ///
-    /// The IO half of the boot probe (wiring-spec D9) and its only
-    /// caller. The **verdict is discarded** — this call exists to
+    /// The IO half of the boot probe (wiring-spec D9); `boot::run_probe`
+    /// is its only caller. The **verdict is discarded** — this call exists to
     /// measure how fast the backend processes a prompt, not to judge
     /// the probe document.
     ///

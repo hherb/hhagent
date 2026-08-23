@@ -131,14 +131,18 @@ async fn report_guard_tier(
          downstream may relax on it."
     );
 
-    if budget.basis.is_coverage_finding() {
+    // The finding TEXT comes from the basis, because the three bases that
+    // qualify are three different findings — a ceiling clamp, a probe that
+    // never returned, and a probe that FAILED (which predicts a tier that
+    // fails open on every dispatch, and used to be reported at `info!`).
+    if let Some(finding) = budget.basis.coverage_finding() {
         tracing::warn!(
             timeout_ms,
-            tok_per_s = tok_per_s.unwrap_or(0.0),
-            "this host cannot adjudicate a worst-case document within the guard timeout \
-             budget: large, token-dense documents WILL time out and fail open to \
-             catalogue-only screening. Set KASTELLAN_LLM_GUARD_TIMEOUT_MS deliberately if \
-             a longer per-dispatch stall is acceptable."
+            timeout_basis = basis,
+            // No `unwrap_or(0.0)`: a fabricated zero would be logged as if
+            // it were measured. Only a real `Probed` basis has a rate.
+            tok_per_s = tok_per_s,
+            "{finding}"
         );
     }
 
@@ -247,30 +251,51 @@ async fn main() -> Result<()> {
     // ── The Shieldstral guard tier (wiring slice). ──
     //
     // Built and reported ONCE, here, beside the router it shares an endpoint
-    // seam with. Three things can stop the daemon, and all three are the same
+    // seam with. FIVE things can stop the daemon, and all five are the same
     // failure wearing different clothes — a security control that is off while
     // looking configured (D6):
     //
     //   * a half-configured tier (URL without model, or either without a tau);
     //   * a tau outside (0.0, 1.0], both ends of which are silent failures;
+    //   * an operator-pinned KASTELLAN_LLM_GUARD_TIMEOUT_MS of 0, which would
+    //     time out every adjudication and so disable the tier while it logged
+    //     as configured;
+    //   * a backend whose /props is UNREACHABLE — so if the guard server is
+    //     not running, the daemon does not start. This is the most likely boot
+    //     failure on a host with the tier configured and the one an operator
+    //     most needs to see named here;
     //   * a backend whose context cannot hold a worst-case document (#604),
     //     which would otherwise fail OPEN at runtime on exactly the dense
     //     adversarial documents the tier exists for.
     //
     // The counter-argument — a down daemon protects nothing — was weighed and
-    // rejected: "loud error at boot" is precisely what gets scrolled past, and
-    // `kastellan-cli install` regenerating `kastellan.env` has been observed
-    // dropping hand-added keys.
+    // rejected: "loud error at boot" is precisely what gets scrolled past.
+    //
+    // A SIXTH, opt-in: KASTELLAN_REQUIRE_GUARD=1 makes an *unconfigured* tier
+    // fatal too. That door needs its own flag because losing all three guard
+    // keys at once — which is what `install` regenerating `kastellan.env`
+    // actually does — lands on the deliberate-opt-out arm, not on any of the
+    // five above.
     //
     // The throughput probe underneath this is deliberately NOT fatal: it picks
     // a timeout, it does not verify a control.
-    let guard_probe_cache_buster = format!(
-        "kastellan-guard-probe-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
+
+    // A pre-epoch clock would make the cache-buster constant across boots, which silently
+    // disables the ONLY defence against M2's 4x cache over-estimate on a backend
+    // that caches without reporting `cached_tokens` (#608). Unlikely, but a
+    // silent fallback here is invisible in exactly the way that measurement is.
+    let probe_nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "system clock is before the epoch; the guard boot probe's cache-buster \
+                 will not vary between boots and its throughput sample may be a cache hit"
+            );
+            0
+        }
+    };
+    let guard_probe_cache_buster = format!("kastellan-guard-probe-{probe_nanos}");
     let guard_tier = kastellan_core::cassandra::guard_model::GuardTier::from_router_config(
         &router_cfg,
         &guard_probe_cache_buster,
@@ -278,6 +303,13 @@ async fn main() -> Result<()> {
     .await
     .map_err(|e| anyhow!("guard tier: {e}"))?
     .map(std::sync::Arc::new);
+    kastellan_core::cassandra::guard_model::tier::boot::require_tier(
+        guard_tier.as_deref(),
+        kastellan_core::worker_lifecycle::force_route::env_flag_enabled(
+            std::env::var("KASTELLAN_REQUIRE_GUARD").ok(),
+        ),
+    )
+    .map_err(|e| anyhow!("guard tier: {e}"))?;
     report_guard_tier(guard_tier.as_deref(), &router_cfg, &pool).await;
 
     let router = Arc::new(

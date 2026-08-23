@@ -13,8 +13,8 @@ use kastellan_llm_router::{RouterConfig, RouterError};
 
 use super::super::context_pin::{self, GuardContextError};
 use super::super::timeout::{self, GuardTimeout, ProbeOutcome};
-use super::super::{decide, GuardClient};
-use super::{resolve, validate_tau, GuardOutcome, GuardReading, TauError};
+use super::super::GuardClient;
+use super::{outcome_and_score, resolve, validate_tau, GuardOutcome, GuardReading, TauError};
 
 /// Why the guard tier could not be built.
 ///
@@ -22,9 +22,20 @@ use super::{resolve, validate_tau, GuardOutcome, GuardReading, TauError};
 /// counter-argument — a down daemon protects nothing — was weighed and
 /// rejected: "loud error at boot" is precisely the thing that gets
 /// scrolled past, and the failure being guarded against is *silent
-/// deactivation of a security control*. The concrete hazard has
-/// happened: `kastellan-cli install` regenerates `kastellan.env` and
-/// has been observed dropping hand-added keys.
+/// deactivation of a security control*.
+///
+/// **What these variants do NOT cover, and why [`Self::Required`]
+/// exists.** The hazard D6 cites by name is `kastellan-cli install`
+/// regenerating `kastellan.env` and dropping hand-added keys — but a
+/// regeneration drops *every* hand-added key, not one of a pair, so the
+/// realistic outcome is all three guard keys gone. That lands on
+/// [`GuardTier::from_router_config`]'s `Ok(None)` arm, which is the one
+/// arm that is **not** fatal: the daemon boots clean and screens with
+/// the catalogue alone. The variants below cover a *half*-drop;
+/// `install`'s own `env_diff` covers the full one; and an operator who
+/// wants the control to be load-bearing sets `KASTELLAN_REQUIRE_GUARD=1`
+/// and gets [`Self::Required`]. The same shape as
+/// `KASTELLAN_REQUIRE_TRUSTED_INSTALL_DIR` (#388).
 #[derive(Debug)]
 pub enum GuardTierError {
     /// The URL/model pair is half-configured, τ is missing while a
@@ -39,6 +50,8 @@ pub enum GuardTierError {
     Context(GuardContextError),
     /// The operator pinned a timeout that cannot work.
     Timeout(timeout::TimeoutError),
+    /// `KASTELLAN_REQUIRE_GUARD=1` is set and no tier is configured.
+    Required,
 }
 
 impl std::fmt::Display for GuardTierError {
@@ -56,6 +69,13 @@ impl std::fmt::Display for GuardTierError {
             ),
             Self::Context(e) => write!(f, "{e}"),
             Self::Timeout(e) => write!(f, "{e}"),
+            Self::Required => write!(
+                f,
+                "KASTELLAN_REQUIRE_GUARD is set but no guard tier is configured. \
+                 Set KASTELLAN_LLM_GUARD_URL, KASTELLAN_LLM_GUARD_MODEL and \
+                 KASTELLAN_LLM_GUARD_TAU, or unset KASTELLAN_REQUIRE_GUARD to run \
+                 on catalogue-only screening deliberately."
+            ),
         }
     }
 }
@@ -64,10 +84,18 @@ impl std::error::Error for GuardTierError {}
 
 /// What one adjudication produced, in the shape the audit row wants.
 ///
-/// `p` is `None` on both fail-open doors — a failed call has no score,
-/// and an `Unmeasured` one had no usable verdict pair. `tau` rides
-/// along so the row is self-describing: a score without the threshold
-/// it was compared against cannot be re-read months later.
+/// `p` is `None` on **every** unadjudicated door — a failed call has no
+/// score, and an `Unmeasured` one had no usable verdict pair. `tau`
+/// rides along so the row is self-describing: a score without the
+/// threshold it was compared against cannot be re-read months later.
+///
+/// The invariant that matters is the biconditional, and
+/// [`super::outcome_and_score`] establishes it by deriving `p` from the
+/// adjudication rather than forwarding it from the raw call:
+///
+/// ```text
+/// p.is_some()  <=>  !matches!(outcome, AllowUnadjudicated { .. })
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GuardReport {
     pub outcome: GuardOutcome,
@@ -77,6 +105,22 @@ pub struct GuardReport {
     pub p: Option<f32>,
     pub tau: f32,
     pub ms: u64,
+    /// Bytes of scannable text the model was actually shown.
+    ///
+    /// Recorded because `p` is uninterpretable without it: a score over
+    /// a 1 KiB result and a score over a 64 KiB truncation of a 10 MB
+    /// one are different populations, and D5's whole purpose is a score
+    /// distribution someone can read later.
+    pub body_byte_len: usize,
+    /// Did `SCAN_BYTE_CAP` cut the document short?
+    ///
+    /// **Recorded on the ALLOW half, which is the half that needed it.**
+    /// The forensic `injection.blocked` row has carried
+    /// `body_truncated_at_64kib` since Item 30, but only on a Block — so
+    /// a `state: "clear"` row on a 10 MB worker result read as "the model
+    /// judged this document clear" when the model judged 1.5% of it, and
+    /// an unadjudicated 98% was indistinguishable from a working tier.
+    pub truncated: bool,
 }
 
 impl GuardReport {
@@ -87,10 +131,12 @@ impl GuardReport {
     /// should not depend on which chokepoint emitted the row.
     pub fn audit_value(&self) -> serde_json::Value {
         serde_json::json!({
-            "state": self.outcome.as_str(),
-            "p":     self.p,
-            "tau":   self.tau,
-            "ms":    self.ms,
+            "state":         self.outcome.as_str(),
+            "p":             self.p,
+            "tau":           self.tau,
+            "ms":            self.ms,
+            "body_byte_len": self.body_byte_len,
+            "truncated":     self.truncated,
         })
     }
 }
@@ -235,12 +281,16 @@ impl GuardTier {
     /// because the latter discards `p`. `probability` remains the only
     /// request-building path, which is the property that actually
     /// matters.
-    pub async fn adjudicate_document(&self, body: &str) -> GuardReport {
+    pub async fn adjudicate_document(&self, body: &str, truncated: bool) -> GuardReport {
         let started = std::time::Instant::now();
         let probability = self.client.probability(body).await;
         let ms = started.elapsed().as_millis() as u64;
         let (outcome, p) = match probability {
-            Ok(p) => (resolve(GuardReading::Adjudicated(decide(p, self.tau))), p),
+            // The mapping is `tier::outcome_and_score`, which derives
+            // `p` from the adjudication rather than forwarding it from
+            // the call — see there for why that difference is load
+            // bearing, and for the invariant it pins.
+            Ok(raw) => outcome_and_score(raw, self.tau),
             Err(e) => {
                 // Logged here and never carried into the verdict, so no
                 // backend message can influence a containment decision.
@@ -253,30 +303,72 @@ impl GuardTier {
                 (resolve(GuardReading::Failed), None)
             }
         };
-        GuardReport { outcome, p, tau: self.tau, ms }
+        GuardReport {
+            outcome,
+            p,
+            tau: self.tau,
+            ms,
+            body_byte_len: body.len(),
+            truncated,
+        }
+    }
+
+    /// The report for a result carrying **no scannable text**.
+    ///
+    /// The model is not asked, and the door is named rather than
+    /// silent — see [`super::Unadjudicated::NoScannableText`] for why an
+    /// empty `<Document>` must not be sent and why returning no report
+    /// at all would be the wrong way to skip it.
+    ///
+    /// `ms: 0` is honest: no call was made.
+    pub fn no_scannable_text(&self) -> GuardReport {
+        GuardReport {
+            outcome: GuardOutcome::AllowUnadjudicated {
+                reason: super::Unadjudicated::NoScannableText,
+            },
+            p: None,
+            tau: self.tau,
+            ms: 0,
+            body_byte_len: 0,
+            truncated: false,
+        }
     }
 }
 
 /// Run the boot probe and classify what came back.
 ///
 /// The IO half of D9. A transport failure here is
-/// [`ProbeOutcome::Failed`] — including the timeout that
-/// [`timeout::PROBE_BUDGET_MS`] imposes, which is reported as
-/// [`ProbeOutcome::Saturated`] because an overrun budget is an *upper
-/// bound on throughput* rather than a missing measurement.
+/// [`ProbeOutcome::Failed`] — **except** the request timeout that
+/// [`timeout::PROBE_BUDGET_MS`] imposes, which is
+/// [`ProbeOutcome::Saturated`], because an overrun budget is a
+/// measurement of slowness rather than a missing measurement. A
+/// *connect* timeout is `Failed`, not `Saturated`: see [`is_timeout`].
 async fn run_probe(client: &GuardClient, cache_buster: &str) -> ProbeOutcome {
     let document = timeout::probe_document(cache_buster);
     match client.timed_probe(&document).await {
         Ok(reading) => timeout::probe_sample(reading),
-        Err(e) => timeout::probe_error_outcome(
-            is_timeout(&e),
-            e.to_string(),
-            timeout::PROBE_BUDGET_MS,
-        ),
+        Err(e) => {
+            // **Logged here, because this is the only place the reason
+            // exists.** `ProbeOutcome::Failed` carries it, and
+            // `derive_guard_timeout` then drops it on the floor — so
+            // without this line the diagnosis is formatted and thrown
+            // away. It matters more than its `info!`-shaped basis
+            // suggests: /props answered (the tier got this far), so a
+            // failure HERE is a failure of the exact call every dispatch
+            // will make, and predicts a tier that fails open on all of
+            // them. `TimeoutBasis::coverage_finding` says so at `warn!`.
+            tracing::warn!(
+                target: "kastellan::guard_model",
+                error = %e,
+                timed_out = is_timeout(&e),
+                "guard boot probe failed"
+            );
+            timeout::probe_error_outcome(is_timeout(&e), e.to_string(), timeout::PROBE_BUDGET_MS)
+        }
     }
 }
 
-/// Did this router error come from the request budget running out?
+/// Did this router error come from the **request** budget running out?
 ///
 /// Asks `reqwest` directly rather than matching its `Display` text.
 /// The text form works today — `RouterError::Transport` appends
@@ -287,8 +379,43 @@ async fn run_probe(client: &GuardClient, cache_buster: &str) -> ProbeOutcome {
 /// the **ceiling** and so hands the slowest hosts the shortest guard
 /// timeout. That is a fail-open, and it would show up as nothing at
 /// all.
+///
+/// **A connect timeout is excluded, and the exclusion is the whole
+/// reason this is not a one-liner.** `reqwest::Error::is_timeout` walks
+/// the source chain for `io::ErrorKind::TimedOut`, and a *connect*
+/// timeout puts one there — so `is_timeout()` and `is_connect()` are
+/// **both** true for it. `Router::with_policy` caps connect at 5 s
+/// independently of the request budget, so without this clause a
+/// transient 5 s connect stall on a perfectly fast host would be read
+/// as [`ProbeOutcome::Saturated`]: derive the 120 s ceiling, fire the
+/// "this host cannot adjudicate a worst-case document" warning, and
+/// write a throughput nobody measured into `policy / guard_tier.boot`.
+///
+/// The two errors mean opposite things. A request timeout says *the
+/// backend is slow*, which is a measurement. A connect timeout says
+/// *the backend was not reachable*, which says nothing about its
+/// throughput and must take the floor with every other failure.
 fn is_timeout(e: &RouterError) -> bool {
-    matches!(e, RouterError::Transport(inner) if inner.is_timeout())
+    matches!(e, RouterError::Transport(inner) if inner.is_timeout() && !inner.is_connect())
+}
+
+/// Refuse to run without a tier when the operator demanded one.
+///
+/// Pure, so the decision is a unit test rather than a daemon boot. The
+/// caller reads `KASTELLAN_REQUIRE_GUARD` through the canonical
+/// `worker_lifecycle::force_route::env_flag_enabled`, so the truthy
+/// spellings match every other daemon-wide opt-in.
+///
+/// **Deliberately not folded into [`GuardTier::from_router_config`].**
+/// That function is about whether a *configured* tier is usable; this is
+/// about whether being unconfigured is acceptable on this host, which is
+/// a deployment question with a different answer per host. Keeping them
+/// apart is also what lets `from_router_config` stay free of env reads.
+pub fn require_tier(tier: Option<&GuardTier>, required: bool) -> Result<(), GuardTierError> {
+    match (tier, required) {
+        (None, true) => Err(GuardTierError::Required),
+        _ => Ok(()),
+    }
 }
 
 /// Share one tier across the dispatcher and whatever else needs it.

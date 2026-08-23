@@ -1,8 +1,11 @@
 //! tool_host/post_process: the post-`worker.call` half of the dispatch
 //! chokepoint.
 //!
-//! Lifted verbatim out of [`super::dispatch_with_sink`] (Item 9b prod-split) so
-//! the parent module stays under the LOC cap. It runs, in order:
+//! Lifted out of [`super::dispatch_with_sink`] (Item 9b prod-split) so the
+//! parent module stays under the LOC cap. It was byte-identical at that
+//! point; the guard-model wiring slice then added tier 2, so diffing this
+//! against `dispatch_with_sink`'s history no longer shows unchanged logic.
+//! It runs, in order:
 //!
 //! 1. **python-exec output secret-scrub** — for a worker that runs
 //!    agent-authored code, redact every secret materialized into this
@@ -120,8 +123,10 @@ async fn screen_result(
     // `consults_model` delegates to the catalogue's own `decision_for_score`
     // rather than re-testing the threshold, so the two cannot drift about where
     // it is. It is asserted here as well as branched on above because the
-    // short-circuit is what makes it true: an edit that reordered these should
-    // fail loudly rather than quietly start paying for a call it must not make.
+    // short-circuit is what makes it true. Note this is a CANARY, not a control:
+    // `debug_assert!` compiles out of the release build the daemon actually
+    // runs, so what makes the short-circuit correct is the `return` above --
+    // this only catches a reordering during development.
     debug_assert!(
         consults_model(verdict.score),
         "the catalogue-Block short-circuit above should already have returned"
@@ -129,7 +134,21 @@ async fn screen_result(
     let Some(tier) = guard else {
         return ScreenOutcome { value, blocked: None, guard: None };
     };
-    let report = tier.adjudicate_document(&body).await;
+    // A result with no scannable text is not a document. `extract_scannable_text`
+    // emits string leaves only, so `{"ok": true, "count": 3}` — the ordinary
+    // shape for `kv.*` and for most workers' structured replies — arrives here
+    // as `""`. Asking the model about it costs a round trip on EVERY such
+    // dispatch and puts an undefined verdict on an empty `<Document>` in the
+    // decision path: a `p >= tau` there would withhold a result that contained
+    // nothing to inject. It would also seed D5's score distribution — the
+    // corpus this slice exists to collect — with scores for empty documents.
+    //
+    // The door is NAMED, not silent: `guard: None` would spell this the same
+    // way as an unconfigured host.
+    if body.is_empty() {
+        return ScreenOutcome { value, blocked: None, guard: Some(tier.no_scannable_text()) };
+    }
+    let report = tier.adjudicate_document(&body, truncated).await;
     if report.outcome.blocks() {
         // The planner sees the SAME note whichever tier withheld the document:
         // its available action is identical, and naming the tier would tell a
@@ -264,7 +283,8 @@ pub(super) async fn finalize(
     // Forensic policy row on Block. SHA-256 of the body that was
     // scanned (which may have been truncated at SCAN_BYTE_CAP).
     // The raw body is never written to any audit column — only the
-    // hash, byte length, score, and class codes are stored.
+    // hash, byte length, score, class codes, the deciding `tier`, and
+    // (on the guard-model arm) `p` and `tau`.
     if let Some(meta) = blocked_meta {
         let mut hasher = Sha256::new();
         hasher.update(meta.body.as_bytes());

@@ -71,6 +71,33 @@ pub use policy::{DefaultLocalPolicy, PolicyGate};
 
 use error::{truncate_for_error, ERROR_BODY_CAP};
 
+/// Read a non-2xx response body for operator triage, **preserving a
+/// timeout instead of flattening it into [`RouterError::HttpStatus`]**.
+///
+/// The best-effort read is right for its stated purpose: the status code
+/// is the actionable part and a body that will not decode should not mask
+/// it. But one read failure is not cosmetic. When the failure is the
+/// request BUDGET EXPIRING, `HttpStatus` erases that fact — and the guard
+/// tier's boot probe classifies a timeout as a *measurement* (it derives
+/// the CEILING, because an overrun budget is an upper bound on
+/// throughput) and every other failure as the FLOOR. Swallowing the
+/// timeout here therefore handed the slowest hosts the SHORTEST guard
+/// timeout, which is a fail-open, through the one door
+/// `kastellan_core::cassandra::guard_model::tier::boot::is_timeout`
+/// structurally cannot watch: it matches on `Transport`, and this path
+/// had already thrown the `Transport` away.
+///
+/// Every other read failure keeps a placeholder. The old wording blamed
+/// UTF-8, which is essentially never the cause — `Response::text`
+/// decodes lossily and fails on transport, not on encoding.
+async fn error_body(resp: reqwest::Response) -> Result<String, RouterError> {
+    match resp.text().await {
+        Ok(body) => Ok(body),
+        Err(e) if e.is_timeout() => Err(RouterError::Transport(e)),
+        Err(_) => Ok("<error body could not be read>".to_string()),
+    }
+}
+
 /// The OpenAI-compatible chat-completion sub-path appended to every
 /// backend's base URL. Pinned as a constant so a refactor that
 /// changes it does so deliberately at one site — every conforming
@@ -240,11 +267,7 @@ impl Router {
         let status = resp.status();
 
         if !status.is_success() {
-            // Best effort: read the body for operator triage. If the
-            // body itself fails to read we still want a useful error.
-            let body = resp.text().await.unwrap_or_else(|_| {
-                "<error body could not be read as UTF-8 text>".to_string()
-            });
+            let body = error_body(resp).await?;
             return Err(RouterError::HttpStatus {
                 status: status.as_u16(),
                 body: truncate_for_error(&body, ERROR_BODY_CAP),
@@ -302,10 +325,7 @@ impl Router {
         let status = resp.status();
 
         if !status.is_success() {
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|_| "<error body could not be read as UTF-8 text>".to_string());
+            let body = error_body(resp).await?;
             return Err(RouterError::HttpStatus {
                 status: status.as_u16(),
                 body: truncate_for_error(&body, ERROR_BODY_CAP),
@@ -352,11 +372,7 @@ impl Router {
         let status = resp.status();
 
         if !status.is_success() {
-            // Best effort: read the body for operator triage. If the
-            // body itself fails to read we still want a useful error.
-            let body = resp.text().await.unwrap_or_else(|_| {
-                "<error body could not be read as UTF-8 text>".to_string()
-            });
+            let body = error_body(resp).await?;
             return Err(RouterError::HttpStatus {
                 status: status.as_u16(),
                 body: truncate_for_error(&body, ERROR_BODY_CAP),

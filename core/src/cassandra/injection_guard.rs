@@ -9,7 +9,9 @@
 //! On `InjectionDecision::Block` the caller replaces the worker
 //! result with a redacted placeholder and writes a second audit row
 //! carrying only the SHA-256 of the scanned body + length + score +
-//! class codes — never the raw scanned text. See
+//! class codes — never the raw scanned text. Since the guard-model
+//! wiring slice that row also carries `tier`, and on a guard-model
+//! block `p` and `tau`; the catalogue is tier 1 of two. See
 //! [`docs/superpowers/specs/2026-05-28-worker-output-prompt-injection-guard-design.md`](../../../docs/superpowers/specs/2026-05-28-worker-output-prompt-injection-guard-design.md)
 //! for the full design.
 //!

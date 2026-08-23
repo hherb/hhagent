@@ -6,13 +6,21 @@
 //! ```text
 //! catalogue >= BLOCK_THRESHOLD  ->  Block, model NOT consulted
 //! catalogue <  BLOCK_THRESHOLD  ->  guard configured?
-//!                                     no  -> Allow, audited (NotConfigured)
-//!                                     yes -> probability()
-//!                                              Err(..)     -> Allow, audited (RouterError)
-//!                                              Unmeasured  -> Allow, audited (Unmeasured)
-//!                                              Flagged     -> Block
-//!                                              Clear       -> Allow
+//!                                     no  -> Allow (reported at BOOT, not per dispatch)
+//!                                     yes -> any scannable text?
+//!                                              no  -> Allow, audited (NoScannableText)
+//!                                              yes -> probability()
+//!                                                       Err(..)     -> Allow, audited (RouterError)
+//!                                                       Unmeasured  -> Allow, audited (Unmeasured)
+//!                                                       Flagged     -> Block
+//!                                                       Clear       -> Allow
 //! ```
+//!
+//! The `no` row is annotated deliberately: an unconfigured tier is
+//! reported **once** by the `policy / guard_tier.boot` row and emits no
+//! per-dispatch field at all, so reading that row as a dispatch-time
+//! audit would send someone looking for a row that is never written.
+//! See [`Unadjudicated::NotConfigured`].
 //!
 //! **Escalate-up only.** The model can turn an `Allow` into a `Block`
 //! and never the reverse, so every failure mode of this tier is at
@@ -26,11 +34,17 @@
 //!
 //! Measurement 3 fitted τ = 0.79552656 on 133 cases, 109 of them
 //! captured through the real `web.fetch` path. At that threshold the
-//! tier catches **36 of 55 attacks — 65% recall** at zero false
-//! positives, and the misses concentrate exactly where its rationale is
+//! tier catches **36 of 55 attacks — 65% recall** at an FP-0 threshold,
+//! and the misses concentrate exactly where its rationale is
 //! strongest: bare imperative payloads are caught 6/6 at a median
 //! 0.9955, while the same intent wrapped in a plausible document runs a
 //! median 0.0797 with 5 of 8 missed.
+//!
+//! **"FP-0" is the criterion that CHOSE τ, not a measured
+//! false-positive rate.** τ was fitted and evaluated on the same 133
+//! cases, so zero false positives there is guaranteed by construction.
+//! What the number on an unseen corpus would be is unknown — which is
+//! part of why D5 records `p` on cleared documents in production.
 //!
 //! **So this is advisory defence-in-depth, not a gate**, and nothing
 //! downstream may relax on it: no catalogue weight is lowered because
@@ -50,8 +64,8 @@ pub use boot::{GuardReport, GuardTier, GuardTierError, SharedGuardTier};
 /// A named enum rather than a `bool` plus a log line, for three
 /// reasons. It keeps [`super::decide`]'s ban on an `escalates() -> bool`
 /// helper intact — a caller consuming a bool structurally cannot audit
-/// a distinction it has already erased. It makes the three fail-open
-/// doors **countable** in the audit log. And it makes the mapping
+/// a distinction it has already erased. It makes every fail-open
+/// door **countable** in the audit log. And it makes the mapping
 /// exhaustively testable without a server, which is where the security
 /// decisions actually get pinned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +87,23 @@ pub enum Unadjudicated {
     /// status. Includes the attacker-reachable HTTP 400 of issue #604
     /// and the timeout of issue #586.
     RouterError,
+    /// The result carried **no scannable text**, so there was nothing to
+    /// adjudicate and the model was not asked.
+    ///
+    /// `extract_scannable_text` emits string leaves only, so a result
+    /// like `{"ok": true, "count": 3}` — the ordinary shape for `kv.*`,
+    /// most net workers' status replies, and any tool returning
+    /// structured data — yields an empty body. Sending that to the model
+    /// costs a round trip per dispatch and asks it to judge an empty
+    /// `<Document>`, whose verdict is undefined: a `p >= tau` there would
+    /// withhold a result that contained nothing to inject.
+    ///
+    /// **A named door rather than a silent skip.** The alternative —
+    /// returning no guard report at all — spells this the same way as an
+    /// unconfigured host, and D5's score distribution would silently
+    /// include scores for empty documents. Both are the confusion this
+    /// enum exists to prevent.
+    NoScannableText,
 }
 
 impl Unadjudicated {
@@ -82,6 +113,7 @@ impl Unadjudicated {
             Self::NotConfigured => "not_configured",
             Self::Unmeasured => "unmeasured",
             Self::RouterError => "router_error",
+            Self::NoScannableText => "no_scannable_text",
         }
     }
 }
@@ -177,6 +209,37 @@ pub fn resolve(reading: GuardReading) -> GuardOutcome {
             GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::Unmeasured }
         }
     }
+}
+
+/// The `(outcome, p)` pair for a call that returned a score slot.
+///
+/// **`p` is derived from the adjudication, never forwarded from the
+/// input**, and that is the whole reason this is a function rather than
+/// two lines at the call site. [`super::decide`] has *two* routes to
+/// `GuardAdjudication::Unmeasured` — `None`, and `Some(p)` where `p` is
+/// not finite — and forwarding `raw` verbatim produced an
+/// `AllowUnadjudicated` carrying `Some(NaN)`, contradicting
+/// [`super::GuardReport`]'s stated invariant. It survived only because
+/// `serde_json` renders a non-finite float as `null`: an undocumented
+/// behaviour of a dependency was holding up a security control's audit
+/// shape. `decide` went out of its way to close that door; this keeps
+/// it closed on the way out.
+///
+/// The invariant, pinned by
+/// `score_is_present_exactly_when_the_model_adjudicated`:
+///
+/// ```text
+/// p.is_some()  <=>  !matches!(outcome, AllowUnadjudicated { .. })
+/// ```
+///
+/// Pure.
+pub fn outcome_and_score(raw: Option<f32>, tau: f32) -> (GuardOutcome, Option<f32>) {
+    let adjudication = super::decide(raw, tau);
+    let p = match adjudication {
+        GuardAdjudication::Unmeasured => None,
+        _ => raw,
+    };
+    (resolve(GuardReading::Adjudicated(adjudication)), p)
 }
 
 /// Why an operator-supplied τ is unusable.

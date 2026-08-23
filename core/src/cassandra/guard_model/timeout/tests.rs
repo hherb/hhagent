@@ -81,7 +81,7 @@ fn a_slow_host_clamps_to_the_ceiling_and_says_so() {
     assert_eq!(t.timeout, Duration::from_millis(TIMEOUT_CEILING_MS));
     assert_eq!(clamped_of(&t), Clamped::ToCeiling);
     assert!(
-        t.basis.is_coverage_finding(),
+        t.basis.coverage_finding().is_some(),
         "a ceiling clamp is a finding about the host, not a routine value"
     );
     // The derived figure is retained even though it was clamped away,
@@ -106,7 +106,7 @@ fn a_very_fast_host_clamps_to_the_floor_without_it_being_a_finding() {
     assert_eq!(t.timeout, Duration::from_millis(TIMEOUT_FLOOR_MS));
     assert_eq!(clamped_of(&t), Clamped::ToFloor);
     assert!(
-        !t.basis.is_coverage_finding(),
+        t.basis.coverage_finding().is_none(),
         "a floor clamp costs no coverage -- warning about it buries the one that does"
     );
 }
@@ -125,12 +125,40 @@ fn a_saturated_probe_derives_the_ceiling_and_never_the_floor() {
         Duration::from_millis(TIMEOUT_CEILING_MS),
         "overrunning the probe budget is evidence of slowness, not absence of evidence"
     );
-    assert_eq!(clamped_of(&t), Clamped::ToCeiling);
-    assert!(t.basis.is_coverage_finding());
+    assert!(t.basis.coverage_finding().is_some());
     assert_ne!(
         t.timeout,
         Duration::from_millis(TIMEOUT_FLOOR_MS),
         "the floor would be exactly inverted"
+    );
+    assert_eq!(t.basis, TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS });
+}
+
+/// A saturated probe reports **no throughput and no derivation**, and
+/// that absence is the assertion.
+///
+/// It used to be reported as `Probed`, which forced two fabrications:
+/// a `tok_per_s` computed from `MIN_UNCACHED_PROBE_TOKENS` — a
+/// sample-rejection floor, not a count of anything the probe processed,
+/// giving 12.8 tok/s against a real upper bound of ~40 — and a
+/// `derived_ms` holding the POST-clamp ceiling while the `Probed` arm's
+/// `derived_ms` is the PRE-clamp derivation (pinned above by
+/// `derived_ms > TIMEOUT_CEILING_MS`). One field, two meanings, and
+/// `main.rs` writes the rate into `policy / guard_tier.boot` calling it
+/// the number needed to re-derive the timeout — re-deriving from 12.8
+/// yields ~10.3 million ms against a recorded 120,000.
+#[test]
+fn a_saturated_probe_claims_no_measurement_it_did_not_make() {
+    let t = derive_guard_timeout(&ProbeOutcome::Saturated { budget_ms: PROBE_BUDGET_MS });
+    assert!(
+        !matches!(t.basis, TimeoutBasis::Probed { .. }),
+        "a probe that never returned a sample must not report one: {:?}",
+        t.basis
+    );
+    assert_eq!(
+        t.basis.kind(),
+        "probe-saturated",
+        "`probed` would spell a budget overrun the same way as a real measurement"
     );
 }
 
@@ -155,9 +183,13 @@ fn every_unmeasuring_outcome_takes_the_floor_with_a_distinct_reason() {
             matches!(t.basis, TimeoutBasis::Unprobed { .. }),
             "{outcome:?} must not claim to have probed"
         );
-        assert!(
-            !t.basis.is_coverage_finding(),
-            "{outcome:?} says nothing about coverage"
+        // `Failed` IS a coverage finding -- /props answered, so the call
+        // that just failed is the call every dispatch will make. The
+        // other two say nothing about coverage.
+        assert_eq!(
+            t.basis.coverage_finding().is_some(),
+            matches!(outcome, ProbeOutcome::Failed { .. }),
+            "{outcome:?} reports the wrong coverage verdict"
         );
         assert!(
             seen.insert(t.basis.kind()),
@@ -347,7 +379,7 @@ fn an_operator_pinned_timeout_is_taken_verbatim() {
     assert_eq!(t.timeout, Duration::from_millis(45_000));
     assert_eq!(t.basis, TimeoutBasis::Operator);
     assert!(
-        !t.basis.is_coverage_finding(),
+        t.basis.coverage_finding().is_none(),
         "an operator's own number is not a finding about the host"
     );
 }
@@ -431,3 +463,57 @@ fn the_probe_body_is_the_measured_size_and_carries_no_prose() {
         "the probe must clear the uncached floor comfortably, got ~{expected_tokens}"
     );
 }
+
+/// Every `timeout_basis` token is distinct and log-field shaped.
+///
+/// These strings go straight into the `policy / guard_tier.boot` row and
+/// the boot line. `Unprobed`'s three were covered; `Operator`,
+/// `Probed` and `Saturated` were not, and a `Saturated` reported as
+/// `"probed"` would spell a budget overrun the same way as a real
+/// measurement — which it did until this PR.
+#[test]
+fn every_timeout_basis_token_is_distinct_and_log_shaped() {
+    let bases = [
+        TimeoutBasis::Operator,
+        TimeoutBasis::Probed { tok_per_s: 5_000.0, derived_ms: 26_000, clamped: Clamped::No },
+        TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS },
+        TimeoutBasis::Unprobed { reason: UnprobedReason::Nonsensical },
+        TimeoutBasis::Unprobed { reason: UnprobedReason::TooFewUncachedTokens },
+        TimeoutBasis::Unprobed { reason: UnprobedReason::NoTokenCount },
+        TimeoutBasis::Unprobed { reason: UnprobedReason::Failed },
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for b in &bases {
+        let k = b.kind();
+        assert!(!k.is_empty());
+        assert!(!k.chars().any(char::is_whitespace), "not a log token: {k:?}");
+        assert!(seen.insert(k), "duplicate timeout_basis token {k:?}");
+    }
+    assert_eq!(seen.len(), bases.len());
+}
+
+/// The band is pinned to literals, not only to itself.
+///
+/// Every other test in this file expresses its expectation in terms of
+/// `TIMEOUT_FLOOR_MS`/`TIMEOUT_CEILING_MS`, so moving a bound moves the
+/// assertions with it and nothing fails. `context_pin` pins
+/// `REQUIRED_GUARD_N_CTX` to a literal for exactly this reason: a change
+/// to a security-relevant constant should be a visible diff here.
+#[test]
+fn the_derivation_band_is_pinned_to_its_documented_values() {
+    assert_eq!(TIMEOUT_FLOOR_MS, 15_000, "D2's value, kept as the floor");
+    assert_eq!(TIMEOUT_CEILING_MS, 120_000);
+    assert_eq!(PROBE_BUDGET_MS, 20_000);
+    assert_eq!(MIN_UNCACHED_PROBE_TOKENS, 256);
+}
+
+/// A probe budget at or below the floor would saturate on hosts the
+/// floor is perfectly adequate for, sending them to the ceiling.
+///
+/// A `const` assertion rather than a test body: the relation is between
+/// two constants, so it can be a **compile** error rather than a
+/// failing run.
+const _: () = assert!(
+    PROBE_BUDGET_MS > TIMEOUT_FLOOR_MS,
+    "PROBE_BUDGET_MS must exceed TIMEOUT_FLOOR_MS"
+);
