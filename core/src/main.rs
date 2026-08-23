@@ -91,7 +91,15 @@ async fn report_guard_tier(
              catalogue only. Set KASTELLAN_LLM_GUARD_URL, KASTELLAN_LLM_GUARD_MODEL and \
              KASTELLAN_LLM_GUARD_TAU to enable it."
         );
-        let payload = serde_json::json!({"configured": false});
+        // The SAME token the per-dispatch `guard.state` vocabulary uses, so
+        // "no tier ran" has one spelling across the audit log rather than a
+        // live half and an orphaned half. This boot row is deliberately the
+        // ONLY producer of it: a per-dispatch `not_configured` field would be
+        // a constant on every row of an unconfigured host.
+        let payload = serde_json::json!({
+            "configured": false,
+            "state": kastellan_core::cassandra::guard_model::Unadjudicated::NotConfigured.as_str(),
+        });
         if let Err(e) =
             kastellan_db::audit::insert(pool, "policy", "guard_tier.boot", payload).await
         {
