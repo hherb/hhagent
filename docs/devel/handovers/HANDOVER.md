@@ -92,8 +92,11 @@ No new rows. `policy / injection.blocked` gains `tier: "catalogue" | "guard_mode
 instead of re-testing `>= BLOCK_THRESHOLD` a module away. The repo has already paid once for
 a second inline copy (`render_per_case` drifting from `decide`).
 
-**Verification.** **DGX `00fdc513` (branch tip): 3823 / 0 / 54, `TEST_EXIT=0`, 175 suites,
-`--no-fail-fast --nocapture`.** Reconciles **exactly**: `main` 3759 **+64** = core lib +47
+**Verification.** **DGX `69834357` (branch tip): 3823 / 0 / 54, `TEST_EXIT=0`, 175 suites,
+`--no-fail-fast --nocapture`.** Re-gated *after* the `cache_buster` rename, so the tip is gated
+rather than reasoned about — the count is unchanged because the rename is identifier-only and
+renames one test function without adding or removing any. `guard_tier_e2e` ran **13 / 0 on the DGX
+too**, under real bwrap and live PG, not only on the Mac. Reconciles **exactly**: `main` 3759 **+64** = core lib +47
 (context_pin 12, timeout 19, tier 16), `guard_tier_e2e` +13, llm-router +4. The intermediate gate at
 `3ad32005` read 3821, and the +2 is exactly the m13 commit's one unit test and one e2e case. Suites
 174 → 175 for the new test binary; `ignored` unchanged at 54. **8 `[SKIP]` lines, all gliner-relex** (4 × `KASTELLAN_GLINER_RELEX_ENABLE`, 4 × venv shim) —
@@ -413,7 +416,7 @@ review round widened it from two invariants to three, in [`archive/handover_2026
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
-| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`00fdc513`** — the tip of `feat/guard-wiring-slice-586` | **3823 / 0 / 54**, `TEST_EXIT=0`, `--no-fail-fast --nocapture`, **175 suites**. Reconciles exactly: `main` 3759 **+64** (core lib +47, `guard_tier_e2e` +13, llm-router +4); the earlier `3ad32005` gate read 3821 and the +2 is the m13 commit's one unit + one e2e test; suites 174 → 175 for the new binary | `CLIPPY_EXIT=0`, **3 `Checking` lines** — an *incremental* count over the changed crates' reverse-dependency set in a warm dir, NOT a 27-crate sweep; the Mac's 213-line cold run is the load-bearing lint | **8**, all gliner-relex (4 × `ENABLE`, 4 × venv shim) — *not* the bwrap-userns skip, so containment really ran |
+| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`69834357`** — the tip of `feat/guard-wiring-slice-586`, re-gated after the `cache_buster` rename | **3823 / 0 / 54**, `TEST_EXIT=0`, `--no-fail-fast --nocapture`, **175 suites**. Reconciles exactly: `main` 3759 **+64** (core lib +47, `guard_tier_e2e` +13, llm-router +4); the earlier `3ad32005` gate read 3821 and the +2 is the m13 commit's one unit + one e2e test; suites 174 → 175 for the new binary. `guard_tier_e2e` **13 / 0 here as well as on the Mac** | `CLIPPY_EXIT=0`, **3 `Checking` lines** — an *incremental* count over the changed crates' reverse-dependency set in a warm dir, NOT a 27-crate sweep; the Mac's 213-line cold run is the load-bearing lint | **8**, all gliner-relex (4 × `ENABLE`, 4 × venv shim) — *not* the bwrap-userns skip, so containment really ran |
 | **Mac** (aarch64 darwin, Seatbelt + Postgres.app 18 via `KASTELLAN_PG_BIN_DIR`) | `feat/guard-wiring-slice-586` | **targeted, not a sweep:** llm-router lib **87 / 0**, core lib **1923 / 0 / 1**, `guard_tier_e2e` **13 / 0 with zero `[SKIP]`** (real PG, real sandboxed worker, real `dispatch`). **13 mutants: 12 killed, 1 equivalent** | `CLIPPY_EXIT=0`, zero warnings, **213 `Checking` lines** from a COLD private target dir (1m04s) — an honest full-workspace lint, not the warm-cache false green | **0** on `guard_tier_e2e` under the PG override |
 | **DGX** | **`0bae6b2c`** → merged as `d51c9b20` = **`main`** | **3759 / 0 / 54**, 174 suites — the baseline this branch's +62 reconciles against |
 Older rows (`f46c67cf` 3749, `2ab6612c` 3686, `b58edc77` 3668, and 3047 back to 2950) are in the [`archive/`](archive/) snapshots — most recently [`handover_20260823_wiring-slice_pre-prune.md`](archive/handover_20260823_wiring-slice_pre-prune.md) § Test baseline.

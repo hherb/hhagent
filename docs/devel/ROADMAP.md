@@ -471,7 +471,7 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   **advisory defence-in-depth, not a gate** — 65% recall, weakest against narrative
   indirect injection — and nothing downstream may relax on it. D5's per-dispatch `p`, on
   **cleared** documents too, makes production the score source for a corpus that is not
-  catalogue-selected. **DGX gate `00fdc513`: 3823 / 0 / 54**, `TEST_EXIT=0`, 175 suites,
+  catalogue-selected. **DGX gate `69834357` (branch tip): 3823 / 0 / 54**, `TEST_EXIT=0`, 175 suites,
   reconciling exactly against `main` 3759 **+64**; 8 `[SKIP]` all gliner-relex, *not* the
   bwrap-userns skip. Mac: `guard_tier_e2e` 13/0 with zero `[SKIP]` under real PG; clippy
   `-D warnings` exit 0 over **213** `Checking` lines from a cold target dir. **13 mutants,
