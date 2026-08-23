@@ -689,6 +689,73 @@ async fn with_no_override_the_boot_probe_runs_and_derives_a_budget() {
     assert_eq!(tier.tau(), FITTED_TAU);
 }
 
+/// D9: a probe that overruns its budget derives the **CEILING**.
+///
+/// The one case that exercises `is_timeout` end to end, and the reason it is
+/// worth its wall-clock: a mutation making that predicate always-false
+/// survived every other test in this file and in the unit suite, and its
+/// effect is to hand the **slowest** hosts the **shortest** guard timeout —
+/// a fail-open that shows up as nothing at all.
+///
+/// The mock accepts the connection and never answers, so the probe client's
+/// own `PROBE_BUDGET_MS` budget is what ends the call. `/props` still answers,
+/// because the tier must get past D8's fatal check to reach the probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
+    use kastellan_core::cassandra::guard_model::timeout::{
+        Clamped, TimeoutBasis, TIMEOUT_CEILING_MS,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let Some((head, _body)) = read_request(&mut sock).await else { return };
+                if head.starts_with("GET") && head.contains("/props") {
+                    let payload = props_body();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {len}\r\nConnection: close\r\n\r\n{payload}",
+                        len = payload.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return;
+                }
+                // The chat completion: hold the socket open and never answer.
+                // Keeping `sock` alive is the whole mechanism — dropping it
+                // would close the connection and produce a transport error
+                // that is NOT a timeout, which is the other arm.
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let cfg = RouterConfig {
+        guard_timeout_ms: None, // no override: the probe must run
+        ..pinned_cfg(&format!("http://127.0.0.1:{port}/v1"))
+    };
+    let tier = build_tier(&cfg).await;
+
+    let budget = tier.timeout();
+    assert_eq!(
+        budget.timeout.as_millis() as u64,
+        TIMEOUT_CEILING_MS,
+        "an overrun probe is an upper bound on throughput, not a missing measurement"
+    );
+    match budget.basis {
+        TimeoutBasis::Probed { clamped, .. } => assert_eq!(clamped, Clamped::ToCeiling),
+        ref other => panic!("expected a probed basis reporting the ceiling, got {other:?}"),
+    }
+    assert!(
+        budget.basis.is_coverage_finding(),
+        "a host this slow is a finding, not a routine value"
+    );
+    handle.abort();
+}
+
 /// The operator override skips the probe entirely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_operator_pinned_timeout_skips_the_probe() {

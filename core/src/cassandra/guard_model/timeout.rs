@@ -279,6 +279,27 @@ pub fn probe_sample(reading: ProbeReading) -> ProbeOutcome {
     ProbeOutcome::Measured { uncached_tokens, elapsed_ms: reading.elapsed_ms }
 }
 
+/// Map a *failed* probe call to an outcome.
+///
+/// Pure, so the floor/ceiling choice is pinned without a server. The
+/// split matters because the two directions are not symmetric: a
+/// timeout is an **upper bound on throughput** and must reach the
+/// ceiling, while any other failure knows nothing about the host and
+/// takes the floor. Sending a timeout to the floor would hand the
+/// slowest hosts the shortest guard timeout — the inversion
+/// [`derive_guard_timeout`] warns about, arriving one function earlier.
+///
+/// `timed_out` is supplied by the caller because only the transport can
+/// answer it; that one-line boundary is exercised end to end by
+/// `guard_tier_e2e::a_probe_that_overruns_its_budget_derives_the_ceiling`.
+pub fn probe_error_outcome(timed_out: bool, why: String, budget_ms: u64) -> ProbeOutcome {
+    if timed_out {
+        ProbeOutcome::Saturated { budget_ms }
+    } else {
+        ProbeOutcome::Failed { why }
+    }
+}
+
 /// Clamp `derived_ms` into the band and say which bound it hit.
 ///
 /// Pure, and separate from [`derive_guard_timeout`] so the band is one

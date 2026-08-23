@@ -167,6 +167,39 @@ fn every_unmeasuring_outcome_takes_the_floor_with_a_distinct_reason() {
     }
 }
 
+/// The two directions a failed probe can take, and they are NOT
+/// symmetric.
+///
+/// A timeout is an upper bound on throughput — the only failure that
+/// says something about the host — so it must reach the ceiling. Any
+/// other failure knows nothing and takes the floor. Getting this
+/// backwards hands the slowest hosts the shortest guard timeout, which
+/// is a fail-open that shows up as nothing at all.
+#[test]
+fn a_timed_out_probe_saturates_while_any_other_failure_is_merely_failed() {
+    assert_eq!(
+        probe_error_outcome(true, "irrelevant".to_string(), PROBE_BUDGET_MS),
+        ProbeOutcome::Saturated { budget_ms: PROBE_BUDGET_MS },
+        "a timeout is evidence of slowness and must reach the ceiling"
+    );
+    assert_eq!(
+        probe_error_outcome(false, "connection refused".to_string(), PROBE_BUDGET_MS),
+        ProbeOutcome::Failed { why: "connection refused".to_string() },
+        "a connection failure says nothing about throughput"
+    );
+
+    // And the consequence the split exists for, asserted end to end.
+    let timed_out = derive_guard_timeout(&probe_error_outcome(true, String::new(), PROBE_BUDGET_MS));
+    let refused =
+        derive_guard_timeout(&probe_error_outcome(false, "refused".to_string(), PROBE_BUDGET_MS));
+    assert_eq!(timed_out.timeout, Duration::from_millis(TIMEOUT_CEILING_MS));
+    assert_eq!(refused.timeout, Duration::from_millis(TIMEOUT_FLOOR_MS));
+    assert!(
+        timed_out.timeout > refused.timeout,
+        "a slow host must end up with a LONGER budget than an unreachable one"
+    );
+}
+
 // ── probe_sample: turning a raw reading into an outcome ──────────────
 
 /// M2 row 3, the contaminated repeat, is the fixture that kills the

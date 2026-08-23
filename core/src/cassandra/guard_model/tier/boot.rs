@@ -268,8 +268,11 @@ async fn run_probe(client: &GuardClient, nonce: &str) -> ProbeOutcome {
     let document = timeout::probe_document(nonce);
     match client.timed_probe(&document).await {
         Ok(reading) => timeout::probe_sample(reading),
-        Err(e) if is_timeout(&e) => ProbeOutcome::Saturated { budget_ms: timeout::PROBE_BUDGET_MS },
-        Err(e) => ProbeOutcome::Failed { why: e.to_string() },
+        Err(e) => timeout::probe_error_outcome(
+            is_timeout(&e),
+            e.to_string(),
+            timeout::PROBE_BUDGET_MS,
+        ),
     }
 }
 
