@@ -33,7 +33,7 @@
 //!    with `cached_tokens: 809`, which a naive `tokens / elapsed` reads
 //!    as **21,094 tok/s** against the same server's true ~5,000 — a 4x
 //!    over-estimate, deriving a timeout 4x too short. Two defences: the
-//!    probe document carries a per-boot nonce **prefix** (measured to
+//!    probe document carries a per-boot cache-busting **prefix** (measured to
 //!    give `cached_tokens: 0` on consecutive cold runs, agreeing within
 //!    3%), and throughput is computed over **uncached** tokens only, so
 //!    a cache hit shrinks the sample rather than inflating the rate.
@@ -115,8 +115,8 @@ pub const WORST_CASE_TOKENS: u64 = REQUIRED_GUARD_N_CTX;
 /// boots and across hosts. Density is what matters, not content — the
 /// guard's verdict on it is discarded; only the timing is read.
 ///
-/// See [`probe_document`], which prefixes a per-boot nonce so the
-/// sample is cold.
+/// See [`probe_document`], which prefixes a per-boot varying string
+/// so the sample is cold.
 const PROBE_BODY: &str = concat!(
     "PtYgj}mU~h=Bel31iEl]2h>pC~h|~YgCf<rL1s[p|N<xn~|yVm]i>hA/}2O7~6UM",
     "FxFk|M{/R5Kjp_1vRt+1fj<|ORS/~6ilI8ihN|5KXSc7Tvo/hBKqFYY/kv5Z]Jr3",
@@ -234,18 +234,26 @@ pub struct GuardTimeout {
     pub basis: TimeoutBasis,
 }
 
-/// The probe document: a per-boot `nonce` followed by [`PROBE_BODY`].
+/// The probe document: a per-boot `cache_buster` followed by
+/// [`PROBE_BODY`].
 ///
-/// **The nonce goes first, and that is the whole mechanism.** A prefix
-/// cache matches from position 0, so a varying prefix guarantees the
-/// sample is cold; a varying *suffix* would leave the body cached and
-/// reproduce M2's 4x over-estimate. Measured: consecutive cold runs
-/// with different nonces both reported `cached_tokens: 0` and agreed
+/// **The cache-buster goes first, and that is the whole mechanism.** A
+/// prefix cache matches from position 0, so a varying prefix guarantees
+/// the sample is cold; a varying *suffix* would leave the body cached
+/// and reproduce M2's 4x over-estimate. Measured: consecutive cold runs
+/// with different prefixes both reported `cached_tokens: 0` and agreed
 /// within 3%.
 ///
-/// Pure — the caller supplies the nonce, so this stays testable.
-pub fn probe_document(nonce: &str) -> String {
-    format!("{nonce}\n{PROBE_BODY}")
+/// **Deliberately not called a "nonce".** It is not secret, not
+/// authenticating anything, and not protecting against replay — it
+/// exists only to make this boot's prompt differ from the last one's.
+/// Naming it a nonce overstates its role to a reader, and CodeQL's
+/// `rust/hard-coded-cryptographic-value` rule reads the name and flags
+/// every caller that passes a literal.
+///
+/// Pure — the caller supplies the value, so this stays testable.
+pub fn probe_document(cache_buster: &str) -> String {
+    format!("{cache_buster}\n{PROBE_BODY}")
 }
 
 /// Turn one raw reading into an outcome.
@@ -261,7 +269,7 @@ pub fn probe_document(nonce: &str) -> String {
 /// **`cached_tokens` is subtracted, not ignored.** An absent block
 /// means the backend reports no cache and is treated as zero cached —
 /// which is safe only because the uncached-token floor still applies to
-/// the result, and because the nonce prefix makes a cache hit unlikely
+/// the result, and because the varying prefix makes a cache hit unlikely
 /// in the first place. Saturating subtraction, so a backend reporting
 /// more cached than prompt tokens yields zero rather than wrapping to
 /// four billion.

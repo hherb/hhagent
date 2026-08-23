@@ -53,14 +53,17 @@ design.**
 > two constants.** Three requests against the DGX guard server, 2026-08-23:
 > | request | wall | `prompt_tokens` | `cached_tokens` | uncached tok/s |
 > | --- | --- | --- | --- | --- |
-> | cold, nonce `n1` | 159.3 ms | 810 | 0 | **5 084.6** |
-> | cold, nonce `n2` | 164.1 ms | 810 | 0 | **4 935.0** |
+> | cold, prefix `n1` | 159.3 ms | 810 | 0 | **5 084.6** |
+> | cold, prefix `n2` | 164.1 ms | 810 | 0 | **4 935.0** |
 > | repeat of `n2` | 38.4 ms | 810 | **809** | 26.1 |
 >
-> Three facts, each load-bearing. (1) **A nonce PREFIX defeats the prefix cache** — both
+> Three facts, each load-bearing. (1) **A varying PREFIX defeats the prefix cache** (a *cache-buster*, deliberately not called a nonce — see below) — both
 > cold samples report `cached_tokens: 0`, agree within 3%, and land inside M1's
 > independently measured 4 039–6 660 band, so a 1 KiB probe stands in for a 64 KiB document
-> at 1/64th the cost. A nonce *suffix* would not: a prefix cache matches from position 0.
+> at 1/64th the cost. A *suffix* would not: a prefix cache matches from position 0. It is named
+> `cache_buster`, **not** `nonce` — it is not secret, authenticates nothing and guards no replay,
+> and CodeQL's `rust/hard-coded-cryptographic-value` rule reads the *parameter name* and flags every
+> caller passing a literal (it did: 5 critical alerts on PR #607, all from the word).
 > (2) **The contaminated repeat is catchable, and catching it matters** — naive
 > `prompt_tokens / elapsed` reads **21 094 tok/s** there, a **4× over-estimate** deriving a
 > timeout 4× too short. `usage.prompt_tokens_details.cached_tokens` makes it *detectable*,

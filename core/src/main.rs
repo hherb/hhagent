@@ -264,7 +264,7 @@ async fn main() -> Result<()> {
     //
     // The throughput probe underneath this is deliberately NOT fatal: it picks
     // a timeout, it does not verify a control.
-    let guard_boot_nonce = format!(
+    let guard_probe_cache_buster = format!(
         "kastellan-guard-probe-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -273,7 +273,7 @@ async fn main() -> Result<()> {
     );
     let guard_tier = kastellan_core::cassandra::guard_model::GuardTier::from_router_config(
         &router_cfg,
-        &guard_boot_nonce,
+        &guard_probe_cache_buster,
     )
     .await
     .map_err(|e| anyhow!("guard tier: {e}"))?

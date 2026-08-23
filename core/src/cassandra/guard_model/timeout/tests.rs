@@ -390,15 +390,15 @@ fn a_zero_operator_timeout_is_refused_but_one_millisecond_is_not() {
 
 // ── the probe document ──────────────────────────────────────────────
 
-/// The nonce goes FIRST. A prefix cache matches from position 0, so a
-/// nonce suffix would leave the body cached and reproduce the 4x
-/// over-estimate this whole module is built to avoid.
+/// The varying part goes FIRST. A prefix cache matches from position
+/// 0, so putting it at the end would leave the body cached and
+/// reproduce the 4x over-estimate this whole module is built to avoid.
 #[test]
-fn the_probe_document_leads_with_the_nonce() {
+fn the_probe_document_leads_with_the_cache_buster() {
     let doc = probe_document("boot-1724371200");
     assert!(
         doc.starts_with("boot-1724371200"),
-        "the nonce must be a PREFIX; a suffix leaves the body cacheable"
+        "the cache-buster must be a PREFIX; a suffix leaves the body cacheable"
     );
     assert!(doc.contains(PROBE_BODY), "the constant body must be present in full");
     // Two boots differ from the first byte.

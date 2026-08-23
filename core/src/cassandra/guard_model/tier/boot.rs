@@ -152,7 +152,7 @@ impl GuardTier {
     /// measurement.
     pub async fn from_router_config(
         cfg: &RouterConfig,
-        nonce: &str,
+        cache_buster: &str,
     ) -> Result<Option<Self>, GuardTierError> {
         // Step 1 + 2. `for_guard` owns the URL/model tri-state; the
         // probe budget is a placeholder here and never reaches
@@ -196,7 +196,7 @@ impl GuardTier {
             Some(ms) => {
                 timeout::validate_operator_timeout(ms).map_err(GuardTierError::Timeout)?
             }
-            None => timeout::derive_guard_timeout(&run_probe(&probe_client, nonce).await),
+            None => timeout::derive_guard_timeout(&run_probe(&probe_client, cache_buster).await),
         };
 
         let client = GuardClient::from_config(cfg, timeout.timeout)
@@ -264,8 +264,8 @@ impl GuardTier {
 /// [`timeout::PROBE_BUDGET_MS`] imposes, which is reported as
 /// [`ProbeOutcome::Saturated`] because an overrun budget is an *upper
 /// bound on throughput* rather than a missing measurement.
-async fn run_probe(client: &GuardClient, nonce: &str) -> ProbeOutcome {
-    let document = timeout::probe_document(nonce);
+async fn run_probe(client: &GuardClient, cache_buster: &str) -> ProbeOutcome {
+    let document = timeout::probe_document(cache_buster);
     match client.timed_probe(&document).await {
         Ok(reading) => timeout::probe_sample(reading),
         Err(e) => timeout::probe_error_outcome(

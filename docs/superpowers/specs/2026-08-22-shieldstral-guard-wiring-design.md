@@ -282,17 +282,17 @@ diverging.
 Run 2026-08-23 on the DGX against the same `llama-server` measurement 3 used
 (`Shieldstral-1.0-3B-Q8_0`, `-c 131072`, `-ngl 99`, port 8081). Three requests, one probe
 document of **1024 bytes of token-dense text** (mixed case, digits, symbol runs — the
-shape #604 found at 1.47 bytes/token), each prefixed by a short nonce:
+shape #604 found at 1.47 bytes/token), each prefixed by a short varying string (a **cache-buster**, not a nonce — it is not secret and authenticates nothing):
 
 | request | wall | `prompt_tokens` | `cached_tokens` | uncached | uncached tok/s |
 | --- | --- | --- | --- | --- | --- |
-| cold, nonce `n1` | 159.3 ms | 810 | 0 | 810 | **5,084.6** |
-| cold, nonce `n2` | 164.1 ms | 810 | 0 | 810 | **4,935.0** |
-| repeat of nonce `n2` | 38.4 ms | 810 | **809** | 1 | 26.1 |
+| cold, prefix `n1` | 159.3 ms | 810 | 0 | 810 | **5,084.6** |
+| cold, prefix `n2` | 164.1 ms | 810 | 0 | 810 | **4,935.0** |
+| repeat of prefix `n2` | 38.4 ms | 810 | **809** | 1 | 26.1 |
 
 **Three facts this establishes, each load-bearing for D9.**
 
-1. **A nonce prefix defeats the prefix cache.** The two cold samples report
+1. **A varying prefix defeats the prefix cache.** The two cold samples report
    `cached_tokens: 0` and agree within 3%, and both land inside M1's independently measured
    4,039–6,660 tok/s band. So a ~1 KiB probe reproduces the throughput a 64 KiB document
    will see, at 1/64th of the cost.
@@ -390,8 +390,11 @@ Explicit beats measured; it keeps the value pinnable and every timeout test dete
 **When unset, one probe runs at boot**, after the D8 checks, against the same endpoint:
 
 1. Send one adjudication of `PROBE_BYTES` (1024) of committed dense text, prefixed by a
-   per-boot nonce. The nonce is what makes the sample cold (M2, fact 1); the body is a
-   constant so the measurement is comparable across boots.
+   per-boot **cache-buster**. That prefix is what makes the sample cold (M2, fact 1); the body
+   is a constant so the measurement is comparable across boots. It is deliberately **not**
+   called a nonce — it is not secret, authenticates nothing, and guards no replay, and naming
+   it one both overstates its role and trips CodeQL's `rust/hard-coded-cryptographic-value`
+   rule on every caller that passes a literal.
 2. Read `usage.prompt_tokens` and `usage.prompt_tokens_details.cached_tokens`, and measure
    wall clock.
 3. Compute throughput over **uncached** tokens only:

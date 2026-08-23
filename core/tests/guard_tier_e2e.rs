@@ -41,6 +41,16 @@ const PRINTF_PATH: &str = "/usr/bin/printf";
 /// number production would.
 const FITTED_TAU: f32 = 0.795_526_56;
 
+/// The per-boot varying prefix the probe document leads with.
+///
+/// **Not a nonce**, despite occupying the same slot a nonce would: it is not
+/// secret, authenticates nothing, and protects against no replay. Its only job
+/// is to make this boot's prompt differ from the last one's so llama-server's
+/// prefix cache misses — see `timeout::probe_document`. Production derives it
+/// from the wall clock; a fixed value is correct here because each test builds
+/// its own mock.
+const E2E_CACHE_BUSTER: &str = "guard-tier-e2e-probe";
+
 /// Big enough to satisfy D8's `REQUIRED_GUARD_N_CTX`; the value the DGX guard
 /// server actually reports.
 const MOCK_N_CTX: u64 = 131_072;
@@ -337,7 +347,7 @@ async fn last_tool_row(pool: &sqlx::PgPool) -> serde_json::Value {
 
 async fn build_tier(cfg: &RouterConfig) -> Arc<GuardTier> {
     Arc::new(
-        GuardTier::from_router_config(cfg, "e2e-nonce")
+        GuardTier::from_router_config(cfg, E2E_CACHE_BUSTER)
             .await
             .expect("tier builds against the mock")
             .expect("tier is configured"),
@@ -586,7 +596,7 @@ async fn a_backend_with_too_little_context_refuses_to_build_the_tier() {
     });
 
     let cfg = pinned_cfg(&format!("http://127.0.0.1:{port}/v1"));
-    let err = GuardTier::from_router_config(&cfg, "e2e-nonce")
+    let err = GuardTier::from_router_config(&cfg, E2E_CACHE_BUSTER)
         .await
         .expect_err("32768 tokens cannot hold a worst-case document");
     let msg = err.to_string();
@@ -608,7 +618,7 @@ async fn a_guard_configured_without_a_tau_refuses_to_build() {
         guard_tau: None,
         ..pinned_cfg(&mock.base_url)
     };
-    let err = GuardTier::from_router_config(&cfg, "e2e-nonce")
+    let err = GuardTier::from_router_config(&cfg, E2E_CACHE_BUSTER)
         .await
         .expect_err("a guard without a tau is a misconfiguration");
     let msg = err.to_string();
@@ -634,7 +644,7 @@ async fn a_pinned_timeout_of_zero_refuses_to_build() {
         guard_timeout_ms: Some(0),
         ..pinned_cfg(&mock.base_url)
     };
-    let err = GuardTier::from_router_config(&cfg, "e2e-nonce")
+    let err = GuardTier::from_router_config(&cfg, E2E_CACHE_BUSTER)
         .await
         .expect_err("a zero timeout silently disables the tier");
     let msg = err.to_string();
@@ -645,7 +655,7 @@ async fn a_pinned_timeout_of_zero_refuses_to_build() {
     // above a claim about usability rather than about taste.
     let ok = RouterConfig { guard_timeout_ms: Some(1), ..pinned_cfg(&mock.base_url) };
     assert!(
-        GuardTier::from_router_config(&ok, "e2e-nonce").await.is_ok(),
+        GuardTier::from_router_config(&ok, E2E_CACHE_BUSTER).await.is_ok(),
         "the refusal is for the unusable, not for the unwise"
     );
 }
@@ -670,9 +680,9 @@ async fn with_no_override_the_boot_probe_runs_and_derives_a_budget() {
     assert_eq!(mock.completions(), 1, "the boot probe made exactly one call");
     let bodies = mock.bodies();
     assert!(
-        bodies[0].contains("e2e-nonce"),
-        "the probe document must lead with the per-boot nonce, or the prefix cache \
-         makes the sample meaningless"
+        bodies[0].contains(E2E_CACHE_BUSTER),
+        "the probe document must lead with the per-boot varying prefix, or the \
+         prefix cache makes the sample meaningless"
     );
 
     let budget = tier.timeout();
