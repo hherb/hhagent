@@ -451,7 +451,28 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   - **Why it is a prerequisite and not a nicety:** without it, a recurring task raises the same approval every run, the operator approves reflexively, and the gate has negative value — it trains the habit it exists to prevent while still costing a round trip.
 - [ ] Policy gate: per-tool, per-task, per-data-classification routing decision
 - [ ] Frontier escalation through egress proxy (Anthropic / OpenAI)
-- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 MERGED 2026-08-23 as `d51c9b20` (PR [#606](https://github.com/hherb/kastellan/pull/606)); the WIRING slice MERGED 2026-08-23 as `8736f559` (PR [#607](https://github.com/hherb/kastellan/pull/607)).**
+- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 MERGED 2026-08-23 as `d51c9b20` (PR [#606](https://github.com/hherb/kastellan/pull/606)); the WIRING slice MERGED 2026-08-23 as `8736f559` (PR [#607](https://github.com/hherb/kastellan/pull/607)); **LIVE ON THE DGX since 2026-08-23**.**
+  **FIRST PRODUCTION RUN 2026-08-23.** Deployed to the DGX with the three guard keys in the operator
+  overlay. Boot: `tau=0.79552656 timeout_ms=21752 timeout_basis=probed n_ctx=131072`, with
+  `tok_per_s: 6072.99` in the `policy / guard_tier.boot` row — and the derivation reproduces D9's
+  formula exactly (66 048 / 6072.99 * 1000 * 2 = 21 750 vs 21 752 logged). A cleared `web.fetch`
+  recorded `p = 0.0074` at 75 ms. **A real attack document was BLOCKED end to end**: a Wayback
+  jailbreakchat snapshot scored **p = 0.9199** against tau = 0.7955, the result was withheld, and the
+  `injection.blocked` row reads `tier: "guard_model"` with the catalogue's own `score: 0.0` and
+  `reason_codes: []` — the deterministic tier missed it completely, which is the whole thesis of the
+  slice demonstrated rather than argued (1 658 ms on 4 183 bytes).
+  **The bring-up found what the mocks could not.** The 4 KiB audit cap replaced an over-cap payload
+  *in its entirety*, so a tool result past ~4 KiB took the guard score with it (measured live at
+  85 352 bytes) — and biased the wrong way, since a *blocked* dispatch keeps its score while a
+  *cleared* one loses it, which is exactly D5's half. Fixed by `PRESERVED_KEYS` in `db/src/audit.rs`,
+  mutation-proven, with an e2e that reads the row back out of Postgres because a recording sink sees
+  the payload the caller PASSED, never the one the database STORED.
+  **[#612](https://github.com/hherb/kastellan/issues/612) filed, not fixed:** D9's probe extrapolates
+  linearly from ~1 KiB; the DGX is flat (1.09x) but the Mac is **4.37x** optimistic (1 137 tok/s at
+  1 KiB, **260 at 64 KiB**), so a worst-case document takes 171 s against a derived 91 s and **fails
+  OPEN** without firing the ceiling-clamp warning. Metal hosts should pin
+  `KASTELLAN_LLM_GUARD_TIMEOUT_MS` until it is settled. This corrects the earlier expectation that the
+  Mac would clamp to the 120 s ceiling: it does not, and that is the defect.
   **WIRING SLICE MERGED 2026-08-23** (`8736f559`, PR [#607](https://github.com/hherb/kastellan/pull/607), closes
   [#586](https://github.com/hherb/kastellan/issues/586)) — the tier reaches
   `post_process::finalize` as a threaded `Option<Arc<GuardTier>>`, catalogue first with a
