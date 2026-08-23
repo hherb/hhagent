@@ -142,6 +142,16 @@ placeholder fields) and m13 die at layer 2 ONLY**; the rest at layer 1 only.
 > off on this host" must be a query, not an inference from a row that could be absent for two
 > different reasons.
 
+> ⚠️ **CodeQL failed this PR with 5 critical alerts, all five in code the branch added, and all
+> five from ONE WORD.** `rust/hard-coded-cryptographic-value` reads the **parameter name**, so every
+> caller passing a literal to something called `nonce` is flagged. The rule had a point: the probe's
+> varying prefix is not a nonce by any reading — not secret, authenticating nothing, guarding no
+> replay — and calling it one overstated its role to a human auditor exactly as much as to the
+> scanner. Renamed `cache_buster` throughout rather than dismissed. **The generalisable bit: CodeQL's
+> crypto rules fire on identifier names, so a security-flavoured word used loosely costs a red check
+> and, worse, invites a reader to look for a property that is not there.** The ask channel's `nonce`
+> is untouched and stays — that one *is* a bearer token.
+
 **Clippy:** Mac `-D warnings` exit 0, **zero warnings**, over **213 `Checking` lines** from a
 **cold** private target dir — an honest full-workspace lint. The DGX reported exit 0 over **3**,
 which is a legitimate *incremental* count over the changed crates' reverse-dependency set in a warm
