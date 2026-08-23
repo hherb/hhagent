@@ -129,6 +129,7 @@ async fn dispatch_over_handle(handle: &mut WorkerHandle, code: &str) -> serde_js
     dispatch_with_sink(
         &NoopAuditSink,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         handle.worker_mut(),
         TOOL_NAME,
         "python.exec",

@@ -136,6 +136,7 @@ fn endpoint_off_allowlist_fails_closed() {
             let result = dispatch(
                 &pool,
                 &Vault::new(),
+                None, // guard tier: not exercised by this suite
                 &mut sworker,
                 "web-research",
                 "web.research",
@@ -183,6 +184,7 @@ fn real_research_against_searxng() {
         let result = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "web-research",
             "web.research",
@@ -246,6 +248,7 @@ fn real_research_with_hybrid_ranking() {
         let result = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "web-research",
             "web.research",

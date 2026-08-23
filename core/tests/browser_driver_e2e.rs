@@ -188,6 +188,7 @@ async fn render_in_jail(
     let result = dispatch(
         pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         &mut sworker,
         "browser-driver",
         "browser.render",
@@ -310,6 +311,7 @@ async fn render_in_jail_forced(
     let result = dispatch(
         pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         &mut sworker,
         "browser-driver",
         "browser.render",

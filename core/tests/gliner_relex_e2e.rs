@@ -281,6 +281,7 @@ async fn happy_path_extract_returns_entities_and_triples() {
     let result_value = tool_host::dispatch(
         &pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         handle.worker_mut(),
         "gliner-relex",
         "extract",
@@ -353,7 +354,7 @@ async fn warm_reuse_two_calls_keep_one_worker_warm() {
             .await
             .expect("acquire 1 (cold spawn)");
         let params = serde_json::to_value(request()).unwrap();
-        tool_host::dispatch(&pool, &Vault::new(), handle.worker_mut(), "gliner-relex", "extract", params)
+        tool_host::dispatch(&pool, &Vault::new(), None, handle.worker_mut(), "gliner-relex", "extract", params)
             .await
             .expect("dispatch 1");
         // Handle drops here → IdleTimeoutLifecycle returns the
@@ -375,7 +376,7 @@ async fn warm_reuse_two_calls_keep_one_worker_warm() {
             .await
             .expect("acquire 2 (warm reuse)");
         let params = serde_json::to_value(request()).unwrap();
-        tool_host::dispatch(&pool, &Vault::new(), handle.worker_mut(), "gliner-relex", "extract", params)
+        tool_host::dispatch(&pool, &Vault::new(), None, handle.worker_mut(), "gliner-relex", "extract", params)
             .await
             .expect("dispatch 2");
     }
@@ -434,6 +435,7 @@ async fn invalid_input_returns_rpc_error_and_worker_stays_alive() {
     let outcome = tool_host::dispatch(
         &pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         handle.worker_mut(),
         "gliner-relex",
         "extract",
@@ -474,6 +476,7 @@ async fn invalid_input_returns_rpc_error_and_worker_stays_alive() {
     tool_host::dispatch(
         &pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         handle.worker_mut(),
         "gliner-relex",
         "extract",
@@ -543,6 +546,7 @@ async fn happy_path_container_extract_returns_entities_and_triples() {
     let result_value = tool_host::dispatch(
         &pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         handle.worker_mut(),
         "gliner-relex",
         "extract",

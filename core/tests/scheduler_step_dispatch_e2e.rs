@@ -203,6 +203,7 @@ fn dispatcher_routes_ok_denied_and_unknown_tool_paths() {
             lifecycle,
             registry,
             std::sync::Arc::new(kastellan_core::handoff::HandoffCache::new()),
+            None, // guard tier: not exercised by this suite
         );
 
         // ---------- (1) Happy path ----------
@@ -438,6 +439,7 @@ fn dispatcher_stashes_oversized_ok_result_only_for_positive_task_id() {
             lifecycle,
             registry,
             Arc::clone(&handoff),
+            None, // guard tier: not exercised by this suite
         );
 
         // A single echo arg ~80 KiB long → the result's serialized JSON

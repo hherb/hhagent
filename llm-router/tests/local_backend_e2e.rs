@@ -205,6 +205,8 @@ fn router_pointing_at_with_thinking_disabled(
         frontier_model: None,
         guard_url: None,
         guard_model: None,
+        guard_tau: None,
+        guard_timeout_ms: None,
         // Tight timeout so a hung mock fails the test fast rather than
         // waiting for the production 30 s default.
         timeout: Duration::from_secs(2),
@@ -475,6 +477,8 @@ async fn router_send_routes_to_pick_backend_choice() {
         frontier_model: Some("frontier-model".into()),
         guard_url: None,
         guard_model: None,
+        guard_tau: None,
+        guard_timeout_ms: None,
         timeout: Duration::from_secs(2),
         disable_thinking: true,
     };

@@ -372,6 +372,12 @@ fn ask_subprocess_completes_planned_task_end_to_end() {
                    "expected 1× core/startup; multiset = {m:?}");
         assert_eq!(m.get(&("core".into(), "registry.loaded".into())), Some(&1),
                    "expected 1× core/registry.loaded (build_tool_registry summary row); multiset = {m:?}");
+        // The guard tier reports itself once per boot whether or not it is
+        // configured — here it is NOT, and that is the point: "the security
+        // tier is off on this host" must be a query, not an inference from a
+        // row that is absent for two different reasons.
+        assert_eq!(m.get(&("policy".into(), "guard_tier.boot".into())), Some(&1),
+                   "expected 1× policy/guard_tier.boot per daemon start; multiset = {m:?}");
         assert_eq!(m.get(&("cli".into(), "task.submitted".into())), Some(&1),
                    "expected 1× cli/task.submitted (producer-side row from kastellan-cli ask); multiset = {m:?}");
         assert_eq!(m.get(&("agent".into(), "plan.formulate".into())), Some(&2),
@@ -400,11 +406,18 @@ fn ask_subprocess_completes_planned_task_end_to_end() {
             .await
             .expect("count audit_log");
         // +1 for test/setup (pre-seed probe), +1 core/startup, +1 core/registry.loaded,
-        // +1 cli/task.submitted, +2 agent/plan.formulate, +2 llm:router/embed (recall),
-        // +2 cassandra:chain/verdict, +1 tool:shell-exec/shell.exec,
-        // +1 scheduler/plan.outcome, +1 scheduler/task.running,
-        // +1 scheduler/task.completed, +1 scheduler/task.finalize
-        let expected_total: i64 = 1 + 1 + 1 + 1 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1; // = 15
+        // +1 policy/guard_tier.boot, +1 cli/task.submitted, +2 agent/plan.formulate,
+        // +2 llm:router/embed (recall), +2 cassandra:chain/verdict,
+        // +1 tool:shell-exec/shell.exec, +1 scheduler/plan.outcome,
+        // +1 scheduler/task.running, +1 scheduler/task.completed,
+        // +1 scheduler/task.finalize
+        //
+        // `policy/guard_tier.boot` is written once per daemon start whether or
+        // not a guard is configured (here: not), because "the tier is off" is
+        // exactly the fact that must be queryable rather than inferred from an
+        // absent row. This exact-multiset assertion is what caught it being
+        // added — keep it exact.
+        let expected_total: i64 = 1 + 1 + 1 + 1 + 1 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1; // = 16
         assert_eq!(
             total.0, expected_total,
             "audit_log row count mismatch (expected {expected_total}, got {}); multiset = {m:?}",
@@ -678,6 +691,12 @@ fn ask_subprocess_fails_after_plan_iteration_cap() {
                    "expected 1× core/startup; multiset = {m:?}");
         assert_eq!(m.get(&("core".into(), "registry.loaded".into())), Some(&1),
                    "expected 1× core/registry.loaded (build_tool_registry summary row); multiset = {m:?}");
+        // The guard tier reports itself once per boot whether or not it is
+        // configured — here it is NOT, and that is the point: "the security
+        // tier is off on this host" must be a query, not an inference from a
+        // row that is absent for two different reasons.
+        assert_eq!(m.get(&("policy".into(), "guard_tier.boot".into())), Some(&1),
+                   "expected 1× policy/guard_tier.boot per daemon start; multiset = {m:?}");
         assert_eq!(m.get(&("cli".into(), "task.submitted".into())), Some(&1),
                    "expected 1× cli/task.submitted (producer-side row from kastellan-cli ask); multiset = {m:?}");
         assert_eq!(m.get(&("agent".into(), "plan.formulate".into())), Some(&5),
@@ -704,11 +723,12 @@ fn ask_subprocess_fails_after_plan_iteration_cap() {
             .await
             .expect("count audit_log");
         // +1 test/setup (pre-seed probe), +1 core/startup, +1 core/registry.loaded,
+        // +1 policy/guard_tier.boot (once per daemon start, configured or not),
         // +1 cli/task.submitted, +5 agent/plan.formulate, +5 llm:router/embed (recall),
         // +5 cassandra:chain/verdict, +5 tool:shell-exec/shell.exec,
         // +5 scheduler/plan.outcome, +1 scheduler/task.running,
         // +1 scheduler/task.failed, +1 scheduler/task.finalize
-        let expected_total: i64 = 1 + 1 + 1 + 1 + 5 + 5 + 5 + 5 + 5 + 1 + 1 + 1; // = 32
+        let expected_total: i64 = 1 + 1 + 1 + 1 + 1 + 5 + 5 + 5 + 5 + 5 + 1 + 1 + 1; // = 33
         assert_eq!(
             total.0, expected_total,
             "audit_log row count mismatch (expected {expected_total}, got {}); multiset = {m:?}",

@@ -11,6 +11,15 @@ acceptable, the 15 s bound is realistic, and GPU sharing is acceptable because k
 hardware floor is **M-series or DGX-class by design**. The tier's purpose is what buys that
 budget: kastellan targets **high-risk environments such as healthcare**.
 
+**AMENDED 2026-08-23**, after measurement 3 shipped (`d51c9b20`,
+[#606](https://github.com/hherb/kastellan/pull/606)). The run produced **τ = 0.79552656** —
+so this spec is unparked — and three obligations it could not have anticipated. Two are
+correctness and both are attacker-reachable; the third is honesty about what the tier buys.
+They are **D8**, **D9** and **D10**, added below, together with the measurement **M2** that
+D9 rests on. **D2 is superseded by D9** and kept for its derivation. Operator decisions
+recorded 2026-08-23: fail open at runtime *plus* a boot-time context check (D8), and derive
+the timeout per host from a boot probe (D9).
+
 Slice 1 landed the guard endpoint seam, the adjudicator and the calibration harness, and
 deliberately shipped **no production wiring** — five chokepoint files were verified
 byte-identical to `main` as a merge gate. This slice puts the tier on the dispatcher path.
@@ -110,7 +119,17 @@ A non-finite τ is refused for the same reason `decide` routes a non-finite `p` 
 `Unmeasured`: `NaN` comparisons are all false, so a `NaN` τ is the τ > 1 failure wearing a
 different hat.
 
-### D2 — The guard timeout is derived from M1, not chosen
+### D2 — The guard timeout is derived from M1, not chosen — **SUPERSEDED BY D9**
+
+> **Superseded 2026-08-23.** The derivation below is sound and its arithmetic is
+> unchanged; what it got wrong is the *input*. It reasons from M1's 10,062 tokens for a
+> 64 KiB document, and #604 measured the same cap producing **44,437** tokens on
+> adversarial text — M1's material was prose at ~6.5 bytes/token, and dense jailbreak
+> text runs at 1.47. It also assumed one host's throughput generalises; measurement 3
+> found the Mac ~40× slower on the same document. **D9 replaces the constant with a
+> boot-time measurement.** `KASTELLAN_LLM_GUARD_TIMEOUT_MS` survives as an operator
+> override and 15 000 ms survives as the floor.
+
 
 `RouterConfig` gains `guard_timeout: Duration`, read from `KASTELLAN_LLM_GUARD_TIMEOUT_MS`,
 default **15 000 ms**. `for_guard` sets the returned config's `timeout` from it instead of
@@ -258,6 +277,203 @@ diverging.
 
 ---
 
+## M2 — The boot probe, measured before it was specified
+
+Run 2026-08-23 on the DGX against the same `llama-server` measurement 3 used
+(`Shieldstral-1.0-3B-Q8_0`, `-c 131072`, `-ngl 99`, port 8081). Three requests, one probe
+document of **1024 bytes of token-dense text** (mixed case, digits, symbol runs — the
+shape #604 found at 1.47 bytes/token), each prefixed by a short varying string (a **cache-buster**, not a nonce — it is not secret and authenticates nothing):
+
+| request | wall | `prompt_tokens` | `cached_tokens` | uncached | uncached tok/s |
+| --- | --- | --- | --- | --- | --- |
+| cold, prefix `n1` | 159.3 ms | 810 | 0 | 810 | **5,084.6** |
+| cold, prefix `n2` | 164.1 ms | 810 | 0 | 810 | **4,935.0** |
+| repeat of prefix `n2` | 38.4 ms | 810 | **809** | 1 | 26.1 |
+
+**Three facts this establishes, each load-bearing for D9.**
+
+1. **A varying prefix defeats the prefix cache.** The two cold samples report
+   `cached_tokens: 0` and agree within 3%, and both land inside M1's independently measured
+   4,039–6,660 tok/s band. So a ~1 KiB probe reproduces the throughput a 64 KiB document
+   will see, at 1/64th of the cost.
+2. **The repeat is catchable, and catching it matters.** M1's caveat 1 says prefix caching
+   makes repeated identical documents read optimistically; row 3 is that caveat as a number.
+   A naive `prompt_tokens / elapsed` on it reads **21,094 tok/s** — a **4× over-estimate**,
+   which derives a timeout 4× too short and so converts real adjudications into fail-open
+   timeouts. `usage.prompt_tokens_details.cached_tokens` makes it **detectable rather than
+   assumed**, which is why D9 measures over *uncached* tokens and gates on their count.
+3. **The probe material is representative.** 1024 dense bytes tokenised to 810 tokens —
+   **1.26 bytes/token**, close to #604's 1.47 on real adversarial text and nowhere near
+   M1's 6.5 on prose. A probe made of ordinary prose would over-estimate throughput per
+   *byte* by ~5× and reintroduce exactly the error D2 made.
+
+**Endpoint shape, checked rather than assumed** (same host, same session): `/props` carries
+the per-request context at **`default_generation_settings.n_ctx`** (131072) and there is
+**no top-level `n_ctx`** — `total_slots` is 4 while each slot reports the full 131072, so on
+this build `-c` is per-slot and the nested field is the number a request is compared
+against. `usage.prompt_tokens` and `usage.prompt_tokens_details.cached_tokens` are both
+served by the OpenAI-compat endpoint.
+
+---
+
+### D8 — The HTTP 400 door: fail **open** at runtime, refuse at **boot**
+
+#604: `SCAN_BYTE_CAP` bounds bytes and nothing bounds tokens, the ratio is attacker-chosen,
+and a 64 KiB document measured **44,437 tokens** against a 32,768-token server — HTTP 400.
+The same 400 arrives at the chokepoint on a real dispatch, so this slice must say which way
+it fails.
+
+**Runtime: fail open, audited.** `Err(..) -> Allow` with `Unadjudicated::RouterError`,
+exactly as D4 already draws it. Escalate-up-only is the tier's entire safety argument: every
+failure mode is at worst today's catalogue-only behaviour. Fail-closed was rejected because
+the attacker who can force the 400 can force it on *any* document by padding it — that is a
+denial of service on the whole tool path, reachable by anyone who can serve the agent a web
+page.
+
+**Boot: refuse.** Fail-open-at-runtime is only defensible if the 400 is *rare*, and on a
+correctly deployed host it should be impossible. So building the tier reads `/props` and
+refuses to boot unless the server's per-request context can hold a worst-case document:
+
+```
+REQUIRED_GUARD_N_CTX = SCAN_BYTE_CAP + GUARD_PROMPT_OVERHEAD_TOKENS
+                     = 65_536       + 512                          = 66_048
+```
+
+**Why `SCAN_BYTE_CAP` bytes is the token worst case, and not a guess.** Shieldstral's
+tokeniser is byte-level BPE: its base vocabulary contains the individual bytes, so no input
+can ever produce *more* than one token per byte. 1 token/byte is therefore the adversarial
+ceiling, not an estimate — an attacker choosing maximally unmergeable bytes converges on it.
+#604 measured 1.47 bytes/token on real jailbreak text and M2 measured 1.26 on synthetic
+dense text, so the bound is close enough to be worth respecting and provably cannot be
+exceeded.
+
+The 512-token overhead covers the tuned policy prompt and the chat template. It is a
+constant with a comment, not a measurement, and it is deliberately generous: being wrong
+here costs a boot refusal on a marginally-sized server, which is loud, whereas being wrong
+in the other direction costs a runtime fail-open, which is silent.
+
+**This converts an attacker-reachable runtime fail-open into an operator-fixable boot
+refusal.** The DGX passes today (131072 ≥ 66048); the `-c 32768` server that produced #604
+would refuse with a message naming the flag to change. That is D6's argument applied to a
+second way the tier can be silently useless.
+
+**Refusal doors, each named** (the [`weights_pin`] shape, for the same reason: they call for
+different actions):
+
+| door | meaning | operator action |
+| --- | --- | --- |
+| `props-unreachable` | `/props` could not be fetched or parsed | start the guard backend |
+| `no-context-size` | neither `default_generation_settings.n_ctx` nor a top-level `n_ctx` | upgrade llama.cpp, or use a backend that reports it |
+| `context-too-small` | reported context < `REQUIRED_GUARD_N_CTX` | restart `llama-server` with `-c 66048` or higher |
+
+**A note on the fallback.** `default_generation_settings.n_ctx` is read first because M2
+confirmed it is the per-request number on the build both hosts run; a top-level `n_ctx` is
+accepted as a fallback for other builds. Where *neither* is present the tier refuses rather
+than assuming a size — an assumption here fails open at runtime, which is the thing D8
+exists to prevent.
+
+**Not addressed by this slice, deliberately:** #604's option 2 (cap by tokens) still wants a
+core-side tokeniser the guard seam does not have, and option 3 (chunk and combine) changes
+what a score means and needs its own measurement. D8 makes the 400 unreachable on a
+correctly sized host; it does not make it unrepresentable.
+
+### D9 — The guard timeout is **probed at boot**, not assumed
+
+D2 derived 15 s from one host and one token count, and measurement 3 broke both halves: the
+Mac takes **~5.5 minutes** on a document D2's arithmetic budgets at 15 s. A constant cannot
+be right for hosts that differ by more than an order of magnitude, and the failure is
+one-directional and silent — too short a timeout does not error, it *fails open*.
+
+**`KASTELLAN_LLM_GUARD_TIMEOUT_MS`, when set, is an operator override and no probe runs.**
+Explicit beats measured; it keeps the value pinnable and every timeout test deterministic.
+
+**When unset, one probe runs at boot**, after the D8 checks, against the same endpoint:
+
+1. Send one adjudication of `PROBE_BYTES` (1024) of committed dense text, prefixed by a
+   per-boot **cache-buster**. That prefix is what makes the sample cold (M2, fact 1); the body
+   is a constant so the measurement is comparable across boots. It is deliberately **not**
+   called a nonce — it is not secret, authenticates nothing, and guards no replay, and naming
+   it one both overstates its role and trips CodeQL's `rust/hard-coded-cryptographic-value`
+   rule on every caller that passes a literal.
+2. Read `usage.prompt_tokens` and `usage.prompt_tokens_details.cached_tokens`, and measure
+   wall clock.
+3. Compute throughput over **uncached** tokens only:
+   `tok_per_s = (prompt_tokens - cached_tokens) / elapsed_s`.
+4. Derive, then clamp:
+
+```
+worst_case_tokens = REQUIRED_GUARD_N_CTX            (66_048 — the same number D8 pins)
+derived_ms        = worst_case_tokens / tok_per_s * 1000 * PROBE_SAFETY_FACTOR
+timeout           = clamp(derived_ms, TIMEOUT_FLOOR_MS, TIMEOUT_CEILING_MS)
+```
+
+| constant | value | why |
+| --- | --- | --- |
+| `PROBE_BYTES` | 1024 | M2: 810 uncached tokens, ~160 ms on the DGX, ~8 s on a 100 tok/s host |
+| `PROBE_SAFETY_FACTOR` | 2.0 | M1 open risk 3 — GPU contention with the planner, still unmeasured |
+| `MIN_UNCACHED_PROBE_TOKENS` | 256 | below this the sample is fixed-overhead noise (M2 row 3 read 1) |
+| `PROBE_BUDGET_MS` | 20 000 | bounds what a slow host adds to boot |
+| `TIMEOUT_FLOOR_MS` | 15 000 | D2's number. A *shorter* timeout is weaker, so never derive below it |
+| `TIMEOUT_CEILING_MS` | 120 000 | past this, stalling a dispatch is worse than degrading to catalogue-only |
+
+**What the two clamps mean, because they are not symmetric.** `ToFloor` is unremarkable — a
+fast host derives a small number and gets D2's value anyway. **`ToCeiling` is a finding
+about the host** and is reported as one: this machine cannot adjudicate a worst-case
+document inside the budget, so large dense documents *will* time out and fail open to
+catalogue-only. On the DGX, M2's 5,000 tok/s gives `66048 / 5000 * 1000 * 2 ≈ 26.4 s` —
+inside the band, unclamped. On measurement 3's Mac (~135 tok/s implied) it derives ~978 s
+and clamps to 120 s, loudly. That is the honest rendering of a fact the Mac already has.
+
+**Probe outcomes are a closed enum, and every one of them is a value rather than an
+error** — the probe picks a number, it does not verify a control, so it must never stop a
+boot that D8 already let through:
+
+| outcome | timeout | reported |
+| --- | --- | --- |
+| `Measured { uncached_tokens, elapsed_ms }` | derived + clamped | throughput, derived ms, clamp |
+| `TooFewUncachedTokens { .. }` | `TIMEOUT_FLOOR_MS` | why the sample was rejected |
+| `NoTokenCount` (backend omits `usage`) | `TIMEOUT_FLOOR_MS` | the backend cannot be probed |
+| `Saturated { budget_ms }` (exceeded `PROBE_BUDGET_MS`) | `TIMEOUT_CEILING_MS` | **this host is slow** |
+| `Failed { why }` (transport/HTTP) | `TIMEOUT_FLOOR_MS` | the error |
+
+**`Saturated` derives the ceiling, not the floor, and that is the one non-obvious row.** A
+probe that overran its budget is not a missing measurement — it is an *upper bound on
+throughput*, and the only bound in the table that says the host is slow. Sending it to the
+floor would give the slowest hosts the shortest timeout, which is precisely backwards.
+
+**The derivation is a pure function of the outcome.** All the arithmetic, the clamping and
+the basis reporting live in `guard_model/timeout.rs` over the enum above, so every row of
+both tables is a unit test with no server. The IO half only produces the sample.
+
+### D10 — The tier is advisory defence-in-depth, not a gate
+
+D1 says "this slice ships a tier nobody should turn on yet" because measurement 3 was owed.
+Measurement 3 is now done, and the honest replacement is **not** "now it is ready" — it is a
+narrower claim, and the numbers must travel with it:
+
+- **65% recall at an FP-0 threshold** (36 of 55 attacks caught at τ). Not a gate.
+- **Weakest exactly where the tier's rationale is strongest.** TakSec's bare imperative
+  payloads: 6/6 caught, median 0.9955. The greshake scenarios — the same intent wrapped in a
+  plausible document — median 0.0797, 5/8 missed, with the canonical indirect-injection case
+  at 0.0082. A web-fetching agent meets narrative framing, not imperatives.
+- **τ is pinned by roughly four documents** with 1.0–1.2 points of headroom, all of them
+  security prose that quotes payloads verbatim. A thin basis, and a fragile one.
+- **`best_tau` returns NONE** — the classes overlap at every threshold on real captured
+  content.
+- **Truncation can cost the whole signal** — a 1.8 MB payload truncated to 64 KiB scored
+  0.0102 against its family's median of 0.9937.
+
+**The operational consequence, which is the part that binds: nothing downstream may relax on
+this tier.** No catalogue weight is lowered because the model is watching, no allowlist is
+widened, no sandbox constraint is loosened. The tier may only ever turn an `Allow` into a
+`Block` (D4), and every number above is a reason to keep it that way.
+
+This is also why D5's per-dispatch `p` matters more than it looks: production becomes the
+score source for a corpus that does not have to be catalogue-selected, which is the only
+route out of the thin basis above.
+
+---
+
 ## Testing
 
 Two layers, because a pure function agreeing with itself proves nothing about what the
@@ -268,6 +484,24 @@ door; the `consults_model` predicate at and either side of `BLOCK_THRESHOLD`; τ
 across `{negative, 0.0, tiny, 1.0, just over 1.0, NaN, inf}`; the tri-state config builder
 over all four (guard-set × τ-set) combinations; `guard_timeout` parsing including the
 non-numeric refusal and the default.
+
+**Layer 1 also covers D8 and D9 in full, because both are pure over a value the IO half
+produces.** For D8: `n_ctx_from_props` over the nested field, the top-level fallback, a
+missing field, and every non-numeric shape; `context_verdict` at `REQUIRED_GUARD_N_CTX - 1`,
+exactly at it, and above it, plus one test pinning that the required figure is
+`SCAN_BYTE_CAP + GUARD_PROMPT_OVERHEAD_TOKENS` rather than a copied literal — so raising the
+cap cannot silently leave the check behind. For D9: `derive_guard_timeout` over **every row
+of both tables**, with the DGX's own M2 numbers as a fixture (5,000 tok/s → ~26.4 s,
+unclamped) and measurement 3's Mac (~135 tok/s → clamps to the ceiling); the two clamp
+directions asserted by *basis*, not just by value, since `ToFloor` and a coincidentally-equal
+derivation are different facts; and `Saturated` asserted to reach the **ceiling**, which is
+the row a plausible implementation gets backwards.
+
+**The accept path must be reachable at layer 1 — the #598 rule.** `context_verdict` takes
+`required` as a parameter for exactly the reason `hash_matches` does: with
+`REQUIRED_GUARD_N_CTX` hard-wired, an implementation that refused unconditionally would pass
+every test, because no cheap fixture can be a 66,048-token server.
+[[unreachable-success-path-proves-nothing]]
 
 **Layer 2 — the chokepoint, in a new `core/tests/guard_tier_e2e.rs`.** Real
 `dispatch_with_sink` against a real worker and real Postgres — the shape
@@ -286,7 +520,15 @@ your own canned response.*
 that must kill it: invert the `>= BLOCK_THRESHOLD` short-circuit (layer 1 *and* layer 2 —
 the request-count assertion is what makes layer 2 able to); map `Unmeasured` to `Clear`
 (both); drop the `tier` field (layer 2); drop the τ upper-bound check (layer 1); let
-`for_guard` inherit `timeout` again (layer 1). Any mutation only one layer can kill gets
+`for_guard` inherit `timeout` again (layer 1).
+
+**Five more from D8 and D9, all layer 1:** flip `context_verdict`'s comparison from `<` to
+`<=` (the exactly-at-required case must PASS); make `REQUIRED_GUARD_N_CTX` a literal instead
+of `SCAN_BYTE_CAP + GUARD_PROMPT_OVERHEAD_TOKENS`; drop the `cached_tokens` subtraction in
+the throughput computation (M2 row 3 is the fixture that kills it — 4× too fast); send
+`Saturated` to the floor instead of the ceiling; and drop the `MIN_UNCACHED_PROBE_TOKENS`
+gate. Each is a fail-open in the direction the tier cannot afford, and each is killable
+without a server. Any mutation only one layer can kill gets
 that stated rather than glossed — #587's handover entry overstated exactly this and had to
 be corrected.
 
@@ -327,5 +569,23 @@ be corrected.
 4. **`p` recorded per dispatch is a new, long-lived column of model output.** It is a float
    and carries no document content, but it is a behavioural fingerprint of what the agent
    read, retained for as long as `audit_log` rows are.
-5. **M1 is one host.** The Mac leg is unmeasured. Linearity (M1) makes it predictable from
-   that host's prompt-eval throughput, but predicted is not measured.
+5. ~~**M1 is one host.**~~ **Answered, badly, by measurement 3.** The Mac leg is measured
+   now and it is ~40x slower on the same document (~5.5 min against the DGX's 3.5 s). D9
+   turns that from an unstated assumption into a boot-time measurement plus a loud clamp
+   report, which is the best available answer -- but see risk 6.
+6. **On a host that clamps to the ceiling, the tier is off for large documents and only an
+   audit query says so.** D9 reports it at boot and every timeout is an audited
+   `Unadjudicated::RouterError`, so it is countable rather than invisible. It is still a
+   real reduction in coverage on exactly the documents most worth screening, and the honest
+   framing is D10's: advisory defence-in-depth. The lever, if it ever matters, is
+   `SCAN_BYTE_CAP` -- which moves both tiers together and so creates no asymmetry (see the
+   exclusions).
+7. **The boot probe costs one adjudication on every daemon start** with the tier configured,
+   bounded by `PROBE_BUDGET_MS`. On the DGX that is ~160 ms; on a slow host it is up to
+   20 s of boot latency an operator did not previously pay. Bounded, reported, and skipped
+   entirely when `KASTELLAN_LLM_GUARD_TIMEOUT_MS` is set.
+8. **D8's 512-token prompt overhead is a constant, not a measurement.** If the tuned policy
+   prompt ever grows past it, `REQUIRED_GUARD_N_CTX` under-states what a worst-case document
+   needs and the 400 becomes reachable again on a server sized exactly to the check. The
+   overhead is generous relative to today's prompt, and the failure is bounded by D8's
+   runtime half.

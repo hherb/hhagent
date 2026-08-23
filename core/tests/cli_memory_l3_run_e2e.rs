@@ -141,6 +141,7 @@ fn make_dispatcher(
 
     ToolHostStepDispatcher::new(pool, vault, lifecycle, registry,
         std::sync::Arc::new(kastellan_core::handoff::HandoffCache::new()),
+        None, // guard tier: not exercised by this suite
     )
 }
 

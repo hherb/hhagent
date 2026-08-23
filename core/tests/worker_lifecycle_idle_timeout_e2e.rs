@@ -151,6 +151,7 @@ async fn echo_over_handle(
     dispatch_with_sink(
         &NoopAuditSink,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         handle.worker_mut(),
         TOOL_NAME,
         "shell.exec",

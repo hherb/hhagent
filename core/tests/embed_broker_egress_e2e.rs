@@ -300,6 +300,7 @@ fn brokered_worker_ranks_hybrid_with_zero_embed_egress() {
         let result = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "web-research",
             "web.research",

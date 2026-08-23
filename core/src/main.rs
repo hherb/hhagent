@@ -65,6 +65,101 @@ fn probe_install_dir_trust(_exe_dir: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+/// Report the guard tier once, at boot, and record a queryable audit row.
+///
+/// Slice-1's D1 requires the tier's state be reported "once at boot, loudly,
+/// not per-call — a per-call warning on the dispatcher hot path is its own
+/// denial of service". This is that report, and it deliberately extends the
+/// existing "log what was actually resolved, once" block rather than inventing
+/// a second pattern.
+///
+/// **A `Clamped::ToCeiling` timeout is a `warn!`, not an `info!`.** It is the
+/// one basis that reports a reduction in coverage: on that host, documents
+/// large enough to matter will time out and fail open to catalogue-only
+/// screening. Everything else is routine, and warning about routine things is
+/// how the one that matters gets scrolled past.
+async fn report_guard_tier(
+    tier: Option<&kastellan_core::cassandra::guard_model::GuardTier>,
+    cfg: &kastellan_llm_router::RouterConfig,
+    pool: &sqlx::PgPool,
+) {
+    use kastellan_core::cassandra::guard_model::timeout::TimeoutBasis;
+
+    let Some(tier) = tier else {
+        info!(
+            "guard tier NOT configured -- tool output is screened by the deterministic \
+             catalogue only. Set KASTELLAN_LLM_GUARD_URL, KASTELLAN_LLM_GUARD_MODEL and \
+             KASTELLAN_LLM_GUARD_TAU to enable it."
+        );
+        // The SAME token the per-dispatch `guard.state` vocabulary uses, so
+        // "no tier ran" has one spelling across the audit log rather than a
+        // live half and an orphaned half. This boot row is deliberately the
+        // ONLY producer of it: a per-dispatch `not_configured` field would be
+        // a constant on every row of an unconfigured host.
+        let payload = serde_json::json!({
+            "configured": false,
+            "state": kastellan_core::cassandra::guard_model::Unadjudicated::NotConfigured.as_str(),
+        });
+        if let Err(e) =
+            kastellan_db::audit::insert(pool, "policy", "guard_tier.boot", payload).await
+        {
+            tracing::warn!(error = %e, "guard_tier.boot audit insert failed (non-fatal)");
+        }
+        return;
+    };
+
+    let budget = tier.timeout();
+    let timeout_ms = budget.timeout.as_millis() as u64;
+    let basis = budget.basis.kind();
+    // The measured throughput, when there was one — the number a later session
+    // needs to re-derive this timeout without re-running the probe.
+    let tok_per_s = match budget.basis {
+        TimeoutBasis::Probed { tok_per_s, .. } => Some(tok_per_s),
+        _ => None,
+    };
+
+    info!(
+        url = %cfg.guard_url.as_deref().unwrap_or("<unset>"),
+        model = %cfg.guard_model.as_deref().unwrap_or("<unset>"),
+        tau = tier.tau(),
+        timeout_ms,
+        timeout_basis = basis,
+        n_ctx = tier.n_ctx(),
+        policy_digest = %kastellan_core::cassandra::guard_model::policy::policy_digest(),
+        "guard tier configured -- ADVISORY defence-in-depth, not a gate (65% recall at \
+         the fitted tau; weakest against narrative indirect injection). Nothing \
+         downstream may relax on it."
+    );
+
+    // The finding TEXT comes from the basis, because the three bases that
+    // qualify are three different findings — a ceiling clamp, a probe that
+    // never returned, and a probe that FAILED (which predicts a tier that
+    // fails open on every dispatch, and used to be reported at `info!`).
+    if let Some(finding) = budget.basis.coverage_finding() {
+        tracing::warn!(
+            timeout_ms,
+            timeout_basis = basis,
+            // No `unwrap_or(0.0)`: a fabricated zero would be logged as if
+            // it were measured. Only a real `Probed` basis has a rate.
+            tok_per_s = tok_per_s,
+            "{finding}"
+        );
+    }
+
+    let payload = serde_json::json!({
+        "configured":    true,
+        "tau":           tier.tau(),
+        "timeout_ms":    timeout_ms,
+        "timeout_basis": basis,
+        "tok_per_s":     tok_per_s,
+        "n_ctx":         tier.n_ctx(),
+        "policy_digest": kastellan_core::cassandra::guard_model::policy::policy_digest(),
+    });
+    if let Err(e) = kastellan_db::audit::insert(pool, "policy", "guard_tier.boot", payload).await {
+        tracing::warn!(error = %e, "guard_tier.boot audit insert failed (non-fatal)");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -152,6 +247,71 @@ async fn main() -> Result<()> {
         disable_thinking = router_cfg.disable_thinking,
         "llm router configured"
     );
+
+    // ── The Shieldstral guard tier (wiring slice). ──
+    //
+    // Built and reported ONCE, here, beside the router it shares an endpoint
+    // seam with. FIVE things can stop the daemon, and all five are the same
+    // failure wearing different clothes — a security control that is off while
+    // looking configured (D6):
+    //
+    //   * a half-configured tier (URL without model, or either without a tau);
+    //   * a tau outside (0.0, 1.0], both ends of which are silent failures;
+    //   * an operator-pinned KASTELLAN_LLM_GUARD_TIMEOUT_MS of 0, which would
+    //     time out every adjudication and so disable the tier while it logged
+    //     as configured;
+    //   * a backend whose /props is UNREACHABLE — so if the guard server is
+    //     not running, the daemon does not start. This is the most likely boot
+    //     failure on a host with the tier configured and the one an operator
+    //     most needs to see named here;
+    //   * a backend whose context cannot hold a worst-case document (#604),
+    //     which would otherwise fail OPEN at runtime on exactly the dense
+    //     adversarial documents the tier exists for.
+    //
+    // The counter-argument — a down daemon protects nothing — was weighed and
+    // rejected: "loud error at boot" is precisely what gets scrolled past.
+    //
+    // A SIXTH, opt-in: KASTELLAN_REQUIRE_GUARD=1 makes an *unconfigured* tier
+    // fatal too. That door needs its own flag because losing all three guard
+    // keys at once — which is what `install` regenerating `kastellan.env`
+    // actually does — lands on the deliberate-opt-out arm, not on any of the
+    // five above.
+    //
+    // The throughput probe underneath this is deliberately NOT fatal: it picks
+    // a timeout, it does not verify a control.
+
+    // A pre-epoch clock would make the cache-buster constant across boots, which silently
+    // disables the ONLY defence against M2's 4x cache over-estimate on a backend
+    // that caches without reporting `cached_tokens` (#608). Unlikely, but a
+    // silent fallback here is invisible in exactly the way that measurement is.
+    let probe_nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "system clock is before the epoch; the guard boot probe's cache-buster \
+                 will not vary between boots and its throughput sample may be a cache hit"
+            );
+            0
+        }
+    };
+    let guard_probe_cache_buster = format!("kastellan-guard-probe-{probe_nanos}");
+    let guard_tier = kastellan_core::cassandra::guard_model::GuardTier::from_router_config(
+        &router_cfg,
+        &guard_probe_cache_buster,
+    )
+    .await
+    .map_err(|e| anyhow!("guard tier: {e}"))?
+    .map(std::sync::Arc::new);
+    kastellan_core::cassandra::guard_model::tier::boot::require_tier(
+        guard_tier.as_deref(),
+        kastellan_core::worker_lifecycle::force_route::env_flag_enabled(
+            std::env::var("KASTELLAN_REQUIRE_GUARD").ok(),
+        ),
+    )
+    .map_err(|e| anyhow!("guard tier: {e}"))?;
+    report_guard_tier(guard_tier.as_deref(), &router_cfg, &pool).await;
+
     let router = Arc::new(
         kastellan_llm_router::Router::new(router_cfg)
             .map_err(|e| anyhow!("Router::new: {e}"))?,
@@ -524,6 +684,7 @@ async fn main() -> Result<()> {
                 lifecycle,
                 tool_registry,
                 handoff_cache,
+                guard_tier,
             ),
         );
 

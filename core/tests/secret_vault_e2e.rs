@@ -264,7 +264,7 @@ async fn dispatch_substitutes_and_writes_redeemed_row() {
         "argv": [PRINTF_PATH, "%s\n", secret_ref.as_str()],
     });
 
-    let result = dispatch(&pool, &vault, &mut worker, "shell-exec", "shell.exec", params)
+    let result = dispatch(&pool, &vault, None, &mut worker, "shell-exec", "shell.exec", params)
         .await
         .expect("dispatch");
 
@@ -338,7 +338,7 @@ async fn dispatch_fails_closed_on_missing_ref() {
     let synthetic_ref = "secret://00000000";
     let params = json!({"argv": [PRINTF_PATH, "%s\n", synthetic_ref]});
 
-    let err = dispatch(&pool, &vault, &mut worker, "shell-exec", "shell.exec", params)
+    let err = dispatch(&pool, &vault, None, &mut worker, "shell-exec", "shell.exec", params)
         .await
         .expect_err("dispatch must fail");
 
@@ -418,7 +418,7 @@ async fn policy_rows_contain_no_substring_of_redeemed_plaintext() {
     };
     let mut worker = spawn_worker(&*backend_obj, &spec).unwrap();
     let params = json!({"argv": [PRINTF_PATH, "%s\n", secret_ref.as_str()]});
-    let _ = dispatch(&pool, &vault, &mut worker, "shell-exec", "shell.exec", params)
+    let _ = dispatch(&pool, &vault, None, &mut worker, "shell-exec", "shell.exec", params)
         .await
         .expect("dispatch");
 
@@ -521,7 +521,7 @@ async fn dispatch_substitutes_multiple_refs_in_one_params() {
     let mut worker = spawn_worker(&*backend_obj, &spec).unwrap();
 
     let params = json!({"argv": [PRINTF_PATH, "%s/%s\n", ref_a.as_str(), ref_b.as_str()]});
-    let result = dispatch(&pool, &vault, &mut worker, "shell-exec", "shell.exec", params)
+    let result = dispatch(&pool, &vault, None, &mut worker, "shell-exec", "shell.exec", params)
         .await
         .expect("dispatch");
 
@@ -584,7 +584,7 @@ async fn tool_row_req_shows_opaque_ref_not_plaintext() {
     let mut worker = spawn_worker(&*backend_obj, &spec).unwrap();
 
     let params = json!({"argv": [PRINTF_PATH, "%s\n", secret_ref.as_str()]});
-    let result = dispatch(&pool, &vault, &mut worker, "shell-exec", "shell.exec", params)
+    let result = dispatch(&pool, &vault, None, &mut worker, "shell-exec", "shell.exec", params)
         .await
         .expect("dispatch");
 
@@ -721,7 +721,7 @@ async fn dispatch_swallows_redeemed_audit_insert_failure() {
     // Sink fails the `secret.redeemed` insert; every other insert succeeds.
     let sink = MockAuditSink::new(Some("secret.redeemed"));
     let result =
-        dispatch_with_sink(&sink, &vault, &mut worker, "shell-exec", "shell.exec", params)
+        dispatch_with_sink(&sink, &vault, None, &mut worker, "shell-exec", "shell.exec", params)
             .await
             .expect("dispatch must still return Ok despite the redeemed-row audit failure");
 
@@ -787,7 +787,7 @@ async fn dispatch_swallows_redemption_failed_audit_insert_failure() {
 
     // Sink fails the `secret.redemption_failed` insert.
     let sink = MockAuditSink::new(Some("secret.redemption_failed"));
-    let err = dispatch_with_sink(&sink, &vault, &mut worker, "shell-exec", "shell.exec", params)
+    let err = dispatch_with_sink(&sink, &vault, None, &mut worker, "shell-exec", "shell.exec", params)
         .await
         .expect_err("dispatch must fail closed even though the audit row insert also failed");
 

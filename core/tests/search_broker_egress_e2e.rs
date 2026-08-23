@@ -239,6 +239,7 @@ fn brokered_web_search_returns_results_with_zero_egress() {
         let result = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "web-search",
             "web.search",

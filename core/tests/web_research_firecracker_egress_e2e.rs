@@ -161,6 +161,7 @@ async fn web_research_vm_reaches_proxy_with_ca_delivered() {
         let _ = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut worker,
             "web-research",
             "web.research",

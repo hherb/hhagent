@@ -296,6 +296,7 @@ async fn brokered_web_research_vm_returns_results_with_zero_egress() {
     let result = dispatch(
         &pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         handle.worker_mut(),
         "web-research",
         "web.research",

@@ -395,6 +395,7 @@ async fn brokered_vm_worker_ranks_hybrid_over_vsock_with_zero_embed_egress() {
     let result = dispatch(
         &pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         &mut worker,
         "web-research",
         "web.research",

@@ -259,6 +259,7 @@ async fn web_fetch_vm_reaches_proxy_with_ca_delivered() {
         let _ = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut worker,
             "web-fetch",
             "web.fetch",
@@ -348,6 +349,7 @@ async fn fetch_in_vm_through_real_sidecar(
     let result = dispatch(
         pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         handle.worker_mut(),
         "web-fetch",
         "web.fetch",

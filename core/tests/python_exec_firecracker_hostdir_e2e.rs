@@ -68,6 +68,7 @@ async fn host_dir_is_readonly_and_scratch_writable_in_vm() {
     let out = dispatch_with_sink(
         &NoopAuditSink,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         &mut worker,
         "python-exec",
         "python.exec",

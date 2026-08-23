@@ -615,6 +615,11 @@ fn fetch_through_worker(url: &str) -> Result<serde_json::Value, String> {
         dispatch_with_sink(
             &NullSink,
             &Vault::new(),
+            // No guard tier: `guard capture` records what the DETERMINISTIC
+            // chokepoint saw, and the corpus it builds is what the model tier
+            // is later calibrated against. Running the model here would score
+            // the corpus with the thing the corpus exists to measure.
+            None,
             &mut worker,
             "web-fetch",
             "web.fetch",

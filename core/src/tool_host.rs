@@ -155,8 +155,11 @@ impl WorkerCommand {
 ///   ref that was substituted from `params` (Item 31). Carries
 ///   `{tool, method, ref_hash, ms}`; never the plaintext.
 /// * `policy / injection.blocked` — emitted when the prompt-injection
-///   guard blocks a worker result (Item 30). Carries SHA-256 + length
-///   + score + class codes; never the raw scanned body.
+///   guard blocks a worker result (Item 30). Carries the body SHA-256,
+///   its length, the catalogue score and the class codes; never the raw
+///   scanned body. Since the guard-model wiring slice it also carries
+///   `tier` (`"catalogue"` or `"guard_model"`), plus `p` and `tau` on
+///   the guard arm.
 ///
 /// On a substitution miss the chokepoint writes exactly one row,
 /// `policy / secret.redemption_failed`, and returns
@@ -170,7 +173,10 @@ impl WorkerCommand {
 /// * `action` = `<method>` — the JSON-RPC method name (`"echo"`,
 ///   `"call"`, etc.).
 /// * `payload` = `{"req": <params>, "result": <ok value>, "ms": <duration>}`
-///   on success, or
+///   on success — plus a `guard` sub-object
+///   `{state, p, tau, ms, body_byte_len, truncated}` whenever the guard
+///   model tier ran, **including on documents it cleared** (that is what
+///   makes production the source of a real-world score distribution). Or
 ///   `{"req": <params>, "err": "<error string>", "ms": <duration>}`
 ///   on failure. Payloads larger than 4 KiB are replaced inside
 ///   [`kastellan_db::audit::insert`] with a SHA-256 envelope.
@@ -220,9 +226,17 @@ impl WorkerCommand {
 /// `current_thread` runtimes panic from `block_in_place`. Tests that
 /// exercise `dispatch` are responsible for choosing the right
 /// runtime; the daemon's `#[tokio::main]` already does.
+///
+/// **Latency, when `guard` is `Some`.** Every result the catalogue
+/// allows and that carries scannable text costs one extra model round
+/// trip, bounded by the tier's own derived timeout (up to 120 s) and
+/// paid inside this call — so the worker lease is held across it.
+/// Results with no scannable text short-circuit without a call.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     pool: &sqlx::PgPool,
     vault: &crate::secrets::Vault,        // NEW — Item 31
+    guard: Option<&crate::cassandra::guard_model::SharedGuardTier>, // NEW — guard wiring slice
     worker: &mut SupervisedWorker,
     tool: &str,
     method: &str,
@@ -231,7 +245,7 @@ pub async fn dispatch(
     // Production always routes through PgAuditSink. The sink seam
     // ([`dispatch_with_sink`]) exists for fault-injection tests (issue #148),
     // not as a production audit-policy knob — see the `audit_sink` module docs.
-    dispatch_with_sink(&PgAuditSink::new(pool), vault, worker, tool, method, params).await
+    dispatch_with_sink(&PgAuditSink::new(pool), vault, guard, worker, tool, method, params).await
 }
 
 /// Fault-injectable core of [`dispatch`]. Behaviourally identical, but audit
@@ -241,9 +255,11 @@ pub async fn dispatch(
 /// #148). **Production code calls [`dispatch`]**, which pins `sink` to a real
 /// [`PgAuditSink`]; this entry point is `pub` only because the fault-injection
 /// tests live in the separate integration-test crate.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_with_sink(
     sink: &dyn AuditSink,
     vault: &crate::secrets::Vault,
+    guard: Option<&crate::cassandra::guard_model::SharedGuardTier>,
     worker: &mut SupervisedWorker,
     tool: &str,
     method: &str,
@@ -352,6 +368,7 @@ pub async fn dispatch_with_sink(
     post_process::finalize(
         sink,
         vault,
+        guard,
         tool,
         method,
         &req_for_audit,

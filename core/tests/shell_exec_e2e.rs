@@ -145,6 +145,7 @@ fn echo_round_trip_through_sandboxed_worker() {
         let result = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "shell-exec",
             "shell.exec",
@@ -187,6 +188,7 @@ fn argv_outside_allowlist_is_rejected_by_worker_policy() {
         let err = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "shell-exec",
             "shell.exec",
@@ -234,6 +236,7 @@ fn unknown_method_yields_method_not_found() {
         let err = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "shell-exec",
             "does.not.exist",
@@ -324,6 +327,7 @@ fn workspace_dir_is_writable_during_call_and_wiped_on_drop() {
         let result = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "shell-exec",
             "shell.exec",

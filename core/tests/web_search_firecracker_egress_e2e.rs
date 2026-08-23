@@ -170,6 +170,7 @@ async fn web_search_vm_reaches_proxy_with_ca_delivered() {
         let _ = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut worker,
             "web-search",
             "web.search",
@@ -297,6 +298,7 @@ async fn brokered_web_search_vm_returns_results_with_zero_egress() {
     let result = dispatch(
         &pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         handle.worker_mut(),
         "web-search",
         "web.search",

@@ -178,6 +178,7 @@ async fn daemon_force_routes_vm_web_research_through_host_sidecar_and_broker() {
     let result = dispatch(
         &pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         handle.worker_mut(),
         "web-research",
         "web.research",

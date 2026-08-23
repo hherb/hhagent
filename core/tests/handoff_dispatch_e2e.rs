@@ -63,6 +63,7 @@ fn dispatcher_with(cache: Arc<HandoffCache>) -> ToolHostStepDispatcher {
         Arc::new(NeverAcquire),
         Arc::new(ToolRegistry::new()), // empty: the intercept returns before lookup
         cache,
+        None, // guard tier: not exercised by this suite
     )
 }
 

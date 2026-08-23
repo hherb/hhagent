@@ -4,19 +4,33 @@
 //! never the reverse, so a guard-model failure can only ever be as
 //! permissive as today's catalogue-only behaviour.
 //!
-//! **This module reports; it never decides to allow.** Fail-open on a
-//! router error is the documented posture (the sandbox and the egress
-//! allowlist are the boundary, not this), but it is applied at the
-//! wiring site so the whole security posture is legible in one place.
+//! Fail-open on a router error is the documented posture — the sandbox
+//! and the egress allowlist are the boundary, not this — and since the
+//! wiring slice it is **decided inside this module**, by
+//! [`tier::resolve`]. (It used to be applied at the wiring site, and
+//! this paragraph used to say so; the chokepoint now only reads
+//! `report.outcome.blocks()`, so looking for the fail-open in
+//! `tool_host` finds nothing.)
 //!
-//! Not wired into the chokepoint yet — see
-//! `docs/superpowers/specs/2026-08-21-shieldstral-guard-slice-1-design.md`.
+//! **Wired into the chokepoint** as of the wiring slice
+//! ([#586](https://github.com/hherb/kastellan/issues/586)): the tier
+//! runs in `tool_host::post_process::screen_result` on every tool result
+//! the deterministic catalogue allowed. Slice-1 design:
+//! `docs/superpowers/specs/2026-08-21-shieldstral-guard-slice-1-design.md`;
+//! wiring design: `docs/superpowers/specs/2026-08-22-shieldstral-guard-wiring-design.md`.
 
+pub mod context_pin;
 pub mod decide;
 pub mod policy;
+pub mod tier;
+pub mod timeout;
 pub mod weights_pin;
 
 pub use decide::{decide, GuardAdjudication, DEFAULT_TAU};
+pub use tier::{
+    GuardOutcome, GuardReading, GuardReport, GuardTier, GuardTierError, SharedGuardTier,
+    Unadjudicated,
+};
 
 use kastellan_llm_router::logprob_score::{
     binary_token_probability, first_position_alternatives, NO_FORMS, YES_FORMS,
@@ -46,8 +60,17 @@ impl GuardClient {
     /// client could not be built. Collapsing those into one `None` would
     /// make an unconfigured guard indistinguishable from a broken one,
     /// which is how a security tier ends up silently off.
-    pub fn from_config(cfg: &RouterConfig) -> Result<Option<Self>, RouterError> {
-        match cfg.for_guard()? {
+    ///
+    /// `timeout` is the budget this client spends per request, stated
+    /// by the caller rather than inherited from the planner's config —
+    /// see [`RouterConfig::for_guard`] and wiring-spec D9. The boot
+    /// sequence builds two clients: a short-budget one for the probe,
+    /// and the production one at the timeout that probe derived.
+    pub fn from_config(
+        cfg: &RouterConfig,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Self>, RouterError> {
+        match cfg.for_guard(timeout)? {
             None => Ok(None),
             Some(guard_cfg) => Router::new(guard_cfg).map(|router| Some(Self { router })),
         }
@@ -85,6 +108,46 @@ impl GuardClient {
         let resp = self.router.send(&req).await?;
         Ok(first_position_alternatives(&resp)
             .and_then(|alts| binary_token_probability(alts, YES_FORMS, NO_FORMS)))
+    }
+
+    /// One adjudication, timed, reporting the backend's own token
+    /// accounting alongside the wall clock.
+    ///
+    /// The IO half of the boot probe (wiring-spec D9); `boot::run_probe`
+    /// is its only caller. The **verdict is discarded** — this call exists to
+    /// measure how fast the backend processes a prompt, not to judge
+    /// the probe document.
+    ///
+    /// It rebuilds `probability`'s request envelope rather than calling
+    /// it, for one reason: `probability` returns only the score, and
+    /// the probe needs `usage`. What is duplicated is the envelope,
+    /// which `guard_model_e2e::serves_the_pinned_request_envelope` pins
+    /// for the production path — and a probe that sent a slightly
+    /// different envelope would still measure this backend's throughput
+    /// on a same-sized prompt, which is all the derivation reads.
+    ///
+    /// The wall clock brackets the send alone.
+    pub async fn timed_probe(&self, document: &str) -> Result<timeout::ProbeReading, RouterError> {
+        let mut req = ChatRequest::new(
+            self.router.config().local_model.clone(),
+            policy::build_messages(document),
+        )
+        .with_logprobs(TOP_LOGPROBS);
+        req.max_tokens = Some(1);
+        req.temperature = Some(0.0);
+
+        let started = std::time::Instant::now();
+        let resp = self.router.send(&req).await?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        let usage = resp.usage.as_ref();
+        Ok(timeout::ProbeReading {
+            prompt_tokens: usage.and_then(|u| u.prompt_tokens),
+            cached_tokens: usage
+                .and_then(|u| u.prompt_tokens_details.as_ref())
+                .and_then(|d| d.cached_tokens),
+            elapsed_ms,
+        })
     }
 
     /// Screen one document against `tau`.
