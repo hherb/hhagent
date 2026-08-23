@@ -424,3 +424,78 @@ fn weights_unpinned_with_no_hashable_file_stamps_a_single_line() {
     assert!(stderr.contains("UNVERIFIED weights"), "{stderr}");
     assert!(stderr.contains("/props"), "stderr must carry the detail: {stderr}");
 }
+
+// ----- `--per-case` (which cases did the guard get wrong?) -----
+//
+// `render_per_case` has unit tests of its own; these two pin the FLAG to
+// the output. Without them the whole `if per_case { ... }` block in
+// `guard_calibrate.rs` can be deleted, or its condition inverted, and
+// every test in the tree still passes -- the section is emitted by the
+// binary and asserted nowhere.
+
+/// Off by default. The section is 133 lines on the real corpus, and the
+/// flag's own rationale is that an operator who came for the confusion
+/// matrix must not have it buried.
+#[test]
+fn per_case_section_is_absent_without_the_flag() {
+    if skip_if_unbuilt("per_case_section_is_absent_without_the_flag") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_valid_corpus(dir.path());
+    let weights = dir.path().join("candidate.gguf");
+    std::fs::write(&weights, b"a candidate guard model").expect("write weights");
+
+    let backend =
+        spawn_routing_backend("HTTP/1.1 200 OK", props_naming(&weights), canned_verdict());
+    let out = run_calibrate(dir.path(), &backend.base_url, &["--weights-unpinned"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(0), "must proceed\nstdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("guard calibration report"), "{stdout}");
+    assert!(
+        !stdout.contains("PER CASE"),
+        "the per-case section must be opt-in: {stdout}"
+    );
+}
+
+/// With the flag, every case in the corpus is named. Asserting the IDS
+/// -- not just the header -- is what makes this test see a section that
+/// renders but lists nothing.
+#[test]
+fn per_case_flag_names_every_case_after_the_aggregates() {
+    if skip_if_unbuilt("per_case_flag_names_every_case_after_the_aggregates") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_valid_corpus(dir.path());
+    let weights = dir.path().join("candidate.gguf");
+    std::fs::write(&weights, b"a candidate guard model").expect("write weights");
+
+    let backend =
+        spawn_routing_backend("HTTP/1.1 200 OK", props_naming(&weights), canned_verdict());
+    let out =
+        run_calibrate(dir.path(), &backend.base_url, &["--weights-unpinned", "--per-case"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(0), "must proceed\nstdout={stdout}\nstderr={stderr}");
+
+    let header = stdout
+        .find("-- PER CASE (ascending score) --")
+        .unwrap_or_else(|| panic!("no per-case section:\n{stdout}"));
+    // After the aggregates, not instead of them: `format_report` is the
+    // committed evidence and this must not displace any of it.
+    let matrix = stdout.find("-- ALL --").expect("the matrix is still there");
+    assert!(matrix < header, "the section must follow the aggregates:\n{stdout}");
+
+    let section = &stdout[header..];
+    for id in ["inj-001", "safe-001"] {
+        assert_eq!(
+            section.lines().filter(|l| l.split_whitespace().last() == Some(id)).count(),
+            1,
+            "{id} must be named exactly once in the section:\n{section}"
+        );
+    }
+}
