@@ -451,8 +451,8 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   - **Why it is a prerequisite and not a nicety:** without it, a recurring task raises the same approval every run, the operator approves reflexively, and the gate has negative value — it trains the habit it exists to prevent while still costing a round trip.
 - [ ] Policy gate: per-tool, per-task, per-data-classification routing decision
 - [ ] Frontier escalation through egress proxy (Anthropic / OpenAI)
-- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 MERGED 2026-08-23 as `d51c9b20` (PR [#606](https://github.com/hherb/kastellan/pull/606)); the WIRING slice is on `feat/guard-wiring-slice-586`.**
-  **WIRING SLICE 2026-08-23** (branch `feat/guard-wiring-slice-586`, closes
+- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 MERGED 2026-08-23 as `d51c9b20` (PR [#606](https://github.com/hherb/kastellan/pull/606)); the WIRING slice MERGED 2026-08-23 as `8736f559` (PR [#607](https://github.com/hherb/kastellan/pull/607)).**
+  **WIRING SLICE MERGED 2026-08-23** (`8736f559`, PR [#607](https://github.com/hherb/kastellan/pull/607), closes
   [#586](https://github.com/hherb/kastellan/issues/586)) — the tier reaches
   `post_process::finalize` as a threaded `Option<Arc<GuardTier>>`, catalogue first with a
   short-circuit proved by a request count, escalate-up only. Spec amended with **M2** and
