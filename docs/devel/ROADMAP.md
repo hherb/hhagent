@@ -471,8 +471,14 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   **advisory defence-in-depth, not a gate** — 65% recall, weakest against narrative
   indirect injection — and nothing downstream may relax on it. D5's per-dispatch `p`, on
   **cleared** documents too, makes production the score source for a corpus that is not
-  catalogue-selected. Mac gate: core lib 1923/0, `guard_tier_e2e` 11/0 with zero `[SKIP]`,
-  clippy 0 over 235 `Checking` lines, **all 11 named mutants killed**. **DGX sweep owed.**
+  catalogue-selected. **DGX gate `00fdc513`: 3823 / 0 / 54**, `TEST_EXIT=0`, 175 suites,
+  reconciling exactly against `main` 3759 **+64**; 8 `[SKIP]` all gliner-relex, *not* the
+  bwrap-userns skip. Mac: `guard_tier_e2e` 13/0 with zero `[SKIP]` under real PG; clippy
+  `-D warnings` exit 0 over **213** `Checking` lines from a cold target dir. **13 mutants,
+  12 killed, 1 equivalent** — `is_timeout` had no coverage at all and its always-false mutant
+  left the whole workspace green while handing the slowest hosts the shortest guard timeout;
+  killed by a pure `probe_error_outcome` plus a layer-2 case against a mock that accepts and
+  never answers.
   **MEASUREMENT 3 MERGED 2026-08-23** (`d51c9b20`, PR [#606](https://github.com/hherb/kastellan/pull/606)) — plan Task 5
   complete. **133 cases, 109 captured** through the real `web.fetch` path (D5 floor: ≥100 with a
   captured half), 24 truncated at `SCAN_BYTE_CAP` on both labels, **zero `Unmeasured`**, weights
@@ -545,19 +551,10 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   rendered **once, corpus-wide**; a `manifest` module carrying metadata and never text; and
   `kastellan-cli guard capture`, which drives the **real** chokepoint and refuses a result
   that came back as the injection placeholder (storing it would record a benign-looking
-  document in place of the page, which then gets scored). **Task 5 PILOTED LIVE 2026-08-22** (runbook
-  `docs/devel/runbooks/2026-08-22-guard-calibration-campaign.md`): 4 entries captured through the
-  real sandboxed worker, record→verify→tamper-refuse all proved, calibration over 3 strata with
-  zero `Unmeasured` — `best_tau` 0.336 (midpoint) vs operating point **τ ≈ 0.5666** (boundary),
-  both correct and differing exactly as D7 predicts. (The `0.566605` every earlier document
-  quotes is the `{:.6}`-**rounded** value; six decimals do not round-trip an f32, and since
-  this τ is by construction an observed score against a `p >= tau` comparison, the rounded
-  number is a *different, weaker* threshold about half the time. Fixed below; a re-run prints
-  the exact value.) **Still a PILOT, not measurement 3:** 4
-  captured cases, all benign, against a ≥100-with-a-captured-half requirement; ~35 captured
-  attacks and ≥8 over-cap documents are the main gaps. Two plan claims were corrected by running
-  it — `guard capture` needs **no** allowlist row and no daemon restart (it derives its own,
-  per-fetch), and Wayback pinning collapses the campaign's egress to one domain.
+  document in place of the page, which then gets scored). **Task 5 PILOTED LIVE 2026-08-22** and superseded by the real campaign; its two plan
+  corrections still hold — `guard capture` needs **no** `tool_allowlists` row and no daemon
+  restart (it derives its allowlist per entry), and Wayback pinning collapses the campaign's
+  egress surface to one domain.
   **[#592](https://github.com/hherb/kastellan/issues/592) blocked the two-host τ
   comparison:** the hosts ran different Q8_0 builds (HF LFS oid `35b755be…` vs the DGX's `5cee57a9…` at identical byte
   length) — pinning a quantisation LABEL is not pinning the bytes.
