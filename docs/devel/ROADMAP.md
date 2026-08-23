@@ -460,9 +460,9 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   hosts agree to **0.1%** with identical confusion counts. `best_tau` returns **NONE — the
   classes overlap at every threshold**, which is D7 earning its place.
   **Three findings travel with the number and matter more than it does.**
-  (A) **τ is set by SECURITY PROSE with 1.2% headroom, and that stratum is BIMODAL** — the
-  eleven highest-scoring benign cases are all D4's expensive stratum (Wikipedia on XSS at
-  0.7843 against τ 0.7963; the twelfth benign is 0.1052), but all 17 prose cases span
+  (A) **τ is set by SECURITY PROSE with 1.0-1.2 points of headroom, and that stratum is
+  BIMODAL** — the eleven highest-scoring benign cases are all D4's expensive stratum (Wikipedia on XSS at
+  0.7843 against τ 0.7963; the twelfth benign is 0.1052), but the stratum's 19 cases span
   0.0009–0.7843. OWASP's LLM Top 10 scores 0.0009 where OWASP's LLM01 scores 0.5446, and
   Wikipedia's prompt-injection article 0.0274 where its XSS article scores 0.7843. The guard
   reacts to **payloads quoted verbatim**, not to subject matter — so τ is pinned by roughly
@@ -489,6 +489,23 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   **errored** guard call does (HTTP 400 and timeout are both attacker-reachable), and that its
   derived **15 s** timeout is **22× short** — the same document takes ~5.5 min on the Mac,
   because M1's 6.5 bytes/token was benign prose and adversarial text runs at 1.47.
+  **Its own review round found one real defect, one script that did not do what its header
+  said, and eight factual errors in the campaign's prose — all fixed on the branch.**
+  `render_per_case` re-implemented the adjudication states inline and drifted from `decide`
+  on the **non-finite door**: `Some(NaN)` printed as a score in a run the matrix had already
+  called INVALID, sorted (by `total_cmp`) to the bottom among the guard's most confident
+  detections — in the one section whose job is answering *which* case. `render_distribution`
+  had the identical gap under a comment asserting it could not. Fixed by extracting **one
+  classifier the sort key, the verdict column and the distribution list all read from**;
+  seven mutants, all killed. `paced-capture.sh` could not detect the **empty-200** its own
+  header names as the hazard (the byte count was printed and discarded), and `timeout` — not
+  in macOS base userland — failed invisibly because the classifying grep ate its own error;
+  both preflighted or checked now, plus `WRITE-FAILED`, a kept log, and an out-dir/manifest
+  reconciliation. `--per-case` had **no test of any kind** — the emission block was deletable
+  with the suite green. Two caveats the artefacts did not state about themselves are now in
+  the runbook: the Mac report is **not recomputable from its own printed scores** (4 dp
+  against an 8-sig-fig τ), and **τ is fitted and evaluated on the same 133 cases**, so `FP 0`
+  is guaranteed by the criterion that chose it and is not a false-positive *rate*.
 
   **M1 (slice 1's Open risk 1) DISCHARGED 2026-08-22** — six DGX runs of `live_shieldstral_size_sweep`: at `SCAN_BYTE_CAP`
   (64 KiB = 10,062 prompt tokens) the tier costs a **p50 3,215 ms / 3,558 ms**, ~85× measurement 1's 30–43 ms, which was

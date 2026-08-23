@@ -1,6 +1,6 @@
-//! `guard calibrate [--corpus DIR] [--tau F] [--weights-unpinned]` — score
-//! a labelled corpus through the shipping guard adjudicator and print a
-//! confusion matrix.
+//! `guard calibrate [--corpus DIR] [--tau F] [--weights-unpinned]
+//! [--per-case]` — score a labelled corpus through the shipping guard
+//! adjudicator and print a confusion matrix.
 //!
 //! Offline tooling. Nothing here runs in the daemon.
 

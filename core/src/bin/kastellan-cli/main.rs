@@ -65,10 +65,11 @@
 //!   `MAX_WALK_DEPTH` = 5). Read-only — uses the runtime pool, emits no
 //!   audit row. Quarantined endpoints are tagged `[Q]`.
 //!
-//! * `guard calibrate [--corpus DIR] [--tau F]` — score a labelled
-//!   document corpus through the shipping Shieldstral adjudicator and
-//!   print a confusion matrix. Offline tooling; needs
-//!   `KASTELLAN_LLM_GUARD_URL`/`_MODEL` set.
+//! * `guard calibrate [--corpus DIR] [--tau F] [--weights-unpinned]
+//!   [--per-case]` — score a labelled document corpus through the
+//!   shipping Shieldstral adjudicator and print a confusion matrix.
+//!   `--per-case` adds one line per case after the aggregates. Offline
+//!   tooling; needs `KASTELLAN_LLM_GUARD_URL`/`_MODEL` set.
 //! * `observation replay [--captures-dir PATH] [--model SLUG]` — re-run
 //!   captured plans through the production review chain for offline
 //!   rule iteration.
@@ -251,7 +252,7 @@ usage:
     kastellan-cli relations kinds list
     kastellan-cli relations show         <entity-id> [--depth N] [--format plain|json]
     kastellan-cli observation replay     [--captures-dir PATH] [--model SLUG]
-    kastellan-cli guard calibrate        [--corpus DIR] [--tau F]
+    kastellan-cli guard calibrate        [--corpus DIR] [--tau F] [--weights-unpinned] [--per-case]
     kastellan-cli guard capture          --manifest DIR --out DIR [--record]
     kastellan-cli pair issue   [--label <text>] [--ttl-mins <n>]
     kastellan-cli pair list    [--all]

@@ -257,33 +257,32 @@ pub struct RunMeta {
 /// attack the tier is blind to. On measurement 3's corpus the corpus-wide
 /// count was `FN 19` and nothing in the artefact said which nineteen.
 ///
-/// Sorted ascending, so the two failure modes land at the two ends: the
-/// lowest-scoring ATTACKS (misses) at the top, the highest-scoring
-/// BENIGNS (false positives) at the bottom. A reader scans inwards from
-/// both ends and stops when the labels stop surprising them.
+/// Sorted ascending over the scored cases, so the two failure modes land
+/// at the two ends of that region: the lowest-scoring ATTACKS (misses)
+/// first, the highest-scoring BENIGNS (false positives) last. A reader
+/// scans inwards from both ends and stops when the labels stop
+/// surprising them.
 ///
 /// Three states are rendered distinctly, because collapsing any two of
-/// them would misreport a case:
-///
-/// * a **score**, for a case the guard actually judged;
-/// * `excluded`, for a case the catalogue blocks -- the CLI never sent
-///   it to the model, so it has no score, and printing `0.0000` would
-///   read as "judged harmless" when the truth is "blocked outright";
-/// * `UNMEASURED`, for an *adjudicated* case the backend returned no
-///   usable verdict for. D5 makes a single one of these an invalid run,
-///   so it is shouted rather than mentioned.
+/// them would misreport a case -- a **score**, `excluded` for a case the
+/// catalogue blocks outright, and `UNMEASURED` for an adjudicated case
+/// the backend gave no usable verdict for. The two that have no score
+/// sort *below* every scored case rather than being given a fake `0.0`.
+/// The classifier that decides between them, and the reasoning, are on
+/// `per_case_verdict`.
 pub fn render_per_case(cases: &[ScoredCase]) -> String {
     let mut rows: Vec<&ScoredCase> = cases.iter().collect();
     // Excluded and unmeasured cases have no score to sort by. They sort
     // last, together, rather than being given a fake 0.0 that would put
     // them among the guard's most confident benign judgements.
+    //
+    // The ordering key comes from the SAME classifier the verdict column
+    // renders from, so a case cannot sort as scored and then print as
+    // `UNMEASURED`, or the reverse.
     rows.sort_by(|a, b| {
-        let key = |c: &ScoredCase| {
-            if c.is_adjudicated() {
-                c.probability
-            } else {
-                None
-            }
+        let key = |c: &ScoredCase| match per_case_verdict(c) {
+            PerCaseVerdict::Scored(p) => Some(p),
+            PerCaseVerdict::Unmeasured | PerCaseVerdict::Excluded => None,
         };
         match (key(a), key(b)) {
             (Some(x), Some(y)) => x.total_cmp(&y),
@@ -296,15 +295,23 @@ pub fn render_per_case(cases: &[ScoredCase]) -> String {
 
     let mut s = String::from("\n-- PER CASE (ascending score) --\n");
     for c in rows {
-        let verdict = match (c.is_adjudicated(), c.probability) {
-            (true, Some(p)) => format!("{p:.4}"),
-            (true, None) => "UNMEASURED".to_string(),
-            (false, _) => "excluded".to_string(),
+        let verdict = match per_case_verdict(c) {
+            // `{:.4}` not `{}`: the distribution section renders scores
+            // at the same precision, and an operator cross-references a
+            // score there against a case id here. Two precisions break
+            // that lookup silently.
+            PerCaseVerdict::Scored(p) => format!("{p:.4}"),
+            PerCaseVerdict::Unmeasured => "UNMEASURED".to_string(),
+            PerCaseVerdict::Excluded => "excluded".to_string(),
         };
         let label = match c.label {
             Label::Attack => "attack",
             Label::Benign => "benign",
         };
+        // The two widths are load-bearing and exact, not generous:
+        // `UNMEASURED` is 10 and `derived_from_catalogue` is 22. A new
+        // `Provenance` variant or a longer verdict word ragged-edges the
+        // column rather than truncating, so widen them together.
         s.push_str(&format!(
             "  {verdict:>10}  {label:6}  {:<22}  {}\n",
             c.provenance.as_str(),
@@ -312,6 +319,50 @@ pub fn render_per_case(cases: &[ScoredCase]) -> String {
         ));
     }
     s
+}
+
+/// What [`render_per_case`] has to say about one case.
+///
+/// Three states, kept distinct because collapsing any two of them would
+/// misreport a case:
+///
+/// * [`Scored`](PerCaseVerdict::Scored) -- the guard actually judged it;
+/// * [`Excluded`](PerCaseVerdict::Excluded) -- the catalogue blocks it,
+///   so the CLI never sent it to the model. It has no score, and
+///   printing `0.0000` would read as "judged harmless" when the truth is
+///   "blocked outright";
+/// * [`Unmeasured`](PerCaseVerdict::Unmeasured) -- *adjudicated*, but the
+///   backend returned no usable verdict. D5 makes a single one of these
+///   an invalid run, so it is shouted rather than mentioned.
+enum PerCaseVerdict {
+    Scored(f32),
+    Unmeasured,
+    Excluded,
+}
+
+/// Classify one case for the per-case section.
+///
+/// **A non-finite probability is `Unmeasured`, not a score.** This is the
+/// same door [`decide`] closes (`Some(p) if !p.is_finite()`) and the same
+/// one [`best_tau`] filters on, and it must not drift from them: the
+/// matrix would call the run INVALID over an unmeasured case while this
+/// section rendered it as `NaN` and -- because `total_cmp` orders a
+/// positive NaN last -- sorted it to the very bottom, among the guard's
+/// most confident detections. The section whose whole job is answering
+/// "*which* case?" would then point at the wrong end of the list.
+///
+/// Not reachable from the wire today, for the reason `decide` documents:
+/// `serde_json` rejects an out-of-range float rather than decoding it to
+/// an infinity. Guarded anyway, on the same grounds -- "unreachable" is a
+/// property of a dependency's parser.
+fn per_case_verdict(c: &ScoredCase) -> PerCaseVerdict {
+    if !c.is_adjudicated() {
+        return PerCaseVerdict::Excluded;
+    }
+    match c.probability.filter(|p| p.is_finite()) {
+        Some(p) => PerCaseVerdict::Scored(p),
+        None => PerCaseVerdict::Unmeasured,
+    }
 }
 
 /// Render the operator-facing report.
@@ -597,19 +648,29 @@ fn render_section(name: &str, cases: &[ScoredCase], tau: f32) -> String {
 fn render_distribution(cases: &[ScoredCase]) -> String {
     let mut out = String::new();
     for (label, name) in [(Label::Attack, "attack"), (Label::Benign, "benign")] {
+        // Through `per_case_verdict`, the same classifier the per-case
+        // section renders from — so a non-finite probability is dropped
+        // here exactly as `decide` calls it `Unmeasured` and `best_tau`
+        // filters it out, rather than being printed as `NaN` in a list
+        // of scores. Dropping it does not lose it silently: a single
+        // unmeasured case makes the whole run INVALID, which the matrix
+        // above says in its own words.
         let mut scores: Vec<f32> = cases
             .iter()
-            .filter(|c| c.is_adjudicated() && c.label == label)
-            .filter_map(|c| c.probability)
+            .filter(|c| c.label == label)
+            .filter_map(|c| match per_case_verdict(c) {
+                PerCaseVerdict::Scored(p) => Some(p),
+                PerCaseVerdict::Unmeasured | PerCaseVerdict::Excluded => None,
+            })
             .collect();
         if scores.is_empty() {
             continue;
         }
         // `total_cmp` rather than `partial_cmp().expect(..)`: a total
         // order needs no NaN precondition, so this is the only sort in
-        // the module that cannot panic. Non-finite scores are already
-        // routed to `Unmeasured` upstream, so none reach here — but a
-        // panic in a report renderer is a poor way to learn otherwise.
+        // the module that cannot panic. Nothing non-finite reaches here
+        // now that the filter above routes it out — but a panic in a
+        // report renderer is a poor way to learn otherwise.
         scores.sort_by(|a, b| a.total_cmp(b));
         let rendered: Vec<String> = scores.iter().map(|p| format!("{p:.4}")).collect();
         out.push_str(&format!("  {name} scores ({}): {}\n", scores.len(), rendered.join(" ")));
@@ -619,6 +680,8 @@ fn render_distribution(cases: &[ScoredCase]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::cassandra::guard_model::weights_pin::FileDigest;
     use std::path::PathBuf;
@@ -680,14 +743,51 @@ mod tests {
         }
     }
 
-
     // ----- per-case rendering (which cases did the guard get wrong?) -----
+
+    /// One rendered row, split into its four columns.
+    ///
+    /// **Parsed by COLUMN, never by substring.** An earlier draft of
+    /// these tests counted `out.matches(id)`, which is sound only by
+    /// accident: the shipped ids are `cap-005-...`, and `cap` is a
+    /// substring of `captured` on every single line. Ids like `att`,
+    /// `ben`, `red` or an `fp` alongside an `fp-thing` all break it, and
+    /// the failure lands nowhere near its cause.
+    fn per_case_rows(out: &str) -> Vec<(String, String, String, String)> {
+        out.lines()
+            .filter(|l| l.starts_with("  "))
+            .map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                assert_eq!(f.len(), 4, "expected 4 columns, got {l:?}");
+                (
+                    f[0].to_string(),
+                    f[1].to_string(),
+                    f[2].to_string(),
+                    f[3].to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The verdict column of the row naming `id`.
+    fn verdict_of(out: &str, id: &str) -> String {
+        per_case_rows(out)
+            .into_iter()
+            .find(|r| r.3 == id)
+            .unwrap_or_else(|| panic!("no row for {id} in:\n{out}"))
+            .0
+    }
 
     /// The whole point of the section: an operator reading a corpus-wide
     /// `FN 19` must be able to find out WHICH nineteen. Before this
     /// existed the report printed sorted score lists with no case
     /// identity attached, so "the guard misses a third of the attacks"
     /// was measurable and "which attacks" was not.
+    ///
+    /// Asserts ONE ROW PER CASE and the exact id set, so both a dropped
+    /// case and a duplicated one fail -- and, because the id is read out
+    /// of its own column, so does a renderer that emits the ids anywhere
+    /// other than one per line.
     #[test]
     fn per_case_names_every_case_exactly_once() {
         let cases = vec![
@@ -697,20 +797,25 @@ mod tests {
             case("tn", Label::Benign, Provenance::Captured, 0.0, Some(0.02)),
         ];
         let out = render_per_case(&cases);
-        for id in ["miss", "hit", "fp", "tn"] {
-            assert_eq!(
-                out.matches(id).count(),
-                1,
-                "{id} must appear exactly once in:\n{out}"
-            );
-        }
+        let rows = per_case_rows(&out);
+        assert_eq!(rows.len(), cases.len(), "one row per case, got:\n{out}");
+        let ids: BTreeSet<&str> = rows.iter().map(|r| r.3.as_str()).collect();
+        assert_eq!(
+            ids,
+            BTreeSet::from(["miss", "hit", "fp", "tn"]),
+            "every case exactly once, got:\n{out}"
+        );
     }
 
-    /// Ascending, so the two failure modes sit at the two ends: the
-    /// attacks the guard scored lowest (misses) at the top, the benigns
-    /// it scored highest (false positives) at the bottom. Sorting is the
-    /// entire ergonomic value -- an unsorted list of 133 lines is a file
-    /// to grep, not a section to read.
+    /// Ascending, so within the scored region the two failure modes sit
+    /// at its two ends: the attacks the guard scored lowest (misses)
+    /// first, the benigns it scored highest (false positives) last.
+    /// Sorting is the entire ergonomic value -- an unsorted list of 133
+    /// lines is a file to grep, not a section to read.
+    ///
+    /// The fixture deliberately puts the ATTACK at the top of the score
+    /// range and a BENIGN at the bottom, so the assertion can only be
+    /// satisfied by ordering on the score and not on the label.
     #[test]
     fn per_case_is_sorted_by_score_ascending() {
         let cases = vec![
@@ -719,10 +824,41 @@ mod tests {
             case("mid", Label::Attack, Provenance::Captured, 0.0, Some(0.5)),
         ];
         let out = render_per_case(&cases);
-        let pos = |id: &str| out.find(id).expect("id present");
-        assert!(
-            pos("low") < pos("mid") && pos("mid") < pos("high"),
-            "must be ascending by score, got:\n{out}"
+        let ids: Vec<String> = per_case_rows(&out).into_iter().map(|r| r.3).collect();
+        assert_eq!(ids, ["low", "mid", "high"], "must be ascending:\n{out}");
+    }
+
+    /// **The unscored cases sort BELOW every scored one**, which the
+    /// section's own doc promises and which nothing else here would
+    /// catch: with the `Some`/`None` arms of the comparator swapped, the
+    /// `excluded` and `UNMEASURED` rows move to the TOP -- exactly where
+    /// the reader has been told the guard's worst misses live. Every
+    /// other fixture in this block is all-scored or all-unscored, so
+    /// this is the only one that exercises the mixed comparison at all.
+    #[test]
+    fn per_case_sorts_unscored_cases_below_every_scored_one() {
+        let cases = vec![
+            // Deliberately in the WRONG order relative to the expected
+            // output: the two unscored cases both key to `None`, so
+            // `sort_by` being stable would leave them exactly as given.
+            // Only the `.then_with(id)` tie-break reorders them, which
+            // is what makes that clause load-bearing here rather than
+            // decorative.
+            case("nul", Label::Attack, Provenance::Captured, 0.0, None),
+            case("blocked", Label::Attack, Provenance::DerivedFromCatalogue, BLOCK_THRESHOLD, None),
+            // Scored, and scored at the very BOTTOM of the range: if the
+            // unscored rows were being sorted as a fake 0.0 they would
+            // still land above this one, so the assertion distinguishes
+            // "sorted last" from "sorted as zero".
+            case("lowest", Label::Benign, Provenance::Captured, 0.0, Some(0.0)),
+            case("highest", Label::Attack, Provenance::Captured, 0.0, Some(1.0)),
+        ];
+        let out = render_per_case(&cases);
+        let ids: Vec<String> = per_case_rows(&out).into_iter().map(|r| r.3).collect();
+        assert_eq!(
+            ids,
+            ["lowest", "highest", "blocked", "nul"],
+            "scored first (ascending), then the unscored, id-ordered:\n{out}"
         );
     }
 
@@ -740,10 +876,7 @@ mod tests {
             None,
         )];
         let out = render_per_case(&cases);
-        assert!(
-            out.contains("excluded"),
-            "an excluded case must say so: {out}"
-        );
+        assert_eq!(verdict_of(&out, "blocked"), "excluded", "got:\n{out}");
         assert!(
             !out.contains("0.0000"),
             "must not render a score it never had: {out}"
@@ -754,40 +887,67 @@ mod tests {
     /// the backend returned no usable logprob. D5 makes that an invalid
     /// run, so it must be visually distinct from both a real score and
     /// from an exclusion, which is a different thing entirely.
+    ///
+    /// **Both fixtures share a provenance and neither id is a verdict
+    /// word.** They differ only in `catalogue_score`, which is what
+    /// `is_adjudicated` reads -- so the two rows are identical outside
+    /// the verdict column, and comparing those columns is the only thing
+    /// that can distinguish them. An earlier draft varied the provenance
+    /// too, which made the rows differ for a reason that had nothing to
+    /// do with the collapse being guarded against: force the two
+    /// verdicts to render the same string and the assertion still
+    /// passed.
     #[test]
     fn per_case_marks_an_unmeasured_case_distinctly_from_an_excluded_one() {
         let cases = vec![
-            case("unmeasured", Label::Attack, Provenance::Captured, 0.0, None),
-            case(
-                "excluded",
-                Label::Attack,
-                Provenance::DerivedFromCatalogue,
-                BLOCK_THRESHOLD,
-                None,
-            ),
+            case("u1", Label::Attack, Provenance::Captured, 0.0, None),
+            case("x1", Label::Attack, Provenance::Captured, BLOCK_THRESHOLD, None),
         ];
         let out = render_per_case(&cases);
-        let line = |id: &str| {
-            out.lines()
-                .find(|l| l.contains(id))
-                .unwrap_or_else(|| panic!("no line for {id} in {out}"))
-                .to_string()
-        };
-        assert!(
-            line("unmeasured").contains("UNMEASURED"),
-            "an unmeasured adjudicated case must be loud: {}",
-            line("unmeasured")
-        );
+        assert_eq!(verdict_of(&out, "u1"), "UNMEASURED", "got:\n{out}");
+        assert_eq!(verdict_of(&out, "x1"), "excluded", "got:\n{out}");
         assert_ne!(
-            line("unmeasured").replace("unmeasured", ""),
-            line("excluded").replace("excluded", ""),
-            "unmeasured and excluded must not render identically"
+            verdict_of(&out, "u1"),
+            verdict_of(&out, "x1"),
+            "unmeasured and excluded must not collapse:\n{out}"
         );
+    }
+
+    /// **A non-finite probability is UNMEASURED here too.** [`decide`]
+    /// routes `Some(p)` with a non-finite `p` to `Unmeasured` and
+    /// `confusion_at` counts it as one, so the matrix calls the run
+    /// INVALID. If this section rendered `NaN` in the score column
+    /// instead, the operator who came here to find out WHICH case
+    /// invalidated the run would find no `UNMEASURED` row at all -- and
+    /// `total_cmp` orders a positive NaN last, so the case would be
+    /// sitting at the bottom of the list among the guard's most
+    /// confident detections.
+    ///
+    /// The sibling `a_non_finite_score_is_unmeasured_in_the_matrix_and_in_the_fit`
+    /// pins the same door for `confusion_at` and `best_tau`; this is the
+    /// third consumer.
+    #[test]
+    fn per_case_renders_a_non_finite_score_as_unmeasured() {
+        for (id, p) in [("nan", f32::NAN), ("inf", f32::INFINITY), ("ninf", f32::NEG_INFINITY)] {
+            let cases = vec![case(id, Label::Attack, Provenance::Captured, 0.0, Some(p))];
+            let out = render_per_case(&cases);
+            assert_eq!(
+                verdict_of(&out, id),
+                "UNMEASURED",
+                "a non-finite score is not a verdict:\n{out}"
+            );
+        }
     }
 
     /// The label has to be on the line, or a reader cannot tell a miss
     /// (low-scoring ATTACK) from a correct rejection (low-scoring
     /// benign) -- and those sit adjacent to each other in the sort.
+    ///
+    /// The score is asserted at its full `{:.4}` width, not as `0.25`:
+    /// the distribution section renders scores at the same precision and
+    /// an operator cross-references between the two, so a looser
+    /// assertion would let `{p:.2}` -- or a bare `{p}`, which also blows
+    /// the column -- through unnoticed.
     #[test]
     fn per_case_carries_the_label_and_provenance() {
         let cases = vec![case(
@@ -798,9 +958,40 @@ mod tests {
             Some(0.25),
         )];
         let out = render_per_case(&cases);
-        assert!(out.contains("attack"), "label must be present: {out}");
-        assert!(out.contains("captured"), "provenance must be present: {out}");
-        assert!(out.contains("0.25"), "score must be present: {out}");
+        let rows = per_case_rows(&out);
+        assert_eq!(
+            rows,
+            vec![(
+                "0.2500".to_string(),
+                "attack".to_string(),
+                "captured".to_string(),
+                "x".to_string()
+            )],
+            "got:\n{out}"
+        );
+    }
+
+    /// The distribution list is the OTHER place a non-finite score
+    /// could be printed as a number. It is the list an operator
+    /// cross-references against the per-case section, so the two must
+    /// agree about what counts as a score -- and `attack scores (2):
+    /// 0.9000 NaN` would read as a measurement the guard never made.
+    ///
+    /// The count shrinks with it, deliberately. That is not a silent
+    /// loss: one unmeasured case makes the run INVALID, and the matrix
+    /// directly above says so.
+    #[test]
+    fn the_distribution_omits_a_non_finite_score_rather_than_printing_nan() {
+        let cases = vec![
+            case("ok", Label::Attack, Provenance::HandWritten, 0.0, Some(0.9)),
+            case("bad", Label::Attack, Provenance::HandWritten, 0.0, Some(f32::NAN)),
+        ];
+        let out = render_distribution(&cases);
+        assert!(!out.contains("NaN"), "must not print a non-verdict: {out}");
+        assert!(
+            out.contains("attack scores (1): 0.9000"),
+            "the count must follow the list: {out}"
+        );
     }
 
     #[test]
