@@ -363,21 +363,51 @@ pub fn derive_guard_timeout(outcome: &ProbeOutcome) -> GuardTimeout {
     }
 }
 
-/// The operator's override, or the derivation.
+/// Why an operator-supplied guard timeout is unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutError {
+    /// `KASTELLAN_LLM_GUARD_TIMEOUT_MS=0`.
+    ///
+    /// No HTTP request completes in zero milliseconds, so every
+    /// adjudication would time out and take the fail-open door: the tier
+    /// would look configured, log as configured, and be off. That is the
+    /// same silent failure [`super::tier::validate_tau`] refuses at both
+    /// ends of the threshold range, reached through the timeout instead.
+    Zero,
+}
+
+impl std::fmt::Display for TimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero => write!(
+                f,
+                "KASTELLAN_LLM_GUARD_TIMEOUT_MS is 0. No request completes in zero \
+                 milliseconds, so every adjudication would time out and fail OPEN -- the \
+                 tier would be configured, logged as configured, and off. Unset it to \
+                 derive a budget from a boot probe, or set a positive value."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TimeoutError {}
+
+/// Accept an operator-pinned timeout verbatim, refusing only the value
+/// that cannot work.
 ///
-/// **The override wins without consulting the outcome at all**, which
-/// is why it takes the outcome by reference and may ignore it: an
-/// operator who pinned a number has already decided, and re-deriving
-/// underneath them would make the env var advisory.
+/// **Deliberately NOT clamped to the derivation band.** The band
+/// constrains what this module may *infer*; an operator who pinned a
+/// number has already decided, and silently overriding them would make
+/// the env var advisory. What is refused is zero — not because it is
+/// unwise but because it is unusable, the same line
+/// [`super::tier::validate_tau`] draws.
 ///
 /// Pure.
-pub fn guard_timeout_from(override_ms: Option<u64>, outcome: &ProbeOutcome) -> GuardTimeout {
-    match override_ms {
-        Some(ms) => {
-            GuardTimeout { timeout: Duration::from_millis(ms), basis: TimeoutBasis::Operator }
-        }
-        None => derive_guard_timeout(outcome),
+pub fn validate_operator_timeout(ms: u64) -> Result<GuardTimeout, TimeoutError> {
+    if ms == 0 {
+        return Err(TimeoutError::Zero);
     }
+    Ok(GuardTimeout { timeout: Duration::from_millis(ms), basis: TimeoutBasis::Operator })
 }
 
 #[cfg(test)]

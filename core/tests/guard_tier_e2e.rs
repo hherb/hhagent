@@ -620,6 +620,36 @@ async fn a_guard_configured_without_a_tau_refuses_to_build() {
     );
 }
 
+/// A pinned timeout of zero refuses to boot.
+///
+/// Not a range check — 1 ms is accepted. Zero is the one value that cannot
+/// work: no request completes in zero milliseconds, so every adjudication
+/// would time out and take the fail-open door, leaving the tier configured,
+/// logged as configured, and off. This case exists at layer 2 because the pure
+/// refusal proves nothing about whether the boot sequence propagates it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pinned_timeout_of_zero_refuses_to_build() {
+    let mock = MockGuardServer::spawn(Verdict::Clear).await;
+    let cfg = RouterConfig {
+        guard_timeout_ms: Some(0),
+        ..pinned_cfg(&mock.base_url)
+    };
+    let err = GuardTier::from_router_config(&cfg, "e2e-nonce")
+        .await
+        .expect_err("a zero timeout silently disables the tier");
+    let msg = err.to_string();
+    assert!(msg.contains("KASTELLAN_LLM_GUARD_TIMEOUT_MS"), "must name the key: {msg}");
+    assert!(msg.contains("OPEN"), "must state the consequence: {msg}");
+
+    // One millisecond is unwise and accepted, which is what makes the refusal
+    // above a claim about usability rather than about taste.
+    let ok = RouterConfig { guard_timeout_ms: Some(1), ..pinned_cfg(&mock.base_url) };
+    assert!(
+        GuardTier::from_router_config(&ok, "e2e-nonce").await.is_ok(),
+        "the refusal is for the unusable, not for the unwise"
+    );
+}
+
 /// D9: with no operator override, the boot probe runs and derives a timeout.
 ///
 /// The mock reports 810 uncached prompt tokens (M2's measured figure) and

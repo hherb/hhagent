@@ -306,30 +306,53 @@ fn the_uncached_token_floor_accepts_exactly_the_minimum() {
 
 // ── the operator override ───────────────────────────────────────────
 
-/// The override wins over ANY outcome, including one that would have
-/// derived something very different in each direction.
+/// A pinned timeout is honoured verbatim and reports itself as the
+/// operator's, not as a measurement.
 #[test]
-fn the_operator_override_wins_without_consulting_the_probe() {
-    for outcome in [&DGX_MEASURED, &MAC_MEASURED, &ProbeOutcome::NoTokenCount] {
-        let t = guard_timeout_from(Some(45_000), outcome);
-        assert_eq!(t.timeout, Duration::from_millis(45_000), "for {outcome:?}");
-        assert_eq!(t.basis, TimeoutBasis::Operator, "for {outcome:?}");
-    }
+fn an_operator_pinned_timeout_is_taken_verbatim() {
+    let t = validate_operator_timeout(45_000).expect("a positive value is usable");
+    assert_eq!(t.timeout, Duration::from_millis(45_000));
+    assert_eq!(t.basis, TimeoutBasis::Operator);
+    assert!(
+        !t.basis.is_coverage_finding(),
+        "an operator's own number is not a finding about the host"
+    );
 }
 
-/// An override outside the derived band is honoured verbatim — the
-/// band constrains the *derivation*, not the operator.
+/// **Not clamped to the derivation band.**
+///
+/// The band constrains what this module may *infer*; an operator who
+/// pinned a number has already decided, and silently overriding them
+/// would make the env var advisory. Both sides of the band are checked
+/// so a future "just clamp it for safety" edit fails here.
 #[test]
-fn the_operator_override_is_not_clamped() {
-    let t = guard_timeout_from(Some(1), &DGX_MEASURED);
-    assert_eq!(t.timeout, Duration::from_millis(1));
-    let t = guard_timeout_from(Some(600_000), &DGX_MEASURED);
-    assert_eq!(t.timeout, Duration::from_millis(600_000));
+fn an_operator_pinned_timeout_is_not_clamped_to_the_derivation_band() {
+    let below = validate_operator_timeout(TIMEOUT_FLOOR_MS - 1).expect("usable");
+    assert_eq!(below.timeout, Duration::from_millis(TIMEOUT_FLOOR_MS - 1));
+    let above = validate_operator_timeout(TIMEOUT_CEILING_MS + 1).expect("usable");
+    assert_eq!(above.timeout, Duration::from_millis(TIMEOUT_CEILING_MS + 1));
 }
 
+/// Zero is refused — the one value that cannot work.
+///
+/// No request completes in zero milliseconds, so every adjudication
+/// would time out and take the fail-open door: configured, logged as
+/// configured, and off. Same silent failure `validate_tau` refuses at
+/// both ends of the threshold range, reached through the timeout
+/// instead. **1 ms is accepted**, because the refusal is for values
+/// that cannot work rather than for values that are unwise — the same
+/// line `validate_tau` draws at `f32::MIN_POSITIVE`.
 #[test]
-fn no_override_falls_through_to_the_derivation() {
-    assert_eq!(guard_timeout_from(None, &DGX_MEASURED), derive_guard_timeout(&DGX_MEASURED));
+fn a_zero_operator_timeout_is_refused_but_one_millisecond_is_not() {
+    assert_eq!(validate_operator_timeout(0), Err(TimeoutError::Zero));
+    let msg = TimeoutError::Zero.to_string();
+    assert!(msg.contains("KASTELLAN_LLM_GUARD_TIMEOUT_MS"), "must name the key: {msg}");
+    assert!(msg.contains("OPEN"), "must state the consequence: {msg}");
+
+    assert!(
+        validate_operator_timeout(1).is_ok(),
+        "the refusal is for the unusable, not for the unwise"
+    );
 }
 
 // ── the probe document ──────────────────────────────────────────────

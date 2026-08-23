@@ -37,6 +37,8 @@ pub enum GuardTierError {
     PropsUnavailable(RouterError),
     /// The backend's context cannot hold a worst-case document.
     Context(GuardContextError),
+    /// The operator pinned a timeout that cannot work.
+    Timeout(timeout::TimeoutError),
 }
 
 impl std::fmt::Display for GuardTierError {
@@ -53,6 +55,7 @@ impl std::fmt::Display for GuardTierError {
                  to run without the tier deliberately."
             ),
             Self::Context(e) => write!(f, "{e}"),
+            Self::Timeout(e) => write!(f, "{e}"),
         }
     }
 }
@@ -181,12 +184,20 @@ impl GuardTier {
         let n_ctx = context_pin::verify_guard_context(context_pin::n_ctx_from_props(&props))
             .map_err(GuardTierError::Context)?;
 
-        // Step 4 — never fatal.
-        let outcome = match cfg.guard_timeout_ms {
-            Some(_) => ProbeOutcome::NoTokenCount, // ignored by the override arm
-            None => run_probe(&probe_client, nonce).await,
+        // Step 4. The probe is never fatal; the operator's own value IS
+        // validated, because a pinned 0 would silently disable the tier.
+        //
+        // The two arms are kept apart rather than folded into one helper
+        // taking both: an earlier revision passed a fabricated
+        // `ProbeOutcome` on the override path for the callee to ignore,
+        // which is a value that means nothing travelling through a
+        // signature that implies it means something.
+        let timeout = match cfg.guard_timeout_ms {
+            Some(ms) => {
+                timeout::validate_operator_timeout(ms).map_err(GuardTierError::Timeout)?
+            }
+            None => timeout::derive_guard_timeout(&run_probe(&probe_client, nonce).await),
         };
-        let timeout = timeout::guard_timeout_from(cfg.guard_timeout_ms, &outcome);
 
         let client = GuardClient::from_config(cfg, timeout.timeout)
             .map_err(GuardTierError::Config)?
@@ -264,15 +275,17 @@ async fn run_probe(client: &GuardClient, nonce: &str) -> ProbeOutcome {
 
 /// Did this router error come from the request budget running out?
 ///
-/// `reqwest` surfaces a total-timeout as a `Transport` error whose
-/// `Display` names it. Matching on the text is coarse, and the
-/// consequence of getting it wrong is bounded: a misread timeout
-/// becomes [`ProbeOutcome::Failed`] and takes the floor instead of the
-/// ceiling, which is a *shorter* guard timeout on a slow host — worth
-/// avoiding, not worth a boot failure over.
+/// Asks `reqwest` directly rather than matching its `Display` text.
+/// The text form works today — `RouterError::Transport` appends
+/// `" [request timed out]"` via `transport_kind_tag` — but it is the
+/// wrong predicate for a load-bearing distinction: a reqwest upgrade
+/// that reworded the tag would silently reclassify every probe timeout
+/// as [`ProbeOutcome::Failed`], which takes the **floor** instead of
+/// the **ceiling** and so hands the slowest hosts the shortest guard
+/// timeout. That is a fail-open, and it would show up as nothing at
+/// all.
 fn is_timeout(e: &RouterError) -> bool {
-    let s = e.to_string().to_ascii_lowercase();
-    s.contains("timed out") || s.contains("timeout")
+    matches!(e, RouterError::Transport(inner) if inner.is_timeout())
 }
 
 /// Share one tier across the dispatcher and whatever else needs it.
