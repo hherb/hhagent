@@ -96,8 +96,11 @@ pub struct CapturedPlan {
     pub data_ceiling: String,
     /// `true` iff the source `agent/plan.formulate` row's payload was a
     /// [`kastellan_db::audit::truncate_payload`] envelope
-    /// (`{_truncated: true, sha256, len}`) — meaning every payload key,
-    /// including `plan`, was elided at write time. When set, the
+    /// (`{_truncated: true, sha256, len}`) — meaning `plan` was elided at
+    /// write time. Truncation carries [`kastellan_db::audit::PRESERVED_KEYS`]
+    /// through, so an envelope is no longer necessarily bare; `plan` is not
+    /// and cannot be one of them (it is neither bounded nor a decision
+    /// record), so for this field the distinction does not arise. When set, the
     /// `plan_json: null` / `step_count: 0` fields on this struct are
     /// *artefacts of truncation*, not a real zero-step plan. This makes
     /// the row wire-distinct from a pre-Slice-A capture (also
@@ -223,9 +226,10 @@ pub fn capture_filename(date_yyyy_mm_dd: &str, model_slug: &str) -> String {
 ///   1. Pre-Slice-A capture (operator must recapture).
 ///   2. The producer wrote a payload that exceeded
 ///      [`kastellan_db::audit::PAYLOAD_MAX_BYTES`] (4 KiB) and
-///      [`kastellan_db::audit::truncate_payload`] replaced the entire
-///      object with the `{_truncated, sha256, len}` envelope — `plan`
-///      was nuked along with every other key.
+///      [`kastellan_db::audit::truncate_payload`] replaced it with the
+///      `{_truncated, sha256, len}` envelope — `plan` was nuked with it.
+///      (Truncation preserves [`kastellan_db::audit::PRESERVED_KEYS`];
+///      `plan` is not one, and would not qualify as one.)
 ///   3. A genuine writer regression dropped the key.
 ///
 /// Case (2) is now surfaced explicitly: when the source row's payload
@@ -242,11 +246,12 @@ pub fn extract_plans_from_audit_rows(rows: &[CapturedAuditRow]) -> Vec<CapturedP
         if row.actor == "agent" && row.action == "plan.formulate" {
             iter = iter.saturating_add(1);
             // A truncated row's payload is the `{_truncated, sha256, len}`
-            // envelope from `truncate_payload` — every real key, `plan`
-            // included, was elided. Detect it (via the predicate that lives
-            // next to the producer, so the wire contract can't drift) so the
-            // null `plan_json` below is attributable to truncation rather
-            // than a pre-Slice-A capture or a real zero-step plan.
+            // envelope from `truncate_payload`, carrying at most the
+            // allowlisted `PRESERVED_KEYS` — `plan` is not one of them, so
+            // it was elided. Detect the envelope (via the predicate that
+            // lives next to the producer, so the wire contract can't drift)
+            // so the null `plan_json` below is attributable to truncation
+            // rather than a pre-Slice-A capture or a real zero-step plan.
             let source_truncated = kastellan_db::audit::is_truncation_envelope(&row.payload);
             let plan_json = row.payload.get("plan").cloned().unwrap_or(serde_json::Value::Null);
             let step_count = plan_json

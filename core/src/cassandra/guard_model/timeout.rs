@@ -304,18 +304,37 @@ fn clamp_derived(derived_ms: u64) -> (u64, Clamped) {
 /// ```
 ///
 /// ⚠️ **This is a LINEAR extrapolation from a ~1 KiB sample, and on one
-/// of the two supported platforms it is wrong by 4.4x
-/// ([#612](https://github.com/hherb/kastellan/issues/612)).** Measured
-/// 2026-08-23 with the same dense filler on both hosts: the DGX (CUDA)
-/// holds 3 177 tok/s at 1 KiB and 2 907 at 64 KiB — flat, so the
-/// extrapolation is sound there. The Mac (Metal) holds 1 137 at 1 KiB
-/// and **260 at 64 KiB**, so a worst-case document takes 171 s against a
-/// derived budget of 91 s and the adjudication times out — which, as
-/// this module's own note above says, does not error but **fails open**.
-/// [`PROBE_SAFETY_FACTOR`]'s 2x does not cover a 4.4x error, and the knee
-/// sits between 8 KiB and 64 KiB, so a cheap second sample would not find
-/// it. Until #612 is settled, a Metal host should pin
-/// `KASTELLAN_LLM_GUARD_TIMEOUT_MS` rather than trust the probe.
+/// of the two supported platforms the linearity is false by 4.4x
+/// ([#612](https://github.com/hherb/kastellan/issues/612)).**
+///
+/// Two *different* samples are involved, and conflating them is how these
+/// numbers stop adding up. A **size sweep** with identical dense filler
+/// (1.47 B/token) measures the *shape*: the DGX (CUDA) holds 3 177 tok/s
+/// at 1 KiB and 2 907 at 64 KiB — flat, so extrapolating is sound there;
+/// the Mac (Metal) holds 1 137 at 1 KiB, 1 209 at 8 KiB, and **260 at
+/// 64 KiB**. The **boot probe** measures the rate this formula is
+/// actually fed, on its own denser body (1.26 B/token — see the module
+/// note above), and so reads higher on both hosts: 6 073 tok/s on the DGX
+/// → a 21.8 s budget, and ~1 445 on the Mac → 91 s. Do not try to derive
+/// one host's budget from the other table's tok/s; they are not the same
+/// measurement.
+///
+/// The consequence is the Mac's alone. A worst-case 64 KiB document
+/// really takes ~171 s there, against that derived 91 s, so the
+/// adjudication times out — which, as this module's own note above says,
+/// does not error but **fails open**. [`PROBE_SAFETY_FACTOR`]'s 2x does
+/// not cover a 4.4x error, and the knee sits above the 8 KiB sample, so a
+/// cheap second probe would not find it.
+///
+/// Until #612 is settled a Metal host should pin
+/// `KASTELLAN_LLM_GUARD_TIMEOUT_MS` rather than trust the probe — at
+/// **≥ ~350 s**, not at the 171 s above: that figure came from 1.47
+/// B/token filler, while [`WORST_CASE_TOKENS`] budgets for the ~1 B/token
+/// adversarial ceiling [`super::context_pin`] argues for. Note that
+/// pinning **skips the probe entirely** ([`TimeoutBasis::Operator`]) and
+/// that `validate_operator_timeout` does *not* clamp the pinned value to
+/// the range below — both deliberate, and both worth knowing before you
+/// read a boot line as a measurement.
 ///
 /// **[`ProbeOutcome::Saturated`] derives the CEILING, not the floor**,
 /// and that is the one row a plausible implementation gets backwards. A

@@ -467,6 +467,16 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   *cleared* one loses it, which is exactly D5's half. Fixed by `PRESERVED_KEYS` in `db/src/audit.rs`,
   mutation-proven, with an e2e that reads the row back out of Postgres because a recording sink sees
   the payload the caller PASSED, never the one the database STORED.
+  **A four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
+  half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
+  byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one
+  function down. Keys are now admitted individually against the budget less a reserved marker
+  allowance, anything refused is named under `DROPPED_PRESERVED_KEY`, and a `const` block makes a
+  future member that shadows `_truncated`/`sha256`/`len` a **compile error**. The same review found
+  the new live probe instrument passed having measured nothing whenever
+  `KASTELLAN_LLM_GUARD_TIMEOUT_MS` was pinned — precisely what #612 tells a Metal operator to do —
+  and that `derive_guard_timeout`'s doc conflated the size sweep's tok/s with the boot probe's, so
+  its own arithmetic did not close.
   **[#612](https://github.com/hherb/kastellan/issues/612) filed, not fixed:** D9's probe extrapolates
   linearly from ~1 KiB; the DGX is flat (1.09x) but the Mac is **4.37x** optimistic (1 137 tok/s at
   1 KiB, **260 at 64 KiB**), so a worst-case document takes 171 s against a derived 91 s and **fails

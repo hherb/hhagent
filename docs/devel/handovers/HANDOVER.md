@@ -11,7 +11,7 @@
 > [`archive/handover_20260823_wiring-slice_pre-prune.md`](archive/handover_20260823_wiring-slice_pre-prune.md))
 > the measurement-3, weights-pin and ask-containment ones.
 
-**Last updated:** 2026-08-23 · **`main` HEAD:** `8736f559` ([#607](https://github.com/hherb/kastellan/pull/607)) · **ONE OPEN BRANCH: `feat/guard-live-bringup`** · **Gate at `09c6231f` GREEN ON BOTH HOSTS: DGX 3840 / 0 / 55, Mac 3718 / 0 / 25, 175 suites, clippy 0** (later commits on the branch are docs-only). · **THE GUARD TIER RAN LIVE FOR THE FIRST TIME** (DGX, 2026-08-23). It booted with a **probed** 21 752 ms budget at 6 073 tok/s, scored a cleared document at `p = 0.0074`, and **blocked a real attack document at `p = 0.9199` where the deterministic catalogue scored `0.0`** — the tier's whole thesis, demonstrated rather than argued. **The bring-up found in an hour what seventeen e2e cases and a five-agent review did not:** the 4 KiB audit cap was replacing whole payloads, so any tool result past ~4 KiB took D5's guard score with it — biased the wrong way, since blocks kept their score and *clears* lost theirs. Fixed here (`db::audit::PRESERVED_KEYS`), mutation-proven. Also filed, **not** fixed: [#612](https://github.com/hherb/kastellan/issues/612) — D9's boot probe extrapolates linearly from ~1 KiB, which is flat on CUDA but **4.4× optimistic on Metal**, where a worst-case document takes 171 s against a derived 91 s and so **fails OPEN** without ever firing the ceiling-clamp warning. **The tier remains ADVISORY defence-in-depth at 65% recall, not a gate**, and nothing downstream may relax on it.
+**Last updated:** 2026-08-24 · **`main` HEAD:** `8736f559` ([#607](https://github.com/hherb/kastellan/pull/607)) · **ONE OPEN BRANCH: `feat/guard-live-bringup`** · **Gate at `09c6231f` GREEN ON BOTH HOSTS: DGX 3840 / 0 / 55, Mac 3718 / 0 / 25, 175 suites, clippy 0.** **Re-gated on the Mac after the [#614](https://github.com/hherb/kastellan/pull/614) review fixes: 175 suites, 3721 / 1 / 25, clippy 0 over 27 crates** — the one failure is `ask_subprocess_completes_planned_task_end_to_end`, which waits ≤ 10 s for the daemon's `scheduler spawned` line and blew that under full-sweep load; it passes in **4 s** in isolation. **The DGX has NOT been re-gated since the review fixes** — do that before merge. · **THE GUARD TIER RAN LIVE FOR THE FIRST TIME** (DGX, 2026-08-23). It booted with a **probed** 21 752 ms budget at 6 073 tok/s, scored a cleared document at `p = 0.0074`, and **blocked a real attack document at `p = 0.9199` where the deterministic catalogue scored `0.0`** — the tier's whole thesis, demonstrated rather than argued. **The bring-up found in an hour what seventeen e2e cases and a five-agent review did not:** the 4 KiB audit cap was replacing whole payloads, so any tool result past ~4 KiB took D5's guard score with it — biased the wrong way, since blocks kept their score and *clears* lost theirs. Fixed here (`db::audit::PRESERVED_KEYS`), mutation-proven. Also filed, **not** fixed: [#612](https://github.com/hherb/kastellan/issues/612) — D9's boot probe extrapolates linearly from ~1 KiB, which is flat on CUDA but **4.4× optimistic on Metal**, where a worst-case document takes 171 s against a derived 91 s and so **fails OPEN** without ever firing the ceiling-clamp warning. **The tier remains ADVISORY defence-in-depth at 65% recall, not a gate**, and nothing downstream may relax on it.
 
 ---
 
@@ -58,7 +58,15 @@ to report.
 > plus only the *small* clears — a size-selected sample that reads like a score distribution.
 > Fixed by `PRESERVED_KEYS` (`db/src/audit.rs`): an allowlist of keys carried *through*
 > truncation, admitting only what is bounded by construction, a decision record rather than
-> data, and recoverable from nowhere else. **The reason nothing caught it generalises:
+> data, and recoverable from nowhere else on the cleared path. **A four-agent review of the fix
+> found it kept half the defect**: a preserved key too large to afford was dropped *silently*,
+> producing a row byte-identical to one whose dispatch never ran a tier at all — the same
+> "cannot tell absence from loss" ambiguity, one function further down. Keys are now admitted
+> one at a time against the budget less a reserved `DROP_MARKER_RESERVE`, and anything refused
+> is named under `DROPPED_PRESERVED_KEY`. A `const` block additionally makes it a **compile
+> error** for a future `PRESERVED_KEYS` member to shadow `_truncated`, `sha256` or `len` — the
+> first would make `is_truncation_envelope` report the payload's own value and resurrect #62;
+> the others would silently break fingerprint equality. **The reason nothing caught it generalises:
 > `truncate_payload` runs inside `db::audit::insert`, so a recording sink sees the payload the
 > caller PASSED, never the one the database STORED.** The new e2e reads the row back out of
 > Postgres and asserts both halves — that the row really did exceed the cap, and that the score
@@ -68,11 +76,15 @@ to report.
 > ⚠️ **[#612](https://github.com/hherb/kastellan/issues/612) — D9's probe is wrong by 4.4× on
 > Metal, and it fails OPEN. Filed, not fixed; it needs a design call.** The probe measures
 > uncached throughput on a **~1 KiB** sample and extrapolates **linearly** to 66 048 tokens.
-> Measured on both hosts with identical dense filler (1.47 B/token):
-> | host | 1 KiB | 8 KiB | 64 KiB | 64 KiB wall | derived budget |
-> | --- | --- | --- | --- | --- | --- |
-> | DGX (CUDA) | 3 177 | 6 327 | 2 907 tok/s | 15.4 s | 21.8 s — **covered** |
-> | Mac (Metal) | 1 137 | 1 209 | **260 tok/s** | **171.5 s** | **91.4 s — times out** |
+> Two *different* samples are in play and conflating them makes the arithmetic look
+> broken. The **size sweep** below uses identical dense filler (1.47 B/token) and measures
+> the *shape*; the **boot probe** measures the rate the formula is actually fed, on its own
+> denser body (1.26 B/token), and so reads higher on both hosts — which is where the last
+> column comes from. Do not derive one host's budget from the other column's tok/s.
+> | host | 1 KiB | 8 KiB | 64 KiB | 64 KiB wall | boot-probe tok/s | derived budget |
+> | --- | --- | --- | --- | --- | --- | --- |
+> | DGX (CUDA) | 3 177 | 6 327 | 2 907 tok/s | 15.4 s | 6 073 | 21.8 s — **covered** |
+> | Mac (Metal) | 1 137 | 1 209 | **260 tok/s** | **171.5 s** | ~1 445 | **91.4 s — times out** |
 >
 > The DGX is flat (1.09×) and slightly pessimistic at 1 KiB, which is the safe direction. The
 > Mac is 4.37× optimistic, so a worst-case document times out and **fails open, silently** —
@@ -81,8 +93,15 @@ to report.
 > Three cheap fixes are each closed off by the measurement: `PROBE_SAFETY_FACTOR`'s 2× does not
 > cover 4.37×; the Mac is still flat at 8 KiB so a second cheap sample misses the knee; and
 > probing at the cap costs 171 s against a deliberate 20 s budget. **Available mitigation
-> today: pin `KASTELLAN_LLM_GUARD_TIMEOUT_MS` on a Metal host** (≥ ~350 s), which skips the
-> probe — trading a fail-open for a stalled dispatch, hence an operator decision, not a default.
+> today: pin `KASTELLAN_LLM_GUARD_TIMEOUT_MS` on a Metal host** (≥ ~350 s — *not* the 171 s
+> above, which came from 1.47 B/token filler while `WORST_CASE_TOKENS` budgets for the
+> ~1 B/token adversarial ceiling), which skips the probe — trading a fail-open for a stalled
+> dispatch, hence an operator decision, not a default. `validate_operator_timeout` does **not**
+> clamp a pinned value to `[15 s, 120 s]`; that is deliberate, and it is what makes ≥ ~350 s
+> expressible at all. **The new live instrument now refuses to run under a pin**, because the
+> pin skips the probe and the run would otherwise report PASS having derived nothing — the
+> review caught that the one mitigation this file recommends was also the one configuration
+> that silently disarmed the instrument built to check it.
 > **This also corrects a prediction this file used to make:** the Mac was expected to derive
 > ~978 s and clamp to the ceiling. It derives 91 s and does *not* clamp. The host is slow
 > exactly as predicted; the probe simply cannot see it.
@@ -107,6 +126,43 @@ real boot path (`GuardTier::from_router_config` against a live `llama-server` on
 `-c 66048`) via the new `#[ignore]` instrument, which is strictly more informative than a boot
 line — and given #612, putting the tier on the Mac daemon is a decision to take knowingly
 rather than a step to tick off. The Mac guard server was stopped after measuring.
+
+### The review of the fix ([#614](https://github.com/hherb/kastellan/pull/614)) — four agents, all findings closed
+
+A four-agent review (general, tests, silent-failure, comments) of the bring-up branch. **Two
+findings were defects the branch itself shipped**, and they composed: #612's stated mitigation
+was the exact configuration that disarmed the instrument built to check #612.
+
+- **The live instrument passed having measured nothing under a pinned timeout.**
+  `from_router_config` branches on `guard_timeout_ms` *before* `run_probe`, so a pin skips the
+  probe entirely; the instrument then printed `basis=operator`, no throughput line, "no coverage
+  finding", and PASSED — from a test named `live_boot_probe_derives_this_hosts_timeout`. It
+  would also have *false-failed* its clamp assertion for a legitimate ≥ 350 s pin, since
+  `validate_operator_timeout` does not clamp. Now refuses a pin outright, and asserts the basis
+  is a real measurement (`Probed`/`Saturated`), so an `Unprobed` host cannot pass quietly either.
+- **`derive_guard_timeout`'s doc did not add up.** It said the Mac "holds 1 137 tok/s … *so* a
+  worst-case document takes 171 s against a derived budget of 91 s" — but 1 137 through the
+  module's own formula gives **116 s**, and 91 s back-solves to ~1 445. Both numbers are real
+  and come from *different samples*: the size sweep uses 1.47 B/token filler, the boot probe its
+  own 1.26 B/token body. The doc (and the table in this file) now name the two separately. The
+  same skew is larger on the DGX — sweep 3 177 → 41.6 s, boot probe 6 073 → 21.8 s.
+- **The fix kept half the defect** (silent drop of an unaffordable preserved key) and left a
+  latent one (nothing stopped a future member shadowing the envelope's own keys). Both closed —
+  see the audit-cap blockquote above. Mutation-proven: removing the reserve, the marker, or
+  adding a shadowing key each turns the tree red, the last at **compile time**.
+- **Six reader comments across `capture.rs`, `replay.rs`, `audit_text.rs` and
+  `capture/tests.rs`** still said truncation replaces *every* key. Behaviourally harmless
+  (`plan` is not and cannot be a preserved key) but each stated a general property of a wire
+  contract that had stopped being true — one of them three lines above the call to the very
+  predicate whose doc now says the opposite. All corrected, plus a reader-side round-trip test
+  that feeds the extractor a real envelope *carrying* a preserved key.
+- Smaller: two operator-facing panic strings carried collapsed-continuation whitespace runs;
+  four `{value:.N}` format specs were silent no-ops (serde_json's `Display` never consults
+  `precision`, so a failure would have dumped the whole 4 KiB fixture); the e2e now asserts the
+  **stored** row is within budget, the one place in the tree that can.
+
+**Deliberately not done:** a `cfg!(target_os = "macos")` boot warning for #612. Filing it with
+the evidence is the call; the runtime path already `warn!`s on every fail-open.
 
 ### The wiring slice ([#607](https://github.com/hherb/kastellan/pull/607), `8736f559`) — merged, compressed
 

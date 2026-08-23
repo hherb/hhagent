@@ -546,14 +546,14 @@ async fn live_shieldstral_size_sweep() {
     }
 }
 
-
 /// **Live instrument: what THIS host's boot probe actually derives.**
 ///
 /// The wiring spec's D9 replaced D2's constant 15 s with a probe,
 /// because a constant cannot be right for hosts that differ by 40x and
 /// the failure is silent and one-directional — *too short a guard
 /// timeout does not error, it fails open*. `guard_tier_e2e` pins every
-/// arm of that derivation against a mock. Nothing until now ran it
+/// arm of that derivation against a mock but `NoTokenCount`, which is
+/// unit-tested in `timeout/tests.rs`. Nothing until now ran any of it
 /// against a real server, so the numbers a real deployment produces
 /// were predictions.
 ///
@@ -571,13 +571,25 @@ async fn live_shieldstral_size_sweep() {
 ///   --ignored --nocapture live_boot_probe_derives_this_hosts_timeout
 /// ```
 ///
-/// **The line worth waiting for is `COVERAGE FINDING`.** A host slow
-/// enough to derive past the 120 s ceiling is clamped, and the clamp
-/// means documents large enough to matter will time out and fail open
-/// to catalogue-only screening. That is a fact about the host, not a
-/// routine adjustment, and it is the one thing an operator should learn
-/// *before* the tier is carrying traffic rather than from its absence
-/// afterwards.
+/// **The line worth waiting for is `COVERAGE FINDING`** — but read the
+/// sentence, not just the label: `coverage_finding()` speaks for three
+/// different situations and they are not interchangeable. The host
+/// derived past the 120 s ceiling and was clamped; the probe never
+/// returned within its budget; or the probe call failed outright. All
+/// three mean documents large enough to matter will time out and fail
+/// open to catalogue-only screening, and the third predicts a tier that
+/// fails open on *every* dispatch. Each is a fact about the host, not a
+/// routine adjustment, and is the thing an operator should learn *before*
+/// the tier is carrying traffic rather than from its absence afterwards.
+///
+/// **A pinned `KASTELLAN_LLM_GUARD_TIMEOUT_MS` makes this instrument
+/// pointless, so it refuses to run under one.** The pin skips the probe
+/// (see `from_router_config`), which would leave this test printing "no
+/// coverage finding" and passing green having measured nothing at all —
+/// the same silent-PASS failure its unconfigured arm below exists to
+/// prevent, one level down. Awkwardly, pinning is exactly what #612 tells
+/// a Metal operator to do, which is why the refusal is explicit rather
+/// than left to the reader.
 ///
 /// **Fails rather than skips when unconfigured**, for the same reason
 /// its sibling above does: an operator who asks for this by name and
@@ -599,7 +611,21 @@ async fn live_boot_probe_derives_this_hosts_timeout() {
     assert_ne!(
         cfg.guard_url.as_deref(),
         Some(cfg.local_url.as_str()),
-        "the guard endpoint is the PLANNER endpoint; the derived budget would          describe a different model"
+        "the guard endpoint is the PLANNER endpoint; the derived budget would \
+         describe a different model"
+    );
+    // A pinned timeout SKIPS the probe entirely (`from_router_config`
+    // branches on `guard_timeout_ms` before `run_probe` is ever called), so
+    // without this arm the run below would print `basis=operator`, no
+    // throughput line, "no coverage finding", and PASS -- having measured
+    // nothing, from a test whose name promises a derivation. It would also
+    // fail the clamp assertion at the end for a perfectly good pin, since
+    // `validate_operator_timeout` does not clamp.
+    assert!(
+        cfg.guard_timeout_ms.is_none(),
+        "KASTELLAN_LLM_GUARD_TIMEOUT_MS is pinned ({:?} ms), which skips the probe. \
+         This run would report PASS having derived nothing. Unset it to measure this host.",
+        cfg.guard_timeout_ms
     );
 
     // Varying prefix per run, exactly as the boot block builds it — a
@@ -614,7 +640,8 @@ async fn live_boot_probe_derives_this_hosts_timeout() {
         .await
     {
         Ok(None) => panic!(
-            "this test was asked for by name but the guard keys are unset; a skip              here would report as PASSED and teach an operator nothing"
+            "this test was asked for by name but the guard keys are unset; a skip \
+             here would report as PASSED and teach an operator nothing"
         ),
         // Every one of these stops the daemon, so say so in the words an
         // operator would otherwise meet at boot.
@@ -648,9 +675,25 @@ async fn live_boot_probe_derives_this_hosts_timeout() {
         ),
     }
 
+    // An `Unprobed` basis reaches here with the pin unset: the probe ran
+    // and came back with nothing usable. That is a fact about the host, not
+    // a reason to pass quietly -- and `coverage_finding()` is `None` for
+    // two of the three reasons, so the print above cannot be relied on to
+    // have said it. Asserted AFTER that print deliberately: a failed probe
+    // has a finding worth reading, and an assert placed earlier would
+    // swallow the most alarming sentence this instrument can produce.
+    assert!(
+        matches!(budget.basis, TimeoutBasis::Probed { .. } | TimeoutBasis::Saturated { .. }),
+        "the probe produced no usable sample on this host (basis={}), so the budget above \
+         is a fallback and not a measurement of it",
+        budget.basis.kind()
+    );
+
     // The postcondition, checked on live data rather than only on mocks:
     // whatever the probe measured, the budget the tier will actually
-    // spend is inside the documented clamp.
+    // spend is inside the documented clamp. Reachable only for a derived
+    // basis -- a pinned one is refused above, and `validate_operator_timeout`
+    // would not have clamped it.
     assert!(
         (TIMEOUT_FLOOR_MS..=TIMEOUT_CEILING_MS).contains(&ms),
         "derived budget {ms} ms is outside [{TIMEOUT_FLOOR_MS}, {TIMEOUT_CEILING_MS}]"

@@ -338,8 +338,9 @@ pub async fn replay_capture(
         if cp.plan_json.is_null() {
             skipped = skipped.saturating_add(1);
             // Schema-v3 (#62): a truncated source row is *not* recoverable by
-            // recapture — the audit writer replaced the whole payload with the
-            // `truncate_payload` fingerprint. Surface it distinctly so the
+            // recapture — the audit writer replaced the payload with the
+            // `truncate_payload` fingerprint, and `plan` is not among the
+            // `PRESERVED_KEYS` that ride through it. Surface it distinctly so the
             // operator doesn't chase the recapture advice for rows where it
             // can't help.
             let reason = if cp.source_truncated {

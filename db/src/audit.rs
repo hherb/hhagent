@@ -2,14 +2,15 @@
 //!
 //! ## Where rows come from
 //!
-//! Today exactly two callers write into `audit_log`:
-//!
-//!   1. [`crate::probe::run`] — the daemon's bring-up row, written
-//!      under [`crate::conn::RUNTIME_ROLE`] right after migrations.
-//!   2. `core::tool_host::dispatch` (Phase 0 Option I) — one row per
-//!      tool call, again under the runtime role via the
-//!      `after_connect` SET ROLE hook on
-//!      [`crate::pool::connect_runtime_pool`].
+//! Write sites are many and growing — the daemon's bring-up row
+//! ([`crate::probe::run`]), every tool call (`core::tool_host::dispatch`),
+//! memory writes, egress verdicts, secrets administration, channel I/O.
+//! An enumeration here only ever went stale (it said "exactly two" long
+//! after there were twenty). The invariant worth stating is that **every
+//! one of them goes through [`insert`]**, under
+//! [`crate::conn::RUNTIME_ROLE`] via the `after_connect` SET ROLE hook on
+//! [`crate::pool::connect_runtime_pool`] — which is what makes the GRANT
+//! below load-bearing rather than advisory.
 //!
 //! The shape `(actor, action, payload)` is deliberately schema-less so
 //! every future write site (memory writer, channel I/O, scheduler
@@ -44,6 +45,9 @@
 //! record is bounded, tiny, and — unlike a request body — recoverable
 //! from nowhere else. Dropping it was measured live: on 2026-08-23 two
 //! 85 KB `web.fetch` rows took the guard tier's score down with them.
+//! A preserved key that still cannot be afforded is named by
+//! [`DROPPED_PRESERVED_KEY`] rather than vanishing, because an
+//! unrecorded loss is the shape of the defect above.
 //!
 //! Pure: returns a new `serde_json::Value`, performs no I/O. Tested
 //! with deterministic-fingerprint regression pins.
@@ -73,9 +77,12 @@ pub const PAYLOAD_MAX_BYTES: usize = 4096;
 /// 2. **a decision record, not data** — the outcome of a control, not the
 ///    document the control ran on. The cap exists to stop bodies dominating
 ///    the heap, and preserving a body under another name would defeat it;
-/// 3. **irrecoverable** — it exists nowhere else. `req` and `result` can be
-///    reconstructed from the worker and the surrounding rows; a guard score
-///    is computed once, in memory, and is gone if this row drops it.
+/// 3. **irrecoverable** — it exists nowhere else *on the path that matters*.
+///    `req` and `result` can be reconstructed from the worker and the
+///    surrounding rows. A guard score is computed once, in memory; a Block
+///    mirrors its `p`/`tau` onto the forensic `policy` / `injection.blocked`
+///    row, but a **clear writes no second row at all**, and the cleared half
+///    is exactly the half D5 needs.
 ///
 /// `guard` is the wiring slice's per-dispatch guard-tier report
 /// (`{state, p, tau, ms, body_byte_len, truncated}`). Before it was listed
@@ -90,6 +97,103 @@ pub const PAYLOAD_MAX_BYTES: usize = 4096;
 /// exactly what it meant in the untruncated payload.
 pub const PRESERVED_KEYS: [&str; 1] = ["guard"];
 
+/// Payload key naming the [`PRESERVED_KEYS`] that did **not** fit.
+///
+/// Without it, an envelope whose preserved key was dropped for size is
+/// byte-identical to one whose payload never carried that key — so a reader
+/// cannot tell "the control never ran" from "the control ran, and its
+/// verdict was discarded here". That ambiguity *is* the defect this
+/// allowlist exists to fix, one function further down; leaving it in place
+/// would be fixing the loss and keeping the silence.
+///
+/// A **wire contract** in the same sense as [`TRUNCATED_MARKER_KEY`]:
+/// present only on an envelope, and only when something was actually lost.
+pub const DROPPED_PRESERVED_KEY: &str = "_dropped_preserved";
+
+/// Bytes held back from [`PAYLOAD_MAX_BYTES`] so [`DROPPED_PRESERVED_KEY`]
+/// is *always* affordable.
+///
+/// A drop that could not be recorded would be a silent drop again, so the
+/// room for the record is reserved before any preserved key is admitted
+/// rather than hoped for afterwards. [`drop_marker_worst_case`] is checked
+/// against this at compile time.
+const DROP_MARKER_RESERVE: usize = 64;
+
+/// `a == b` for `&str` in const context, which `PartialEq` is not.
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Worst-case serialised cost of appending [`DROPPED_PRESERVED_KEY`] to an
+/// object that already has keys: a leading comma, the quoted key, a colon,
+/// and an array naming every member of [`PRESERVED_KEYS`].
+const fn drop_marker_worst_case() -> usize {
+    // `,"<key>":[]`
+    let mut n = DROPPED_PRESERVED_KEY.len() + 6;
+    let mut i = 0;
+    while i < PRESERVED_KEYS.len() {
+        // `"<key>",`
+        n += PRESERVED_KEYS[i].len() + 3;
+        i += 1;
+    }
+    n
+}
+
+/// The envelope's own keys are reserved, and the marker is affordable.
+///
+/// [`PRESERVED_KEYS`]' three admission criteria are prose, and a key can
+/// satisfy all three and still be catastrophic: `len` or `sha256` would
+/// silently overwrite the fingerprint — so two rows for the same body stop
+/// comparing equal, which is precisely what
+/// `a_preserved_key_does_not_change_the_fingerprint` was written to protect
+/// and cannot catch for a key it does not name. [`TRUNCATED_MARKER_KEY`] is
+/// worse still: shadowing it makes [`is_truncation_envelope`] report
+/// whatever the payload happened to carry, resurrecting the issue-#62
+/// misclassification the predicate exists to prevent.
+///
+/// Prose cannot enforce that. This can, at compile time, for every future
+/// member — which is the same move the size postcondition already makes.
+const _: () = {
+    let mut i = 0;
+    while i < PRESERVED_KEYS.len() {
+        let key = PRESERVED_KEYS[i];
+        assert!(
+            !str_eq(key, TRUNCATED_MARKER_KEY),
+            "a PRESERVED_KEYS member may not shadow the truncation marker: \
+             is_truncation_envelope would report the payload's value, not the truth"
+        );
+        assert!(
+            !str_eq(key, DROPPED_PRESERVED_KEY),
+            "a PRESERVED_KEYS member may not shadow the dropped-key marker"
+        );
+        assert!(
+            !str_eq(key, "sha256"),
+            "a PRESERVED_KEYS member may not shadow the fingerprint digest: \
+             two rows for the same body would stop comparing equal"
+        );
+        assert!(
+            !str_eq(key, "len"),
+            "a PRESERVED_KEYS member may not shadow the fingerprint length"
+        );
+        i += 1;
+    }
+    assert!(
+        drop_marker_worst_case() <= DROP_MARKER_RESERVE,
+        "DROP_MARKER_RESERVE no longer covers the marker PRESERVED_KEYS can produce"
+    );
+};
+
 /// Payload key that marks a [`truncate_payload`] envelope. This is a **wire
 /// contract**: readers in other crates (e.g. `kastellan-core`'s observation
 /// capture, issue #62) detect truncation via [`is_truncation_envelope`], so
@@ -100,7 +204,8 @@ pub const TRUNCATED_MARKER_KEY: &str = "_truncated";
 /// True iff `payload` is a truncation envelope produced by
 /// [`truncate_payload`] — i.e. the original payload was over budget and
 /// its keys were replaced by the `{_truncated, sha256, len}` fingerprint,
-/// except any listed in [`PRESERVED_KEYS`], which ride along unchanged.
+/// except any listed in [`PRESERVED_KEYS`], which ride along unchanged (and
+/// [`DROPPED_PRESERVED_KEY`], which names those that could not).
 ///
 /// The predicate deliberately tests only the marker, so adding a preserved
 /// key stays additive for every existing reader.
@@ -156,11 +261,22 @@ pub struct AuditRow {
 /// equal whatever else they carry.
 ///
 /// Any [`PRESERVED_KEYS`] present in the input are then copied onto the
-/// envelope verbatim, because a bounded decision record is not what the
-/// cap is defending against and is worth more than the bytes it costs.
-/// The return value is always within budget: if the preserved keys would
-/// break that — which nothing in this workspace can do, but the signature
-/// permits — the bare envelope is returned instead.
+/// envelope **verbatim, whatever their value** — including a `null` or a
+/// scalar, since this function judges keys and not shapes — because a
+/// bounded decision record is not what the cap is defending against and is
+/// worth more than the bytes it costs.
+///
+/// Keys are admitted **one at a time**, each against the budget less
+/// [`DROP_MARKER_RESERVE`]. Two properties follow that an all-or-nothing
+/// copy does not have: one oversized key cannot take a bounded sibling
+/// down with it, and anything refused can still be *named*, under
+/// [`DROPPED_PRESERVED_KEY`]. Nothing in this workspace can produce an
+/// oversized preserved key, but the signature permits one.
+///
+/// The budget postcondition is therefore structural rather than checked
+/// after the fact: every admitted key left [`DROP_MARKER_RESERVE`] bytes
+/// free, and the compile-time assertion above pins the marker's worst case
+/// under that reserve.
 ///
 /// Pure: deterministic, no I/O, no global state. Same input → same
 /// output, every call.
@@ -196,19 +312,33 @@ pub fn truncate_payload(payload: serde_json::Value) -> serde_json::Value {
         return bare;
     };
 
-    let mut envelope = bare.clone();
-    let keep = envelope.as_object_mut().expect("built from a JSON object literal above");
+    // `bare` is moved here: the only path that returns it untouched is the
+    // non-object early return above, which has already run.
+    let mut envelope = bare;
+    let mut dropped: Vec<&str> = Vec::new();
     for key in PRESERVED_KEYS {
-        if let Some(value) = source.get(key) {
-            keep.insert(key.to_string(), value.clone());
+        let Some(value) = source.get(key) else { continue };
+        let mut candidate = envelope.clone();
+        candidate
+            .as_object_mut()
+            .expect("built from a JSON object literal above")
+            .insert(key.to_string(), value.clone());
+        let grown =
+            serde_json::to_vec(&candidate).expect("serde_json::Value cannot fail to serialise");
+        // The reserve is what keeps the ELSE arm affordable: a key refused
+        // for size must still leave room to say so.
+        if grown.len() + DROP_MARKER_RESERVE <= PAYLOAD_MAX_BYTES {
+            envelope = candidate;
+        } else {
+            dropped.push(key);
         }
     }
 
-    // The postcondition, enforced rather than argued: whatever a caller put
-    // under a preserved key, the stored row fits the budget.
-    let grown = serde_json::to_vec(&envelope).expect("serde_json::Value cannot fail to serialise");
-    if grown.len() > PAYLOAD_MAX_BYTES {
-        return bare;
+    if !dropped.is_empty() {
+        envelope
+            .as_object_mut()
+            .expect("built from a JSON object literal above")
+            .insert(DROPPED_PRESERVED_KEY.to_string(), serde_json::json!(dropped));
     }
     envelope
 }
@@ -431,10 +561,12 @@ mod tests {
     /// output, so any result past ~4 KiB took the `guard` object down with
     /// it.
     ///
-    /// **The bias runs the wrong way.** A *blocked* dispatch keeps its
-    /// score, because the result was already replaced by a short withheld
-    /// placeholder; a *cleared* one loses it as soon as the document is
-    /// large. Recording `p` on the cleared half is the whole of the wiring
+    /// **The bias runs the wrong way.** A *blocked* dispatch usually keeps
+    /// its score, because the result was already replaced by a short
+    /// withheld placeholder — `req` is still in the payload, so a block on a
+    /// multi-KiB `shell.exec` argv could lose one too, but not as a function
+    /// of document size. A *cleared* dispatch loses its score as soon as the
+    /// document is large. Recording `p` on the cleared half is the whole of the wiring
     /// spec's D5 — it is what makes production a score source that is not
     /// catalogue-selected — so what survived was every block plus only the
     /// small clears: a size-selected sample that reads like data.
@@ -514,7 +646,7 @@ mod tests {
         assert_eq!(keys, vec!["_truncated", "len", "sha256"]);
     }
 
-    /// An oversized preserved key falls back to the bare envelope.
+    /// An oversized preserved key is dropped — and SAID to be dropped.
     ///
     /// The allowlisted keys are bounded *by construction* at every site
     /// this crate knows about, but `truncate_payload` is public and takes
@@ -522,8 +654,14 @@ mod tests {
     /// value fits the budget; a preserved key must never be able to break
     /// that, and silently storing an over-budget row is exactly the failure
     /// the cap exists to prevent.
+    ///
+    /// But dropping it *silently* would be the other failure the cap
+    /// exists to prevent: an envelope with no `guard` and no explanation is
+    /// byte-identical to one whose dispatch never ran a guard tier at all,
+    /// which is the ambiguity that let the original defect hide. So the
+    /// budget wins, and the loss is recorded rather than merely suffered.
     #[test]
-    fn an_oversized_preserved_key_falls_back_to_the_bare_envelope() {
+    fn an_oversized_preserved_key_is_dropped_but_named() {
         let v = serde_json::json!({
             "guard": {"state": "clear", "junk": "!".repeat(PAYLOAD_MAX_BYTES)},
         });
@@ -533,7 +671,98 @@ mod tests {
             out.get("guard").is_none(),
             "a preserved key that does not fit is dropped, not stored over budget"
         );
+        assert_eq!(
+            out.get(DROPPED_PRESERVED_KEY),
+            Some(&serde_json::json!(["guard"])),
+            "and a reader must be able to tell this from a dispatch that never ran the tier"
+        );
         assert!(serde_json::to_vec(&out).unwrap().len() <= PAYLOAD_MAX_BYTES);
+    }
+
+    /// A preserved key that fits leaves NO drop marker.
+    ///
+    /// The marker means "something was lost". If it appeared on the happy
+    /// path it would mean nothing at all, and the assertion above would be
+    /// pinning noise rather than a signal.
+    #[test]
+    fn a_preserved_key_that_fits_leaves_no_drop_marker() {
+        let v = serde_json::json!({
+            "result": "z".repeat(PAYLOAD_MAX_BYTES),
+            "guard": {"state": "clear", "p": 0.5},
+        });
+        let out = truncate_payload(v);
+        assert!(out.get("guard").is_some(), "it fits, so it rides");
+        assert!(out.get(DROPPED_PRESERVED_KEY).is_none(), "nothing was lost: {out}");
+    }
+
+    /// A preserved key is copied VERBATIM, whatever its value.
+    ///
+    /// `truncate_payload` allowlists *keys*, not shapes — it has no opinion
+    /// about what a decision record should look like, and acquiring one
+    /// would make it a second, silent validator of every producer. `null` is
+    /// the case that matters in practice: `guard.p` is an `Option<f32>` and
+    /// serialises to `null` on the unadjudicated arm, so a reader already
+    /// has to handle it.
+    #[test]
+    fn a_preserved_key_is_copied_verbatim_including_null() {
+        let big = "y".repeat(PAYLOAD_MAX_BYTES);
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!("router_error"),
+            serde_json::json!({"state": "unmeasured", "p": null}),
+        ] {
+            let out = truncate_payload(serde_json::json!({"result": big, "guard": value}));
+            assert_eq!(out.get("guard"), Some(&value), "copied as-is, not normalised");
+            assert!(out.get(DROPPED_PRESERVED_KEY).is_none());
+        }
+    }
+
+    /// The admission boundary is exact, and it reserves the marker's room.
+    ///
+    /// `truncate_payload` admits a key when the grown envelope plus
+    /// [`DROP_MARKER_RESERVE`] fits. Both halves of that condition are easy
+    /// to lose: drop the reserve and a key admitted at exactly the cap
+    /// leaves no room to record a *later* key's loss; flip the comparator
+    /// and the boundary moves by one. Rather than hardcode the threshold —
+    /// which would be a second implementation of the thing under test, and
+    /// wrong the moment the `len` digit count changes — this walks a range
+    /// that straddles it and asserts the invariant on whichever side each
+    /// size lands, plus that the range really did contain both.
+    #[test]
+    fn admission_reserves_room_for_the_drop_marker_on_both_sides() {
+        let big = "r".repeat(PAYLOAD_MAX_BYTES);
+        let (mut saw_admitted, mut saw_dropped) = (false, false);
+        // The bare envelope is ~110 bytes, so the boundary sits just under
+        // `PAYLOAD_MAX_BYTES - DROP_MARKER_RESERVE`. Straddle it widely
+        // enough that the window cannot drift off the transition.
+        let lo = PAYLOAD_MAX_BYTES - DROP_MARKER_RESERVE - 300;
+        for n in lo..(lo + 400) {
+            let v = serde_json::json!({"result": big, "guard": "!".repeat(n)});
+            let out = truncate_payload(v);
+            let len = serde_json::to_vec(&out).expect("serialises").len();
+            assert!(len <= PAYLOAD_MAX_BYTES, "n={n} produced {len} bytes");
+            if out.get("guard").is_some() {
+                saw_admitted = true;
+                assert!(
+                    out.get(DROPPED_PRESERVED_KEY).is_none(),
+                    "n={n}: admitted and yet marked dropped"
+                );
+                assert!(
+                    len + DROP_MARKER_RESERVE <= PAYLOAD_MAX_BYTES,
+                    "n={n}: admitted with only {} bytes free, less than the reserve",
+                    PAYLOAD_MAX_BYTES - len
+                );
+            } else {
+                saw_dropped = true;
+                assert_eq!(
+                    out.get(DROPPED_PRESERVED_KEY),
+                    Some(&serde_json::json!(["guard"])),
+                    "n={n}: dropped without saying so"
+                );
+            }
+        }
+        assert!(saw_admitted && saw_dropped, "the window must straddle the boundary");
     }
 
     /// Every envelope this function can return is within budget.
@@ -554,7 +783,12 @@ mod tests {
         for v in cases {
             let out = truncate_payload(v.clone());
             let n = serde_json::to_vec(&out).unwrap().len();
-            assert!(n <= PAYLOAD_MAX_BYTES, "envelope of {v:.40} is {n} bytes");
+            // NOT `{v:.40}`: serde_json's `Display` streams straight through
+            // `Formatter::write_str` and never consults `precision`, so the
+            // width is silently ignored and a failure would dump the whole
+            // 4 KiB fixture into the test output.
+            let head: String = v.to_string().chars().take(40).collect();
+            assert!(n <= PAYLOAD_MAX_BYTES, "envelope of {head} is {n} bytes");
         }
     }
 
