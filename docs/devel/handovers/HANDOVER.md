@@ -9,7 +9,7 @@
 > including the full measurement-3, weights-pin and ask-containment write-ups
 > compressed below.
 
-**Last updated:** 2026-08-23 · **`main` HEAD:** `d51c9b20` ([#606](https://github.com/hherb/kastellan/pull/606)) · **`main` baseline: 3759 / 0 / 54** DGX · **ONE OPEN BRANCH: `feat/guard-wiring-slice-586` ([PR #607](https://github.com/hherb/kastellan/pull/607)) — THE GUARD TIER IS WIRED TO THE CHOKEPOINT.** A five-agent PR review then produced **eleven fixes**, all mutation-proven, and four deferred issues ([#608](https://github.com/hherb/kastellan/issues/608)–[#611](https://github.com/hherb/kastellan/issues/611)) — see [the review section](#the-five-agent-pr-review-of-607-and-the-eleven-fixes-it-produced). **Post-review Mac sweep 3712 / 0 / 24, `TEST_EXIT=0`; the DGX gate is OUTSTANDING.** Closes [#586](https://github.com/hherb/kastellan/issues/586). Measurement 3's τ = 0.79552656 is a **required** operator input with no default; the HTTP-400 door ([#604](https://github.com/hherb/kastellan/issues/604)) became a **boot refusal** instead of a runtime fail-open; and the timeout is **probed per host** rather than assumed — D2's 15 s constant was wrong by 40× on the Mac. **The tier is ADVISORY defence-in-depth at 65% recall, not a gate**, and nothing downstream may relax on it. **It has never run live** — DGX/Mac bring-up is the next step.
+**Last updated:** 2026-08-23 · **`main` HEAD:** `d51c9b20` ([#606](https://github.com/hherb/kastellan/pull/606)) · **`main` baseline: 3759 / 0 / 54** DGX · **ONE OPEN BRANCH: `feat/guard-wiring-slice-586` ([PR #607](https://github.com/hherb/kastellan/pull/607)) — THE GUARD TIER IS WIRED TO THE CHOKEPOINT.** A five-agent PR review then produced **eleven fixes**, all mutation-proven, and four deferred issues ([#608](https://github.com/hherb/kastellan/issues/608)–[#611](https://github.com/hherb/kastellan/issues/611)) — see [the review section](#the-five-agent-pr-review-of-607-and-the-eleven-fixes-it-produced). **Post-review gate GREEN ON BOTH HOSTS at `31a05e00`: DGX 3834 / 0 / 54, Mac 3712 / 0 / 24, `TEST_EXIT=0`, clippy 0.** Closes [#586](https://github.com/hherb/kastellan/issues/586). Measurement 3's τ = 0.79552656 is a **required** operator input with no default; the HTTP-400 door ([#604](https://github.com/hherb/kastellan/issues/604)) became a **boot refusal** instead of a runtime fail-open; and the timeout is **probed per host** rather than assumed — D2's 15 s constant was wrong by 40× on the Mac. **The tier is ADVISORY defence-in-depth at 65% recall, not a gate**, and nothing downstream may relax on it. **It has never run live** — DGX/Mac bring-up is the next step.
 
 ---
 
@@ -236,12 +236,25 @@ daemon with no retry, and a boot refusal is the one guard state absent from `aud
 [#611](https://github.com/hherb/kastellan/issues/611) — `report_guard_tier`'s configured branch is
 untestable and untested; lift the payload into a pure fn.
 
-**Post-review gate (Mac, full sweep):** **3712 / 0 / 24**, `TEST_EXIT=0`, **175 suites**,
-`--no-fail-fast --nocapture`. `guard_tier_e2e` **17 / 0** (13 **+4**) with **zero** relevant skips —
-the 26 `[SKIP]` lines are all Apple-`container` (service not started) and gliner-relex, **not** the
-sandbox or PG skip, so the guard e2e ran contained against a real Postgres 18. Core lib **1931**
-(1924 **+7**), llm-router **87** unchanged. Clippy `-D warnings` exit 0 over **218** `Checking` lines
-from a cold dir. **The DGX has not re-run since these fixes** — that gate is outstanding.
+**Post-review gate — BOTH HOSTS, at `31a05e00`.**
+
+**DGX (native aarch64, real bwrap + live PG 18): 3834 / 0 / 54**, `TEST_EXIT=0`, **175 suites**,
+`--no-fail-fast --nocapture`. Reconciles **exactly**: the pre-review tip was 3823, and 3823 **+11** =
+3834 — the eleven new tests, no more and no less; against `main`'s 3759 the slice is **+75**. Suites
+unchanged (no new binary), `ignored` unchanged at 54. **8 `[SKIP]`, all gliner-relex** (4 × `ENABLE`,
+4 × venv shim) — *not* the bwrap-userns skip, so containment really ran. Clippy `-D warnings` exit 0
+over **231** `Checking` lines from a cold dir.
+
+**Mac (Seatbelt + Postgres.app 18): 3712 / 0 / 24**, `TEST_EXIT=0`, 175 suites. Its 26 `[SKIP]` lines
+are all Apple-`container` (service not started) and gliner-relex — again *not* the sandbox or PG skip.
+Clippy exit 0 over **218** cold `Checking` lines.
+
+`guard_tier_e2e` is **17 / 0 on BOTH hosts** (13 **+4**), and all four new cases ran on the DGX under
+real bwrap and live PG, not only on the Mac. Core lib **1931** (1924 **+7**) and llm-router **87**
+match across hosts — the useful cross-check, since the two are structurally blind to each other's
+`cfg` arms [[cfg-linux-e2e-deadcode-dgx-clippy]] and a divergence would have meant a Linux-only arm
+nobody had seen. The clippy counts differ (231 vs 218) for the same reason and legitimately: the DGX
+compiles the bwrap backend, Firecracker and the systemd units that the Mac compiles out.
 
 **Two behaviour changes an operator must know about**, both deliberate and both in D6/D8:
 a configured tier whose backend is unreachable, half-configured, τ-less, τ-out-of-range, or

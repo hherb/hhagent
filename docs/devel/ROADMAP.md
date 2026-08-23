@@ -496,8 +496,10 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   probe discarded its error text and logged at `info!`; `truncated`/`body_byte_len` now ride the
   Allow half; and `KASTELLAN_REQUIRE_GUARD=1` closes the gap that the hazard D6 argues from — an
   `install` that drops **all three** keys lands on the one non-fatal arm. All eleven mutation-proven.
-  Post-review Mac sweep **3712 / 0 / 24**, `TEST_EXIT=0`, 175 suites, clippy 0 over **218** cold
-  `Checking` lines; `guard_tier_e2e` **17 / 0**. **DGX re-gate outstanding.** Deferred:
+  Post-review gate green on **both** hosts at `31a05e00`: **DGX 3834 / 0 / 54** (`TEST_EXIT=0`, 175
+  suites, 8 `[SKIP]` all gliner-relex — *not* the bwrap-userns skip; clippy 0 over **231** cold
+  `Checking` lines), **Mac 3712 / 0 / 24** (clippy 0 over 218). Reconciles exactly — 3823 **+11** for
+  the eleven new tests, **+75** against `main`. `guard_tier_e2e` **17 / 0 on both**. Deferred:
   [#608](https://github.com/hherb/kastellan/issues/608)–[#611](https://github.com/hherb/kastellan/issues/611).
   **MEASUREMENT 3 MERGED 2026-08-23** (`d51c9b20`, PR [#606](https://github.com/hherb/kastellan/pull/606)) — plan Task 5
   complete. **133 cases, 109 captured** through the real `web.fetch` path (D5 floor: ≥100 with a
