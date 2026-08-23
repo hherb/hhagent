@@ -39,6 +39,12 @@
 //! equality without storing the bytes themselves; the length tells an
 //! operator how much was elided.
 //!
+//! **[`PRESERVED_KEYS`] ride through that replacement.** "Who did what"
+//! includes the outcome of a control that ran on the payload, and such a
+//! record is bounded, tiny, and — unlike a request body — recoverable
+//! from nowhere else. Dropping it was measured live: on 2026-08-23 two
+//! 85 KB `web.fetch` rows took the guard tier's score down with them.
+//!
 //! Pure: returns a new `serde_json::Value`, performs no I/O. Tested
 //! with deterministic-fingerprint regression pins.
 
@@ -57,6 +63,33 @@ use crate::DbError;
 /// the JSONL mirror line count.
 pub const PAYLOAD_MAX_BYTES: usize = 4096;
 
+/// Payload keys carried THROUGH truncation instead of being replaced by
+/// the fingerprint envelope.
+///
+/// A key earns a place here only if it is all three of:
+///
+/// 1. **bounded by construction** — a fixed set of scalars, so it cannot
+///    itself push the envelope over [`PAYLOAD_MAX_BYTES`];
+/// 2. **a decision record, not data** — the outcome of a control, not the
+///    document the control ran on. The cap exists to stop bodies dominating
+///    the heap, and preserving a body under another name would defeat it;
+/// 3. **irrecoverable** — it exists nowhere else. `req` and `result` can be
+///    reconstructed from the worker and the surrounding rows; a guard score
+///    is computed once, in memory, and is gone if this row drops it.
+///
+/// `guard` is the wiring slice's per-dispatch guard-tier report
+/// (`{state, p, tau, ms, body_byte_len, truncated}`). Before it was listed
+/// here, a tool result over the cap took the score with it — measured live
+/// on 2026-08-23 at 85,352 bytes — which silently inverted spec D5: blocked
+/// dispatches kept their score (their result is a short placeholder) while
+/// *cleared* ones lost theirs, leaving a size-selected sample that reads
+/// like a score distribution.
+///
+/// This is a **wire contract** in the same sense as
+/// [`TRUNCATED_MARKER_KEY`]: readers may rely on a preserved key meaning
+/// exactly what it meant in the untruncated payload.
+pub const PRESERVED_KEYS: [&str; 1] = ["guard"];
+
 /// Payload key that marks a [`truncate_payload`] envelope. This is a **wire
 /// contract**: readers in other crates (e.g. `kastellan-core`'s observation
 /// capture, issue #62) detect truncation via [`is_truncation_envelope`], so
@@ -66,8 +99,11 @@ pub const TRUNCATED_MARKER_KEY: &str = "_truncated";
 
 /// True iff `payload` is a truncation envelope produced by
 /// [`truncate_payload`] — i.e. the original payload was over budget and
-/// every real key was replaced by the `{_truncated, sha256, len}`
-/// fingerprint.
+/// its keys were replaced by the `{_truncated, sha256, len}` fingerprint,
+/// except any listed in [`PRESERVED_KEYS`], which ride along unchanged.
+///
+/// The predicate deliberately tests only the marker, so adding a preserved
+/// key stays additive for every existing reader.
 ///
 /// Lives next to the producer so the two cannot drift: a shape change to the
 /// envelope must update this predicate (and the shape-pin test below) in the
@@ -115,9 +151,16 @@ pub struct AuditRow {
 /// ```
 ///
 /// where `len` is the original serialised byte length and `sha256` is
-/// the lowercase-hex SHA-256 digest of the same bytes. The envelope
-/// itself is well under the budget so the return value is always
-/// within budget.
+/// the lowercase-hex SHA-256 digest of the same bytes — **of the input,
+/// not of the envelope**, so two rows for the same body still compare
+/// equal whatever else they carry.
+///
+/// Any [`PRESERVED_KEYS`] present in the input are then copied onto the
+/// envelope verbatim, because a bounded decision record is not what the
+/// cap is defending against and is worth more than the bytes it costs.
+/// The return value is always within budget: if the preserved keys would
+/// break that — which nothing in this workspace can do, but the signature
+/// permits — the bare envelope is returned instead.
 ///
 /// Pure: deterministic, no I/O, no global state. Same input → same
 /// output, every call.
@@ -141,11 +184,33 @@ pub fn truncate_payload(payload: serde_json::Value) -> serde_json::Value {
         write!(&mut hex, "{:02x}", b).expect("write to String cannot fail");
     }
 
-    serde_json::json!({
+    let bare = serde_json::json!({
         (TRUNCATED_MARKER_KEY): true,
         "sha256": hex,
         "len": bytes.len(),
-    })
+    });
+
+    // Only an object can have keys to preserve; a bare string or array
+    // over the cap is all data by definition.
+    let Some(source) = payload.as_object() else {
+        return bare;
+    };
+
+    let mut envelope = bare.clone();
+    let keep = envelope.as_object_mut().expect("built from a JSON object literal above");
+    for key in PRESERVED_KEYS {
+        if let Some(value) = source.get(key) {
+            keep.insert(key.to_string(), value.clone());
+        }
+    }
+
+    // The postcondition, enforced rather than argued: whatever a caller put
+    // under a preserved key, the stored row fits the budget.
+    let grown = serde_json::to_vec(&envelope).expect("serde_json::Value cannot fail to serialise");
+    if grown.len() > PAYLOAD_MAX_BYTES {
+        return bare;
+    }
+    envelope
 }
 
 /// Insert one row into `audit_log` and return its `id`.
@@ -354,6 +419,143 @@ mod tests {
         let a = truncate_payload(v1);
         let b = truncate_payload(v2);
         assert_eq!(a, b);
+    }
+
+    /// A `guard` decision record survives truncation.
+    ///
+    /// Found live on the DGX, 2026-08-23: two `web.fetch` rows whose
+    /// payloads serialised to 85,352 and 85,351 bytes were stored as bare
+    /// fingerprint envelopes, so the guard-tier score the dispatcher had
+    /// just computed was gone. The tool payload is
+    /// `{req, result, ms, guard}` and `result` carries the whole tool
+    /// output, so any result past ~4 KiB took the `guard` object down with
+    /// it.
+    ///
+    /// **The bias runs the wrong way.** A *blocked* dispatch keeps its
+    /// score, because the result was already replaced by a short withheld
+    /// placeholder; a *cleared* one loses it as soon as the document is
+    /// large. Recording `p` on the cleared half is the whole of the wiring
+    /// spec's D5 — it is what makes production a score source that is not
+    /// catalogue-selected — so what survived was every block plus only the
+    /// small clears: a size-selected sample that reads like data.
+    #[test]
+    fn truncation_preserves_the_guard_decision_record() {
+        let guard = serde_json::json!({
+            "state": "clear",
+            "p": 0.0074157947,
+            "tau": 0.79552656,
+            "ms": 75,
+            "body_byte_len": 285,
+            "truncated": false,
+        });
+        let v = serde_json::json!({
+            "req": {"argv": ["/usr/bin/printf", "x"]},
+            "result": {"text": "w".repeat(PAYLOAD_MAX_BYTES)},
+            "ms": 12,
+            "guard": guard.clone(),
+        });
+        assert!(serde_json::to_vec(&v).unwrap().len() > PAYLOAD_MAX_BYTES);
+
+        let out = truncate_payload(v);
+        assert!(
+            is_truncation_envelope(&out),
+            "the row must still declare itself truncated: {out}"
+        );
+        assert_eq!(
+            out.get("guard"),
+            Some(&guard),
+            "the guard score exists nowhere else -- unlike `req` and `result`, \
+             it cannot be recovered from the worker or from the JSONL mirror"
+        );
+        // The data is still gone: preserving a decision record is not
+        // preserving the document it was about.
+        assert!(out.get("result").is_none(), "the oversized data must NOT be kept");
+        assert!(out.get("req").is_none(), "only the allowlisted keys ride along");
+    }
+
+    /// The fingerprint describes the ORIGINAL payload, not the envelope.
+    ///
+    /// Preserving a key must not change what `sha256`/`len` mean, or two
+    /// rows for the same body would stop comparing equal the moment one of
+    /// them carried a guard score.
+    #[test]
+    fn a_preserved_key_does_not_change_the_fingerprint() {
+        let big = serde_json::json!({"result": "q".repeat(PAYLOAD_MAX_BYTES)});
+        let mut with_guard = big.clone();
+        with_guard["guard"] = serde_json::json!({"state": "clear", "p": 0.5});
+
+        let bare = truncate_payload(big.clone());
+        let kept = truncate_payload(with_guard.clone());
+
+        // Each envelope fingerprints its OWN input...
+        let expect = |v: &serde_json::Value| {
+            use sha2::Digest;
+            let bytes = serde_json::to_vec(v).unwrap();
+            (format!("{:x}", sha2::Sha256::digest(&bytes)), bytes.len())
+        };
+        for (env, src) in [(&bare, &big), (&kept, &with_guard)] {
+            let (sha, len) = expect(src);
+            assert_eq!(env.get("sha256").and_then(|v| v.as_str()), Some(sha.as_str()));
+            assert_eq!(env.get("len").and_then(|v| v.as_u64()), Some(len as u64));
+        }
+    }
+
+    /// A payload with no preserved key keeps the exact three-key envelope.
+    ///
+    /// Pins the shape existing readers were written against, so preserving
+    /// a key stays strictly additive.
+    #[test]
+    fn a_payload_without_a_preserved_key_keeps_the_bare_envelope() {
+        let v = serde_json::json!({"plan": {"steps": ["x".repeat(PAYLOAD_MAX_BYTES)]}});
+        let out = truncate_payload(v);
+        let obj = out.as_object().expect("envelope is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["_truncated", "len", "sha256"]);
+    }
+
+    /// An oversized preserved key falls back to the bare envelope.
+    ///
+    /// The allowlisted keys are bounded *by construction* at every site
+    /// this crate knows about, but `truncate_payload` is public and takes
+    /// an arbitrary `Value`. Its one hard postcondition is that the return
+    /// value fits the budget; a preserved key must never be able to break
+    /// that, and silently storing an over-budget row is exactly the failure
+    /// the cap exists to prevent.
+    #[test]
+    fn an_oversized_preserved_key_falls_back_to_the_bare_envelope() {
+        let v = serde_json::json!({
+            "guard": {"state": "clear", "junk": "!".repeat(PAYLOAD_MAX_BYTES)},
+        });
+        let out = truncate_payload(v);
+        assert!(is_truncation_envelope(&out));
+        assert!(
+            out.get("guard").is_none(),
+            "a preserved key that does not fit is dropped, not stored over budget"
+        );
+        assert!(serde_json::to_vec(&out).unwrap().len() <= PAYLOAD_MAX_BYTES);
+    }
+
+    /// Every envelope this function can return is within budget.
+    ///
+    /// The postcondition stated in the doc comment, asserted over both
+    /// arms rather than argued for in prose.
+    #[test]
+    fn every_envelope_fits_the_budget() {
+        let cases = [
+            serde_json::json!({"result": "a".repeat(PAYLOAD_MAX_BYTES)}),
+            serde_json::json!({
+                "result": "b".repeat(PAYLOAD_MAX_BYTES),
+                "guard": {"state": "flagged", "p": 0.92, "tau": 0.79552656},
+            }),
+            serde_json::json!({"guard": {"x": "c".repeat(PAYLOAD_MAX_BYTES)}}),
+            serde_json::Value::String("d".repeat(PAYLOAD_MAX_BYTES)),
+        ];
+        for v in cases {
+            let out = truncate_payload(v.clone());
+            let n = serde_json::to_vec(&out).unwrap().len();
+            assert!(n <= PAYLOAD_MAX_BYTES, "envelope of {v:.40} is {n} bytes");
+        }
     }
 
     /// Different inputs at the same length must produce different

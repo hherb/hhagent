@@ -303,6 +303,20 @@ fn clamp_derived(derived_ms: u64) -> (u64, Clamped) {
 /// timeout    = clamp(derived_ms, TIMEOUT_FLOOR_MS, TIMEOUT_CEILING_MS)
 /// ```
 ///
+/// ⚠️ **This is a LINEAR extrapolation from a ~1 KiB sample, and on one
+/// of the two supported platforms it is wrong by 4.4x
+/// ([#612](https://github.com/hherb/kastellan/issues/612)).** Measured
+/// 2026-08-23 with the same dense filler on both hosts: the DGX (CUDA)
+/// holds 3 177 tok/s at 1 KiB and 2 907 at 64 KiB — flat, so the
+/// extrapolation is sound there. The Mac (Metal) holds 1 137 at 1 KiB
+/// and **260 at 64 KiB**, so a worst-case document takes 171 s against a
+/// derived budget of 91 s and the adjudication times out — which, as
+/// this module's own note above says, does not error but **fails open**.
+/// [`PROBE_SAFETY_FACTOR`]'s 2x does not cover a 4.4x error, and the knee
+/// sits between 8 KiB and 64 KiB, so a cheap second sample would not find
+/// it. Until #612 is settled, a Metal host should pin
+/// `KASTELLAN_LLM_GUARD_TIMEOUT_MS` rather than trust the probe.
+///
 /// **[`ProbeOutcome::Saturated`] derives the CEILING, not the floor**,
 /// and that is the one row a plausible implementation gets backwards. A
 /// probe that overran its budget is an upper bound on throughput — the

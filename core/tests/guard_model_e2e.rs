@@ -5,7 +5,7 @@
 //! four ways a 200 can be unmeasurable (neither verdict spelling; only
 //! one; no `logprobs` block; empty `choices`/`top_logprobs`), a
 //! malformed body, a transport failure, an unconfigured guard and a
-//! half-configured one. Plus one `#[ignore]` live instrument.
+//! half-configured one. Plus two `#[ignore]` live instruments.
 //!
 //! The mock is the same hand-rolled one-shot HTTP/1.1 listener that
 //! `llm-router/tests/local_backend_e2e.rs` uses — bind `127.0.0.1:0`,
@@ -544,4 +544,115 @@ async fn live_shieldstral_size_sweep() {
             }
         }
     }
+}
+
+
+/// **Live instrument: what THIS host's boot probe actually derives.**
+///
+/// The wiring spec's D9 replaced D2's constant 15 s with a probe,
+/// because a constant cannot be right for hosts that differ by 40x and
+/// the failure is silent and one-directional — *too short a guard
+/// timeout does not error, it fails open*. `guard_tier_e2e` pins every
+/// arm of that derivation against a mock. Nothing until now ran it
+/// against a real server, so the numbers a real deployment produces
+/// were predictions.
+///
+/// This is the same code path `kastellan`'s boot block takes, including
+/// the per-boot cache-buster, so what it prints is what the daemon
+/// would log on this host.
+///
+/// Run it wherever you are about to deploy:
+///
+/// ```sh
+/// KASTELLAN_LLM_GUARD_URL=http://127.0.0.1:8081/v1 \
+/// KASTELLAN_LLM_GUARD_MODEL=shieldstral \
+/// KASTELLAN_LLM_GUARD_TAU=0.79552656 \
+/// cargo test -p kastellan-core --test guard_model_e2e -- \
+///   --ignored --nocapture live_boot_probe_derives_this_hosts_timeout
+/// ```
+///
+/// **The line worth waiting for is `COVERAGE FINDING`.** A host slow
+/// enough to derive past the 120 s ceiling is clamped, and the clamp
+/// means documents large enough to matter will time out and fail open
+/// to catalogue-only screening. That is a fact about the host, not a
+/// routine adjustment, and it is the one thing an operator should learn
+/// *before* the tier is carrying traffic rather than from its absence
+/// afterwards.
+///
+/// **Fails rather than skips when unconfigured**, for the same reason
+/// its sibling above does: an operator who asks for this by name and
+/// gets a silent PASS has learned nothing while being told everything
+/// is fine.
+#[tokio::test]
+#[ignore = "needs a live Shieldstral server; see the doc comment"]
+async fn live_boot_probe_derives_this_hosts_timeout() {
+    use kastellan_core::cassandra::guard_model::timeout::{
+        TimeoutBasis, TIMEOUT_CEILING_MS, TIMEOUT_FLOOR_MS,
+    };
+    use kastellan_core::cassandra::guard_model::GuardTier;
+
+    let cfg = RouterConfig::from_env().expect("router config");
+    // The same assertion the sweep makes, for the same reason: pointed
+    // at the planner endpoint this would still produce a plausible
+    // number, and a timeout derived from the wrong model's throughput
+    // is worth less than no timeout at all.
+    assert_ne!(
+        cfg.guard_url.as_deref(),
+        Some(cfg.local_url.as_str()),
+        "the guard endpoint is the PLANNER endpoint; the derived budget would          describe a different model"
+    );
+
+    // Varying prefix per run, exactly as the boot block builds it — a
+    // fixed one would be served from the prefix cache and the sample
+    // would describe the cache, not the host (M2 measured that error at
+    // 4x, in the direction that shortens the timeout).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the epoch")
+        .as_nanos();
+    let tier = match GuardTier::from_router_config(&cfg, &format!("kastellan-guard-probe-{nanos}"))
+        .await
+    {
+        Ok(None) => panic!(
+            "this test was asked for by name but the guard keys are unset; a skip              here would report as PASSED and teach an operator nothing"
+        ),
+        // Every one of these stops the daemon, so say so in the words an
+        // operator would otherwise meet at boot.
+        Err(e) => panic!("the daemon would REFUSE TO BOOT on this host: {e}"),
+        Ok(Some(t)) => t,
+    };
+
+    let budget = tier.timeout();
+    let ms = budget.timeout.as_millis() as u64;
+    println!(
+        "[live] endpoint={} model={} n_ctx={} tau={} timeout_ms={ms} basis={}",
+        cfg.guard_url.as_deref().unwrap_or("<unset>"),
+        cfg.guard_model.as_deref().unwrap_or("<unset>"),
+        tier.n_ctx(),
+        tier.tau(),
+        budget.basis.kind(),
+    );
+    if let TimeoutBasis::Probed { tok_per_s, .. } = budget.basis {
+        println!("[live] measured throughput: {tok_per_s:.1} uncached prompt tok/s");
+    }
+    match budget.basis.coverage_finding() {
+        Some(finding) => println!("[live] COVERAGE FINDING: {finding}"),
+        // Deliberately NOT "this host can adjudicate a worst-case
+        // document": the probe measured ~1 KiB and the budget above is a
+        // LINEAR extrapolation from it. That assumption was measured
+        // false on Apple Metal by 4.4x on 2026-08-23 (#612), where a
+        // 64 KiB document really takes 171 s against a derived 91 s.
+        None => println!(
+            "[live] no coverage finding -- but this budget is extrapolated from a \
+             ~1 KiB sample; see #612 before reading it as worst-case coverage"
+        ),
+    }
+
+    // The postcondition, checked on live data rather than only on mocks:
+    // whatever the probe measured, the budget the tier will actually
+    // spend is inside the documented clamp.
+    assert!(
+        (TIMEOUT_FLOOR_MS..=TIMEOUT_CEILING_MS).contains(&ms),
+        "derived budget {ms} ms is outside [{TIMEOUT_FLOOR_MS}, {TIMEOUT_CEILING_MS}]"
+    );
 }
