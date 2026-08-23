@@ -133,9 +133,17 @@ impl Client {
         // tool call). Pass a process-wide shared empty vault so the
         // substitution walk is a no-op but the API contract is
         // satisfied — and we don't pay a HashMap allocation per call.
+        // No guard tier here, deliberately. This is a core-initiated
+        // extraction call, not a step on the agent's tool path: the input is
+        // text core already holds and the output is structured entity data,
+        // not a document the planner reads. Adding a ~3.5 s model call to
+        // every extraction would also be a real cost for no containment gain.
+        // Widening the tier past `post_process::finalize` is a separate slice
+        // with its own blast radius (wiring spec, exclusions).
         let result = tool_host::dispatch(
             &self.pool,
             empty_vault(),
+            None,
             handle.worker_mut(),
             self.tool_name,
             "extract",

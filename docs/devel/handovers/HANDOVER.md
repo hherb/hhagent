@@ -8,15 +8,110 @@
 > which holds the verbose pre-prune version of everything summarised here —
 > including the full #587 ask-containment write-up compressed below.
 
-**Last updated:** 2026-08-23 · **`main` HEAD:** `abb3d3a7` ([#598](https://github.com/hherb/kastellan/pull/598)) · **`main` baseline: 3749 / 0 / 54** DGX · **ONE OPEN BRANCH: `feat/guard-measurement-3-campaign` — MEASUREMENT 3 IS DONE.** 133 cases (109 captured through the real `web.fetch` path), fitted on both hosts, **τ = 0.79552656**. The number is not the headline: τ is pinned by SECURITY PROSE with ~1 point of headroom, and 19 of 55 attacks are missed — concentrated in *narrative* indirect injection, which is the shape the tier exists for. Five issues filed from the run ([#601](https://github.com/hherb/kastellan/issues/601)–[#605](https://github.com/hherb/kastellan/issues/605)).
+**Last updated:** 2026-08-23 · **`main` HEAD:** `d51c9b20` ([#606](https://github.com/hherb/kastellan/pull/606)) · **`main` baseline: 3759 / 0 / 54** DGX · **ONE OPEN BRANCH: `feat/guard-wiring-slice-586` — THE GUARD TIER IS WIRED TO THE CHOKEPOINT.** Closes [#586](https://github.com/hherb/kastellan/issues/586). Measurement 3's τ = 0.79552656 is now a required operator input with no default, the HTTP-400 door (#604) became a **boot refusal** instead of a runtime fail-open, and the timeout is **probed per host** rather than assumed — D2's 15 s constant was wrong by 40× on the Mac. **The tier is ADVISORY defence-in-depth at 65% recall, not a gate**, and nothing downstream may relax on it.
 
 ---
 
 ## Current state
 
-### OPEN BRANCH `feat/guard-measurement-3-campaign` — measurement 3, and what it says about the tier
+### OPEN BRANCH `feat/guard-wiring-slice-586` — the guard tier is on the dispatcher path
 
-Runbook: [`2026-08-23-guard-measurement-3.md`](../runbooks/2026-08-23-guard-measurement-3.md);
+Spec [`…-shieldstral-guard-wiring-design.md`](../../superpowers/specs/2026-08-22-shieldstral-guard-wiring-design.md)
+(**amended 2026-08-23**: M2 + D8/D9/D10), plan
+[`2026-08-23-shieldstral-guard-wiring.md`](../../superpowers/plans/2026-08-23-shieldstral-guard-wiring.md).
+Closes [#586](https://github.com/hherb/kastellan/issues/586); addresses
+[#604](https://github.com/hherb/kastellan/issues/604) at the wiring layer.
+
+`ToolHostStepDispatcher` gains `guard: Option<Arc<GuardTier>>`, threaded
+`dispatch` → `dispatch_with_sink` → `post_process::finalize` exactly as `vault` was.
+The catalogue runs first and a catalogue Block **short-circuits** — proved by a request
+count, not by inspection. Escalate-up only: every failure door Allows.
+
+**The three measurement-3 obligations were the actual work, and two of them changed the
+design.**
+
+> **D8 — the HTTP 400 door: fail OPEN at runtime, refuse at BOOT.** #604 showed
+> `SCAN_BYTE_CAP` bounds bytes and nothing bounds tokens, at a ratio the attacker writes.
+> Fail-closed was rejected: whoever can force the 400 can force it on *any* document by
+> padding it, which is a DoS on the whole tool path. So the runtime keeps failing open —
+> and the tier now refuses to **boot** unless `/props` reports a per-request context ≥
+> `SCAN_BYTE_CAP + 512 = 66 048`. **One token per byte is a bound, not a guess**:
+> Shieldstral's tokeniser is byte-level BPE, so its base vocabulary is the bytes and no
+> input can exceed 1 tok/byte. That converts an attacker-reachable runtime fail-open into
+> an operator-fixable boot refusal. The DGX passes today (131 072); the `-c 32768` server
+> that produced #604 refuses with a message naming `-c 66048`.
+
+> **D9 — the timeout is PROBED at boot, not assumed.** D2's 15 s came from one host and one
+> token count, and measurement 3 broke both halves (the Mac takes ~5.5 min on a document D2
+> budgets at 15 s). A constant cannot be right for hosts differing by 40×, and the failure
+> is silent and one-directional: **too short a guard timeout does not error, it fails
+> open**. So one probe runs at boot, throughput is derived, and the result is clamped into
+> `[15 s, 120 s]`. `KASTELLAN_LLM_GUARD_TIMEOUT_MS` overrides and skips the probe.
+
+> ⚠️ **M2 — the probe was measured before it was specified, and the measurement changed
+> two constants.** Three requests against the DGX guard server, 2026-08-23:
+> | request | wall | `prompt_tokens` | `cached_tokens` | uncached tok/s |
+> | --- | --- | --- | --- | --- |
+> | cold, nonce `n1` | 159.3 ms | 810 | 0 | **5 084.6** |
+> | cold, nonce `n2` | 164.1 ms | 810 | 0 | **4 935.0** |
+> | repeat of `n2` | 38.4 ms | 810 | **809** | 26.1 |
+>
+> Three facts, each load-bearing. (1) **A nonce PREFIX defeats the prefix cache** — both
+> cold samples report `cached_tokens: 0`, agree within 3%, and land inside M1's
+> independently measured 4 039–6 660 band, so a 1 KiB probe stands in for a 64 KiB document
+> at 1/64th the cost. A nonce *suffix* would not: a prefix cache matches from position 0.
+> (2) **The contaminated repeat is catchable, and catching it matters** — naive
+> `prompt_tokens / elapsed` reads **21 094 tok/s** there, a **4× over-estimate** deriving a
+> timeout 4× too short. `usage.prompt_tokens_details.cached_tokens` makes it *detectable*,
+> so throughput is computed over **uncached** tokens with a 256-token floor. (3) 1024 dense
+> bytes → 810 tokens = **1.26 bytes/token**, close to #604's 1.47 on real jailbreak text and
+> nowhere near M1's 6.5 on prose — a prose probe would over-estimate per byte by ~5× and
+> reintroduce exactly D2's error. **Endpoint shape checked, not assumed:** the per-request
+> context is at `default_generation_settings.n_ctx`; there is **no top-level `n_ctx`**, and
+> `total_slots: 4` with each slot reporting the full 131 072 means `-c` is per-slot on this
+> build.
+
+> **D10 — advisory defence-in-depth, NOT a gate**, and the numbers travel with it: 65%
+> recall (36/55) at FP-0; 6/6 on bare imperatives at median 0.9955 but **5/8 missed** on
+> narrative framing at median 0.0797; τ pinned by ~4 documents with 1.0–1.2 points of
+> headroom; `best_tau` returns NONE. **Nothing downstream may relax on it** — no catalogue
+> weight lowered, no allowlist widened, no sandbox constraint loosened.
+
+**D5's per-dispatch `p` is the highest-leverage part.** The tool row gains a `guard`
+sub-object `{state, p, tau, ms}` whenever the tier ran — **including on cleared documents**,
+which is what makes production the score source for a corpus that is not catalogue-selected.
+No new rows. `policy / injection.blocked` gains `tier: "catalogue" | "guard_model"`, plus
+`p`/`tau` on the guard arm.
+
+**One refactor, taken deliberately:** `decision_for_score` extracted out of
+`screen_with_profile`, so `consults_model` delegates to the catalogue's own predicate
+instead of re-testing `>= BLOCK_THRESHOLD` a module away. The repo has already paid once for
+a second inline copy (`render_per_case` drifting from `decide`).
+
+**Verification.** Mac: llm-router lib **87**, core lib **1923**, and `guard_tier_e2e`
+**11 / 0** with **zero `[SKIP]` lines** under a real Postgres 18 — the audit-row half is
+genuinely exercised, not skip-as-passed. **All ELEVEN named mutants killed**, with the layer
+attribution stated rather than glossed: m1/m2 die at both layers; **m3 (drop `tier`) and m11
+(guard block wearing the catalogue's placeholder fields) die at layer 2 ONLY**; the seven
+D8/D9 mutants die at layer 1 only.
+
+> ⚠️ **The mutation harness contaminated the git index and it would have shipped.** The
+> first batch timed out mid-run leaving `m10` applied, and a `git add -A` staged the mutated
+> `probe_sample` — the working tree was later reverted and looked clean while the *index*
+> carried a dropped `MIN_UNCACHED_PROBE_TOKENS` gate. Caught by reading `git diff` after the
+> revert instead of trusting it. Generalisable: **after mutation testing, diff the index,
+> not just the tree** — [[mutation-revert-never-git-checkout]] is about the same class one
+> layer down.
+
+**Two behaviour changes an operator must know about**, both deliberate and both in D6/D8:
+a configured tier whose backend is unreachable, half-configured, τ-less, τ-out-of-range, or
+too small on context **stops the daemon**. Unconfigured is unchanged and silent-by-design
+(one boot line). `RouterConfig` also lost its `Eq` derive — `guard_tau` is an `Option<f32>`
+and a config that can hold a NaN is not totally equatable.
+
+### MERGED `d51c9b20` ([#606](https://github.com/hherb/kastellan/pull/606)) — measurement 3, and what it says about the tier
+
+Merged 2026-08-23. Runbook: [`2026-08-23-guard-measurement-3.md`](../runbooks/2026-08-23-guard-measurement-3.md);
 both reports committed beside it. Plan Task 5 is **complete**.
 
 **The corpus: 133 cases, 109 captured**, against D5's floor of ≥100 with a captured half.
@@ -102,7 +197,7 @@ and `scripts/eval/paced-capture.sh`, because 104 unpaced entries gave 20 fetch f
 where the same 21 paced gave zero.
 
 > ⚠️ **The branch's own review round found one real defect and one script that did not do
-> what its header said.** Both are fixed on the branch.
+> what its header said.** Both are fixed and merged.
 >
 > (1) **`render_per_case` re-implemented the adjudication states inline and drifted from
 > `decide` on the NON-FINITE door.** `Some(NaN)` rendered as the string `NaN` in the score
@@ -315,11 +410,13 @@ Full prose in [`archive/handover_20260821_pre-prune.md`](archive/handover_202608
   - **Still deliberately excluded:** the `ask_user` planner tool and `propose_plan` (same inbox item, different `kind`), a configured fallback destination for non-channel tasks, the autonomy-ceiling axis (`tasks.autonomy`), and the dead-letter store.
   - **Email delivery is wired but inert** — `EmailChannel::send` still refuses unconditionally, so an email-originated ask produces an honest `ask.delivery_failed` row rather than a silent drop. Correct until outbound SMTP lands.
 
-- **Shieldstral guard-model — MEASUREMENT 3 IS DONE (branch `feat/guard-measurement-3-campaign`); THE WIRING SLICE IS NEXT.** Spec [`…-shieldstral-guard-wiring-design.md`](../../superpowers/specs/2026-08-22-shieldstral-guard-wiring-design.md), operator-approved 2026-08-22, now unparked: it has its **τ = 0.79552656** and three new obligations from the run.
-  - **Two of them are correctness, not polish, and both are attacker-reachable.** A guard call can fail with **HTTP 400** when a 64 KiB document exceeds the server context ([#604](https://github.com/hherb/kastellan/issues/604) — `SCAN_BYTE_CAP` bounds bytes, not tokens; measured 44,437 tokens from 65,536 bytes), and it can **time out** — the same document takes **~5.5 min on the Mac** against the spec's derived **15 s** ([#586](https://github.com/hherb/kastellan/issues/586)). The spec must say which way each fails; *pass it through* would fail open on exactly the documents most likely to be attacks.
-  - **The third is honesty about what the tier buys.** 65% recall at an FP-0 threshold, weakest against narrative indirect injection. The spec's own framing ("this slice ships a tier nobody should turn on yet") should become "advisory defence-in-depth", not "a gate" — and nothing downstream may relax on it.
+- **Shieldstral guard-model — MEASUREMENT 3 MERGED (`d51c9b20`, [#606](https://github.com/hherb/kastellan/pull/606)); THE WIRING SLICE IS ON `feat/guard-wiring-slice-586`** (see [Current state](#current-state)). What remains under this heading:
+  - **Live bring-up on the DGX, which nothing has done yet.** The tier has never run against a real `llama-server` from the daemon — every case in `guard_tier_e2e` is a mock. The three things only a live run can answer: what the boot probe actually derives there (M2 predicts ~26 s, unclamped), whether `report_guard_tier`'s line reads usefully, and what `p` looks like on genuine worker output. Needs `KASTELLAN_LLM_GUARD_URL`/`_MODEL`/`_TAU=0.79552656` in the operator overlay `~/.config/kastellan/kastellan.env.local` (**not** the generated file — `install` regenerates that), and the guard server up on `:8081` with `-c 131072` or higher, which D8 now *enforces*.
+  - **The Mac is the interesting host, not the DGX.** Measurement 3 implies ~135 tok/s there, which derives ~978 s and **clamps to the 120 s ceiling** — so a Mac deployment should print the `warn!` saying large documents will fail open. That warning has never been seen in the wild; seeing it once is worth more than another unit test.
   - **Then, in rough priority:** [#605](https://github.com/hherb/kastellan/issues/605) (the `PROVISIONAL` banner is unconditional — the fix is a pure `provisional_reasons(cases)`, and until it lands no report can say a τ is fitted); [#602](https://github.com/hherb/kastellan/issues/602) (an empty body pinned as the page — fail-**open** under `--record`); [#601](https://github.com/hherb/kastellan/issues/601) (the profile divergence, quantified **inert** for this run but still wrong); [#603](https://github.com/hherb/kastellan/issues/603) (the URL inside the hash); [#599](https://github.com/hherb/kastellan/issues/599)/[#600](https://github.com/hherb/kastellan/issues/600) from #598's review.
-  - **Corpus growth, if the tier is pursued:** the security-prose stratum is **catalogue-selected, not sampled** — 15 of 121 attempted captures were refused by the deterministic catalogue under the *production* `Relaxed` profile, including every GitHub-hosted security-prose candidate (PIPE's primer, PayloadsAllTheThings, CWE-77). The agent cannot read those documents today, which is D4's expensive failure happening one layer *below* the guard.
+  - **#604 is addressed, not closed.** D8 makes the 400 unreachable on a correctly sized host; it does not make it unrepresentable. The issue's option 2 (cap by tokens) still wants a core-side tokeniser the guard seam deliberately does not have, and option 3 (chunk and combine) changes what a score means and needs its own measurement.
+  - **Corpus growth, if the tier is pursued:** the security-prose stratum is **catalogue-selected, not sampled** — 15 of 121 attempted captures were refused by the deterministic catalogue under the *production* `Relaxed` profile, including every GitHub-hosted security-prose candidate (PIPE's primer, PayloadsAllTheThings, CWE-77). The agent cannot read those documents today, which is D4's expensive failure happening one layer *below* the guard. **D5's per-dispatch `p` is the way out** — it makes production the score source, with no catalogue selection at all.
+  - **The other four `screen` call sites** (`fetch_screen`, `inner_loop/summary`, `channel/ingest`, `recall_assembly/pg_builder`) keep catalogue-only behaviour, and so does the core-initiated `gliner-relex` dispatch. Widening is a separate slice with its own blast radius.
 - **Email channel — slices 2 and 3.** Slice 1 (gated inbound) MERGED, and #503 closed its MITM gap. Spec `docs/superpowers/specs/2026-07-28-email-fallback-channel-design.md`. **Slice 2** = SMTP outbound (`lettre`, MIT-verified) + full round trip; today `EmailChannel::send` refuses and every refusal is audited `channel.reply_undelivered`. **Slice 3** = DGX deploy + live tier: re-verify both negative controls (plan Task 4 Step 5 and Task 5 Step 5) on the deployed host, and **restart `localmail-serve` (+ `localmail-daemon`) on the DGX first** — see [Deployment facts](#deployment-facts-dgx). Its deploy blocker is gone: `41b21f36` (#520) installs `kastellan-worker-email-in`, so the channel is deployable for the first time.
 - **[#497](https://github.com/hherb/kastellan/issues/497) — unify the per-family `ChannelBus` instances into one bus.** `main.rs` spawns a Matrix bus and an email bus, each with its own `PgCompletedTasks` LISTEN, so every bus sees every completed channel task and `handle_completed`'s `senders` miss is the normal case (the misleading `warn!("…dropping")` was demoted to `debug!` in `658924ae`). `ChannelBus::spawn` already takes a `Vec<Box<dyn Channel>>`, so this is mostly rewiring the two boot modules to return a *channel* rather than a *bus*; it also drops a redundant LISTEN connection and lets that log line be a real `warn!` again. Worth doing before a third channel family lands.
 - **macOS Seatbelt-loopback verification of mail tier 1a** (carried from #490, non-blocking) — needs a Mac run with working launchd-PG; the Linux/bwrap leg is validated and tier 1b carries the macOS sandbox leg.
@@ -418,7 +515,8 @@ review round widened it from two invariants to three, in [`archive/handover_2026
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
-| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`0bae6b2c`** — `feat/guard-measurement-3-campaign`, the review-fix tip | **3759 / 0 / 54**, `TEST_EXIT=0`, `--no-fail-fast --nocapture`, **174 suites**. Reconciles exactly: `main` 3749 **+5** (the campaign's `render_per_case` tests) **+5** (the review round: 2 more unit tests on `render_per_case`, 1 on `render_distribution`, 2 e2e legs pinning `--per-case` to the output) | `CLIPPY_EXIT=0`, **zero warnings**, over **3 `Checking` lines** — `core` holds every changed Rust file, plus `tests-common`/`db` in the dev graph, so this is the complete reverse-dep set for the diff rather than the warm-cache false green. **CI stays the authority on lints** (rust 1.97 vs local 1.96) | **8**, all gliner-relex (4 venv-not-built + 4 `KASTELLAN_GLINER_RELEX_ENABLE`) — *not* the bwrap-userns skip, so containment really ran |
+| **Mac** (aarch64 darwin, Seatbelt + Postgres.app 18 via `KASTELLAN_PG_BIN_DIR`) | `feat/guard-wiring-slice-586` | **targeted, not a sweep:** llm-router lib **87 / 0**, core lib **1923 / 0 / 1**, `guard_tier_e2e` **11 / 0** with **zero `[SKIP]` lines** (real PG, real sandboxed worker, real `dispatch`). **All 11 named mutants killed** — m3/m11 at layer 2 only, the seven D8/D9 mutants at layer 1 only, m1/m2 at both. **A full DGX sweep is still owed** and is what the count delta must reconcile against | `CLIPPY_EXIT=0`, zero warnings, over **235 `Checking` lines** — an honest full-workspace lint, not the warm-cache false green | **0** on `guard_tier_e2e` under the PG override |
+| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`0bae6b2c`** — the review-fix tip of `feat/guard-measurement-3-campaign`, **merged as `d51c9b20`**. `git diff 0bae6b2c d51c9b20` is one HANDOVER line, so this IS the current `main` baseline despite the squash | **3759 / 0 / 54**, `TEST_EXIT=0`, `--no-fail-fast --nocapture`, **174 suites**. Reconciles exactly: `main` 3749 **+5** (the campaign's `render_per_case` tests) **+5** (the review round: 2 more unit tests on `render_per_case`, 1 on `render_distribution`, 2 e2e legs pinning `--per-case` to the output) | `CLIPPY_EXIT=0`, **zero warnings**, over **3 `Checking` lines** — `core` holds every changed Rust file, plus `tests-common`/`db` in the dev graph, so this is the complete reverse-dep set for the diff rather than the warm-cache false green. **CI stays the authority on lints** (rust 1.97 vs local 1.96) | **8**, all gliner-relex (4 venv-not-built + 4 `KASTELLAN_GLINER_RELEX_ENABLE`) — *not* the bwrap-userns skip, so containment really ran |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`f46c67cf`** — post-review tip of `fix/592-guard-weights-pin`, **merged as `abb3d3a7`**. `git diff f46c67cf abb3d3a7` touches **only HANDOVER + ROADMAP**, so this IS the current `main` baseline despite the squash. (The pre-review gate was `424e736a` at 3728 / 0 / 54; superseded.) | **3749 / 0 / 54**, `TEST_EXIT=0`, `--no-fail-fast`, `--nocapture`, **174 suites**. Reconciles exactly: `main` 3686 **+63** — the pin's original +42, plus the review's **+21** (7 `weights_pin` unit 22→29, 9 `tests-common::guard_pin` 2→11, 1 `guard_weights_pin_cli_e2e`, 4 `kastellan-cli` bin `apply_opt_out`) | `CLIPPY_EXIT=0`, **zero warnings**, over **4 `Checking` lines** — `core`, `llm-router`, `tests-common` are every crate with modified code, plus `db` in the dev graph; not the warm-cache false green | **8**, all gliner-relex (4 venv-not-built + 4 `KASTELLAN_GLINER_RELEX_ENABLE`) — *not* the bwrap-userns skip, so containment really ran |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`2ab6612c`** — **`main`**, discharging the gate [#596](https://github.com/hherb/kastellan/pull/596) merged without | **3686 / 0 / 54**, `TEST_EXIT=0`, **172 suites**. Reconciles exactly: 3668 at `b58edc77` **+18** for #596 | exit 0, **27 `Checking` lines** = the full workspace, so not the warm-cache false green | **4**, all `KASTELLAN_GLINER_RELEX_ENABLE` — *not* the bwrap-userns skip, so containment really ran |
 | — | ⚠️ **A first DGX attempt under a fresh private `CARGO_TARGET_DIR` reported `TEST_EXIT=101` with 7 failures — and was not a gate at all.** The tell was the `[SKIP]` breakdown: **54 lines, ~50 of them `worker binary not built`**. `cargo test` never builds the worker *binaries*, and discovery is `current_exe()`-relative, so the skips and the failures are ONE cause. Read the skip breakdown before the failure count | — | — | — |

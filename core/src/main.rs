@@ -65,6 +65,89 @@ fn probe_install_dir_trust(_exe_dir: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+/// Report the guard tier once, at boot, and record a queryable audit row.
+///
+/// Slice-1's D1 requires the tier's state be reported "once at boot, loudly,
+/// not per-call — a per-call warning on the dispatcher hot path is its own
+/// denial of service". This is that report, and it deliberately extends the
+/// existing "log what was actually resolved, once" block rather than inventing
+/// a second pattern.
+///
+/// **A `Clamped::ToCeiling` timeout is a `warn!`, not an `info!`.** It is the
+/// one basis that reports a reduction in coverage: on that host, documents
+/// large enough to matter will time out and fail open to catalogue-only
+/// screening. Everything else is routine, and warning about routine things is
+/// how the one that matters gets scrolled past.
+async fn report_guard_tier(
+    tier: Option<&kastellan_core::cassandra::guard_model::GuardTier>,
+    cfg: &kastellan_llm_router::RouterConfig,
+    pool: &sqlx::PgPool,
+) {
+    use kastellan_core::cassandra::guard_model::timeout::TimeoutBasis;
+
+    let Some(tier) = tier else {
+        info!(
+            "guard tier NOT configured -- tool output is screened by the deterministic \
+             catalogue only. Set KASTELLAN_LLM_GUARD_URL, KASTELLAN_LLM_GUARD_MODEL and \
+             KASTELLAN_LLM_GUARD_TAU to enable it."
+        );
+        let payload = serde_json::json!({"configured": false});
+        if let Err(e) =
+            kastellan_db::audit::insert(pool, "policy", "guard_tier.boot", payload).await
+        {
+            tracing::warn!(error = %e, "guard_tier.boot audit insert failed (non-fatal)");
+        }
+        return;
+    };
+
+    let budget = tier.timeout();
+    let timeout_ms = budget.timeout.as_millis() as u64;
+    let basis = budget.basis.kind();
+    // The measured throughput, when there was one — the number a later session
+    // needs to re-derive this timeout without re-running the probe.
+    let tok_per_s = match budget.basis {
+        TimeoutBasis::Probed { tok_per_s, .. } => Some(tok_per_s),
+        _ => None,
+    };
+
+    info!(
+        url = %cfg.guard_url.as_deref().unwrap_or("<unset>"),
+        model = %cfg.guard_model.as_deref().unwrap_or("<unset>"),
+        tau = tier.tau(),
+        timeout_ms,
+        timeout_basis = basis,
+        n_ctx = tier.n_ctx(),
+        policy_digest = %kastellan_core::cassandra::guard_model::policy::policy_digest(),
+        "guard tier configured -- ADVISORY defence-in-depth, not a gate (65% recall at \
+         the fitted tau; weakest against narrative indirect injection). Nothing \
+         downstream may relax on it."
+    );
+
+    if budget.basis.is_coverage_finding() {
+        tracing::warn!(
+            timeout_ms,
+            tok_per_s = tok_per_s.unwrap_or(0.0),
+            "this host cannot adjudicate a worst-case document within the guard timeout \
+             budget: large, token-dense documents WILL time out and fail open to \
+             catalogue-only screening. Set KASTELLAN_LLM_GUARD_TIMEOUT_MS deliberately if \
+             a longer per-dispatch stall is acceptable."
+        );
+    }
+
+    let payload = serde_json::json!({
+        "configured":    true,
+        "tau":           tier.tau(),
+        "timeout_ms":    timeout_ms,
+        "timeout_basis": basis,
+        "tok_per_s":     tok_per_s,
+        "n_ctx":         tier.n_ctx(),
+        "policy_digest": kastellan_core::cassandra::guard_model::policy::policy_digest(),
+    });
+    if let Err(e) = kastellan_db::audit::insert(pool, "policy", "guard_tier.boot", payload).await {
+        tracing::warn!(error = %e, "guard_tier.boot audit insert failed (non-fatal)");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -152,6 +235,43 @@ async fn main() -> Result<()> {
         disable_thinking = router_cfg.disable_thinking,
         "llm router configured"
     );
+
+    // ── The Shieldstral guard tier (wiring slice). ──
+    //
+    // Built and reported ONCE, here, beside the router it shares an endpoint
+    // seam with. Three things can stop the daemon, and all three are the same
+    // failure wearing different clothes — a security control that is off while
+    // looking configured (D6):
+    //
+    //   * a half-configured tier (URL without model, or either without a tau);
+    //   * a tau outside (0.0, 1.0], both ends of which are silent failures;
+    //   * a backend whose context cannot hold a worst-case document (#604),
+    //     which would otherwise fail OPEN at runtime on exactly the dense
+    //     adversarial documents the tier exists for.
+    //
+    // The counter-argument — a down daemon protects nothing — was weighed and
+    // rejected: "loud error at boot" is precisely what gets scrolled past, and
+    // `kastellan-cli install` regenerating `kastellan.env` has been observed
+    // dropping hand-added keys.
+    //
+    // The throughput probe underneath this is deliberately NOT fatal: it picks
+    // a timeout, it does not verify a control.
+    let guard_boot_nonce = format!(
+        "kastellan-guard-probe-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let guard_tier = kastellan_core::cassandra::guard_model::GuardTier::from_router_config(
+        &router_cfg,
+        &guard_boot_nonce,
+    )
+    .await
+    .map_err(|e| anyhow!("guard tier: {e}"))?
+    .map(std::sync::Arc::new);
+    report_guard_tier(guard_tier.as_deref(), &router_cfg, &pool).await;
+
     let router = Arc::new(
         kastellan_llm_router::Router::new(router_cfg)
             .map_err(|e| anyhow!("Router::new: {e}"))?,
@@ -524,6 +644,7 @@ async fn main() -> Result<()> {
                 lifecycle,
                 tool_registry,
                 handoff_cache,
+                guard_tier,
             ),
         );
 

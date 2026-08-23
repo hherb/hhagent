@@ -64,7 +64,9 @@ pub use backend::Backend;
 pub use config::RouterConfig;
 pub use embeddings::{EmbeddingData, EmbeddingRequest, EmbeddingResponse};
 pub use error::RouterError;
-pub use messages::{ChatChoice, ChatMessage, ChatRequest, ChatResponse, ChatRole, Usage};
+pub use messages::{
+    ChatChoice, ChatMessage, ChatRequest, ChatResponse, ChatRole, PromptTokensDetails, Usage,
+};
 pub use policy::{DefaultLocalPolicy, PolicyGate};
 
 use error::{truncate_for_error, ERROR_BODY_CAP};

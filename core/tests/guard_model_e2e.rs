@@ -38,6 +38,14 @@ impl Drop for MockGuard {
     }
 }
 
+/// Per-request budget for these hermetic cases.
+///
+/// Short on purpose: every backend here is a local one-shot mock, so a case
+/// that reaches this bound is hung rather than slow, and a test that hangs
+/// tells you less than one that fails. Production derives its budget from a
+/// boot-time throughput probe instead (wiring-spec D9).
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Build a config pointed at `url` with the guard configured.
 ///
 /// Struct-update rather than field reassignment: `..Default::default()`
@@ -182,7 +190,7 @@ async fn serves_the_pinned_request_envelope() {
     use kastellan_core::cassandra::guard_model::policy::{INSTRUCT, QUERY, SYSTEM_PROMPT};
 
     let (url, served, _srv) = spawn_mock(200, canned(-0.01, -5.0)).await;
-    let client = GuardClient::from_config(&guard_cfg(&url))
+    let client = GuardClient::from_config(&guard_cfg(&url), TEST_BUDGET)
         .expect("not misconfigured")
         .expect("configured");
     let _ = client.adjudicate("THE-DOCUMENT-BODY", 0.5).await.expect("ok");
@@ -233,7 +241,7 @@ async fn exactly_one_verdict_spelling_is_unmeasured_not_a_confident_score() {
     })
     .to_string();
     let (url, _served, _srv) = spawn_mock(200, body).await;
-    let client = GuardClient::from_config(&guard_cfg(&url))
+    let client = GuardClient::from_config(&guard_cfg(&url), TEST_BUDGET)
         .expect("not misconfigured")
         .expect("configured");
     let got = client.adjudicate("some document", 0.5).await.expect("ok");
@@ -266,7 +274,7 @@ async fn empty_choices_and_empty_top_logprobs_are_unmeasured() {
         ),
     ] {
         let (url, _served, _srv) = spawn_mock(200, body).await;
-        let client = GuardClient::from_config(&guard_cfg(&url))
+        let client = GuardClient::from_config(&guard_cfg(&url), TEST_BUDGET)
             .expect("not misconfigured")
             .expect("configured");
         let got = client.adjudicate("some document", 0.5).await.expect("ok");
@@ -277,7 +285,7 @@ async fn empty_choices_and_empty_top_logprobs_are_unmeasured() {
 #[tokio::test]
 async fn a_confident_yes_flags() {
     let (url, _served, _srv) = spawn_mock(200, canned(-0.01, -5.0)).await;
-    let client = GuardClient::from_config(&guard_cfg(&url))
+    let client = GuardClient::from_config(&guard_cfg(&url), TEST_BUDGET)
         .expect("not misconfigured")
         .expect("configured");
     let got = client.adjudicate("some document", 0.5).await.expect("ok");
@@ -287,7 +295,7 @@ async fn a_confident_yes_flags() {
 #[tokio::test]
 async fn a_confident_no_is_clear() {
     let (url, _served, _srv) = spawn_mock(200, canned(-5.0, -0.01)).await;
-    let client = GuardClient::from_config(&guard_cfg(&url))
+    let client = GuardClient::from_config(&guard_cfg(&url), TEST_BUDGET)
         .expect("not misconfigured")
         .expect("configured");
     let got = client.adjudicate("some document", 0.5).await.expect("ok");
@@ -314,7 +322,7 @@ async fn neither_verdict_spelling_is_unmeasured_not_clear() {
     })
     .to_string();
     let (url, _served, _srv) = spawn_mock(200, body).await;
-    let client = GuardClient::from_config(&guard_cfg(&url))
+    let client = GuardClient::from_config(&guard_cfg(&url), TEST_BUDGET)
         .expect("not misconfigured")
         .expect("configured");
     let got = client.adjudicate("some document", 0.5).await.expect("ok");
@@ -341,7 +349,7 @@ async fn a_response_with_no_logprobs_block_is_unmeasured() {
     })
     .to_string();
     let (url, _served, _srv) = spawn_mock(200, body).await;
-    let client = GuardClient::from_config(&guard_cfg(&url))
+    let client = GuardClient::from_config(&guard_cfg(&url), TEST_BUDGET)
         .expect("not misconfigured")
         .expect("configured");
     let got = client.adjudicate("some document", 0.5).await.expect("ok");
@@ -357,7 +365,7 @@ async fn a_response_with_no_logprobs_block_is_unmeasured() {
 #[tokio::test]
 async fn a_malformed_200_body_surfaces_rather_than_deciding() {
     let (url, _served, _srv) = spawn_mock(200, "{ this is not json".to_string()).await;
-    let client = GuardClient::from_config(&guard_cfg(&url))
+    let client = GuardClient::from_config(&guard_cfg(&url), TEST_BUDGET)
         .expect("not misconfigured")
         .expect("configured");
     // The VARIANT, not merely `is_err()`: a bare `is_err()` would also
@@ -372,7 +380,7 @@ async fn a_malformed_200_body_surfaces_rather_than_deciding() {
 #[tokio::test]
 async fn an_http_error_surfaces_rather_than_deciding() {
     let (url, _served, _srv) = spawn_mock(500, "upstream exploded".to_string()).await;
-    let client = GuardClient::from_config(&guard_cfg(&url))
+    let client = GuardClient::from_config(&guard_cfg(&url), TEST_BUDGET)
         .expect("not misconfigured")
         .expect("configured");
     match client.adjudicate("some document", 0.5).await {
@@ -383,7 +391,7 @@ async fn an_http_error_surfaces_rather_than_deciding() {
 
 #[test]
 fn an_unconfigured_guard_yields_ok_none() {
-    assert!(matches!(GuardClient::from_config(&RouterConfig::default()), Ok(None)));
+    assert!(matches!(GuardClient::from_config(&RouterConfig::default(), TEST_BUDGET), Ok(None)));
 }
 
 /// A guard with a URL but no model is a MISCONFIGURATION, and must not
@@ -398,7 +406,7 @@ fn a_half_configured_guard_is_an_error_not_unconfigured() {
     };
     // `match` rather than `expect_err`: that helper needs the Ok type to
     // be Debug, and `GuardClient` holds a `Router`, which is not.
-    match GuardClient::from_config(&cfg) {
+    match GuardClient::from_config(&cfg, TEST_BUDGET) {
         Err(e) => assert!(
             e.to_string().contains("KASTELLAN_LLM_GUARD_MODEL"),
             "must name the missing key: {e}"
@@ -456,7 +464,7 @@ async fn live_shieldstral_size_sweep() {
          answer the guard prompt with prose and yield a number that looks \
          exactly like a score and means nothing"
     );
-    let client = match GuardClient::from_config(&cfg) {
+    let client = match GuardClient::from_config(&cfg, TEST_BUDGET) {
         Ok(None) => panic!(
             "this test was asked for by name but KASTELLAN_LLM_GUARD_URL / \
              KASTELLAN_LLM_GUARD_MODEL are unset; a skip here would report as \

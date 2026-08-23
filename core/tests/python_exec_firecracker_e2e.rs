@@ -69,6 +69,7 @@ async fn try_dispatch_in_microvm(
     let result = dispatch_with_sink(
         &NoopAuditSink,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         &mut worker,
         "python-exec",
         "python.exec",

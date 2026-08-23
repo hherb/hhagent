@@ -109,6 +109,7 @@ fn direct_search_round_trips_under_the_jail() {
         let result = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "mail",
             "mail.search",
@@ -159,7 +160,7 @@ fn attachment_delivered_into_the_task_out_dir() {
 
         // get_message returns the attachment sha the agent then delivers.
         let msg = dispatch(
-            &pool, &Vault::new(), &mut sworker, "mail", "mail.get_message",
+            &pool, &Vault::new(), None, &mut sworker, "mail", "mail.get_message",
             serde_json::json!({"message_id": CANNED_MESSAGE_ID}),
         )
         .await
@@ -168,7 +169,7 @@ fn attachment_delivered_into_the_task_out_dir() {
         assert_eq!(sha, CANNED_SHA256);
 
         let out = dispatch(
-            &pool, &Vault::new(), &mut sworker, "mail", "mail.get_attachment",
+            &pool, &Vault::new(), None, &mut sworker, "mail", "mail.get_attachment",
             serde_json::json!({"sha256": sha, "filename": "invoice.pdf"}),
         )
         .await
@@ -424,6 +425,7 @@ async fn run_forced_mail_search_over_tls(
     let result = dispatch(
         &pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         &mut worker,
         "mail",
         "mail.search",
@@ -661,6 +663,7 @@ fn force_routed_search_against_real_localmail() {
         let value = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut worker,
             "mail",
             "mail.search",

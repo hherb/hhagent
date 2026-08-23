@@ -328,6 +328,7 @@ async fn render_in_vm_through_real_sidecar(
     let result = dispatch(
         pool,
         &Vault::new(),
+        None, // guard tier: not exercised by this suite
         handle.worker_mut(),
         "browser-driver",
         "browser.render",
@@ -604,6 +605,7 @@ async fn vm_booted_browser_driver_launches_chromium() {
         let _ = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut worker,
             "browser-driver",
             "browser.render",

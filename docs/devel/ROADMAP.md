@@ -451,8 +451,29 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   - **Why it is a prerequisite and not a nicety:** without it, a recurring task raises the same approval every run, the operator approves reflexively, and the gate has negative value — it trains the habit it exists to prevent while still costing a round trip.
 - [ ] Policy gate: per-tool, per-task, per-data-classification routing decision
 - [ ] Frontier escalation through egress proxy (Anthropic / OpenAI)
-- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 then the WIRING slice remain, both specced 2026-08-22 on `feat/guard-wiring-slice`.**
-  **MEASUREMENT 3 DONE 2026-08-23** (branch `feat/guard-measurement-3-campaign`) — plan Task 5
+- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 MERGED 2026-08-23 as `d51c9b20` (PR [#606](https://github.com/hherb/kastellan/pull/606)); the WIRING slice is on `feat/guard-wiring-slice-586`.**
+  **WIRING SLICE 2026-08-23** (branch `feat/guard-wiring-slice-586`, closes
+  [#586](https://github.com/hherb/kastellan/issues/586)) — the tier reaches
+  `post_process::finalize` as a threaded `Option<Arc<GuardTier>>`, catalogue first with a
+  short-circuit proved by a request count, escalate-up only. Spec amended with **M2** and
+  **D8/D9/D10**. **D8:** the attacker-reachable HTTP 400 of
+  [#604](https://github.com/hherb/kastellan/issues/604) still fails **open** at runtime
+  (fail-closed would let anyone serving the agent a web page deny it every document by
+  padding one) but the tier now refuses to **boot** below
+  `SCAN_BYTE_CAP + 512 = 66 048` tokens of per-request context — 1 tok/byte is a *bound*,
+  not a guess, because Shieldstral's tokeniser is byte-level BPE. **D9:** the timeout is
+  derived from a boot **throughput probe** and clamped to `[15 s, 120 s]`; D2's constant
+  was wrong by 40x on the Mac, and too short a guard timeout does not error, it fails
+  open. **M2** measured the probe first: a nonce **prefix** defeats the prefix cache
+  (`cached_tokens: 0`, two cold samples within 3%, inside M1's band), the contaminated
+  repeat reads **21 094 tok/s** against a true ~5 000 unless `cached_tokens` is subtracted,
+  and 1024 dense bytes tokenise at **1.26 bytes/token**. **D10:** the tier ships as
+  **advisory defence-in-depth, not a gate** — 65% recall, weakest against narrative
+  indirect injection — and nothing downstream may relax on it. D5's per-dispatch `p`, on
+  **cleared** documents too, makes production the score source for a corpus that is not
+  catalogue-selected. Mac gate: core lib 1923/0, `guard_tier_e2e` 11/0 with zero `[SKIP]`,
+  clippy 0 over 235 `Checking` lines, **all 11 named mutants killed**. **DGX sweep owed.**
+  **MEASUREMENT 3 MERGED 2026-08-23** (`d51c9b20`, PR [#606](https://github.com/hherb/kastellan/pull/606)) — plan Task 5
   complete. **133 cases, 109 captured** through the real `web.fetch` path (D5 floor: ≥100 with a
   captured half), 24 truncated at `SCAN_BYTE_CAP` on both labels, **zero `Unmeasured`**, weights
   hashed against the pin at use on both hosts so D6's comparison is *enforced*.

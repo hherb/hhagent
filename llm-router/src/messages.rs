@@ -233,12 +233,34 @@ pub struct ChatChoice {
     pub logprobs: Option<LogProbs>,
 }
 
+/// How many of `prompt_tokens` the backend served from its prefix
+/// cache instead of processing.
+///
+/// OpenAI defines this block; llama.cpp's OpenAI-compat endpoint serves
+/// it too (measured on the DGX guard server 2026-08-23: a repeated
+/// document came back `{"prompt_tokens":810,"prompt_tokens_details":
+/// {"cached_tokens":809}}` in 38 ms).
+///
+/// **It is read as a correctness signal, not as telemetry.** The guard
+/// tier's boot probe derives a prompt-processing throughput from
+/// tokens-per-second, and a cached token was never processed. Dividing
+/// by wall clock without subtracting them read **21,094 tok/s** against
+/// the same server's true ~5,000 — a 4x over-estimate, which derives a
+/// timeout 4x too short and so turns real adjudications into fail-open
+/// timeouts. See `kastellan_core::cassandra::guard_model::timeout` and
+/// M2 in the wiring spec.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+}
+
 /// Token-accounting envelope returned by the backend.
 ///
 /// Phase 0 forwards this through unchanged; Phase 1+ will read it for
-/// budgeting decisions in the scheduler's context-manager. All three
-/// fields are `Option` because Ollama and some llama.cpp builds omit
-/// the `usage` block entirely when the request was a non-streaming
+/// budgeting decisions in the scheduler's context-manager. Every field
+/// is `Option` because Ollama and some llama.cpp builds omit the
+/// `usage` block entirely when the request was a non-streaming
 /// completion.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
@@ -248,6 +270,13 @@ pub struct Usage {
     pub completion_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u32>,
+    /// Absent on every backend that does not report a prefix cache.
+    /// Absence means "we do not know", never "nothing was cached" —
+    /// which is why the guard probe treats a missing block as zero
+    /// cached tokens only after its own uncached-token floor has had a
+    /// chance to reject the sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 /// Decoded `200 OK` response from a chat-completion call.
@@ -374,6 +403,49 @@ mod tests {
         assert_eq!(req.max_tokens, Some(8192));
         assert_eq!(req.temperature, Some(0.2));
         assert_eq!(req.messages.len(), 1);
+    }
+
+    /// The prefix-cache block decodes when present, and its absence
+    /// stays absent rather than defaulting to zero.
+    ///
+    /// The distinction is load-bearing: the guard probe must be able to
+    /// tell "this backend reports no cache" from "nothing was cached",
+    /// because only the second is a number it may divide by. Verbatim
+    /// shape from the DGX guard server, 2026-08-23.
+    #[test]
+    fn usage_decodes_prompt_tokens_details_and_tolerates_its_absence() {
+        let with: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 810,
+            "completion_tokens": 1,
+            "total_tokens": 811,
+            "prompt_tokens_details": {"cached_tokens": 809}
+        }))
+        .unwrap();
+        assert_eq!(with.prompt_tokens, Some(810));
+        assert_eq!(
+            with.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            Some(809)
+        );
+
+        // A backend that reports `usage` but no cache block at all.
+        let without: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14
+        }))
+        .unwrap();
+        assert!(
+            without.prompt_tokens_details.is_none(),
+            "a missing block must stay None, not become Some(cached_tokens: 0)"
+        );
+
+        // Present but empty — llama.cpp omits `cached_tokens` on a
+        // fully-cold request in some builds.
+        let empty: Usage =
+            serde_json::from_value(json!({"prompt_tokens": 810, "prompt_tokens_details": {}}))
+                .unwrap();
+        assert_eq!(
+            empty.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            None
+        );
     }
 
     #[test]

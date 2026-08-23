@@ -140,7 +140,14 @@ async fn guard_calibrate_async(
     // header can name the endpoint that actually produced the scores.
     let guard_endpoint = cfg.guard_url.clone().unwrap_or_default();
     let guard_model = cfg.guard_model.clone().unwrap_or_default();
-    let client = match GuardClient::from_config(&cfg) {
+    // The calibration harness spends the PLANNER's generous budget, stated
+    // explicitly here rather than inherited: it adjudicates documents at
+    // SCAN_BYTE_CAP, which measurement 3 clocked at ~5.5 minutes on the Mac,
+    // and a run that timed out mid-corpus would fit a threshold on a partial
+    // one. Production's budget is derived per host instead (wiring-spec D9);
+    // this is deliberately not that number.
+    let calibrate_budget = cfg.timeout;
+    let client = match GuardClient::from_config(&cfg, calibrate_budget) {
         Ok(None) => {
             eprintln!(
                 "guard calibrate: the guard tier is unconfigured.\n\

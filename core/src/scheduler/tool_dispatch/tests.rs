@@ -325,6 +325,7 @@ fn dispatcher_with_registry(reg: ToolRegistry) -> ToolHostStepDispatcher {
         std::sync::Arc::new(NeverAcquire),
         std::sync::Arc::new(reg),
         std::sync::Arc::new(crate::handoff::HandoffCache::new()),
+        None, // guard tier: not exercised by this suite
     )
 }
 

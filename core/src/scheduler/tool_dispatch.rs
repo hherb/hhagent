@@ -375,6 +375,13 @@ pub struct ToolHostStepDispatcher {
     lifecycle: Arc<dyn crate::worker_lifecycle::WorkerLifecycleManager>,
     registry: Arc<ToolRegistry>,
     handoff: Arc<HandoffCache>,
+    /// The Shieldstral guard tier, or `None` when the operator configured
+    /// none. Threaded to `tool_host::dispatch` exactly as `vault` is
+    /// (wiring-spec D3) rather than reached through a process-global: a
+    /// `OnceLock` would make the dependency invisible at the site a reviewer
+    /// needs to see it, and would stop two tests in one binary configuring
+    /// different tiers.
+    guard: Option<crate::cassandra::guard_model::SharedGuardTier>,
     /// Per-task workspace `out/` dirs, registered by the lane runner. Read in
     /// `dispatch_step` to bind `out/` into an opt-in worker's policy clone;
     /// cleared by `purge_task`.
@@ -388,6 +395,7 @@ impl ToolHostStepDispatcher {
         lifecycle: Arc<dyn crate::worker_lifecycle::WorkerLifecycleManager>,
         registry: Arc<ToolRegistry>,
         handoff: Arc<HandoffCache>,
+        guard: Option<crate::cassandra::guard_model::SharedGuardTier>,
     ) -> Self {
         Self {
             pool,
@@ -395,6 +403,7 @@ impl ToolHostStepDispatcher {
             lifecycle,
             registry,
             handoff,
+            guard,
             task_out_dirs: Mutex::new(HashMap::new()),
         }
     }
@@ -614,6 +623,7 @@ impl StepDispatcher for ToolHostStepDispatcher {
         let result = dispatch(
             &self.pool,
             &self.vault,             // NEW — Item 31
+            self.guard.as_ref(),     // NEW — guard wiring slice
             handle.worker_mut(),
             &step.tool,
             method,

@@ -162,7 +162,7 @@ async fn dispatch_in_jail(
     let mut sworker = spawn_worker(&*backend, &spec)
         .expect("spawn python-exec under sandbox")
         .with_scratch(scratch);
-    let result = dispatch(pool, vault, &mut sworker, "python-exec", "python.exec", params).await;
+    let result = dispatch(pool, vault, None, &mut sworker, "python-exec", "python.exec", params).await;
     let _ = sworker.close();
     if let Some(p) = scratch_path {
         assert!(

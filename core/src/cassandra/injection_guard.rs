@@ -255,6 +255,27 @@ fn normalize(text: &str) -> String {
         .collect()
 }
 
+/// Does a catalogue `score` Block?
+///
+/// The threshold comparison, extracted so there is exactly **one** copy
+/// of it. [`screen_with_profile`] calls it, and so does the model
+/// tier's `consults_model` — which needs to know whether the catalogue
+/// already decided, and would otherwise re-implement `>= BLOCK_THRESHOLD`
+/// a module away. A second inline copy is a second thing to keep in
+/// step, and this repo has already paid for one (`render_per_case`
+/// drifting from `decide` on the non-finite door).
+///
+/// Inclusive at the threshold: `score == BLOCK_THRESHOLD` Blocks.
+///
+/// Pure.
+pub fn decision_for_score(score: f32) -> InjectionDecision {
+    if score >= BLOCK_THRESHOLD {
+        InjectionDecision::Block
+    } else {
+        InjectionDecision::Allow
+    }
+}
+
 /// Catalogue scan over `text` using [`GuardProfile::Strict`]. Returns an
 /// [`InjectionVerdict`] whose `score` is the sum of per-rule weights that
 /// fired (cap 1.0) and whose `decision` is `Block` iff
@@ -301,11 +322,7 @@ pub fn screen_with_profile(text: &str, profile: GuardProfile) -> InjectionVerdic
     if chat_template_hit {
         score = (score + RELAXED_CHAT_TEMPLATE_WEIGHT).min(1.0);
     }
-    let decision = if score >= BLOCK_THRESHOLD {
-        InjectionDecision::Block
-    } else {
-        InjectionDecision::Allow
-    };
+    let decision = decision_for_score(score);
     InjectionVerdict {
         score,
         decision,

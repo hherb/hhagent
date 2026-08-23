@@ -220,9 +220,11 @@ impl WorkerCommand {
 /// `current_thread` runtimes panic from `block_in_place`. Tests that
 /// exercise `dispatch` are responsible for choosing the right
 /// runtime; the daemon's `#[tokio::main]` already does.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     pool: &sqlx::PgPool,
     vault: &crate::secrets::Vault,        // NEW — Item 31
+    guard: Option<&crate::cassandra::guard_model::SharedGuardTier>, // NEW — guard wiring slice
     worker: &mut SupervisedWorker,
     tool: &str,
     method: &str,
@@ -231,7 +233,7 @@ pub async fn dispatch(
     // Production always routes through PgAuditSink. The sink seam
     // ([`dispatch_with_sink`]) exists for fault-injection tests (issue #148),
     // not as a production audit-policy knob — see the `audit_sink` module docs.
-    dispatch_with_sink(&PgAuditSink::new(pool), vault, worker, tool, method, params).await
+    dispatch_with_sink(&PgAuditSink::new(pool), vault, guard, worker, tool, method, params).await
 }
 
 /// Fault-injectable core of [`dispatch`]. Behaviourally identical, but audit
@@ -241,9 +243,11 @@ pub async fn dispatch(
 /// #148). **Production code calls [`dispatch`]**, which pins `sink` to a real
 /// [`PgAuditSink`]; this entry point is `pub` only because the fault-injection
 /// tests live in the separate integration-test crate.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_with_sink(
     sink: &dyn AuditSink,
     vault: &crate::secrets::Vault,
+    guard: Option<&crate::cassandra::guard_model::SharedGuardTier>,
     worker: &mut SupervisedWorker,
     tool: &str,
     method: &str,
@@ -352,6 +356,7 @@ pub async fn dispatch_with_sink(
     post_process::finalize(
         sink,
         vault,
+        guard,
         tool,
         method,
         &req_for_audit,

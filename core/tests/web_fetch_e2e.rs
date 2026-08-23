@@ -108,6 +108,7 @@ fn host_outside_allowlist_is_denied() {
         let err = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "web-fetch",
             "web.fetch",
@@ -151,6 +152,7 @@ fn real_fetch_extracts_readable_text() {
         let result = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "web-fetch",
             "web.fetch",
@@ -201,6 +203,7 @@ fn real_modelcard_with_chat_template_is_not_blocked() {
         let result = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "web-fetch",
             "web.fetch",

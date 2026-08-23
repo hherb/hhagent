@@ -99,6 +99,7 @@ fn dispatch_writes_audit_row_for_success_and_failure() {
         let result = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "shell-exec",
             "shell.exec",
@@ -116,6 +117,7 @@ fn dispatch_writes_audit_row_for_success_and_failure() {
         let err = dispatch(
             &pool,
             &Vault::new(),
+            None, // guard tier: not exercised by this suite
             &mut sworker,
             "shell-exec",
             "shell.exec",

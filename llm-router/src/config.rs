@@ -102,7 +102,14 @@ pub fn default_local_url_for_os() -> &'static str {
     "http://127.0.0.1:8000/v1"
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` is deliberately NOT derived: `guard_tau` is an `Option<f32>`,
+// and floats are not `Eq` because `NaN != NaN`. That is not a nuisance
+// to work around here — a config holding a NaN threshold is exactly the
+// case `validate_tau` refuses, and claiming total equality over a type
+// that can hold one would be a lie the compiler is right to reject.
+// Nothing keys a map on a `RouterConfig`; `PartialEq` is all the tests
+// need.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RouterConfig {
     pub local_url: String,
     pub local_model: String,
@@ -134,6 +141,33 @@ pub struct RouterConfig {
     /// Model name sent to [`RouterConfig::guard_url`]. `None` means
     /// unconfigured; both must be set for the tier to be usable.
     pub guard_model: Option<String>,
+    /// The guard tier's decision threshold, from
+    /// `KASTELLAN_LLM_GUARD_TAU`. `None` means the operator supplied
+    /// none.
+    ///
+    /// **There is deliberately no default** (wiring-spec D1): a
+    /// provisional threshold that becomes a default is an unfitted
+    /// number wearing the appearance of a sanctioned one. The fitted
+    /// value from measurement 3 is 0.79552656 and it is the operator's
+    /// to supply.
+    ///
+    /// **Parsed here, validated elsewhere.** This field holds whatever
+    /// float the operator wrote; whether it is a *usable* threshold is
+    /// a security decision and lives beside the comparison it feeds, in
+    /// `kastellan_core::cassandra::guard_model::tier::validate_tau`.
+    /// Splitting it that way keeps this module free of policy and keeps
+    /// the range check next to the `p >= tau` it protects.
+    pub guard_tau: Option<f32>,
+    /// Operator override for the guard tier's request timeout, in
+    /// milliseconds, from `KASTELLAN_LLM_GUARD_TIMEOUT_MS`.
+    ///
+    /// `None` does **not** mean "use `timeout`" — it means *derive one
+    /// at boot* by probing the guard backend's prompt-processing
+    /// throughput (wiring-spec D9). A constant cannot be right for
+    /// hosts that differ by more than an order of magnitude on the same
+    /// document, and too short a guard timeout does not error: it fails
+    /// open.
+    pub guard_timeout_ms: Option<u64>,
     pub timeout: Duration,
     /// Ask the local backend's chat template to suppress the model's
     /// thinking block on every chat completion (see
@@ -162,6 +196,8 @@ impl Default for RouterConfig {
             frontier_model: None,
             guard_url: None,
             guard_model: None,
+            guard_tau: None,
+            guard_timeout_ms: None,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
             disable_thinking: true,
         }
@@ -198,6 +234,26 @@ impl RouterConfig {
         cfg.frontier_model = read_env("KASTELLAN_LLM_FRONTIER_MODEL")?;
         cfg.guard_url = read_env("KASTELLAN_LLM_GUARD_URL")?;
         cfg.guard_model = read_env("KASTELLAN_LLM_GUARD_MODEL")?;
+        if let Some(v) = read_env("KASTELLAN_LLM_GUARD_TAU")? {
+            // Parsed, not range-checked: `validate_tau` in `core` owns
+            // the range because it owns the comparison. What is refused
+            // here is text that is not a float at all — the same
+            // fail-loudly posture KASTELLAN_LLM_TIMEOUT_MS takes.
+            let tau: f32 = v.parse().map_err(|_| {
+                RouterError::Config(format!(
+                    "KASTELLAN_LLM_GUARD_TAU must be a decimal number, got {v:?}"
+                ))
+            })?;
+            cfg.guard_tau = Some(tau);
+        }
+        if let Some(v) = read_env("KASTELLAN_LLM_GUARD_TIMEOUT_MS")? {
+            let ms: u64 = v.parse().map_err(|_| {
+                RouterError::Config(format!(
+                    "KASTELLAN_LLM_GUARD_TIMEOUT_MS must be a non-negative integer, got {v:?}"
+                ))
+            })?;
+            cfg.guard_timeout_ms = Some(ms);
+        }
         if let Some(v) = read_env("KASTELLAN_LLM_TIMEOUT_MS")? {
             let ms: u64 = v.parse().map_err(|_| {
                 RouterError::Config(format!(
@@ -246,8 +302,17 @@ impl RouterConfig {
     /// the URL would turn the security tier off behind a
     /// correct-looking "guard unconfigured" log line.
     ///
+    /// **`timeout` is a parameter, not an inheritance.** It used to be
+    /// inherited through the struct update below, and that inheritance
+    /// was documented as "observed, not endorsed" — the planner's
+    /// generous 180 s is not a guard budget, and wiring-spec D9 derives
+    /// the guard's own bound from a boot-time throughput probe. Taking
+    /// it here means every caller has to state which budget it is
+    /// spending, and there is exactly one method rather than an
+    /// inheriting and a non-inheriting one that could drift.
+    ///
     /// Pure — no I/O, no env read.
-    pub fn for_guard(&self) -> Result<Option<RouterConfig>, RouterError> {
+    pub fn for_guard(&self, timeout: Duration) -> Result<Option<RouterConfig>, RouterError> {
         match (self.guard_url.as_ref(), self.guard_model.as_ref()) {
             (None, None) => Ok(None),
             (Some(_), None) => Err(RouterError::Config(
@@ -263,6 +328,7 @@ impl RouterConfig {
             (Some(url), Some(model)) => Ok(Some(RouterConfig {
                 local_url: url.clone(),
                 local_model: model.clone(),
+                timeout,
                 ..self.clone()
             })),
         }
@@ -595,11 +661,69 @@ mod tests {
         assert_eq!(cfg.embedding_url, "http://local:8080/v1");
     }
 
+    /// Both guard tuning keys parse, and **absence is not zero**.
+    ///
+    /// `guard_tau: None` means the operator supplied no threshold —
+    /// which wiring-spec D1 makes a misconfiguration when a guard URL
+    /// *is* set, not a silent 0.0. A `Some(0.0)` would flag every
+    /// document ever fetched; a defaulted `None` would look configured
+    /// and be off. Neither may arise from a missing key.
+    #[test]
+    fn from_env_parses_guard_tau_and_guard_timeout() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _scope = EnvScope::new(&[
+            ("KASTELLAN_LLM_GUARD_TAU", Some("0.79552656")),
+            ("KASTELLAN_LLM_GUARD_TIMEOUT_MS", Some("26419")),
+        ]);
+        let cfg = RouterConfig::from_env().unwrap();
+        // The fitted value from measurement 3, round-tripped through
+        // f32 — the number an operator actually pastes.
+        assert_eq!(cfg.guard_tau, Some(0.795_526_56_f32));
+        assert_eq!(cfg.guard_timeout_ms, Some(26_419));
+    }
+
+    #[test]
+    fn from_env_leaves_guard_tuning_absent_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _scope = EnvScope::new(&[
+            ("KASTELLAN_LLM_GUARD_TAU", None),
+            ("KASTELLAN_LLM_GUARD_TIMEOUT_MS", None),
+        ]);
+        let cfg = RouterConfig::from_env().unwrap();
+        assert_eq!(cfg.guard_tau, None, "no tau key must NOT become a default threshold");
+        assert_eq!(cfg.guard_timeout_ms, None, "no timeout key means DERIVE, not 0");
+    }
+
+    /// Text that is not a number is refused loudly rather than
+    /// silently ignored. Same posture as `KASTELLAN_LLM_TIMEOUT_MS`:
+    /// a typo'd threshold that fell back to "unconfigured" would turn
+    /// the security tier off behind a correct-looking log line.
+    #[test]
+    fn from_env_rejects_non_numeric_guard_tuning() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        {
+            let _scope = EnvScope::new(&[("KASTELLAN_LLM_GUARD_TAU", Some("nought-point-eight"))]);
+            let err = RouterConfig::from_env().expect_err("a non-numeric tau must be refused");
+            assert!(
+                err.to_string().contains("KASTELLAN_LLM_GUARD_TAU"),
+                "the error must name the key: {err}"
+            );
+        }
+        {
+            let _scope = EnvScope::new(&[("KASTELLAN_LLM_GUARD_TIMEOUT_MS", Some("15s"))]);
+            let err = RouterConfig::from_env().expect_err("a non-numeric timeout must be refused");
+            assert!(
+                err.to_string().contains("KASTELLAN_LLM_GUARD_TIMEOUT_MS"),
+                "the error must name the key: {err}"
+            );
+        }
+    }
+
     #[test]
     fn for_guard_is_ok_none_when_neither_key_is_set() {
         let cfg = RouterConfig::default();
         assert!(
-            matches!(cfg.for_guard(), Ok(None)),
+            matches!(cfg.for_guard(Duration::from_secs(15)), Ok(None)),
             "no guard keys at all is a deliberate opt-out, not an error"
         );
     }
@@ -616,7 +740,9 @@ mod tests {
             guard_url: Some("http://127.0.0.1:8080/v1".to_string()),
             ..Default::default()
         };
-        let err = url_only.for_guard().expect_err("url without model must be an error");
+        let err = url_only
+            .for_guard(Duration::from_secs(15))
+            .expect_err("url without model must be an error");
         assert!(
             err.to_string().contains("KASTELLAN_LLM_GUARD_MODEL"),
             "the error must name the MISSING key: {err}"
@@ -626,7 +752,9 @@ mod tests {
             guard_model: Some("shieldstral".to_string()),
             ..Default::default()
         };
-        let err = model_only.for_guard().expect_err("model without url must be an error");
+        let err = model_only
+            .for_guard(Duration::from_secs(15))
+            .expect_err("model without url must be an error");
         assert!(
             err.to_string().contains("KASTELLAN_LLM_GUARD_URL"),
             "the error must name the MISSING key: {err}"
@@ -639,6 +767,10 @@ mod tests {
     /// that looks exactly like a score and means nothing.
     #[test]
     fn for_guard_overrides_local_url_and_model_and_never_falls_back() {
+        // Deliberately unequal to the default 180 s so the two
+        // assertions below can tell "took the parameter" from "kept the
+        // parent's value".
+        const GUARD_BUDGET: Duration = Duration::from_millis(26_419);
         let planner_url = RouterConfig::default().local_url;
         let cfg = RouterConfig {
             guard_url: Some("http://127.0.0.1:8080/v1".to_string()),
@@ -646,21 +778,30 @@ mod tests {
             ..Default::default()
         };
 
-        let guard = cfg.for_guard().expect("no misconfiguration").expect("configured");
+        let guard = cfg
+            .for_guard(GUARD_BUDGET)
+            .expect("no misconfiguration")
+            .expect("configured");
         assert_eq!(guard.local_url, "http://127.0.0.1:8080/v1");
         assert_eq!(guard.local_model, "shieldstral-1.0-3b-q8");
         assert_ne!(guard.local_url, planner_url, "must not be the planner endpoint");
-        // Pins the inheritance as OBSERVED, not as endorsed. 180 s is the
-        // planner's budget; the guard's measured p50 is 30-43 ms, and on
-        // the dispatcher hot path an endpoint that is up-but-hung would
-        // stall three minutes per document. Open risk 6 in the slice-1
-        // spec owns this; a guard-specific bound belongs with the wiring
-        // slice, where the size sweep will have produced a number to
-        // derive it from. Changing this line without changing that risk
-        // would hide the gap rather than close it.
-        assert_eq!(
+        // The inheritance is GONE, and this assertion is what closes
+        // slice-1's open risk 6 / issue #586. It used to read
+        // `guard.timeout == cfg.timeout` and was documented as
+        // "observed, not endorsed": 180 s is the planner's budget, and
+        // on the dispatcher hot path an endpoint that is up-but-hung
+        // would stall three minutes per document. The guard now spends
+        // a budget its caller states — derived at boot from a
+        // throughput probe (wiring-spec D9), or set by the operator.
+        //
+        // `assert_ne!` against the parent is the half that matters: an
+        // implementation that took the parameter and then let the
+        // struct update overwrite it would satisfy the `assert_eq!`
+        // alone only by coincidence, so both are asserted.
+        assert_eq!(guard.timeout, GUARD_BUDGET, "the passed budget must win");
+        assert_ne!(
             guard.timeout, cfg.timeout,
-            "timeout is inherited (see slice-1 spec, open risk 6)"
+            "the planner's timeout must NOT be inherited (issue #586)"
         );
         assert_eq!(
             guard.disable_thinking, cfg.disable_thinking,

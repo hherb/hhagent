@@ -127,6 +127,8 @@ fn pg_recall_builder_round_trips_against_seeded_pool_and_mock_embedding() {
             frontier_model: None,
             guard_url: None,
             guard_model: None,
+            guard_tau: None,
+            guard_timeout_ms: None,
             embedding_url: mock_url,
             embedding_model: "test-embedding-model".into(),
             timeout: Duration::from_millis(5000),
