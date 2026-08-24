@@ -241,6 +241,17 @@ sensitive is added to any audit column.
 `Unadjudicated` reason. A tier that is silently absent — endpoint down, unconfigured, or
 returning no verdict pair — is then a query rather than a hunch.
 
+> **AMENDED 2026-08-24 ([#616](https://github.com/hherb/kastellan/issues/616)).** `state`
+> names the *door*, and one door — `router_error` — was carrying four different failures:
+> a request timeout, a refused connection, an HTTP status and a decode failure. That made
+> the paragraph above true and insufficient: the fail-open of
+> [#612](https://github.com/hherb/kastellan/issues/612) is *specifically* the timeout, and
+> counting it meant correlating `router_error` rows against a large `body_byte_len` and an
+> `ms` near the budget across a rotating log. A companion field `guard.error_kind` now
+> rides beside `state`, `null` unless the call failed. It is a **closed discriminant**, not
+> the backend's error text — the no-backend-message rule below is unchanged, and every
+> possible value is a `&'static str` this repo wrote.
+
 ### D6 — The tier is built and reported once at boot, and a misconfiguration refuses to boot
 
 D1 of slice 1 requires the enabled-but-unconfigured case be reported "once at boot, loudly,

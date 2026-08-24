@@ -112,6 +112,23 @@ pub struct GuardReport {
     /// one are different populations, and D5's whole purpose is a score
     /// distribution someone can read later.
     pub body_byte_len: usize,
+    /// **Why** the call failed, when it did (issue [#616]).
+    ///
+    /// `Some` exactly on the [`super::Unadjudicated::RouterError`] door
+    /// and `None` everywhere else — including the other two
+    /// unadjudicated doors, which did not involve a failing call.
+    ///
+    /// A closed discriminant, never the backend's error text: the rule
+    /// that no backend-controlled message may reach a durable row still
+    /// holds, and [`super::GuardErrorKind`] carries no bytes a backend
+    /// chose. Without it a timeout, a refused connection and an HTTP 400
+    /// were one string, so the fail-open [#612] is about could not be
+    /// counted — only inferred, by correlating `router_error` rows
+    /// against `body_byte_len` and `ms` across a rotating log.
+    ///
+    /// [#612]: https://github.com/hherb/kastellan/issues/612
+    /// [#616]: https://github.com/hherb/kastellan/issues/616
+    pub error_kind: Option<super::GuardErrorKind>,
     /// Did `SCAN_BYTE_CAP` cut the document short?
     ///
     /// **Recorded on the ALLOW half, which is the half that needed it.**
@@ -137,6 +154,14 @@ impl GuardReport {
             "ms":            self.ms,
             "body_byte_len": self.body_byte_len,
             "truncated":     self.truncated,
+            // Emitted on EVERY row, `null` when the call did not fail —
+            // the same shape `p` already has, and for the same reason.
+            // A key that appears only on failures cannot distinguish "the
+            // call succeeded" from "this row predates the field", which
+            // is the absence-vs-loss ambiguity #614 spent a branch
+            // closing one layer up. So the query for #612's fail-opens is
+            // a plain equality: `payload->'guard'->>'error_kind' = 'timeout'`.
+            "error_kind":    self.error_kind.map(|k| k.as_str()),
         })
     }
 }
@@ -285,22 +310,32 @@ impl GuardTier {
         let started = std::time::Instant::now();
         let probability = self.client.probability(body).await;
         let ms = started.elapsed().as_millis() as u64;
-        let (outcome, p) = match probability {
+        let (outcome, p, error_kind) = match probability {
             // The mapping is `tier::outcome_and_score`, which derives
             // `p` from the adjudication rather than forwarding it from
             // the call — see there for why that difference is load
             // bearing, and for the invariant it pins.
-            Ok(raw) => outcome_and_score(raw, self.tau),
+            Ok(raw) => {
+                let (outcome, p) = outcome_and_score(raw, self.tau);
+                (outcome, p, None)
+            }
             Err(e) => {
-                // Logged here and never carried into the verdict, so no
-                // backend message can influence a containment decision.
+                // The error TEXT is logged here and never carried into
+                // the verdict or the row, so no backend message can
+                // influence a containment decision. The closed
+                // DISCRIMINANT does ride along (issue #616): it carries
+                // no bytes a backend chose, and without it every failure
+                // mode reads as one `router_error` string and the
+                // fail-open #612 is about cannot be counted.
+                let kind = super::error_kind::classify(&e);
                 tracing::warn!(
                     target: "kastellan::guard_model",
                     error = %e,
+                    error_kind = kind.as_str(),
                     ms,
                     "guard adjudication failed; failing OPEN to catalogue-only screening"
                 );
-                (resolve(GuardReading::Failed), None)
+                (resolve(GuardReading::Failed), None, Some(kind))
             }
         };
         GuardReport {
@@ -310,6 +345,7 @@ impl GuardTier {
             ms,
             body_byte_len: body.len(),
             truncated,
+            error_kind,
         }
     }
 
@@ -331,6 +367,9 @@ impl GuardTier {
             ms: 0,
             body_byte_len: 0,
             truncated: false,
+            // No call was made, so there is no failure to classify. The
+            // door is named by `outcome`, not here.
+            error_kind: None,
         }
     }
 }

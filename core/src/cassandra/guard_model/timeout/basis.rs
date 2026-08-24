@@ -2,14 +2,20 @@
 //! (wiring-spec D9).
 //!
 //! Split out of [`super`] to keep that file under the 500-LOC cap, and
-//! because these four types are one coherent thing: the *provenance* of
-//! a timeout, as distinct from the arithmetic that derives it. Nothing
-//! here does IO or arithmetic — [`super::derive_guard_timeout`] owns
-//! that and constructs these.
+//! because these types are one coherent thing: the *provenance* of a
+//! timeout, as distinct from the arithmetic that derives it. No IO
+//! happens here and no timeout is derived here —
+//! [`super::derive_guard_timeout`] owns that and constructs these.
+//!
+//! The one function that does live here is [`classify_pin`], which is
+//! not a derivation: it reads an operator's already-decided number and
+//! says which [`PinBand`] it falls in. It sits beside the type it
+//! constructs rather than beside the arithmetic it is not part of.
 
 use std::time::Duration;
 
-// Referenced from doc links in this module; not used in code here.
+// `TIMEOUT_FLOOR_MS`/`TIMEOUT_CEILING_MS` are used by `classify_pin`; the
+// other two are referenced from doc links only.
 #[allow(unused_imports)]
 use super::{
     MIN_UNCACHED_PROBE_TOKENS, PROBE_BUDGET_MS, TIMEOUT_CEILING_MS, TIMEOUT_FLOOR_MS,
@@ -64,11 +70,95 @@ impl UnprobedReason {
     }
 }
 
+/// Where an operator's pinned timeout sits relative to the band this
+/// module would derive within (issue [#615]).
+///
+/// **Not a clamp, and must not become one.** The band constrains what
+/// [`super::derive_guard_timeout`] may *infer*; an operator who pinned a
+/// number has decided, and silently overriding them would make
+/// `KASTELLAN_LLM_GUARD_TIMEOUT_MS` advisory. What was missing is that
+/// the pin was applied in *silence*, so both ends of the band — each a
+/// real, opposite exposure — arrived looking like a routine boot.
+///
+/// Three states, so an enum rather than two `bool`s: `below_floor` and
+/// `above_ceiling` can both be `true` in a struct and cannot both be
+/// true in reality, and a reader then has to work out which one wins.
+/// Same argument [`UnprobedReason`] makes one type up.
+///
+/// [#615]: https://github.com/hherb/kastellan/issues/615
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinBand {
+    /// Inside `[TIMEOUT_FLOOR_MS, TIMEOUT_CEILING_MS]`. Routine.
+    InBand,
+    /// Below [`TIMEOUT_FLOOR_MS`]. A *shorter* timeout is a *weaker*
+    /// control: the tier is escalate-up only, so an adjudication that
+    /// runs out of budget does not error — it fails OPEN to
+    /// catalogue-only screening.
+    BelowFloor,
+    /// Above [`TIMEOUT_CEILING_MS`], the point past which stalling a
+    /// dispatch is judged worse than degrading to catalogue-only
+    /// screening. Reachable by *following this project's own advice*:
+    /// issue #612's mitigation for a Metal host is a pin of roughly 3x
+    /// the ceiling.
+    AboveCeiling,
+}
+
+impl PinBand {
+    /// The `timeout_basis` token for an operator pin in this band.
+    ///
+    /// Encoded into the token rather than left to a separate field,
+    /// following [`UnprobedReason`]: `Unprobed` reports
+    /// `"probe-failed"`, not a bare `"unprobed"` with the reason
+    /// elsewhere. So `SELECT ... WHERE payload->>'timeout_basis' =
+    /// 'operator-below-floor'` counts the exposed hosts directly.
+    ///
+    /// **An in-band pin keeps the historic `"operator"` token
+    /// unchanged**, so this is additive for every healthy deployment and
+    /// no existing query breaks.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InBand => "operator",
+            Self::BelowFloor => "operator-below-floor",
+            Self::AboveCeiling => "operator-above-ceiling",
+        }
+    }
+}
+
+/// Where a pinned timeout sits relative to `[TIMEOUT_FLOOR_MS,
+/// TIMEOUT_CEILING_MS]`.
+///
+/// Split from [`super::validate_operator_timeout`] so the classification is a
+/// total function of one number and every boundary is a unit test — the
+/// two comparisons are the whole of issue [#615], and an off-by-one on
+/// either would make the reporting wrong in the direction that stays
+/// quiet. Both bounds are **inclusive**: a pin exactly at the floor or
+/// exactly at the ceiling is a value this module would itself derive,
+/// so it is not a finding.
+///
+/// Pure.
+///
+/// [#615]: https://github.com/hherb/kastellan/issues/615
+pub fn classify_pin(ms: u64) -> PinBand {
+    if ms < TIMEOUT_FLOOR_MS {
+        PinBand::BelowFloor
+    } else if ms > TIMEOUT_CEILING_MS {
+        PinBand::AboveCeiling
+    } else {
+        PinBand::InBand
+    }
+}
+
 /// Where a guard timeout came from, in enough detail to log it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TimeoutBasis {
     /// `KASTELLAN_LLM_GUARD_TIMEOUT_MS`. No probe was run.
-    Operator,
+    ///
+    /// Carries where the pin sits relative to the derivation band so
+    /// that an out-of-band value reaches the `warn!` and the durable
+    /// `policy / guard_tier.boot` row instead of only the routine
+    /// `info!` line — see [`PinBand`] and issue #615. The value itself
+    /// is still honoured verbatim.
+    Operator { band: PinBand },
     /// Derived from a boot probe that produced a real sample.
     Probed { tok_per_s: f32, derived_ms: u64, clamped: Clamped },
     /// The probe overran [`PROBE_BUDGET_MS`] without answering.
@@ -94,7 +184,7 @@ impl TimeoutBasis {
     /// A short, stable, whitespace-free token for a log field.
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Operator => "operator",
+            Self::Operator { band } => band.as_str(),
             Self::Probed { .. } => "probed",
             Self::Saturated { .. } => "probe-saturated",
             Self::Unprobed { reason } => reason.as_str(),
@@ -108,7 +198,7 @@ impl TimeoutBasis {
     /// warning about routine things is how the one that matters gets
     /// scrolled past.
     ///
-    /// Three bases qualify, and they are not the same finding — which is
+    /// Five bases qualify, and they are not the same finding — which is
     /// why this returns the sentence rather than a `bool`:
     ///
     /// * [`Clamped::ToCeiling`] — large documents will time out here.
@@ -118,6 +208,18 @@ impl TimeoutBasis {
     ///   fail the same way. That is the strongest predictor of a
     ///   totally fail-open tier in this enum, and it used to be reported
     ///   at `info!` alongside a "guard tier configured" line.
+    /// * [`PinBand::BelowFloor`] — an operator pin shorter than the
+    ///   shortest value this module would derive.
+    /// * [`PinBand::AboveCeiling`] — an operator pin longer than the
+    ///   longest.
+    ///
+    /// **The last two are findings about the CONFIGURATION, not about
+    /// the host** (issue #615), and they are reported through the same
+    /// channel deliberately: an operator reading a boot line wants one
+    /// place that says "this deployment screens less than it looks like
+    /// it does", regardless of whether a probe or a pin got it there.
+    /// An *in-band* pin stays silent — it is the operator's own number,
+    /// inside the range this module would have chosen anyway.
     pub fn coverage_finding(&self) -> Option<&'static str> {
         match self {
             Self::Probed { clamped: Clamped::ToCeiling, .. } => Some(
@@ -130,6 +232,22 @@ impl TimeoutBasis {
                 "the guard boot probe never returned within its budget. The timeout was \
                  set to the ceiling, but nothing about this backend's throughput was \
                  measured -- large documents will very likely time out and fail open.",
+            ),
+            Self::Operator { band: PinBand::BelowFloor } => Some(
+                "KASTELLAN_LLM_GUARD_TIMEOUT_MS is pinned BELOW the shortest timeout \
+                 this module will ever derive. The pin is honoured, but an adjudication \
+                 that runs out of budget does not error -- it fails OPEN to \
+                 catalogue-only screening, so this converts documents the tier could \
+                 otherwise have judged into unscreened ones.",
+            ),
+            Self::Operator { band: PinBand::AboveCeiling } => Some(
+                "KASTELLAN_LLM_GUARD_TIMEOUT_MS is pinned ABOVE the longest timeout this \
+                 module will derive, past the point where stalling a dispatch is judged \
+                 worse than degrading to catalogue-only screening. The pin is honoured: \
+                 a single dispatch may now block for the whole pinned budget. That is \
+                 the intended trade on a host whose throughput the boot probe cannot \
+                 measure (issue #612) -- recorded here so it is a decision on the \
+                 record rather than a silent one.",
             ),
             Self::Unprobed { reason: UnprobedReason::Failed } => Some(
                 "the guard boot probe FAILED while /props answered. The tier is \

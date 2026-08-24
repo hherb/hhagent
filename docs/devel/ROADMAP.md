@@ -451,7 +451,7 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   - **Why it is a prerequisite and not a nicety:** without it, a recurring task raises the same approval every run, the operator approves reflexively, and the gate has negative value — it trains the habit it exists to prevent while still costing a round trip.
 - [ ] Policy gate: per-tool, per-task, per-data-classification routing decision
 - [ ] Frontier escalation through egress proxy (Anthropic / OpenAI)
-- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 MERGED 2026-08-23 as `d51c9b20` (PR [#606](https://github.com/hherb/kastellan/pull/606)); the WIRING slice MERGED 2026-08-23 as `8736f559` (PR [#607](https://github.com/hherb/kastellan/pull/607)); **LIVE ON THE DGX since 2026-08-23**.**
+- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 MERGED 2026-08-23 as `d51c9b20` (PR [#606](https://github.com/hherb/kastellan/pull/606)); the WIRING slice MERGED 2026-08-23 as `8736f559` (PR [#607](https://github.com/hherb/kastellan/pull/607)); the LIVE BRING-UP + audit-cap fix MERGED 2026-08-24 as `45d5f6c2` (PR [#614](https://github.com/hherb/kastellan/pull/614)); **LIVE ON THE DGX since 2026-08-23**.**
   **FIRST PRODUCTION RUN 2026-08-23.** Deployed to the DGX with the three guard keys in the operator
   overlay. Boot: `tau=0.79552656 timeout_ms=21752 timeout_basis=probed n_ctx=131072`, with
   `tok_per_s: 6072.99` in the `policy / guard_tier.boot` row — and the derivation reproduces D9's
@@ -487,7 +487,22 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   that is the audited act), [#618](https://github.com/hherb/kastellan/issues/618) (an else-less
   `as_object_mut` on a screening path).
   **Gate at `8cb8cfb7`: DGX 175 suites, 3854 / 0 / 55, `TEST_EXIT=0`, cold clippy exit 0 over 245
-  `Checking` lines.**
+  `Checking` lines** — squash-merged 2026-08-24 as `45d5f6c2`.
+  **DIAGNOSTICS FOLLOW-UP, branch `fix/615-616-618-guard-diagnostics` (2026-08-24):** the three
+  cheap findings of that review, taken together because they are one thing — the tier's durable
+  record could not answer the questions its own open design call turns on. `guard.error_kind`
+  (#616) is a **closed discriminant** beside `guard.state`, so a timeout is countable by equality
+  instead of inferred from `ms` and `body_byte_len`; `TimeoutBasis::Operator` carries a `PinBand`
+  (#615), so an operator pin outside `[15 s, 120 s]` reaches the `warn!` and the `guard_tier.boot`
+  row while still being honoured verbatim; and `fetch_screen`'s Block arm withholds through a
+  **total** function (#618) rather than inside an else-less `if let`. Mutation-proven six for six,
+  with a seventh that survived and was closed — a `\`-continuation weld is invisible to a
+  whitespace assertion and is now pinned per-finding by a phrase crossing the joins.
+  **#616 is what unblocks #612's favoured option** (measure at runtime from the guard row): that
+  option needs the fail-open to be countable, which it now is. #612 itself is untouched.
+  Mac gate: 175 suites, 3748 / 0 / 25, TEST_EXIT=0. **That merge wrongly auto-closed #612 and
+  #615**, whose "Filed, not fixed: #N" phrasing GitHub read as `fixed: #N`; both reopened the same day and
+  both remain open design work.
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one

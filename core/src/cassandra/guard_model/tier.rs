@@ -55,8 +55,10 @@ use super::GuardAdjudication;
 use crate::cassandra::injection_guard::{decision_for_score, InjectionDecision};
 
 pub mod boot;
+pub mod error_kind;
 
 pub use boot::{GuardReport, GuardTier, GuardTierError, SharedGuardTier};
+pub use error_kind::GuardErrorKind;
 
 /// Why a document was allowed through **without** the model having
 /// judged it.
@@ -86,6 +88,13 @@ pub enum Unadjudicated {
     /// The call itself failed: transport error, timeout, or an HTTP
     /// status. Includes the attacker-reachable HTTP 400 of issue #604
     /// and the timeout of issue #586.
+    ///
+    /// **Which of those it was rides beside it**, in
+    /// [`GuardReport::error_kind`] (issue #616). This variant names the
+    /// *door*; the door is the same one for all of them, and the tier's
+    /// behaviour does not depend on the cause — but the durable record
+    /// has to be able to count timeouts separately, because that is the
+    /// fail-open issue #612 is about.
     RouterError,
     /// The result carried **no scannable text**, so there was nothing to
     /// adjudicate and the model was not asked.
