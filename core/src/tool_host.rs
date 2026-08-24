@@ -179,7 +179,12 @@ impl WorkerCommand {
 ///   makes production the source of a real-world score distribution). Or
 ///   `{"req": <params>, "err": "<error string>", "ms": <duration>}`
 ///   on failure. Payloads larger than 4 KiB are replaced inside
-///   [`kastellan_db::audit::insert`] with a SHA-256 envelope.
+///   [`kastellan_db::audit::insert`] with a SHA-256 envelope — **except
+///   the `guard` sub-object**, which rides through it
+///   ([`kastellan_db::audit::PRESERVED_KEYS`]). Without that it was the
+///   large *cleared* documents that lost their score while blocks kept
+///   theirs, which is the wrong half: recording `p` on the cleared side is
+///   what makes production a score source that is not catalogue-selected.
 ///
 /// **Secret refs are redacted in `payload.req` (issue #147).** The
 /// `req` snapshot is taken BEFORE secret-ref substitution, so the

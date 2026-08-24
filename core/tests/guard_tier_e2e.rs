@@ -515,8 +515,10 @@ async fn a_cleared_document_passes_through_and_still_records_its_probability() {
 /// stubs, so the scores were gone.
 ///
 /// **The loss was biased, and biased the wrong way.** A *blocked* dispatch
-/// keeps its score, because its result is already a short withheld
-/// placeholder; a *cleared* one loses it as soon as the document is large.
+/// usually keeps its score, because its result is already a short withheld
+/// placeholder -- `req` is still in the payload, so a block on a multi-KiB
+/// `shell.exec` argv can lose one too, but not as a function of document
+/// size. A *cleared* one loses it as soon as the document is large.
 /// D5's leverage is precisely the cleared half, so production recorded
 /// every block plus only the small clears — a size-selected sample wearing
 /// the appearance of a score distribution.

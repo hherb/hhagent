@@ -72,7 +72,7 @@ struct NullSink;
 
 #[async_trait::async_trait]
 impl AuditSink for NullSink {
-    async fn insert(
+    async fn insert_stored(
         &self,
         _actor: &str,
         _action: &str,

@@ -650,7 +650,7 @@ impl MockAuditSink {
 
 #[async_trait::async_trait]
 impl AuditSink for MockAuditSink {
-    async fn insert(
+    async fn insert_stored(
         &self,
         actor: &str,
         action: &str,

@@ -30,11 +30,47 @@ use kastellan_db::DbError;
 /// Mirrors the shape of [`kastellan_db::audit::insert`] (actor, action,
 /// payload → row id) so [`PgAuditSink`] is a one-line adapter and the prod
 /// behaviour is byte-for-byte what `dispatch` did before the seam existed.
+///
+/// ## Why [`AuditSink::insert`] is a *provided* method
+///
+/// [`kastellan_db::audit::truncate_payload`] runs **inside**
+/// [`kastellan_db::audit::insert`], which is where PR #614's defect hid:
+/// a double that records what the caller *passed* can never observe what
+/// the database *stores*, so a payload key silently destroyed by the 4 KiB
+/// cap looks perfectly preserved from every test in the tree. The guard
+/// tier's per-dispatch score was lost that way on every tool result over
+/// ~4 KiB, through seventeen e2e cases and a five-agent review, until it
+/// was found in production.
+///
+/// Making the transform a provided method fixes the *class* rather than
+/// that one key: a double implements [`insert_stored`](Self::insert_stored)
+/// and therefore receives the stored payload whether or not its author
+/// thought about truncation. `PgAuditSink` re-applies it via
+/// `db::audit::insert`, which is harmless — `truncate_payload` is
+/// idempotent, an envelope being already under the cap.
 #[async_trait]
 pub trait AuditSink: Send + Sync {
+    /// Insert one row whose payload has **already** been through
+    /// [`kastellan_db::audit::truncate_payload`].
+    ///
+    /// Implement this; call [`insert`](Self::insert).
+    async fn insert_stored(
+        &self,
+        actor: &str,
+        action: &str,
+        payload: Value,
+    ) -> Result<i64, DbError>;
+
     /// Insert one audit row. Returns the new row id on success, mirroring
     /// [`kastellan_db::audit::insert`].
-    async fn insert(&self, actor: &str, action: &str, payload: Value) -> Result<i64, DbError>;
+    ///
+    /// Applies the storage transform every production write goes through,
+    /// then delegates to [`insert_stored`](Self::insert_stored). Not
+    /// overridable in practice — override it and a double stops observing
+    /// what Postgres would hold, which is the whole point of the seam.
+    async fn insert(&self, actor: &str, action: &str, payload: Value) -> Result<i64, DbError> {
+        self.insert_stored(actor, action, kastellan_db::audit::truncate_payload(payload)).await
+    }
 }
 
 /// Production [`AuditSink`]: forwards straight to [`kastellan_db::audit::insert`]
@@ -53,7 +89,12 @@ impl<'a> PgAuditSink<'a> {
 
 #[async_trait]
 impl AuditSink for PgAuditSink<'_> {
-    async fn insert(&self, actor: &str, action: &str, payload: Value) -> Result<i64, DbError> {
+    async fn insert_stored(
+        &self,
+        actor: &str,
+        action: &str,
+        payload: Value,
+    ) -> Result<i64, DbError> {
         kastellan_db::audit::insert(self.pool, actor, action, payload).await
     }
 }

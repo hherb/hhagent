@@ -149,7 +149,12 @@ mod tests {
 
     #[async_trait]
     impl AuditSink for RecordingSink {
-        async fn insert(&self, actor: &str, action: &str, _payload: Value) -> Result<i64, DbError> {
+        async fn insert_stored(
+            &self,
+            actor: &str,
+            action: &str,
+            _payload: Value,
+        ) -> Result<i64, DbError> {
             self.rows
                 .lock()
                 .unwrap()

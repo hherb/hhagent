@@ -154,6 +154,15 @@ async fn report_guard_tier(
         "tok_per_s":     tok_per_s,
         "n_ctx":         tier.n_ctx(),
         "policy_digest": kastellan_core::cassandra::guard_model::policy::policy_digest(),
+        // The finding belongs in the DURABLE record, not only in the
+        // `warn!` above. `kind()` folds `Clamped::ToCeiling` into a bare
+        // "probed", so without this the row for a host that cannot
+        // adjudicate a worst-case document is indistinguishable from a
+        // healthy one unless the reader happens to know that
+        // `timeout_ms == TIMEOUT_CEILING_MS` is meaningful. Tracing logs
+        // rotate; `audit_log` does not. `null` when routine, so a query
+        // for affected hosts is `WHERE payload->>'coverage_finding' IS NOT NULL`.
+        "coverage_finding": budget.basis.coverage_finding(),
     });
     if let Err(e) = kastellan_db::audit::insert(pool, "policy", "guard_tier.boot", payload).await {
         tracing::warn!(error = %e, "guard_tier.boot audit insert failed (non-fatal)");

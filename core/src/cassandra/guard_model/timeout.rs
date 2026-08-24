@@ -310,14 +310,16 @@ fn clamp_derived(derived_ms: u64) -> (u64, Clamped) {
 /// Two *different* samples are involved, and conflating them is how these
 /// numbers stop adding up. A **size sweep** with identical dense filler
 /// (1.47 B/token) measures the *shape*: the DGX (CUDA) holds 3 177 tok/s
-/// at 1 KiB and 2 907 at 64 KiB — flat, so extrapolating is sound there;
-/// the Mac (Metal) holds 1 137 at 1 KiB, 1 209 at 8 KiB, and **260 at
-/// 64 KiB**. The **boot probe** measures the rate this formula is
-/// actually fed, on its own denser body (1.26 B/token — see the module
-/// note above), and so reads higher on both hosts: 6 073 tok/s on the DGX
-/// → a 21.8 s budget, and ~1 445 on the Mac → 91 s. Do not try to derive
-/// one host's budget from the other table's tok/s; they are not the same
-/// measurement.
+/// at 1 KiB, 6 327 at 8 KiB and 2 907 at 64 KiB; the Mac (Metal) holds
+/// 1 137, 1 209, and **260**. Neither curve is flat — but the DGX's
+/// 1 KiB reading sits *below* its 64 KiB one, so extrapolating from the
+/// probe's sample errs in the **safe** direction there, which is the
+/// property that matters and not flatness. The **boot probe** measures
+/// the rate this formula is actually fed, on its own denser body
+/// (1.26 B/token — see the module note above), and so reads higher on
+/// both hosts: 6 073 tok/s on the DGX → a 21.8 s budget, and ~1 445 on
+/// the Mac → 91 s. Do not try to derive one host's budget from the other
+/// table's tok/s; they are not the same measurement.
 ///
 /// The consequence is the Mac's alone. A worst-case 64 KiB document
 /// really takes ~171 s there, against that derived 91 s, so the
@@ -328,13 +330,26 @@ fn clamp_derived(derived_ms: u64) -> (u64, Clamped) {
 ///
 /// Until #612 is settled a Metal host should pin
 /// `KASTELLAN_LLM_GUARD_TIMEOUT_MS` rather than trust the probe — at
-/// **≥ ~350 s**, not at the 171 s above: that figure came from 1.47
-/// B/token filler, while [`WORST_CASE_TOKENS`] budgets for the ~1 B/token
-/// adversarial ceiling [`super::context_pin`] argues for. Note that
-/// pinning **skips the probe entirely** ([`TimeoutBasis::Operator`]) and
-/// that `validate_operator_timeout` does *not* clamp the pinned value to
-/// the range below — both deliberate, and both worth knowing before you
-/// read a boot line as a measurement.
+/// **≥ ~350 s**. Where that comes from, since 171 s is the measured
+/// number and neither figure is the other: the 171 s used 1.47 B/token
+/// filler, i.e. ~44 400 tokens, while [`WORST_CASE_TOKENS`] (66 048)
+/// budgets for the ~1 B/token adversarial ceiling
+/// [`super::context_pin`] argues for. Scaling by tokens alone gives
+/// 66 048 ÷ 260 tok/s ≈ **254 s** — and 254 s is the number that
+/// *follows*. The recommendation is deliberately above it, because 260
+/// tok/s was itself measured at 64 KiB and the curve is still falling
+/// there: extrapolating a decaying rate linearly is the same mistake
+/// this whole block is about. ~350 s is a floor with headroom for a knee
+/// nobody has characterised, not a derivation — treat it as such, and
+/// measure your own host with `live_boot_probe_derives_this_hosts_timeout`.
+///
+/// Note that pinning **skips the probe entirely**
+/// ([`TimeoutBasis::Operator`]) and that `validate_operator_timeout` does
+/// *not* clamp the pinned value to the range below — both deliberate,
+/// both worth knowing before you read a boot line as a measurement, and
+/// together the reason a pin is an operator decision rather than a new
+/// default. It also means a pin *below* [`TIMEOUT_FLOOR_MS`] is accepted
+/// in silence; see #615.
 ///
 /// **[`ProbeOutcome::Saturated`] derives the CEILING, not the floor**,
 /// and that is the one row a plausible implementation gets backwards. A

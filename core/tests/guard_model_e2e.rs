@@ -571,16 +571,23 @@ async fn live_shieldstral_size_sweep() {
 ///   --ignored --nocapture live_boot_probe_derives_this_hosts_timeout
 /// ```
 ///
-/// **The line worth waiting for is `COVERAGE FINDING`** — but read the
-/// sentence, not just the label: `coverage_finding()` speaks for three
-/// different situations and they are not interchangeable. The host
-/// derived past the 120 s ceiling and was clamped; the probe never
-/// returned within its budget; or the probe call failed outright. All
-/// three mean documents large enough to matter will time out and fail
-/// open to catalogue-only screening, and the third predicts a tier that
-/// fails open on *every* dispatch. Each is a fact about the host, not a
-/// routine adjustment, and is the thing an operator should learn *before*
-/// the tier is carrying traffic rather than from its absence afterwards.
+/// **A coverage finding FAILS this test.** `coverage_finding()` speaks for
+/// three different situations — the host derived past the 120 s ceiling
+/// and was clamped; the probe never returned within its budget; or the
+/// probe call failed outright — and they are not interchangeable, so read
+/// the sentence and not just the label. But all three mean documents large
+/// enough to matter will time out and fail open to catalogue-only
+/// screening, and the third predicts a tier that fails open on *every*
+/// dispatch.
+///
+/// It is a failure and not a printed note because **libtest captures
+/// `println!` on a passing test.** Printing the finding and returning
+/// green makes `--nocapture` load-bearing, and load-bearing flags get
+/// forgotten — leaving an operator with `test … ok` on a host whose tier
+/// cannot adjudicate a worst-case document. That is this instrument's own
+/// stated failure mode ("a silent PASS has learned nothing while being
+/// told everything is fine"), one level up from the unconfigured arm it
+/// already guards against.
 ///
 /// **A pinned `KASTELLAN_LLM_GUARD_TIMEOUT_MS` makes this instrument
 /// pointless, so it refuses to run under one.** The pin skips the probe
@@ -651,6 +658,10 @@ async fn live_boot_probe_derives_this_hosts_timeout() {
 
     let budget = tier.timeout();
     let ms = budget.timeout.as_millis() as u64;
+    // Printed before the finding check below, so the numbers an operator
+    // needs are on screen whichever way this run ends. A failure dumps
+    // captured output; a pass does not, which is exactly why a finding
+    // must fail rather than print.
     println!(
         "[live] endpoint={} model={} n_ctx={} tau={} timeout_ms={ms} basis={}",
         cfg.guard_url.as_deref().unwrap_or("<unset>"),
@@ -662,38 +673,47 @@ async fn live_boot_probe_derives_this_hosts_timeout() {
     if let TimeoutBasis::Probed { tok_per_s, .. } = budget.basis {
         println!("[live] measured throughput: {tok_per_s:.1} uncached prompt tok/s");
     }
-    match budget.basis.coverage_finding() {
-        Some(finding) => println!("[live] COVERAGE FINDING: {finding}"),
-        // Deliberately NOT "this host can adjudicate a worst-case
-        // document": the probe measured ~1 KiB and the budget above is a
-        // LINEAR extrapolation from it. That assumption was measured
-        // false on Apple Metal by 4.4x on 2026-08-23 (#612), where a
-        // 64 KiB document really takes 171 s against a derived 91 s.
-        None => println!(
-            "[live] no coverage finding -- but this budget is extrapolated from a \
-             ~1 KiB sample; see #612 before reading it as worst-case coverage"
-        ),
+
+    // The fact this instrument exists to surface. A finding is never a
+    // routine adjustment: it says this host's guard tier will fail open on
+    // documents large enough to matter, and `Saturated` says nothing about
+    // its throughput was measured at all. Panicking is what makes it
+    // unmissable -- see the doc comment on capture.
+    if let Some(finding) = budget.basis.coverage_finding() {
+        panic!(
+            "COVERAGE FINDING on this host (basis={}, timeout_ms={ms}): {finding}",
+            budget.basis.kind()
+        );
     }
+    // Deliberately NOT "this host can adjudicate a worst-case document":
+    // the probe measured ~1 KiB and the budget above is a LINEAR
+    // extrapolation from it. That assumption was measured false on Apple
+    // Metal by 4.4x on 2026-08-23 (#612), where a 64 KiB document really
+    // takes 171 s against a derived 91 s.
+    println!(
+        "[live] no coverage finding -- but this budget is extrapolated from a \
+         ~1 KiB sample; see #612 before reading it as worst-case coverage"
+    );
 
     // An `Unprobed` basis reaches here with the pin unset: the probe ran
-    // and came back with nothing usable. That is a fact about the host, not
-    // a reason to pass quietly -- and `coverage_finding()` is `None` for
-    // two of the three reasons, so the print above cannot be relied on to
-    // have said it. Asserted AFTER that print deliberately: a failed probe
-    // has a finding worth reading, and an assert placed earlier would
-    // swallow the most alarming sentence this instrument can produce.
+    // and came back with nothing usable. `coverage_finding()` is `None`
+    // for three of `UnprobedReason`'s four variants (only `Failed` earns a
+    // sentence; `Nonsensical` cannot come from `probe_sample`), so the
+    // check below is what catches the quiet ones.
     assert!(
-        matches!(budget.basis, TimeoutBasis::Probed { .. } | TimeoutBasis::Saturated { .. }),
+        matches!(budget.basis, TimeoutBasis::Probed { .. }),
         "the probe produced no usable sample on this host (basis={}), so the budget above \
          is a fallback and not a measurement of it",
         budget.basis.kind()
     );
 
-    // The postcondition, checked on live data rather than only on mocks:
-    // whatever the probe measured, the budget the tier will actually
-    // spend is inside the documented clamp. Reachable only for a derived
-    // basis -- a pinned one is refused above, and `validate_operator_timeout`
-    // would not have clamped it.
+    // The clamp postcondition. Honest framing: by the time control gets
+    // here the basis is `Probed` and un-clamped-to-ceiling, so no value
+    // outside the band can reach this line -- it cannot fail, and it is
+    // documentation of the band rather than coverage of it. The clamp
+    // itself is exhaustively unit-tested in `timeout/tests.rs`; what this
+    // line adds is that the number printed above is the number the tier
+    // will spend, in the units the band is stated in.
     assert!(
         (TIMEOUT_FLOOR_MS..=TIMEOUT_CEILING_MS).contains(&ms),
         "derived budget {ms} ms is outside [{TIMEOUT_FLOOR_MS}, {TIMEOUT_CEILING_MS}]"

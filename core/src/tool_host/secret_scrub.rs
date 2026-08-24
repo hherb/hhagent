@@ -113,7 +113,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditSink for RecordingSink {
-        async fn insert(
+        async fn insert_stored(
             &self,
             actor: &str,
             action: &str,
