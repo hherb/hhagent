@@ -467,7 +467,28 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   *cleared* one loses it, which is exactly D5's half. Fixed by `PRESERVED_KEYS` in `db/src/audit.rs`,
   mutation-proven, with an e2e that reads the row back out of Postgres because a recording sink sees
   the payload the caller PASSED, never the one the database STORED.
-  **A four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
+  **A SECOND four-agent review (2026-08-24, `8cb8cfb7`) found the fix correct and its scaffolding
+  under-enforced — and closed the class rather than the key.** `truncate_payload` runs *inside*
+  `db::audit::insert`, so every `AuditSink` double recorded the payload its caller PASSED and never
+  the one Postgres STORED — which is *why* the original loss survived seventeen e2e cases. Round one
+  closed that for `guard` with one PG-backed e2e and left the class open. `AuditSink::insert` is now
+  a **provided method** applying the transform before delegating to `insert_stored`, so a double
+  cannot skip it. Also: the allowlist and its producer were two unlinked string literals in different
+  crates (now both `db::audit::GUARD_KEY`, so a rename is a compile error); the multi-key path was
+  executed by nothing, because at one member a running envelope is indistinguishable from a fixed one
+  (the loop is now `preserve_onto(envelope, source, keys)` with `keys` a parameter, driven by six
+  two-key unit tests); and round one's own module invariant was **false** — it claimed every write
+  goes through `insert` while `probe::run`, the site it named first, used its own uncapped `INSERT`
+  (now routed through `audit::insert`). Mutation-proven six for six. Four issues filed:
+  [#615](https://github.com/hherb/kastellan/issues/615) (a pin below the floor or above the ceiling
+  is accepted in silence), [#616](https://github.com/hherb/kastellan/issues/616) (`guard.state`
+  collapses every failure mode, so the fail-open cannot be counted),
+  [#617](https://github.com/hherb/kastellan/issues/617) (`req` lost above the cap — for `shell.exec`
+  that is the audited act), [#618](https://github.com/hherb/kastellan/issues/618) (an else-less
+  `as_object_mut` on a screening path).
+  **Gate at `8cb8cfb7`: DGX 175 suites, 3854 / 0 / 55, `TEST_EXIT=0`, cold clippy exit 0 over 245
+  `Checking` lines.**
+  **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one
   function down. Keys are now admitted individually against the budget less a reserved marker
