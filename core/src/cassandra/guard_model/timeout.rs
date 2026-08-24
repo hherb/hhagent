@@ -59,7 +59,7 @@ use super::context_pin::REQUIRED_GUARD_N_CTX;
 
 pub mod basis;
 
-pub use basis::{Clamped, GuardTimeout, TimeoutBasis, UnprobedReason};
+pub use basis::{classify_pin, Clamped, GuardTimeout, PinBand, TimeoutBasis, UnprobedReason};
 
 /// Bytes of dense text in the boot probe.
 ///
@@ -348,8 +348,13 @@ fn clamp_derived(derived_ms: u64) -> (u64, Clamped) {
 /// *not* clamp the pinned value to the range below — both deliberate,
 /// both worth knowing before you read a boot line as a measurement, and
 /// together the reason a pin is an operator decision rather than a new
-/// default. It also means a pin *below* [`TIMEOUT_FLOOR_MS`] is accepted
-/// in silence; see #615.
+/// default. A pin outside the range below is still honoured verbatim,
+/// but since #615 it is no longer applied in *silence*: [`classify_pin`]
+/// puts a [`PinBand`] on the basis, which earns a `warn!` and a
+/// `coverage_finding` in the durable boot row. The ~350 s recommended
+/// above is deliberately one of those — following this advice is a trade
+/// (an unbounded per-dispatch stall in exchange for not failing open),
+/// and it belongs on the record.
 ///
 /// **[`ProbeOutcome::Saturated`] derives the CEILING, not the floor**,
 /// and that is the one row a plausible implementation gets backwards. A
@@ -438,7 +443,7 @@ impl std::fmt::Display for TimeoutError {
 impl std::error::Error for TimeoutError {}
 
 /// Accept an operator-pinned timeout verbatim, refusing only the value
-/// that cannot work.
+/// that cannot work — and **say so when it is out of band**.
 ///
 /// **Deliberately NOT clamped to the derivation band.** The band
 /// constrains what this module may *infer*; an operator who pinned a
@@ -447,12 +452,27 @@ impl std::error::Error for TimeoutError {}
 /// unwise but because it is unusable, the same line
 /// [`super::tier::validate_tau`] draws.
 ///
+/// **Not clamping is not the same as not reporting** (issue [#615]).
+/// Until it carried a [`PinBand`], this function applied a pin at either
+/// extreme in silence, and each extreme is a real exposure: a pin below
+/// [`TIMEOUT_FLOOR_MS`] turns adjudications into fail-opens, and one
+/// above [`TIMEOUT_CEILING_MS`] buys an unbounded per-dispatch stall —
+/// which is what issue #612 currently tells a Metal operator to do. The
+/// band rides on the basis, so it reaches the `warn!` and the durable
+/// `policy / guard_tier.boot` row through
+/// [`TimeoutBasis::coverage_finding`] with no new plumbing.
+///
 /// Pure.
+///
+/// [#615]: https://github.com/hherb/kastellan/issues/615
 pub fn validate_operator_timeout(ms: u64) -> Result<GuardTimeout, TimeoutError> {
     if ms == 0 {
         return Err(TimeoutError::Zero);
     }
-    Ok(GuardTimeout { timeout: Duration::from_millis(ms), basis: TimeoutBasis::Operator })
+    Ok(GuardTimeout {
+        timeout: Duration::from_millis(ms),
+        basis: TimeoutBasis::Operator { band: classify_pin(ms) },
+    })
 }
 
 #[cfg(test)]

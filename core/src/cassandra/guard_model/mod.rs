@@ -28,8 +28,8 @@ pub mod weights_pin;
 
 pub use decide::{decide, GuardAdjudication, DEFAULT_TAU};
 pub use tier::{
-    GuardOutcome, GuardReading, GuardReport, GuardTier, GuardTierError, SharedGuardTier,
-    Unadjudicated,
+    GuardErrorKind, GuardOutcome, GuardReading, GuardReport, GuardTier, GuardTierError,
+    SharedGuardTier, Unadjudicated,
 };
 
 use kastellan_llm_router::logprob_score::{

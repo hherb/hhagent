@@ -309,3 +309,114 @@ fn no_scannable_text_allows_but_is_never_reported_as_clear() {
     assert_ne!(out, GuardOutcome::Allow, "the model did not clear it -- it was never asked");
     assert_eq!(out.as_str(), "no_scannable_text");
 }
+
+// ── the audit sub-object's wire contract (#616) ─────────────────────
+
+/// Build a report by hand, so the audit shape can be asserted without a
+/// backend.
+///
+/// `adjudicate_document` is the only production constructor and it needs
+/// a live client; `audit_value` is a pure method on the struct, so the
+/// shape it emits is testable directly. That split is the reason the
+/// field was added to the struct rather than assembled at the emission
+/// site.
+fn report(outcome: GuardOutcome, p: Option<f32>, error_kind: Option<GuardErrorKind>) -> GuardReport {
+    GuardReport { outcome, p, tau: 0.795_526_56, ms: 12, body_byte_len: 34, truncated: false, error_kind }
+}
+
+/// The `guard` sub-object carries exactly these seven keys, always.
+///
+/// A **fixed** key set is the point. A key that appears only on failures
+/// cannot distinguish "the call succeeded" from "this row predates the
+/// field" — the absence-vs-loss ambiguity #614 spent a branch closing one
+/// layer up — and it would force every forensic query to be written as
+/// `COALESCE(...)` rather than an equality. Pinned as a set because these
+/// names are a wire contract that outlives any one reader.
+#[test]
+fn the_guard_audit_object_has_a_fixed_key_set() {
+    let expected: std::collections::BTreeSet<&str> =
+        ["state", "p", "tau", "ms", "body_byte_len", "truncated", "error_kind"]
+            .into_iter()
+            .collect();
+    for r in [
+        report(GuardOutcome::Allow, Some(0.01), None),
+        report(GuardOutcome::Block, Some(0.99), None),
+        report(
+            GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::RouterError },
+            None,
+            Some(GuardErrorKind::Timeout),
+        ),
+        report(
+            GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::NoScannableText },
+            None,
+            None,
+        ),
+    ] {
+        let v = r.audit_value();
+        let got: std::collections::BTreeSet<&str> =
+            v.as_object().expect("an object").keys().map(String::as_str).collect();
+        assert_eq!(got, expected, "the guard sub-object's key set drifted: {v}");
+    }
+}
+
+/// `error_kind` is the token on a failed call and `null` otherwise.
+///
+/// The biconditional the field exists to support: a query for
+/// `error_kind = 'timeout'` counts #612's fail-opens exactly, and a query
+/// for `error_kind IS NULL` counts the dispatches where the call did not
+/// fail — including the two unadjudicated doors that involved no call at
+/// all, which must not be swept in with the failures.
+#[test]
+fn error_kind_is_present_exactly_when_the_call_failed() {
+    let failed = report(
+        GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::RouterError },
+        None,
+        Some(GuardErrorKind::Timeout),
+    );
+    assert_eq!(failed.audit_value()["error_kind"], "timeout");
+
+    for r in [
+        report(GuardOutcome::Allow, Some(0.01), None),
+        report(GuardOutcome::Block, Some(0.99), None),
+        report(
+            GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::Unmeasured },
+            None,
+            None,
+        ),
+        report(
+            GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::NoScannableText },
+            None,
+            None,
+        ),
+    ] {
+        let v = r.audit_value();
+        assert!(v["error_kind"].is_null(), "no call failed here: {v}");
+    }
+}
+
+/// Every kind reaches the row as its own token.
+///
+/// `as_str` is unit-tested next door; this asserts the value is not
+/// normalised, stringified through `Debug`, or collapsed on the way into
+/// the JSON — the three ways a correct classifier still produces a
+/// useless row.
+#[test]
+fn every_error_kind_reaches_the_audit_row_verbatim() {
+    for kind in [
+        GuardErrorKind::Timeout,
+        GuardErrorKind::Connect,
+        GuardErrorKind::Transport,
+        GuardErrorKind::HttpStatus,
+        GuardErrorKind::Decode,
+        GuardErrorKind::Config,
+        GuardErrorKind::Other,
+    ] {
+        let v = report(
+            GuardOutcome::AllowUnadjudicated { reason: Unadjudicated::RouterError },
+            None,
+            Some(kind),
+        )
+        .audit_value();
+        assert_eq!(v["error_kind"], kind.as_str(), "{kind:?} did not survive the round trip");
+    }
+}

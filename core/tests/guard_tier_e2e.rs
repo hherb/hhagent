@@ -623,6 +623,15 @@ async fn an_unmeasurable_response_passes_the_document_but_never_reads_as_clear()
     );
     assert_ne!(guard["state"], "clear");
     assert!(guard["p"].is_null(), "there was no probability to record: {guard}");
+    // #616: the key is present on every row and `null` when no call
+    // failed, so "the call succeeded" and "this row predates the field"
+    // are different things. The call here SUCCEEDED — it just carried no
+    // usable verdict pair — so an `error_kind` would be a lie.
+    assert!(
+        guard.get("error_kind").is_some(),
+        "the key rides on every guard row: {guard}"
+    );
+    assert!(guard["error_kind"].is_null(), "no call failed here: {guard}");
 }
 
 /// **RouterError**: the call itself failed, and the tier fails OPEN.
@@ -648,6 +657,119 @@ async fn a_failing_backend_fails_open_and_is_recorded_as_a_router_error() {
     assert_eq!(
         guard["state"], "router_error",
         "the fail-open door must be countable in the audit log"
+    );
+    assert!(guard["p"].is_null());
+    // #616: WHICH failure, from a real HTTP response rather than a
+    // hand-built `RouterError`. `state` alone cannot separate this from
+    // the timeout of #612, and separating them is the whole point.
+    assert_eq!(
+        guard["error_kind"], "http_status",
+        "a status failure must be distinguishable from a timeout: {guard}"
+    );
+}
+
+/// **#616, the arm #612 needs: a real timeout is recorded as one.**
+///
+/// The audit row, not the log line. A mock that holds the completion socket
+/// open and never answers is the only way to produce a genuine
+/// `reqwest` timeout — `reqwest::Error` cannot be constructed by hand, so
+/// the unit tests classify from the two booleans and this case proves the
+/// booleans arrive set the way the classifier assumes.
+///
+/// Without it, `guard.error_kind = "timeout"` would be pinned only against
+/// a fixture of our own making, which is exactly the shape of failure
+/// #612 was filed for: the fail-open that nothing counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_adjudication_is_recorded_as_a_timeout_not_a_bare_router_error() {
+    const PINNED_MS: u64 = 1_000;
+
+    let Some(rig) = bootstrap("touterr") else { return };
+    let pool = probe_and_pool(&rig.cluster.conn_spec).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let Some((head, _body)) = read_request(&mut sock).await else { return };
+                if head.starts_with("GET") && head.contains("/props") {
+                    let payload = props_body();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {len}\r\nConnection: close\r\n\r\n{payload}",
+                        len = payload.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return;
+                }
+                // Held open, never answered: the client's own budget is
+                // the only thing that can end this call. Dropping the
+                // socket instead would yield a transport error that is
+                // NOT a timeout, which would pass a weaker assertion.
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let cfg = RouterConfig {
+        guard_timeout_ms: Some(PINNED_MS),
+        ..pinned_cfg(&format!("http://127.0.0.1:{port}/v1"))
+    };
+    let tier = build_tier(&cfg).await;
+
+    let result = dispatch_printf(&pool, &rig, Some(&tier), "an ordinary sentence").await;
+    assert!(
+        result.get("injection_blocked").is_none(),
+        "a timeout must fail OPEN, never withhold: {result}"
+    );
+
+    let guard = &last_tool_row(&pool).await["guard"];
+    assert_eq!(guard["state"], "router_error");
+    assert_eq!(
+        guard["error_kind"], "timeout",
+        "the #612 fail-open must be countable by equality, not inferred from ms: {guard}"
+    );
+    assert!(guard["p"].is_null());
+    handle.abort();
+}
+
+/// **#616: a backend that DIES reads as `connect`, not as a timeout.**
+///
+/// The other half of the distinction, and the reason it has to be a real
+/// socket. An operator who cannot tell these apart cannot tell "raise the
+/// timeout" from "start the server" — and #612's argument is a *count* of
+/// timeouts, which a dead backend would otherwise inflate.
+///
+/// The mock answers `/props` so the tier can build, and is then shut down
+/// before the dispatch, so the adjudication's connect is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_backend_is_recorded_as_a_connect_failure() {
+    let Some(rig) = bootstrap("conerr") else { return };
+    let pool = probe_and_pool(&rig.cluster.conn_spec).await;
+
+    let mock = MockGuardServer::spawn(Verdict::Clear).await;
+    let cfg = pinned_cfg(&mock.base_url);
+    let tier = build_tier(&cfg).await;
+
+    // Kill the backend: aborting the accept loop drops the listener, so
+    // the port stops accepting and a connect is REFUSED rather than
+    // hanging (which would produce a timeout and pass the wrong
+    // assertion). `drop` runs `MockGuardServer::drop`, which aborts.
+    drop(mock);
+
+    let result = dispatch_printf(&pool, &rig, Some(&tier), "an ordinary sentence").await;
+    assert!(
+        result.get("injection_blocked").is_none(),
+        "a dead guard backend must fail OPEN, never withhold: {result}"
+    );
+
+    let guard = &last_tool_row(&pool).await["guard"];
+    assert_eq!(guard["state"], "router_error");
+    assert_eq!(
+        guard["error_kind"], "connect",
+        "a backend that is not there must not be counted as a timeout: {guard}"
     );
     assert!(guard["p"].is_null());
 }
@@ -940,21 +1062,72 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
     handle.abort();
 }
 
-/// The operator override skips the probe entirely.
+/// The operator override skips the probe entirely — and, since #615,
+/// says where the pinned value sits relative to the derivation band.
+///
+/// **Both bands are exercised through the REAL boot path**
+/// (`GuardTier::from_router_config`), not just through
+/// `validate_operator_timeout`. The unit tests pin the classification;
+/// this pins that the classification survives being carried through boot
+/// into the `GuardTimeout` an operator's `guard_tier.boot` row is
+/// rendered from.
+///
+/// `pinned_cfg`'s own 5 s is *deliberately* below `TIMEOUT_FLOOR_MS` —
+/// short pins keep this file's hung-backend cases fast — which makes the
+/// suite's default fixture the below-floor case for free. The in-band
+/// leg pins a value inside the band; it costs nothing, because a pin is
+/// only ever *spent* by a call that hangs and this test makes none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_operator_pinned_timeout_skips_the_probe() {
-    use kastellan_core::cassandra::guard_model::timeout::TimeoutBasis;
+async fn an_operator_pinned_timeout_skips_the_probe_and_reports_its_band() {
+    use kastellan_core::cassandra::guard_model::timeout::{
+        PinBand, TimeoutBasis, TIMEOUT_FLOOR_MS,
+    };
 
     let mock = MockGuardServer::spawn(Verdict::Clear).await;
-    let tier = build_tier(&pinned_cfg(&mock.base_url)).await;
 
+    // Below the floor: the fixture's own 5 s.
+    let tier = build_tier(&pinned_cfg(&mock.base_url)).await;
     assert_eq!(
         mock.completions(),
         0,
         "a pinned timeout must cost no model traffic at boot"
     );
-    assert_eq!(tier.timeout().basis, TimeoutBasis::Operator);
     assert_eq!(tier.timeout().timeout.as_millis() as u64, 5_000);
+    // A `const` block, not an `assert!`: both sides are constants, so this
+    // can be a COMPILE error rather than a failing run — and clippy's
+    // `assertions_on_constants` refuses the runtime form anyway. Raising
+    // `TIMEOUT_FLOOR_MS` past `pinned_cfg`'s 5 s would silently turn the
+    // leg below into a second in-band case; this stops the build instead.
+    const _: () = assert!(5_000 < TIMEOUT_FLOOR_MS);
+    assert_eq!(
+        tier.timeout().basis,
+        TimeoutBasis::Operator { band: PinBand::BelowFloor },
+        "a pin shorter than anything this module would derive is a #615 finding"
+    );
+    assert!(
+        tier.timeout().basis.coverage_finding().is_some(),
+        "and the finding must reach the boot report, not just the type"
+    );
+
+    // Inside the band: honoured, and silent.
+    let in_band = RouterConfig {
+        guard_timeout_ms: Some(TIMEOUT_FLOOR_MS + 1_000),
+        ..pinned_cfg(&mock.base_url)
+    };
+    let tier = build_tier(&in_band).await;
+    assert_eq!(
+        tier.timeout().basis,
+        TimeoutBasis::Operator { band: PinBand::InBand }
+    );
+    assert!(
+        tier.timeout().basis.coverage_finding().is_none(),
+        "an in-band pin is the operator's own number and earns no warning"
+    );
+    assert_eq!(
+        mock.completions(),
+        0,
+        "still no probe traffic -- a pin skips it regardless of band"
+    );
 }
 
 // ── the boot seams the mutation set did not reach ───────────────────

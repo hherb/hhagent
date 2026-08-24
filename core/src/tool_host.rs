@@ -174,7 +174,7 @@ impl WorkerCommand {
 ///   `"call"`, etc.).
 /// * `payload` = `{"req": <params>, "result": <ok value>, "ms": <duration>}`
 ///   on success — plus a `guard` sub-object
-///   `{state, p, tau, ms, body_byte_len, truncated}` whenever the guard
+///   `{state, p, tau, ms, body_byte_len, truncated, error_kind}` whenever the guard
 ///   model tier ran, **including on documents it cleared** (that is what
 ///   makes production the source of a real-world score distribution). Or
 ///   `{"req": <params>, "err": "<error string>", "ms": <duration>}`
@@ -185,6 +185,11 @@ impl WorkerCommand {
 ///   large *cleared* documents that lost their score while blocks kept
 ///   theirs, which is the wrong half: recording `p` on the cleared side is
 ///   what makes production a score source that is not catalogue-selected.
+///   `error_kind` is a **closed discriminant** (never the backend's error
+///   text) naming *why* a failed adjudication failed, `null` when it did
+///   not — so `WHERE payload->'guard'->>'error_kind' = 'timeout'` counts
+///   the fail-opens of issue #612 instead of leaving them inferred from
+///   `ms` and `body_byte_len`.
 ///
 /// **Secret refs are redacted in `payload.req` (issue #147).** The
 /// `req` snapshot is taken BEFORE secret-ref substitution, so the
