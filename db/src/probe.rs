@@ -79,13 +79,19 @@ pub async fn run(
         .await
         .map_err(|e| DbError::Query(format!("SET ROLE kastellan_runtime: {e}")))?;
 
-    sqlx::query("INSERT INTO audit_log (actor, action, payload) VALUES ($1, $2, $3)")
-        .bind(actor)
-        .bind(action)
-        .bind(payload)
-        .execute(&mut conn)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
+    // Through [`crate::audit::insert`], not a statement of our own. The
+    // bring-up payload is bounded, so the 4 KiB cap is not what this is
+    // for -- it is that `audit::insert` is documented as the path EVERY
+    // audit write takes, and a second spelling here is what would make
+    // that sentence false. A future caller passing something larger (the
+    // signature invites one: "a future caller that wants to log `{}`")
+    // then gets the same truncation and the same PRESERVED_KEYS
+    // treatment as every other row, rather than an uncapped one.
+    //
+    // The role is still assumed by the explicit SET ROLE above rather
+    // than by `connect_runtime_pool`'s `after_connect` hook: there is no
+    // pool yet at this point in bring-up. Same role, different mechanism.
+    crate::audit::insert(&mut conn, actor, action, payload).await?;
 
     // `close()` flushes the terminate message; the connection is
     // being dropped either way so we don't propagate the error, but

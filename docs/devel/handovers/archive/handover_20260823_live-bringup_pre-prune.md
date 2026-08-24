@@ -4,237 +4,263 @@
 > session (likely a fresh Claude Code) can resume cold. Convention in
 > [`README.md`](README.md); full historical detail in the [`archive/`](archive/)
 > snapshots — most recently
-> [`archive/handover_20260823_live-bringup_pre-prune.md`](archive/handover_20260823_live-bringup_pre-prune.md),
+> [`archive/handover_20260823_wiring-slice_pre-prune.md`](archive/handover_20260823_wiring-slice_pre-prune.md),
 > which holds the verbose pre-prune version of everything summarised here —
-> including the full wiring-slice and five-agent-review write-ups compressed
-> below, and (one snapshot further back, in
-> [`archive/handover_20260823_wiring-slice_pre-prune.md`](archive/handover_20260823_wiring-slice_pre-prune.md))
-> the measurement-3, weights-pin and ask-containment ones.
+> including the full measurement-3, weights-pin and ask-containment write-ups
+> compressed below.
 
-**Last updated:** 2026-08-24 · **`main` HEAD:** `8736f559` ([#607](https://github.com/hherb/kastellan/pull/607)) · **ONE OPEN BRANCH: `feat/guard-live-bringup`** · **GATE GREEN ON THE DGX AT THE BRANCH HEAD `8cb8cfb7`: 175 suites, 3854 / 0 / 55, `TEST_EXIT=0`, `--no-fail-fast --nocapture`; cold clippy `-D warnings` exit 0 over 245 `Checking` lines.** 8 `[SKIP]`, all gliner-relex — **not** the bwrap-userns skip, so containment really ran. **The count reconciles exactly and by measurement, not subtraction:** 3840 at `09c6231f` **+ 4** (`a1c10da3` added four `db::audit` tests and was never DGX-gated — that was the open gap) **+ 10** (the second review round, all in `db::audit`; `audit::tests` goes 15 → 25). Mac at `a1c10da3`: 175 suites, 3721 / 1 / 25 — the one failure is `ask_subprocess_completes_planned_task_end_to_end`, which waits ≤ 10 s for the daemon's `scheduler spawned` line and blew that under full-sweep load; it passes in **4 s** in isolation. **The Mac has not been re-gated since `8cb8cfb7`**, whose changes are platform-neutral. · **THE GUARD TIER RAN LIVE FOR THE FIRST TIME** (DGX, 2026-08-23). It booted with a **probed** 21 752 ms budget at 6 073 tok/s, scored a cleared document at `p = 0.0074`, and **blocked a real attack document at `p = 0.9199` where the deterministic catalogue scored `0.0`** — the tier's whole thesis, demonstrated rather than argued. **The bring-up found in an hour what seventeen e2e cases and a five-agent review did not:** the 4 KiB audit cap was replacing whole payloads, so any tool result past ~4 KiB took D5's guard score with it — biased the wrong way, since blocks kept their score and *clears* lost theirs. Fixed here (`db::audit::PRESERVED_KEYS`), mutation-proven. **Two review rounds then hardened the fix rather than the key:** the first found it kept half the defect (a preserved key too large to afford was dropped *silently*); the second found the *class* still open — every `AuditSink` double recorded the payload its caller PASSED and never the one Postgres STORED, which is why the original loss survived seventeen e2e cases, so `AuditSink::insert` is now a provided method applying `truncate_payload` before delegating to `insert_stored`. Four issues filed from that round: [#615](https://github.com/hherb/kastellan/issues/615), [#616](https://github.com/hherb/kastellan/issues/616), [#617](https://github.com/hherb/kastellan/issues/617), [#618](https://github.com/hherb/kastellan/issues/618). Also filed, **not** fixed: [#612](https://github.com/hherb/kastellan/issues/612) — D9's boot probe extrapolates linearly from ~1 KiB, which is flat on CUDA but **4.4× optimistic on Metal**, where a worst-case document takes 171 s against a derived 91 s and so **fails OPEN** without ever firing the ceiling-clamp warning. **The tier remains ADVISORY defence-in-depth at 65% recall, not a gate**, and nothing downstream may relax on it.
+**Last updated:** 2026-08-23 · **`main` HEAD:** `8736f559` ([#607](https://github.com/hherb/kastellan/pull/607)) · **`main` baseline: 3834 / 0 / 54** DGX, **3712 / 0 / 24** Mac · **NO OPEN BRANCHES — [#607](https://github.com/hherb/kastellan/pull/607) MERGED 2026-08-23 07:42 UTC, SO THE GUARD TIER IS WIRED TO THE CHOKEPOINT ON `main`.** A five-agent PR review then produced **eleven fixes**, all mutation-proven, and four deferred issues ([#608](https://github.com/hherb/kastellan/issues/608)–[#611](https://github.com/hherb/kastellan/issues/611)) — see [the review section](#the-five-agent-pr-review-of-607-and-the-eleven-fixes-it-produced). **Post-review gate GREEN ON BOTH HOSTS at `31a05e00`: DGX 3834 / 0 / 54, Mac 3712 / 0 / 24, `TEST_EXIT=0`, clippy 0.** Closes [#586](https://github.com/hherb/kastellan/issues/586). Measurement 3's τ = 0.79552656 is a **required** operator input with no default; the HTTP-400 door ([#604](https://github.com/hherb/kastellan/issues/604)) became a **boot refusal** instead of a runtime fail-open; and the timeout is **probed per host** rather than assumed — D2's 15 s constant was wrong by 40× on the Mac. **The tier is ADVISORY defence-in-depth at 65% recall, not a gate**, and nothing downstream may relax on it. **It has never run live** — DGX/Mac bring-up is the next step.
 
 ---
 
 ## Current state
 
-### THE GUARD TIER RAN LIVE — first production run, DGX, 2026-08-23
+### MERGED `8736f559` ([#607](https://github.com/hherb/kastellan/pull/607)) — the guard tier is on the dispatcher path
 
-Deployed `8736f559` to the DGX with the three guard keys in the operator overlay
-`~/.config/kastellan/kastellan.env.local` (**not** the generated file — `install` regenerates
-that). All four questions the slice could not answer are now answered, with numbers.
+Spec [`…-shieldstral-guard-wiring-design.md`](../../superpowers/specs/2026-08-22-shieldstral-guard-wiring-design.md)
+(**amended 2026-08-23**: M2 + D8/D9/D10), plan
+[`2026-08-23-shieldstral-guard-wiring.md`](../../superpowers/plans/2026-08-23-shieldstral-guard-wiring.md).
+Closes [#586](https://github.com/hherb/kastellan/issues/586); addresses
+[#604](https://github.com/hherb/kastellan/issues/604) at the wiring layer.
 
-**1. Boot.** `guard tier configured … tau=0.7955265641212463 timeout_ms=21752
-timeout_basis=probed n_ctx=131072 policy_digest=342e3d9661b2cbe2`, and the queryable
-`policy / guard_tier.boot` row carries `tok_per_s: 6072.99`. The derivation checks out
-against D9's own formula — 66 048 ÷ 6072.99 × 1000 × 2 = 21 750 ms vs the logged 21 752 —
-so the number is the design's, not an accident. M2 predicted ~26 s; the host measured faster.
+`ToolHostStepDispatcher` gains `guard: Option<Arc<GuardTier>>`, threaded
+`dispatch` → `dispatch_with_sink` → `post_process::finalize` exactly as `vault` was.
+The catalogue runs first and a catalogue Block **short-circuits** — proved by a request
+count, not by inspection. Escalate-up only: every failure door Allows.
 
-**2. A cleared document.** `web.fetch` of `example.org` (via Wayback — bare `example.org`
-is not on the DGX allowlist): `{state: "clear", p: 0.0074, tau: 0.7955, ms: 75,
-body_byte_len: 285, truncated: false}`. D5's per-dispatch score is real.
+**The three measurement-3 obligations were the actual work, and two of them changed the
+design.**
 
-**3. A BLOCK, end to end, on a real attack document.** A Wayback snapshot of a
-jailbreakchat prompt (corpus `cap-121`) scored **p = 0.9199** against τ = 0.7955 →
-`state: "flagged"`, result withheld, and the planner reported honestly that it was
-"blocked by a safety filter". The `policy / injection.blocked` row reads
-`tier: "guard_model"`, `p: 0.9199`, **`score: 0.0`, `reason_codes: []`** — *the catalogue
-scored it zero*. That is the tier's whole thesis, demonstrated in production rather than
-argued: 1 658 ms on a 4 183-byte document, catching what the deterministic tier missed
-completely.
+> **D8 — the HTTP 400 door: fail OPEN at runtime, refuse at BOOT.** #604 showed
+> `SCAN_BYTE_CAP` bounds bytes and nothing bounds tokens, at a ratio the attacker writes.
+> Fail-closed was rejected: whoever can force the 400 can force it on *any* document by
+> padding it, which is a DoS on the whole tool path. So the runtime keeps failing open —
+> and the tier now refuses to **boot** unless `/props` reports a per-request context ≥
+> `SCAN_BYTE_CAP + 512 = 66 048`. **One token per byte is a bound, not a guess**:
+> Shieldstral's tokeniser is byte-level BPE, so its base vocabulary is the bytes and no
+> input can exceed 1 tok/byte. That converts an attacker-reachable runtime fail-open into
+> an operator-fixable boot refusal. The DGX passes today (131 072); the `-c 32768` server
+> that produced #604 refuses with a message naming `-c 66048`.
 
-**4. An errored dispatch carries no `guard` key at all** (three seen: an off-allowlist host,
-two dead `web-search` workers). Correct — the `Err` arm screens nothing, so there is nothing
-to report.
+> **D9 — the timeout is PROBED at boot, not assumed.** D2's 15 s came from one host and one
+> token count, and measurement 3 broke both halves (the Mac takes ~5.5 min on a document D2
+> budgets at 15 s). A constant cannot be right for hosts differing by 40×, and the failure
+> is silent and one-directional: **too short a guard timeout does not error, it fails
+> open**. So one probe runs at boot, throughput is derived, and the result is clamped into
+> `[15 s, 120 s]`. `KASTELLAN_LLM_GUARD_TIMEOUT_MS` overrides and skips the probe.
 
-> ⚠️ **The bring-up found a real defect in an hour that seventeen e2e cases and a five-agent
-> review did not: the 4 KiB audit cap was eating the very score the slice exists to collect.**
-> `db::audit::insert` puts every payload through `truncate_payload`, which replaced an
-> over-cap payload **in its entirety** with `{_truncated, sha256, len}` — and a tool payload is
-> `{req, result, ms, guard}` with the whole tool output under `result`. Measured live: two
-> `web.fetch` rows at **85 352** and **85 351** bytes, both stored as bare stubs.
-> **And the loss is biased the wrong way.** A *blocked* dispatch keeps its score (its result is
-> already a short placeholder); a *cleared* one loses it as soon as the document is large. D5's
-> leverage is precisely the cleared half, so what production actually recorded was every block
-> plus only the *small* clears — a size-selected sample that reads like a score distribution.
-> Fixed by `PRESERVED_KEYS` (`db/src/audit.rs`): an allowlist of keys carried *through*
-> truncation, admitting only what is bounded by construction, a decision record rather than
-> data, and recoverable from nowhere else on the cleared path. **A four-agent review of the fix
-> found it kept half the defect**: a preserved key too large to afford was dropped *silently*,
-> producing a row byte-identical to one whose dispatch never ran a tier at all — the same
-> "cannot tell absence from loss" ambiguity, one function further down. Keys are now admitted
-> one at a time against the budget less a reserved `DROP_MARKER_RESERVE`, and anything refused
-> is named under `DROPPED_PRESERVED_KEY`. A `const` block additionally makes it a **compile
-> error** for a future `PRESERVED_KEYS` member to shadow `_truncated`, `sha256` or `len` — the
-> first would make `is_truncation_envelope` report the payload's own value and resurrect #62;
-> the others would silently break fingerprint equality. **The reason nothing caught it generalises:
-> `truncate_payload` runs inside `db::audit::insert`, so a recording sink sees the payload the
-> caller PASSED, never the one the database STORED.** The new e2e reads the row back out of
-> Postgres and asserts both halves — that the row really did exceed the cap, and that the score
-> survived — so it cannot pass vacuously; mutation-proven, with its small-document sibling
-> staying green under the same mutant.
-
-> ⚠️ **A SECOND review round (four agents, 2026-08-24) found the fix correct and its scaffolding
-> under-enforced.** Nothing it changed alters what a row stores on the happy path; it changes how
-> much of that is guaranteed rather than argued. Merged as `8cb8cfb7`.
+> ⚠️ **M2 — the probe was measured before it was specified, and the measurement changed
+> two constants.** Three requests against the DGX guard server, 2026-08-23:
+> | request | wall | `prompt_tokens` | `cached_tokens` | uncached tok/s |
+> | --- | --- | --- | --- | --- |
+> | cold, prefix `n1` | 159.3 ms | 810 | 0 | **5 084.6** |
+> | cold, prefix `n2` | 164.1 ms | 810 | 0 | **4 935.0** |
+> | repeat of `n2` | 38.4 ms | 810 | **809** | 26.1 |
 >
-> - **The class was still open.** `truncate_payload` runs *inside* `db::audit::insert`, so every
->   `AuditSink` double recorded the payload its caller PASSED and never the one Postgres STORED —
->   which is *why* the loss survived seventeen e2e cases. Round one closed that for `guard` with one
->   PG-backed e2e and left the class; the next bounded-and-irrecoverable key would have been found the
->   same way, in production. `AuditSink::insert` is now a **provided method** that applies the
->   transform and delegates to `insert_stored`, so a double receives the stored payload whether or not
->   its author thought about truncation. `PgAuditSink` re-applies it via `db::audit::insert` —
->   harmless, since `truncate_payload` is idempotent on an already-under-cap envelope.
-> - **The allowlist and the producer were two unlinked string literals** in different crates. A rename
->   on either side would have compiled and silently stopped preserving the score — the original defect
->   restored without a failing test, in a change that argues at length that prose cannot enforce an
->   invariant. Both sides now read `db::audit::GUARD_KEY`.
-> - **The multi-key half of the design was executed by nothing.** At one member a running envelope is
->   indistinguishable from a fixed one, so measuring each candidate against `bare` instead of the
->   accumulator — which at two members produces a row at roughly *twice* the cap — was caught by zero
->   tests. The loop is now `preserve_onto(envelope, source, keys)` with `keys` a **parameter**, driven
->   by six unit tests on two-key lists.
-> - **The module invariant round one introduced was false.** It said every write goes through `insert`
->   "via the `after_connect` SET ROLE hook", and `probe::run` — the site the sentence names first —
->   did neither: its own `INSERT`, on a bare connection, uncapped. Fixed at the source rather than in
->   the prose: `probe::run` now calls `audit::insert`.
-> - Smaller: the live probe instrument **printed** `COVERAGE FINDING` and passed green (libtest
->   captures `println!` on a pass, so the one host that cannot adjudicate a worst-case document showed
->   `test … ok`) — a finding now **fails**; `Clamped::ToCeiling` reached only the `warn!`, so the
->   durable `guard_tier.boot` row now carries `coverage_finding`; the compile-time shadow block never
->   checked `DROPPED_PRESERVED_KEY` *itself*; `str_eq`, the sole enforcer of that block, had no test.
->
-> **Mutation-proven, six for six** — each mutation turns exactly its own test red: measuring the value
-> rather than the running envelope; deleting the `DROP_MARKER_RESERVE` term; `str_eq` always false;
-> dropping the displaced-value restore; shrinking `drop_marker_worst_case()` below reality; and
-> all-or-nothing admission. On the accumulator mutation the target test's five siblings stayed green.
->
-> **Prose corrected where it did not survive checking:** "byte-identical" (the fingerprints differ —
-> the claim is *same key set*), the DGX called "flat" while omitting its own 8 KiB hump (the real
-> argument is that the 1 KiB probe reads *below* 64 KiB, so it errs safe), and the ≥ ~350 s Metal pin,
-> which the stated density ratio actually gives as **254 s** — now presented as a floor with headroom
-> for an uncharacterised knee rather than as a derivation.
+> Three facts, each load-bearing. (1) **A varying PREFIX defeats the prefix cache** (a *cache-buster*, deliberately not called a nonce — see below) — both
+> cold samples report `cached_tokens: 0`, agree within 3%, and land inside M1's
+> independently measured 4 039–6 660 band, so a 1 KiB probe stands in for a 64 KiB document
+> at 1/64th the cost. A *suffix* would not: a prefix cache matches from position 0. It is named
+> `cache_buster`, **not** `nonce` — it is not secret, authenticates nothing and guards no replay,
+> and CodeQL's `rust/hard-coded-cryptographic-value` rule reads the *parameter name* and flags every
+> caller passing a literal (it did: 5 critical alerts on PR #607, all from the word).
+> (2) **The contaminated repeat is catchable, and catching it matters** — naive
+> `prompt_tokens / elapsed` reads **21 094 tok/s** there, a **4× over-estimate** deriving a
+> timeout 4× too short. `usage.prompt_tokens_details.cached_tokens` makes it *detectable*,
+> so throughput is computed over **uncached** tokens with a 256-token floor. (3) 1024 dense
+> bytes → 810 tokens = **1.26 bytes/token**, close to #604's 1.47 on real jailbreak text and
+> nowhere near M1's 6.5 on prose — a prose probe would over-estimate per byte by ~5× and
+> reintroduce exactly D2's error. **Endpoint shape checked, not assumed:** the per-request
+> context is at `default_generation_settings.n_ctx`; there is **no top-level `n_ctx`**, and
+> `total_slots: 4` with each slot reporting the full 131 072 means `-c` is per-slot on this
+> build.
 
-> ⚠️ **[#612](https://github.com/hherb/kastellan/issues/612) — D9's probe is wrong by 4.4× on
-> Metal, and it fails OPEN. Filed, not fixed; it needs a design call.** The probe measures
-> uncached throughput on a **~1 KiB** sample and extrapolates **linearly** to 66 048 tokens.
-> Two *different* samples are in play and conflating them makes the arithmetic look
-> broken. The **size sweep** below uses identical dense filler (1.47 B/token) and measures
-> the *shape*; the **boot probe** measures the rate the formula is actually fed, on its own
-> denser body (1.26 B/token), and so reads higher on both hosts — which is where the last
-> column comes from. Do not derive one host's budget from the other column's tok/s.
-> | host | 1 KiB | 8 KiB | 64 KiB | 64 KiB wall | boot-probe tok/s | derived budget |
-> | --- | --- | --- | --- | --- | --- | --- |
-> | DGX (CUDA) | 3 177 | 6 327 | 2 907 tok/s | 15.4 s | 6 073 | 21.8 s — **covered** |
-> | Mac (Metal) | 1 137 | 1 209 | **260 tok/s** | **171.5 s** | ~1 445 | **91.4 s — times out** |
->
-> The DGX is flat (1.09×) and slightly pessimistic at 1 KiB, which is the safe direction. The
-> Mac is 4.37× optimistic, so a worst-case document times out and **fails open, silently** —
-> and `Clamped::ToCeiling`'s `warn!` ("this host cannot adjudicate a worst-case document")
-> never fires, so the one host where that sentence is true is the one host that says nothing.
-> Three cheap fixes are each closed off by the measurement: `PROBE_SAFETY_FACTOR`'s 2× does not
-> cover 4.37×; the Mac is still flat at 8 KiB so a second cheap sample misses the knee; and
-> probing at the cap costs 171 s against a deliberate 20 s budget. **Available mitigation
-> today: pin `KASTELLAN_LLM_GUARD_TIMEOUT_MS` on a Metal host** (≥ ~350 s — *not* the 171 s
-> above, which came from 1.47 B/token filler while `WORST_CASE_TOKENS` budgets for the
-> ~1 B/token adversarial ceiling), which skips the probe — trading a fail-open for a stalled
-> dispatch, hence an operator decision, not a default. `validate_operator_timeout` does **not**
-> clamp a pinned value to `[15 s, 120 s]`; that is deliberate, and it is what makes ≥ ~350 s
-> expressible at all. **The new live instrument now refuses to run under a pin**, because the
-> pin skips the probe and the run would otherwise report PASS having derived nothing — the
-> review caught that the one mitigation this file recommends was also the one configuration
-> that silently disarmed the instrument built to check it.
-> **This also corrects a prediction this file used to make:** the Mac was expected to derive
-> ~978 s and clamp to the ceiling. It derives 91 s and does *not* clamp. The host is slow
-> exactly as predicted; the probe simply cannot see it.
+> **D10 — advisory defence-in-depth, NOT a gate**, and the numbers travel with it: 65%
+> recall (36/55) at FP-0; 6/6 on bare imperatives at median 0.9955 but **5/8 missed** on
+> narrative framing at median 0.0797; τ pinned by ~4 documents with 1.0–1.2 points of
+> headroom; `best_tau` returns NONE. **Nothing downstream may relax on it** — no catalogue
+> weight lowered, no allowlist widened, no sandbox constraint loosened.
 
-**Also observed, pre-existing, not touched —
-[#613](https://github.com/hherb/kastellan/issues/613):** `web.search` and `web.research` die
-with `worker exited before responding` on the DGX (9 failures across 3 tasks).
-`KASTELLAN_WEB_SEARCH_ENDPOINT` is unset there, so `validate_endpoint` fails closed and the
-worker never serves — [[web-research-e2e-endpoint-must-be-allowlisted]] one layer out, in
-production. The behaviour is right and the *message* is the defect: it is the generic wrapper
-for any worker that dies at startup, so it cannot be grepped for this cause, while the worker
-itself had a precise reason formatted and discarded.
+**D5's per-dispatch `p` is the highest-leverage part.** The tool row gains a `guard`
+sub-object `{state, p, tau, ms}` whenever the tier ran — **including on cleared documents**,
+which is what makes production the score source for a corpus that is not catalogue-selected.
+No new rows. `policy / injection.blocked` gains `tier: "catalogue" | "guard_model"`, plus
+`p`/`tau` on the guard arm.
 
-> **The DGX is running `8736f559`, which does NOT carry the audit-cap fix** — it was found
-> *by* that deployment. Until this branch merges and is redeployed, the live host keeps losing
-> the guard score on any tool result past 4 KiB. The block rows are unaffected (a withheld
-> result is small), so containment is intact; what is being lost is D5's score corpus.
-> Redeploy with `scripts/upgrade_from_git.sh` after merge.
+**One refactor, taken deliberately:** `decision_for_score` extracted out of
+`screen_with_profile`, so `consults_model` delegates to the catalogue's own predicate
+instead of re-testing `>= BLOCK_THRESHOLD` a module away. The repo has already paid once for
+a second inline copy (`render_per_case` drifting from `decide`).
 
-**Not done: the Mac daemon itself was not re-installed.** The measurement above came from the
-real boot path (`GuardTier::from_router_config` against a live `llama-server` on `:8081`,
-`-c 66048`) via the new `#[ignore]` instrument, which is strictly more informative than a boot
-line — and given #612, putting the tier on the Mac daemon is a decision to take knowingly
-rather than a step to tick off. The Mac guard server was stopped after measuring.
+**Verification.** **DGX `69834357` (branch tip): 3823 / 0 / 54, `TEST_EXIT=0`, 175 suites,
+`--no-fail-fast --nocapture`.** Re-gated *after* the `cache_buster` rename, so the tip is gated
+rather than reasoned about — the count is unchanged because the rename is identifier-only and
+renames one test function without adding or removing any. `guard_tier_e2e` ran **13 / 0 on the DGX
+too**, under real bwrap and live PG, not only on the Mac. Reconciles **exactly**: `main` 3759 **+64** = core lib +47
+(context_pin 12, timeout 19, tier 16), `guard_tier_e2e` +13, llm-router +4. The intermediate gate at
+`3ad32005` read 3821, and the +2 is exactly the m13 commit's one unit test and one e2e case. Suites
+174 → 175 for the new test binary; `ignored` unchanged at 54. **8 `[SKIP]` lines, all gliner-relex** (4 × `KASTELLAN_GLINER_RELEX_ENABLE`, 4 × venv shim) —
+**not** the bwrap-userns skip, so containment really ran. Mac: `guard_tier_e2e` **13 / 0 with zero
+`[SKIP]`** under a real Postgres 18, so the audit-row half is genuinely exercised rather than
+skip-as-passed.
 
-### The review of the fix ([#614](https://github.com/hherb/kastellan/pull/614)) — ROUND ONE, four agents, all findings closed
+**Mutation: 13 mutants, 12 killed, 1 equivalent** (re-run against the final tree) — and the layer attribution is stated rather than
+glossed. m1/m2/m12 die at both layers; **m3 (drop `tier`), m11 (guard block wearing the catalogue's
+placeholder fields) and m13 die at layer 2 ONLY**; the rest at layer 1 only.
 
-> **Round two** (four agents, 2026-08-24, merged as `8cb8cfb7`) is written up in
-> [Current state](#current-state) above: it left the fix's behaviour alone and closed the
-> *class* — the `AuditSink` doubles that could never see the storage transform — plus the
-> cross-crate `"guard"` coupling, the untested multi-key path, and a module invariant round
-> one introduced that was false. Four issues out of it: #615–#618.
+> ⚠️ **m13 was a real hole, and it is the lesson of the session: writing a paragraph about a
+> fail-open is not the same as testing it.** `is_timeout` always-false left **every test in the
+> workspace green** while inverting D9's most consequential row — a probe that overruns its budget
+> would be misread as a plain failure, take the **floor** instead of the **ceiling**, and hand the
+> **slowest** hosts the **shortest** guard timeout. The commit that introduced the exact predicate
+> argued this risk in prose and shipped no test for it. Killed two ways, because the halves need
+> different tools: a pure `probe_error_outcome` for the floor/ceiling *choice*, and a layer-2 case
+> against a mock that **accepts the connection and never answers** (keeping the socket alive is the
+> mechanism — dropping it yields a transport error that is *not* a timeout, i.e. the other arm). It
+> costs 20 s of wall clock and nothing else in the suite reaches that predicate.
 
-A four-agent review (general, tests, silent-failure, comments) of the bring-up branch. **Two
-findings were defects the branch itself shipped**, and they composed: #612's stated mitigation
-was the exact configuration that disarmed the instrument built to check #612.
+> **m7 is EQUIVALENT, not a hole, and is recorded as such rather than counted as a kill.** Writing
+> `REQUIRED_GUARD_N_CTX` as the literal `66_048` instead of `SCAN_BYTE_CAP +
+> GUARD_PROMPT_OVERHEAD_TOKENS` passes `context_pin_required_tracks_the_scan_cap`, because
+> `66_048 == 65_536 + 512` today. The test still guards the case that matters — it fails the moment
+> `SCAN_BYTE_CAP` moves, which is exactly when a stale literal would silently size the check for the
+> old cap — but that cannot be *demonstrated* without changing the cap.
 
-- **The live instrument passed having measured nothing under a pinned timeout.**
-  `from_router_config` branches on `guard_timeout_ms` *before* `run_probe`, so a pin skips the
-  probe entirely; the instrument then printed `basis=operator`, no throughput line, "no coverage
-  finding", and PASSED — from a test named `live_boot_probe_derives_this_hosts_timeout`. It
-  would also have *false-failed* its clamp assertion for a legitimate ≥ 350 s pin, since
-  `validate_operator_timeout` does not clamp. Now refuses a pin outright, and asserts the basis
-  is a real measurement (`Probed`/`Saturated`), so an `Unprobed` host cannot pass quietly either.
-- **`derive_guard_timeout`'s doc did not add up.** It said the Mac "holds 1 137 tok/s … *so* a
-  worst-case document takes 171 s against a derived budget of 91 s" — but 1 137 through the
-  module's own formula gives **116 s**, and 91 s back-solves to ~1 445. Both numbers are real
-  and come from *different samples*: the size sweep uses 1.47 B/token filler, the boot probe its
-  own 1.26 B/token body. The doc (and the table in this file) now name the two separately. The
-  same skew is larger on the DGX — sweep 3 177 → 41.6 s, boot probe 6 073 → 21.8 s.
-- **The fix kept half the defect** (silent drop of an unaffordable preserved key) and left a
-  latent one (nothing stopped a future member shadowing the envelope's own keys). Both closed —
-  see the audit-cap blockquote above. Mutation-proven: removing the reserve, the marker, or
-  adding a shadowing key each turns the tree red, the last at **compile time**.
-- **Six reader comments across `capture.rs`, `replay.rs`, `audit_text.rs` and
-  `capture/tests.rs`** still said truncation replaces *every* key. Behaviourally harmless
-  (`plan` is not and cannot be a preserved key) but each stated a general property of a wire
-  contract that had stopped being true — one of them three lines above the call to the very
-  predicate whose doc now says the opposite. All corrected, plus a reader-side round-trip test
-  that feeds the extractor a real envelope *carrying* a preserved key.
-- Smaller: two operator-facing panic strings carried collapsed-continuation whitespace runs;
-  four `{value:.N}` format specs were silent no-ops (serde_json's `Display` never consults
-  `precision`, so a failure would have dumped the whole 4 KiB fixture); the e2e now asserts the
-  **stored** row is within budget, the one place in the tree that can.
+> ⚠️ **The mutation harness contaminated the git index and it would have shipped.** The first batch
+> timed out mid-run leaving `m10` applied, and a `git add -A` staged the mutated `probe_sample` — the
+> working tree was later reverted and looked clean while the *index* carried a dropped
+> `MIN_UNCACHED_PROBE_TOKENS` gate. Caught by reading `git diff` after the revert instead of trusting
+> it. **After mutation testing, diff the INDEX, not just the tree** —
+> [[mutation-revert-never-git-checkout]] is the same class one layer down.
 
-**Deliberately not done:** a `cfg!(target_os = "macos")` boot warning for #612. Filing it with
-the evidence is the call; the runtime path already `warn!`s on every fail-open.
+> ⚠️ **The DGX gate script under-reported, and the shape is worth remembering.** It piped the sweep
+> through `tail -400`, which discarded the failing suites *and* the totals: a ~3800-test workspace
+> reported **"230 passed"** with `TEST_EXIT=101` and no visible failure. Fixed to keep the full
+> sweep, derive totals from it, and print failing suite + test names and the clippy `Checking` count.
+> **A truncated log is not a gate.**
 
-### The wiring slice ([#607](https://github.com/hherb/kastellan/pull/607), `8736f559`) — merged, compressed
+> ⚠️ **The DGX gate caught what the Mac structurally could not.** `cli_ask_e2e` asserts an **exact**
+> audit-log multiset and the new `policy / guard_tier.boot` row broke both cases (15 → 16, 32 → 33).
+> Both now **assert the row is present** rather than merely tolerating the new count — "the tier is
+> off on this host" must be a query, not an inference from a row that could be absent for two
+> different reasons.
 
-Full prose in [`archive/handover_20260823_live-bringup_pre-prune.md`](archive/handover_20260823_live-bringup_pre-prune.md)
-(and the deeper `archive/handover_20260823_wiring-slice_pre-prune.md`). Kept here only for what still binds:
+> ⚠️ **CodeQL failed this PR with 5 critical alerts, all five in code the branch added, and all
+> five from ONE WORD.** `rust/hard-coded-cryptographic-value` reads the **parameter name**, so every
+> caller passing a literal to something called `nonce` is flagged. The rule had a point: the probe's
+> varying prefix is not a nonce by any reading — not secret, authenticating nothing, guarding no
+> replay — and calling it one overstated its role to a human auditor exactly as much as to the
+> scanner. Renamed `cache_buster` throughout rather than dismissed. **The generalisable bit: CodeQL's
+> crypto rules fire on identifier names, so a security-flavoured word used loosely costs a red check
+> and, worse, invites a reader to look for a property that is not there.** The ask channel's `nonce`
+> is untouched and stays — that one *is* a bearer token.
 
-- **D10 — the tier is ADVISORY defence-in-depth, NOT a gate.** 65% recall (36/55) at FP-0; 6/6
-  on bare imperatives at median 0.9955 but **5/8 missed** on narrative framing at median 0.0797;
-  τ pinned by ~4 documents. **Nothing downstream may relax on it** — no catalogue weight
-  lowered, no allowlist widened, no sandbox constraint loosened.
-- **τ = 0.79552656 is a REQUIRED operator input with no default.** A provisional value promoted
-  to a default is an unfitted number wearing a sanctioned one's clothes.
-- **Five misconfigurations STOP THE DAEMON** (D6): half-configured keys, τ out of `(0.0, 1.0]`,
-  a pinned timeout of 0, an unreachable `/props`, and a context below `SCAN_BYTE_CAP + 512 =
-  66 048` (D8, which turns #604's attacker-reachable HTTP 400 into a boot refusal). Unconfigured
-  is silent by design — `KASTELLAN_REQUIRE_GUARD=1` makes *that* fatal too, because `install`
-  regenerating `kastellan.env` drops all three keys at once and lands on the one non-fatal arm.
-- **`RouterConfig` lost its `Eq` derive** — `guard_tau: Option<f32>` can hold a NaN.
-- Post-review gate at `31a05e00`: **DGX 3834 / 0 / 54**, **Mac 3712 / 0 / 24**. Eleven review
-  fixes, all mutation-proven; deferred [#608](https://github.com/hherb/kastellan/issues/608)–[#611](https://github.com/hherb/kastellan/issues/611).
-- Lessons already absorbed into [Standing hazards](#standing-hazards-that-have-each-cost-a-session)
-  and memory: a paragraph about a fail-open is not a test for it (m13); CodeQL's crypto rules
-  fire on **identifier names** (`nonce` → `cache_buster`); mutation testing contaminates the git
-  **index**; and a truncated gate log is not a gate.
+**Clippy:** Mac `-D warnings` exit 0, **zero warnings**, over **218 `Checking` lines** from a
+**cold** private target dir — an honest full-workspace lint. The DGX reported exit 0 over **3**,
+which is a legitimate *incremental* count over the changed crates' reverse-dependency set in a warm
+dir and **not** evidence of a workspace sweep; the Mac run is the load-bearing one
+[[mac-cargo-buildlock-prefer-dgx]]. CI's rust 1.97 remains the authority on lints
+[[local-clippy-not-ci-parity-rust-version]] — expect a possible one-line follow-up after the push.
+
+### The five-agent PR review of #607, and the eleven fixes it produced
+
+Run 2026-08-23 against the branch tip. **The findings clustered in one place — the boot-time IO
+glue, one call frame further out than the mutation set reached** — which is the same lesson m13
+taught inside this very slice, arriving again at a larger radius.
+
+> ⚠️ **The single worst finding: the derived timeout was never proven to reach the HTTP client.**
+> `GuardClient::from_config(cfg, timeout.timeout)` → `probe_budget` left the **entire workspace
+> green**. `GuardTier` stores the `GuardTimeout` struct separately from the client and `tier.timeout()`
+> reads the *struct*, so every existing assertion — including `an_operator_pinned_timeout_skips_the_probe`
+> — pinned the record rather than the spend. Live: a host that derived 120 s silently spends 20 s,
+> converting adjudications into fail-open timeouts on exactly the large dense documents the tier
+> exists for. **That is issue #586's whole payload, and nothing tested it.** Now pinned by
+> `the_pinned_budget_is_what_the_adjudication_client_actually_spends`, which is a wall-clock bound
+> against a mock that answers `/props` and then never answers the completion — the mutant takes
+> 20.01 s against a 1.5 s pin.
+
+> ⚠️ **`is_timeout` was wrong in BOTH directions, and one of them was a fail-open.**
+> *Over*-match: `reqwest::Error::is_timeout` walks the source chain for `io::ErrorKind::TimedOut`,
+> which a **connect** timeout populates, and `Router::with_policy` caps connect at 5 s independently
+> of the request budget — so a transient connect stall on a fast host derived the 120 s ceiling and
+> fired the "this host cannot adjudicate a worst-case document" warning. *Under*-match: `Router::send`
+> read a non-2xx body with `resp.text().await.unwrap_or_else(...)`, so a **budget expiry while reading
+> an error body** became `HttpStatus`, not `Transport` — invisible to a predicate that matches on
+> `Transport`, taking the **floor** instead of the ceiling. Fixed at both ends: `is_timeout() &&
+> !is_connect()`, and a shared `error_body` helper in `llm-router` that preserves a timeout (it fixed
+> all **three** non-2xx sites — `send`, `embed`, `props` — which had the same swallow).
+
+> ⚠️ **The model was consulted on every dispatch, including results with no text in them.**
+> `extract_scannable_text` emits string leaves only, so `{"ok": true, "count": 3}` — the ordinary
+> shape for `kv.*` and most structured replies — reached the tier as `""`. Three costs: a model round
+> trip on every such dispatch; an **undefined verdict on an empty `<Document>`**, where a `p >= tau`
+> would withhold a result containing nothing to inject; and D5's score distribution seeded with
+> scores for empty documents. Now a named door, `Unadjudicated::NoScannableText` — *named*, because
+> returning no guard object would spell it the same way as an unconfigured host.
+
+> ⚠️ **The hazard D6 argues from is the one case D6 did not cover.** The rationale for making
+> everything fatal cites `kastellan-cli install` dropping hand-added keys — but a regeneration drops
+> *every* key, not one of a pair, so the realistic outcome is all three guard keys gone, which lands
+> on `Ok(None)`: the single **non**-fatal arm. Daemon boots clean, one `info!` line, catalogue-only.
+> `install`'s own `env_diff` covers the full drop; the new `KASTELLAN_REQUIRE_GUARD=1` lets an
+> operator make it fatal, same shape as `KASTELLAN_REQUIRE_TRUSTED_INSTALL_DIR` (#388).
+
+Also fixed: `GuardReport.p` could be `Some(NaN)` on the `Unmeasured` door (the struct's own doc said
+otherwise; it survived only because `serde_json` renders a non-finite float as `null` — an
+undocumented dependency behaviour holding up an audit shape). The `Saturated` basis reported a
+`tok_per_s` of **12.8** computed from `MIN_UNCACHED_PROBE_TOKENS`, a *sample-rejection floor* rather
+than any token count — against a true bound of ~40 — plus a `derived_ms` holding the **post**-clamp
+ceiling while the `Probed` arm's is **pre**-clamp; it is now its own variant carrying only the budget
+it exceeded, so it cannot claim a measurement it never made. A failed boot probe discarded its own
+error text and was reported at `info!` beside "guard tier configured", despite predicting a tier that
+fails open on **every** dispatch. `truncated`/`body_byte_len` now ride the **Allow** half, so a
+`state: "clear"` row on a 10 MB result no longer reads as "the model judged this clear" when it judged
+1.5% of it. `TimeoutBasis::Unprobed`'s stringly reason became `UnprobedReason`.
+
+**All eleven fixes are mutation-proven** — each mutant confirmed to turn the new test red, index
+diffed clean afterwards [[mutation-testing-contaminates-the-index]].
+
+> ⚠️ **Two verification numbers in the PR body and in this file were WRONG, in the direction that
+> flatters.** The Mac core-lib baseline is **1924**, not the 1923 both claimed (measured by stashing
+> the fix wave and re-running, not by arithmetic); and the PR body said 11 e2e cases and 11 mutants
+> where the tip had **13** of each. A verification number nobody re-measures is a claim, not a gate.
+
+**Deferred with reasoning, all filed:** [#608](https://github.com/hherb/kastellan/issues/608) — an
+**unreported** prefix cache is undetectable and the boot row cannot say so (the uncached-token floor
+does *not* cover that case; the docs claiming it did are corrected, and note the cache-buster is not
+at position 0 of what is actually sent, since `build_messages` prepends ~140 cacheable tokens).
+[#609](https://github.com/hherb/kastellan/issues/609) — an unreachable `/props` crash-loops the whole
+daemon with no retry, and a boot refusal is the one guard state absent from `audit_log`.
+[#610](https://github.com/hherb/kastellan/issues/610) — a deliberate per-call-site opt-out
+(gliner-relex) is spelled the same way as an unconfigured host.
+[#611](https://github.com/hherb/kastellan/issues/611) — `report_guard_tier`'s configured branch is
+untestable and untested; lift the payload into a pure fn.
+
+**Post-review gate — BOTH HOSTS, at `31a05e00`.**
+
+**DGX (native aarch64, real bwrap + live PG 18): 3834 / 0 / 54**, `TEST_EXIT=0`, **175 suites**,
+`--no-fail-fast --nocapture`. Reconciles **exactly**: the pre-review tip was 3823, and 3823 **+11** =
+3834 — the eleven new tests, no more and no less; against `main`'s 3759 the slice is **+75**. Suites
+unchanged (no new binary), `ignored` unchanged at 54. **8 `[SKIP]`, all gliner-relex** (4 × `ENABLE`,
+4 × venv shim) — *not* the bwrap-userns skip, so containment really ran. Clippy `-D warnings` exit 0
+over **231** `Checking` lines from a cold dir.
+
+**Mac (Seatbelt + Postgres.app 18): 3712 / 0 / 24**, `TEST_EXIT=0`, 175 suites. Its 26 `[SKIP]` lines
+are all Apple-`container` (service not started) and gliner-relex — again *not* the sandbox or PG skip.
+Clippy exit 0 over **218** cold `Checking` lines.
+
+`guard_tier_e2e` is **17 / 0 on BOTH hosts** (13 **+4**), and all four new cases ran on the DGX under
+real bwrap and live PG, not only on the Mac. Core lib **1931** (1924 **+7**) and llm-router **87**
+match across hosts — the useful cross-check, since the two are structurally blind to each other's
+`cfg` arms [[cfg-linux-e2e-deadcode-dgx-clippy]] and a divergence would have meant a Linux-only arm
+nobody had seen. The clippy counts differ (231 vs 218) for the same reason and legitimately: the DGX
+compiles the bwrap backend, Firecracker and the systemd units that the Mac compiles out.
+
+**Two behaviour changes an operator must know about**, both deliberate and both in D6/D8:
+a configured tier whose backend is unreachable, half-configured, τ-less, τ-out-of-range, or
+too small on context **stops the daemon**. Unconfigured is unchanged and silent-by-design
+(one boot line). `RouterConfig` also lost its `Eq` derive — `guard_tau` is an `Option<f32>`
+and a config that can hold a NaN is not totally equatable.
 
 ### The guard-model arc so far, compressed
 
@@ -362,14 +388,18 @@ Full prose in [`archive/handover_20260821_pre-prune.md`](archive/handover_202608
   - **Still deliberately excluded:** the `ask_user` planner tool and `propose_plan` (same inbox item, different `kind`), a configured fallback destination for non-channel tasks, the autonomy-ceiling axis (`tasks.autonomy`), and the dead-letter store.
   - **Email delivery is wired but inert** — `EmailChannel::send` still refuses unconditionally, so an email-originated ask produces an honest `ask.delivery_failed` row rather than a silent drop. Correct until outbound SMTP lands.
 
-- **Shieldstral guard-model — WIRED (`8736f559`, [#607](https://github.com/hherb/kastellan/pull/607)) and now RUNNING LIVE on the DGX** (see [Current state](#current-state)). What remains:
-  - **[#612](https://github.com/hherb/kastellan/issues/612) is the one that matters, and it is a design call, not a patch.** D9's boot probe extrapolates linearly from a ~1 KiB sample; on Metal that is 4.4× optimistic and a worst-case document fails **open**. Every cheap fix is closed off by the measurement in the issue — read it before proposing one. The four live options are: probe nearer the cap (correct, unaffordable at boot), fit a curve (inherits the cost), raise the safety factor (another D2 constant), or **measure at runtime from the `ms`/`body_byte_len` the guard row already carries** — which is the only one whose evidence is the real workload, and which reuses D5's own "let production be the measurement" move. Until it lands, a Metal host pins `KASTELLAN_LLM_GUARD_TIMEOUT_MS`.
-  - **A Mac daemon deployment is a deliberate decision now, not a task.** The tier boots fine there (91.4 s derived, `n_ctx` 66 048) but #612 means it fails open on large documents. Decide #612 first, or deploy with a pinned timeout and say so.
-  - **Then, in rough priority:** [#605](https://github.com/hherb/kastellan/issues/605) (the `PROVISIONAL` banner is unconditional — until it lands no report can say a τ is fitted); [#602](https://github.com/hherb/kastellan/issues/602) (an empty body pinned as the page — fail-**open** under `--record`); [#601](https://github.com/hherb/kastellan/issues/601) (profile divergence, quantified **inert** for this run but still wrong); [#603](https://github.com/hherb/kastellan/issues/603) (the URL inside the hash); [#608](https://github.com/hherb/kastellan/issues/608)–[#611](https://github.com/hherb/kastellan/issues/611) from #607's review; [#599](https://github.com/hherb/kastellan/issues/599)/[#600](https://github.com/hherb/kastellan/issues/600) from #598's.
-  - **#604 is addressed, not closed.** D8 makes the 400 unreachable on a correctly sized host; it does not make it unrepresentable. Option 2 (cap by tokens) still wants a core-side tokeniser the guard seam deliberately does not have; option 3 (chunk and combine) changes what a score means.
-  - **Corpus growth is now cheap, and that is new.** D5's per-dispatch `p` is live and — since the audit-cap fix — survives on large documents too, so production is finally a score source with no catalogue selection in it. Measurement 3's security-prose stratum was **catalogue-selected** (15 of 121 captures refused under the production `Relaxed` profile, including every GitHub-hosted candidate); nothing about that is true of the production distribution. Harvest it before designing another capture campaign.
+- **Shieldstral guard-model — MEASUREMENT 3 MERGED (`d51c9b20`, [#606](https://github.com/hherb/kastellan/pull/606)) AND THE WIRING SLICE MERGED (`8736f559`, [#607](https://github.com/hherb/kastellan/pull/607))** (see [Current state](#current-state)). What remains under this heading:
+  - **Live bring-up on the DGX, which nothing has done yet.** The tier has never run against a real `llama-server` from the daemon — every case in `guard_tier_e2e` is a mock. The three things only a live run can answer: what the boot probe actually derives there (M2 predicts ~26 s, unclamped), whether `report_guard_tier`'s line reads usefully, and what `p` looks like on genuine worker output. Needs `KASTELLAN_LLM_GUARD_URL`/`_MODEL`/`_TAU=0.79552656` in the operator overlay `~/.config/kastellan/kastellan.env.local` (**not** the generated file — `install` regenerates that), and the guard server up on `:8081` with `-c 131072` or higher, which D8 now *enforces*. **Host state, verified 2026-08-23:** that server is **UP** (pid from
+    `pgrep -fa llama-server`), serving the pinned `Shieldstral-1.0-3B-Q8_0.gguf` at `-c 131072` —
+    which passes D8's 66 048 requirement with room, and is the server M2's probe numbers were taken
+    against. `/props` reports the per-request context at `default_generation_settings.n_ctx` with
+    **no top-level `n_ctx`**, and `usage.prompt_tokens_details.cached_tokens` is served. Kill it if
+    the GPU is needed; restart with **at least `-c 66048`** or the tier will refuse to boot.
+  - **The Mac is the interesting host, not the DGX.** Measurement 3 implies ~135 tok/s there, which derives ~978 s and **clamps to the 120 s ceiling** — so a Mac deployment should print the `warn!` saying large documents will fail open. That warning has never been seen in the wild; seeing it once is worth more than another unit test.
+  - **Then, in rough priority:** [#605](https://github.com/hherb/kastellan/issues/605) (the `PROVISIONAL` banner is unconditional — the fix is a pure `provisional_reasons(cases)`, and until it lands no report can say a τ is fitted); [#602](https://github.com/hherb/kastellan/issues/602) (an empty body pinned as the page — fail-**open** under `--record`); [#601](https://github.com/hherb/kastellan/issues/601) (the profile divergence, quantified **inert** for this run but still wrong); [#603](https://github.com/hherb/kastellan/issues/603) (the URL inside the hash); [#599](https://github.com/hherb/kastellan/issues/599)/[#600](https://github.com/hherb/kastellan/issues/600) from #598's review.
+  - **#604 is addressed, not closed.** D8 makes the 400 unreachable on a correctly sized host; it does not make it unrepresentable. The issue's option 2 (cap by tokens) still wants a core-side tokeniser the guard seam deliberately does not have, and option 3 (chunk and combine) changes what a score means and needs its own measurement.
+  - **Corpus growth, if the tier is pursued:** the security-prose stratum is **catalogue-selected, not sampled** — 15 of 121 attempted captures were refused by the deterministic catalogue under the *production* `Relaxed` profile, including every GitHub-hosted security-prose candidate (PIPE's primer, PayloadsAllTheThings, CWE-77). The agent cannot read those documents today, which is D4's expensive failure happening one layer *below* the guard. **D5's per-dispatch `p` is the way out** — it makes production the score source, with no catalogue selection at all.
   - **The other four `screen` call sites** (`fetch_screen`, `inner_loop/summary`, `channel/ingest`, `recall_assembly/pg_builder`) keep catalogue-only behaviour, and so does the core-initiated `gliner-relex` dispatch. Widening is a separate slice with its own blast radius.
-  - **Live-host facts** (verified 2026-08-23): the DGX guard server is `llama-server … Shieldstral-1.0-3B-Q8_0.gguf --alias shieldstral --port 8081 -c 131072 -ngl 99`; `/props` reports the per-request context at `default_generation_settings.n_ctx` with **no top-level `n_ctx`**. Restart it with **at least `-c 66048`** or the daemon refuses to boot. The three guard keys live in `~/.config/kastellan/kastellan.env.local`, which `install` never rewrites.
 - **Email channel — slices 2 and 3.** Slice 1 (gated inbound) MERGED, and #503 closed its MITM gap. Spec `docs/superpowers/specs/2026-07-28-email-fallback-channel-design.md`. **Slice 2** = SMTP outbound (`lettre`, MIT-verified) + full round trip; today `EmailChannel::send` refuses and every refusal is audited `channel.reply_undelivered`. **Slice 3** = DGX deploy + live tier: re-verify both negative controls (plan Task 4 Step 5 and Task 5 Step 5) on the deployed host, and **restart `localmail-serve` (+ `localmail-daemon`) on the DGX first** — see [Deployment facts](#deployment-facts-dgx). Its deploy blocker is gone: `41b21f36` (#520) installs `kastellan-worker-email-in`, so the channel is deployable for the first time.
 - **[#497](https://github.com/hherb/kastellan/issues/497) — unify the per-family `ChannelBus` instances into one bus.** `main.rs` spawns a Matrix bus and an email bus, each with its own `PgCompletedTasks` LISTEN, so every bus sees every completed channel task and `handle_completed`'s `senders` miss is the normal case (the misleading `warn!("…dropping")` was demoted to `debug!` in `658924ae`). `ChannelBus::spawn` already takes a `Vec<Box<dyn Channel>>`, so this is mostly rewiring the two boot modules to return a *channel* rather than a *bus*; it also drops a redundant LISTEN connection and lets that log line be a real `warn!` again. Worth doing before a third channel family lands.
 - **macOS Seatbelt-loopback verification of mail tier 1a** (carried from #490, non-blocking) — needs a Mac run with working launchd-PG; the Linux/bwrap leg is validated and tier 1b carries the macOS sandbox leg.
@@ -480,9 +510,6 @@ review round widened it from two invariants to three, in [`archive/handover_2026
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
-| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`8cb8cfb7`** — tip of `feat/guard-live-bringup`, after review round two | **3854 / 0 / 55**, 175 suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly, and by measurement rather than subtraction:** 3840 at `09c6231f` **+ 4** (`a1c10da3`'s four `db::audit` tests — that commit was never DGX-gated, which was the open gap) **+ 10** (round two, all `db::audit`; `audit::tests` 15 → 25, confirmed by counting `^test audit::tests::` in the log). Ignored unchanged at 55 — round two added no `#[ignore]` | exit 0 over **245** `Checking` lines from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-614`) | **8**, all gliner-relex — *not* the bwrap-userns skip |
-| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`09c6231f`** — tip of `feat/guard-live-bringup` | **3840 / 0 / 55**, 175 suites, `TEST_EXIT=0` — reconciles exactly: `main` 3834 **+6** (5 new `db::audit` unit tests + 1 `guard_tier_e2e` case), ignored 54 **+1** for the new `#[ignore]` live instrument | exit 0 over **244** `Checking` lines from a cold private dir. The in-place run first reported exit 0 over **4** — a warm-dir incremental count that is not evidence of a sweep, which is why it was re-run cold | **8**, all gliner-relex (4 × `ENABLE`, 4 × venv shim) — *not* the bwrap-userns skip, so containment really ran |
-| **Mac** (aarch64 darwin, Seatbelt + Postgres.app 18 via `KASTELLAN_PG_BIN_DIR`) | **`09c6231f`** | **3718 / 0 / 25**, 175 suites — same **+6** / **+1** delta against `main`'s 3712 / 24. The sweep itself reported 2 failures, both `probe run: Connect("the database system is starting up")` in `db/tests/asks_e2e.rs` — a per-test PG cluster losing a startup race under concurrent load, **not** a code failure; the suite re-ran clean at **35 / 0** | exit 0 over **234** `Checking` lines — the load-bearing lint of the two [[mac-cargo-buildlock-prefer-dgx]] | **26**, all Apple-`container` (service not started) + gliner-relex |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`69834357`** — the tip of `feat/guard-wiring-slice-586`, re-gated after the `cache_buster` rename | **3823 / 0 / 54**, `TEST_EXIT=0`, `--no-fail-fast --nocapture`, **175 suites**. Reconciles exactly: `main` 3759 **+64** (core lib +47, `guard_tier_e2e` +13, llm-router +4); the earlier `3ad32005` gate read 3821 and the +2 is the m13 commit's one unit + one e2e test; suites 174 → 175 for the new binary. `guard_tier_e2e` **13 / 0 here as well as on the Mac** | `CLIPPY_EXIT=0`, **3 `Checking` lines** — an *incremental* count over the changed crates' reverse-dependency set in a warm dir, NOT a 27-crate sweep; the Mac's 213-line cold run is the load-bearing lint | **8**, all gliner-relex (4 × `ENABLE`, 4 × venv shim) — *not* the bwrap-userns skip, so containment really ran |
 | **Mac** (aarch64 darwin, Seatbelt + Postgres.app 18 via `KASTELLAN_PG_BIN_DIR`) | `feat/guard-wiring-slice-586` | **targeted, not a sweep:** llm-router lib **87 / 0**, core lib **1923 / 0 / 1**, `guard_tier_e2e` **13 / 0 with zero `[SKIP]`** (real PG, real sandboxed worker, real `dispatch`). **13 mutants: 12 killed, 1 equivalent** | `CLIPPY_EXIT=0`, zero warnings, **213 `Checking` lines** from a COLD private target dir (1m04s) — an honest full-workspace lint, not the warm-cache false green | **0** on `guard_tier_e2e` under the PG override |
 | **DGX** | **`0bae6b2c`** → merged as `d51c9b20` = **`main`** | **3759 / 0 / 54**, 174 suites — the baseline this branch's +62 reconciles against |
@@ -637,7 +664,6 @@ Beyond those already listed under [Next TODO](#next-todo). Only currently-open i
 - ~~[#592](https://github.com/hherb/kastellan/issues/592)~~ **CLOSED by `abb3d3a7`** ([#598](https://github.com/hherb/kastellan/pull/598)) — the pin is checked at use, so the measurement-3 spec's D6 is unblocked. See [Current state](#current-state).
 - **From [#598](https://github.com/hherb/kastellan/pull/598)'s review, both deferred because each changes another tool's contract:** [#599](https://github.com/hherb/kastellan/issues/599) — `--weights-unpinned` still exits **0**, so nothing machine-readable separates a τ fitted on the pinned bytes from one fitted against a server we could not identify at all; the artefact says `UNPINNED` loudly but the exit status does not, and `guard_calibrate_cli_e2e` now passes the flag on every leg, which is how a flag becomes habitual. [#600](https://github.com/hherb/kastellan/issues/600) — `scripts/eval/run-shieldstral-llamacpp.sh`, **the one script in the tree that launches a Shieldstral server**, still checks only that `$MODEL` exists; `require_guard_weights` has no automated caller at all, which is weaker than the `require_guest_kernel` precedent it cites.
 - **From measurement 3 (2026-08-23), five filed with the evidence that found each:** [#601](https://github.com/hherb/kastellan/issues/601) — `guard capture` admits a document under `Relaxed` (production's profile for `web-fetch`, via `for_tool`) and `guard calibrate` then excludes on `Strict` (`screen()`), so the corpus is filtered by one gate and scored for exclusion by a stricter one; **quantified as inert for this run** (0 captured cases excluded), still wrong. [#602](https://github.com/hherb/kastellan/issues/602) — a rate-limited **200 with an empty or truncated body** is hashed and, under `--record`, pinned *as the case*; measured `e3b0c442…` (the empty-string sha256) from a real fetch with curl exiting 0. #596 closed this for 404s and never checked the body. Fail-**open**. [#603](https://github.com/hherb/kastellan/issues/603) — the pin covers the **final URL**, so a Wayback redirect to an equivalent snapshot reads as `The source has drifted` when the document is byte-identical; fail-noisy, and it trains an operator to look past the campaign's loudest signal. [#604](https://github.com/hherb/kastellan/issues/604) — **`SCAN_BYTE_CAP` bounds bytes, not tokens**: 65,536 bytes tokenised to **44,437** and the adjudication died on HTTP 400, because the byte→token ratio is **attacker-controlled** (M1's prose 6.5 B/token, dense jailbreak text 1.47). [#605](https://github.com/hherb/kastellan/issues/605) — the `PROVISIONAL` banner is an unconditional `push_str` stating a criterion it does not check, so the one line separating a proof-of-concept τ from a fitted one can never change.
-- **From [#614](https://github.com/hherb/kastellan/pull/614)'s round-two review, four filed rather than folded in because each changes behaviour beyond the branch:** [#615](https://github.com/hherb/kastellan/issues/615) — an operator-pinned `KASTELLAN_LLM_GUARD_TIMEOUT_MS` **below `TIMEOUT_FLOOR_MS` or above `TIMEOUT_CEILING_MS` is accepted in silence** (`validate_operator_timeout` refuses only `0`, and `TimeoutBasis::Operator` yields no `coverage_finding`). Not clamping is deliberate and should stay; saying *nothing* is the defect — sharpened by #612 telling Metal operators to pin ~3× the ceiling. [#616](https://github.com/hherb/kastellan/issues/616) — `guard.state` collapses timeout / connect / HTTP-status / decode into `"router_error"`, so the durable record **cannot count the fail-open** that #612 is entirely about; a closed enum discriminant (`error_kind`) carries no attacker-controlled bytes and would fix it without weakening the no-backend-text rule. [#617](https://github.com/hherb/kastellan/issues/617) — `req` is still lost wholesale above the cap, and for `shell.exec` **`req.argv` *is* the audited act**; the allowlist is the wrong tool (unbounded), a bounded producer-side summary is the right one. [#618](https://github.com/hherb/kastellan/issues/618) — `fetch_screen`'s Block arm has an else-less `as_object_mut`, a silent fail-open *shape* on a screening path (unreachable today via the `get("data")` guard three lines up).
 - [#597](https://github.com/hherb/kastellan/issues/597) — **#592's shape one artefact along:** the two hosts hold different *projectors* (Mac `mmproj-F16`, DGX `mmproj-BF16`, different sizes), and ROADMAP claimed they matched. Inert while the guard tier runs `vision:false`; pin it the same way if a guard path ever loads one. The mechanism already exists — `require_guard_weights` takes a path.
 - [#564](https://github.com/hherb/kastellan/issues/564) — also carries a [Next TODO](#next-todo) bullet; listed here too because it is the blocker under `ask_user`, plan-approval, and the deferred `Escalate` severity-split alike.
 - [#515](https://github.com/hherb/kastellan/issues/515) — the channel supervisor awaits its audit sink (deliberately: row ordering + test determinism), and the Postgres sink inherits sqlx's 30 s pool-acquire timeout, so an unreachable PG can delay daemon shutdown by that much. Fix is a 5 s `tokio::time::timeout` around the sink call; testable with a `std::future::pending()` sink.

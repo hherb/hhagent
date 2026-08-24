@@ -236,7 +236,11 @@ pub(super) async fn finalize(
                 "ms":     elapsed_ms,
             });
             if let Some(report) = &guard_report {
-                payload["guard"] = report.audit_value();
+                // `GUARD_KEY`, not `"guard"`: the allowlist that carries
+                // this key through `truncate_payload` lives in another
+                // crate, and two independent spellings would let a rename
+                // on either side silently stop preserving the score.
+                payload[kastellan_db::audit::GUARD_KEY] = report.audit_value();
             }
             payload
         }
@@ -307,6 +311,17 @@ pub(super) async fn finalize(
         });
         // `p` and `tau` ride on the guard arm only, so a query filtering on
         // their presence separates the tiers even without reading `tier`.
+        //
+        // They sit at TOP LEVEL here, not under `GUARD_KEY`, so they are
+        // NOT carried through `truncate_payload` the way the tool row's
+        // `guard` object is -- and `PRESERVED_KEYS`' own argument for
+        // admitting only the cleared half leans on this row surviving.
+        // Safe because every field above is bounded by construction:
+        // `reason_codes` is a deduped set drawn from a fixed catalogue,
+        // `body_sha256` is 64 hex chars, and the rest are scalars, so this
+        // payload cannot approach `PAYLOAD_MAX_BYTES`. Adding an unbounded
+        // field (a body head, an error string) would break that silently
+        // -- see the note in `db::audit::PRESERVED_KEYS`.
         if let Some(report) = &guard_report {
             policy_payload["p"] = serde_json::json!(report.p);
             policy_payload["tau"] = serde_json::json!(report.tau);

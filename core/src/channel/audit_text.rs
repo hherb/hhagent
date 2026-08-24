@@ -1,10 +1,14 @@
 //! Bounding text that is about to become a durable `audit_log` payload value.
 //!
 //! Audit payloads are capped as a whole by
-//! [`kastellan_db::audit::truncate_payload`], but that cap replaces the
-//! *entire* payload with a hash — the right backstop, and the wrong outcome
-//! for a row whose other fields (which channel, which attempt) are the useful
-//! part. Bounding the one unbounded field first keeps the row readable.
+//! [`kastellan_db::audit::truncate_payload`], which replaces the payload
+//! with a hash, carrying through only
+//! [`kastellan_db::audit::PRESERVED_KEYS`] — the right backstop, and the
+//! wrong outcome for a row whose other fields (which channel, which
+//! attempt) are the useful part. Those fields are **not** preserved keys
+//! and would not qualify as any: they are per-row context, not the bounded
+//! verdict of a control. So bounding the one unbounded field first is still
+//! what keeps the row readable; the allowlist is not a substitute for it.
 //!
 //! Defence in depth, not belt-and-braces: the values that reach here originate
 //! outside the core (an upstream HTTP error body, a transport error string),

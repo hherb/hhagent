@@ -5,7 +5,7 @@
 //! four ways a 200 can be unmeasurable (neither verdict spelling; only
 //! one; no `logprobs` block; empty `choices`/`top_logprobs`), a
 //! malformed body, a transport failure, an unconfigured guard and a
-//! half-configured one. Plus one `#[ignore]` live instrument.
+//! half-configured one. Plus two `#[ignore]` live instruments.
 //!
 //! The mock is the same hand-rolled one-shot HTTP/1.1 listener that
 //! `llm-router/tests/local_backend_e2e.rs` uses — bind `127.0.0.1:0`,
@@ -544,4 +544,178 @@ async fn live_shieldstral_size_sweep() {
             }
         }
     }
+}
+
+/// **Live instrument: what THIS host's boot probe actually derives.**
+///
+/// The wiring spec's D9 replaced D2's constant 15 s with a probe,
+/// because a constant cannot be right for hosts that differ by 40x and
+/// the failure is silent and one-directional — *too short a guard
+/// timeout does not error, it fails open*. `guard_tier_e2e` pins every
+/// arm of that derivation against a mock but `NoTokenCount`, which is
+/// unit-tested in `timeout/tests.rs`. Nothing until now ran any of it
+/// against a real server, so the numbers a real deployment produces
+/// were predictions.
+///
+/// This is the same code path `kastellan`'s boot block takes, including
+/// the per-boot cache-buster, so what it prints is what the daemon
+/// would log on this host.
+///
+/// Run it wherever you are about to deploy:
+///
+/// ```sh
+/// KASTELLAN_LLM_GUARD_URL=http://127.0.0.1:8081/v1 \
+/// KASTELLAN_LLM_GUARD_MODEL=shieldstral \
+/// KASTELLAN_LLM_GUARD_TAU=0.79552656 \
+/// cargo test -p kastellan-core --test guard_model_e2e -- \
+///   --ignored --nocapture live_boot_probe_derives_this_hosts_timeout
+/// ```
+///
+/// **A coverage finding FAILS this test.** `coverage_finding()` speaks for
+/// three different situations — the host derived past the 120 s ceiling
+/// and was clamped; the probe never returned within its budget; or the
+/// probe call failed outright — and they are not interchangeable, so read
+/// the sentence and not just the label. But all three mean documents large
+/// enough to matter will time out and fail open to catalogue-only
+/// screening, and the third predicts a tier that fails open on *every*
+/// dispatch.
+///
+/// It is a failure and not a printed note because **libtest captures
+/// `println!` on a passing test.** Printing the finding and returning
+/// green makes `--nocapture` load-bearing, and load-bearing flags get
+/// forgotten — leaving an operator with `test … ok` on a host whose tier
+/// cannot adjudicate a worst-case document. That is this instrument's own
+/// stated failure mode ("a silent PASS has learned nothing while being
+/// told everything is fine"), one level up from the unconfigured arm it
+/// already guards against.
+///
+/// **A pinned `KASTELLAN_LLM_GUARD_TIMEOUT_MS` makes this instrument
+/// pointless, so it refuses to run under one.** The pin skips the probe
+/// (see `from_router_config`), which would leave this test printing "no
+/// coverage finding" and passing green having measured nothing at all —
+/// the same silent-PASS failure its unconfigured arm below exists to
+/// prevent, one level down. Awkwardly, pinning is exactly what #612 tells
+/// a Metal operator to do, which is why the refusal is explicit rather
+/// than left to the reader.
+///
+/// **Fails rather than skips when unconfigured**, for the same reason
+/// its sibling above does: an operator who asks for this by name and
+/// gets a silent PASS has learned nothing while being told everything
+/// is fine.
+#[tokio::test]
+#[ignore = "needs a live Shieldstral server; see the doc comment"]
+async fn live_boot_probe_derives_this_hosts_timeout() {
+    use kastellan_core::cassandra::guard_model::timeout::{
+        TimeoutBasis, TIMEOUT_CEILING_MS, TIMEOUT_FLOOR_MS,
+    };
+    use kastellan_core::cassandra::guard_model::GuardTier;
+
+    let cfg = RouterConfig::from_env().expect("router config");
+    // The same assertion the sweep makes, for the same reason: pointed
+    // at the planner endpoint this would still produce a plausible
+    // number, and a timeout derived from the wrong model's throughput
+    // is worth less than no timeout at all.
+    assert_ne!(
+        cfg.guard_url.as_deref(),
+        Some(cfg.local_url.as_str()),
+        "the guard endpoint is the PLANNER endpoint; the derived budget would \
+         describe a different model"
+    );
+    // A pinned timeout SKIPS the probe entirely (`from_router_config`
+    // branches on `guard_timeout_ms` before `run_probe` is ever called), so
+    // without this arm the run below would print `basis=operator`, no
+    // throughput line, "no coverage finding", and PASS -- having measured
+    // nothing, from a test whose name promises a derivation. It would also
+    // fail the clamp assertion at the end for a perfectly good pin, since
+    // `validate_operator_timeout` does not clamp.
+    assert!(
+        cfg.guard_timeout_ms.is_none(),
+        "KASTELLAN_LLM_GUARD_TIMEOUT_MS is pinned ({:?} ms), which skips the probe. \
+         This run would report PASS having derived nothing. Unset it to measure this host.",
+        cfg.guard_timeout_ms
+    );
+
+    // Varying prefix per run, exactly as the boot block builds it — a
+    // fixed one would be served from the prefix cache and the sample
+    // would describe the cache, not the host (M2 measured that error at
+    // 4x, in the direction that shortens the timeout).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the epoch")
+        .as_nanos();
+    let tier = match GuardTier::from_router_config(&cfg, &format!("kastellan-guard-probe-{nanos}"))
+        .await
+    {
+        Ok(None) => panic!(
+            "this test was asked for by name but the guard keys are unset; a skip \
+             here would report as PASSED and teach an operator nothing"
+        ),
+        // Every one of these stops the daemon, so say so in the words an
+        // operator would otherwise meet at boot.
+        Err(e) => panic!("the daemon would REFUSE TO BOOT on this host: {e}"),
+        Ok(Some(t)) => t,
+    };
+
+    let budget = tier.timeout();
+    let ms = budget.timeout.as_millis() as u64;
+    // Printed before the finding check below, so the numbers an operator
+    // needs are on screen whichever way this run ends. A failure dumps
+    // captured output; a pass does not, which is exactly why a finding
+    // must fail rather than print.
+    println!(
+        "[live] endpoint={} model={} n_ctx={} tau={} timeout_ms={ms} basis={}",
+        cfg.guard_url.as_deref().unwrap_or("<unset>"),
+        cfg.guard_model.as_deref().unwrap_or("<unset>"),
+        tier.n_ctx(),
+        tier.tau(),
+        budget.basis.kind(),
+    );
+    if let TimeoutBasis::Probed { tok_per_s, .. } = budget.basis {
+        println!("[live] measured throughput: {tok_per_s:.1} uncached prompt tok/s");
+    }
+
+    // The fact this instrument exists to surface. A finding is never a
+    // routine adjustment: it says this host's guard tier will fail open on
+    // documents large enough to matter, and `Saturated` says nothing about
+    // its throughput was measured at all. Panicking is what makes it
+    // unmissable -- see the doc comment on capture.
+    if let Some(finding) = budget.basis.coverage_finding() {
+        panic!(
+            "COVERAGE FINDING on this host (basis={}, timeout_ms={ms}): {finding}",
+            budget.basis.kind()
+        );
+    }
+    // Deliberately NOT "this host can adjudicate a worst-case document":
+    // the probe measured ~1 KiB and the budget above is a LINEAR
+    // extrapolation from it. That assumption was measured false on Apple
+    // Metal by 4.4x on 2026-08-23 (#612), where a 64 KiB document really
+    // takes 171 s against a derived 91 s.
+    println!(
+        "[live] no coverage finding -- but this budget is extrapolated from a \
+         ~1 KiB sample; see #612 before reading it as worst-case coverage"
+    );
+
+    // An `Unprobed` basis reaches here with the pin unset: the probe ran
+    // and came back with nothing usable. `coverage_finding()` is `None`
+    // for three of `UnprobedReason`'s four variants (only `Failed` earns a
+    // sentence; `Nonsensical` cannot come from `probe_sample`), so the
+    // check below is what catches the quiet ones.
+    assert!(
+        matches!(budget.basis, TimeoutBasis::Probed { .. }),
+        "the probe produced no usable sample on this host (basis={}), so the budget above \
+         is a fallback and not a measurement of it",
+        budget.basis.kind()
+    );
+
+    // The clamp postcondition. Honest framing: by the time control gets
+    // here the basis is `Probed` and un-clamped-to-ceiling, so no value
+    // outside the band can reach this line -- it cannot fail, and it is
+    // documentation of the band rather than coverage of it. The clamp
+    // itself is exhaustively unit-tested in `timeout/tests.rs`; what this
+    // line adds is that the number printed above is the number the tier
+    // will spend, in the units the band is stated in.
+    assert!(
+        (TIMEOUT_FLOOR_MS..=TIMEOUT_CEILING_MS).contains(&ms),
+        "derived budget {ms} ms is outside [{TIMEOUT_FLOOR_MS}, {TIMEOUT_CEILING_MS}]"
+    );
 }

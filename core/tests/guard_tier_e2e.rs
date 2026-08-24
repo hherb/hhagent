@@ -500,6 +500,106 @@ async fn a_cleared_document_passes_through_and_still_records_its_probability() {
     assert!(guard["body_byte_len"].as_u64().expect("byte len") > 0);
 }
 
+/// **Clear, and bigger than the audit cap** — D5 at the size that matters.
+///
+/// The sibling test above uses a short document, and that is exactly why the
+/// defect below survived a five-agent review and seventeen e2e cases: at
+/// `"an ordinary sentence"` the row fits, so the guarantee looks kept.
+///
+/// Found live on the DGX on 2026-08-23, the first day the tier ran in
+/// production. `db::audit::insert` puts every payload through
+/// `truncate_payload`, which replaced an over-4-KiB payload *in its
+/// entirety* with `{_truncated, sha256, len}` — and the tool payload is
+/// `{req, result, ms, guard}` with the whole tool output under `result`.
+/// Two `web.fetch` rows at 85,352 and 85,351 bytes were stored as bare
+/// stubs, so the scores were gone.
+///
+/// **The loss was biased, and biased the wrong way.** A *blocked* dispatch
+/// usually keeps its score, because its result is already a short withheld
+/// placeholder -- `req` is still in the payload, so a block on a multi-KiB
+/// `shell.exec` argv can lose one too, but not as a function of document
+/// size. A *cleared* one loses it as soon as the document is large.
+/// D5's leverage is precisely the cleared half, so production recorded
+/// every block plus only the small clears — a size-selected sample wearing
+/// the appearance of a score distribution.
+///
+/// No mock sink can see this: `truncate_payload` runs inside
+/// `db::audit::insert`, so a recording sink observes the payload the
+/// dispatcher *passed*, never the one the database *stored*. This test
+/// reads the row back out of Postgres.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleared_document_over_the_audit_cap_still_records_its_probability() {
+    let Some(rig) = bootstrap("clear-big") else { return };
+    let pool = probe_and_pool(&rig.cluster.conn_spec).await;
+    let mock = MockGuardServer::spawn(Verdict::Clear).await;
+    let tier = build_tier(&pinned_cfg(&mock.base_url)).await;
+
+    // Benign filler at ~2.2x the cap: the 44-byte unit repeated
+    // `PAYLOAD_MAX_BYTES / 20` times, a divisor chosen so the margin holds
+    // if the cap ever moves. It clears the cap on its own, before any echo
+    // -- `req` carries the full argv, so the payload is over budget
+    // whatever the worker chooses to emit. No `%` or backslash: this is
+    // printf's FORMAT argument, and a stray specifier would change the
+    // output.
+    let big = "the quick brown fox jumps over the lazy dog "
+        .repeat(kastellan_db::audit::PAYLOAD_MAX_BYTES / 20);
+    assert!(big.len() > kastellan_db::audit::PAYLOAD_MAX_BYTES);
+
+    let result = dispatch_printf(&pool, &rig, Some(&tier), &big).await;
+    assert!(
+        result.get("injection_blocked").is_none(),
+        "benign filler must clear both tiers"
+    );
+
+    let row = last_tool_row(&pool).await;
+    // NOT `{row:.300}` in the messages below: serde_json's `Display`
+    // streams through `Formatter::write_str` and never consults the
+    // precision, so a width there is silently ignored.
+    let head = |v: &serde_json::Value| v.to_string().chars().take(300).collect::<String>();
+
+    // Half one: the row really did exceed the cap. Without this the test
+    // could pass on a payload that was never truncated, proving nothing
+    // about the path it exists to cover.
+    assert!(
+        kastellan_db::audit::is_truncation_envelope(&row),
+        "the fixture must be big enough to truncate, or this test is vacuous: {}",
+        head(&row)
+    );
+    // Half two: the score survived it.
+    let guard = &row["guard"];
+    assert_eq!(guard["state"], "clear", "row: {}", head(&row));
+    let p = guard["p"].as_f64().expect("p survives truncation on a CLEARED document (D5)");
+    assert!((0.0..1.0).contains(&p), "p must be a probability, got {p}");
+    assert_eq!(
+        guard["tau"].as_f64().expect("tau survives too") as f32,
+        FITTED_TAU,
+        "a score without its threshold cannot be re-read later"
+    );
+    assert!(
+        row.get(kastellan_db::audit::DROPPED_PRESERVED_KEY).is_none(),
+        "a bounded guard record must FIT, not be dropped and named: {}",
+        head(&row)
+    );
+    // The document itself is still gone -- preserving a decision record
+    // must not become a way to store bodies past the cap.
+    assert!(
+        row.get("result").is_none(),
+        "the oversized result must NOT be preserved: {}",
+        head(&row)
+    );
+    // And the budget postcondition, checked on the STORED row rather than
+    // on the function's return value -- the one place in the tree that can.
+    // `jsonb` normalises on read-back, so this is a sanity bound and not a
+    // byte-exact reproduction of what was written.
+    let stored = serde_json::to_vec(&row).expect("a row read from jsonb re-serialises");
+    assert!(
+        stored.len() <= kastellan_db::audit::PAYLOAD_MAX_BYTES,
+        "the stored row is {} bytes, over the {} cap",
+        stored.len(),
+        kastellan_db::audit::PAYLOAD_MAX_BYTES
+    );
+}
+
 /// **Unmeasured**: the call succeeded but produced no usable verdict pair.
 ///
 /// The document passes — the tier is escalate-up only — but the row must NOT

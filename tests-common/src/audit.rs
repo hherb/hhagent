@@ -18,7 +18,7 @@ pub struct NoopAuditSink;
 
 #[async_trait]
 impl AuditSink for NoopAuditSink {
-    async fn insert(
+    async fn insert_stored(
         &self,
         _actor: &str,
         _action: &str,

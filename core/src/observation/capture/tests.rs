@@ -252,7 +252,8 @@ fn extract_plans_some_approve_is_distinct_from_none() {
 #[test]
 fn extract_plans_flags_truncated_source_row() {
     // A plan.formulate row whose payload is the `truncate_payload`
-    // envelope (`{_truncated, sha256, len}`) has lost its `plan` key.
+    // envelope (`{_truncated, sha256, len}`, plus any `PRESERVED_KEYS` —
+    // `plan` is not one) has lost its `plan` key.
     // Schema-v3 (issue #62) surfaces that as `source_truncated: true`
     // so the null plan_json is attributable to truncation, not a real
     // zero-step plan or a pre-Slice-A capture.
@@ -320,6 +321,36 @@ fn extract_plans_round_trips_real_truncate_payload_output() {
     let plans = extract_plans_from_audit_rows(&rows);
     assert!(plans[0].source_truncated, "real producer envelope must set source_truncated");
     assert!(plans[0].plan_json.is_null(), "the envelope carries no plan key");
+}
+
+#[test]
+fn extract_plans_reads_an_envelope_that_carries_a_preserved_key() {
+    // An envelope is no longer necessarily the bare three keys: since the
+    // `PRESERVED_KEYS` allowlist, one may carry a decision record too. The
+    // reader must key off the marker alone -- a reader tightened to an exact
+    // shape or key count would classify this as an untruncated payload and
+    // report the null `plan_json` as a real zero-step plan, which is the
+    // #62 misclassification `source_truncated` exists to prevent.
+    //
+    // A `plan.formulate` row does not carry `guard` in production. That is
+    // the point: this pins the READER against the producer's whole output
+    // range, not against the one shape today's writers happen to emit.
+    let oversized = serde_json::json!({
+        "task_id": 1,
+        "plan": {"steps": [{"tool": "shell-exec"}]},
+        "guard": {"state": "clear", "p": 0.0074, "tau": 0.79552656},
+        "padding": "x".repeat(kastellan_db::audit::PAYLOAD_MAX_BYTES),
+    });
+    let envelope = kastellan_db::audit::truncate_payload(oversized);
+    assert!(envelope.get("guard").is_some(), "fixture must exercise the preserved path");
+
+    let rows = vec![fake_audit_row(1, "agent", "plan.formulate", envelope)];
+    let plans = extract_plans_from_audit_rows(&rows);
+    assert!(
+        plans[0].source_truncated,
+        "an envelope carrying a preserved key is still a truncation envelope"
+    );
+    assert!(plans[0].plan_json.is_null(), "`plan` is not a preserved key");
 }
 
 /// `SCHEMA_VERSION` pin. Bumping requires a deliberate edit here

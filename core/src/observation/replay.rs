@@ -305,9 +305,10 @@ pub fn load_captures_from_dir(dir: &Path) -> std::io::Result<Vec<LoadedCapture>>
 /// - `capture.plans[i].plan_json` is JSON null → emit `ReplayedPlan`
 ///   with `skipped_reason: Some(...)`; never fabricate a synthetic
 ///   `Plan` from derived fields. The reason distinguishes a
-///   `source_truncated` row (payload destroyed at audit-write time,
-///   unrecoverable — #62) from a pre-Slice-A row (recoverable by
-///   recapture).
+///   `source_truncated` row (the `plan` key was elided at audit-write
+///   time and is not one of the `PRESERVED_KEYS` that ride through the
+///   envelope, so it is unrecoverable — #62) from a pre-Slice-A row
+///   (recoverable by recapture).
 /// - `plan_json` deserialises into a `Plan` → call `chain.review` and
 ///   build a `VerdictSnapshot`.
 ///
@@ -338,8 +339,9 @@ pub async fn replay_capture(
         if cp.plan_json.is_null() {
             skipped = skipped.saturating_add(1);
             // Schema-v3 (#62): a truncated source row is *not* recoverable by
-            // recapture — the audit writer replaced the whole payload with the
-            // `truncate_payload` fingerprint. Surface it distinctly so the
+            // recapture — the audit writer replaced the payload with the
+            // `truncate_payload` fingerprint, and `plan` is not among the
+            // `PRESERVED_KEYS` that ride through it. Surface it distinctly so the
             // operator doesn't chase the recapture advice for rows where it
             // can't help.
             let reason = if cp.source_truncated {
