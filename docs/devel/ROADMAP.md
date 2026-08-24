@@ -500,9 +500,28 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   whitespace assertion and is now pinned per-finding by a phrase crossing the joins.
   **#616 is what unblocks #612's favoured option** (measure at runtime from the guard row): that
   option needs the fail-open to be countable, which it now is. #612 itself is untouched.
-  Mac gate: 175 suites, 3748 / 0 / 25, TEST_EXIT=0. **That merge wrongly auto-closed #612 and
-  #615**, whose "Filed, not fixed: #N" phrasing GitHub read as `fixed: #N`; both reopened the same day and
-  both remain open design work.
+  Mac gate: 175 suites, 3748 / 0 / 25, TEST_EXIT=0.
+  **REVIEWED RETROSPECTIVELY (merged before it was reviewed), branch
+  `fix/619-review-connect-timeout-and-wiring` (2026-08-24):** five reviewers; the headline
+  claims all verified, one real defect and three unpinned wirings found. The defect —
+  `classify_transport` folded the both-reqwest-flags-set case (a **connect timeout**) into
+  `Timeout`, copying `transport_kind_tag`, which makes a *display suffix* and not a *count*,
+  and which put it in flat contradiction with `boot::is_timeout` ~300 lines away. A
+  black-holed SYN would then read as 100% timeouts and send an operator to #612's ~350 s pin,
+  which cannot help: connect is capped at `min(timeout, 5 s)` independently. Fixed with a
+  fourth arm, `GuardErrorKind::ConnectTimeout`, and `boot::is_timeout` redefined as
+  `matches!(classify(e), Timeout)` so the two cannot diverge again. The wirings — `classify`'s
+  `Transport` arm and `screen_fetched_data`'s call site were pinned only by `guard_tier_e2e`
+  (in no CI job, self-skipping) and by nothing at all respectively; both now have **hermetic**
+  tests in suites CI runs. Also: a `warn!` on the `Unmeasured` fail-open, which warned
+  nowhere; `coverage_finding`'s `_ => None` wildcard made exhaustive; and eight comment/doc
+  claims corrected against the code. Deferred to
+  [#620](https://github.com/hherb/kastellan/issues/620),
+  [#621](https://github.com/hherb/kastellan/issues/621) and
+  [#622](https://github.com/hherb/kastellan/issues/622). **That merge wrongly auto-closed #612 and
+  #615**, whose "Filed, not fixed: #N" phrasing GitHub read as `fixed: #N`; both reopened the same day. **#612 remains open design work; #615 was then
+  fixed by [#619](https://github.com/hherb/kastellan/pull/619) and is closed** — the claim that
+  both stayed open was written before that merge and did not survive it.
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one

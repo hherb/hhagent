@@ -131,10 +131,18 @@ async fn report_guard_tier(
          downstream may relax on it."
     );
 
-    // The finding TEXT comes from the basis, because the three bases that
-    // qualify are three different findings — a ceiling clamp, a probe that
-    // never returned, and a probe that FAILED (which predicts a tier that
-    // fails open on every dispatch, and used to be reported at `info!`).
+    // The finding TEXT comes from the basis, because the FIVE bases that
+    // qualify are five different findings — a ceiling clamp, a probe that
+    // never returned, a probe that FAILED (which predicts a tier that
+    // fails open on every dispatch, and used to be reported at `info!`),
+    // and an operator pin below the floor or above the ceiling (#615).
+    // The last two are findings about the CONFIGURATION rather than the
+    // host, and they come through this same channel deliberately: an
+    // operator reading a boot line wants one place that says "this
+    // deployment screens less than it looks like it does".
+    // (`basis.rs` said "three" here too until #619's review; keeping the
+    // count in two places is what let them drift, so if a sixth lands,
+    // grep for the number.)
     if let Some(finding) = budget.basis.coverage_finding() {
         tracing::warn!(
             timeout_ms,

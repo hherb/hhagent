@@ -113,8 +113,14 @@ impl PinBand {
     /// 'operator-below-floor'` counts the exposed hosts directly.
     ///
     /// **An in-band pin keeps the historic `"operator"` token
-    /// unchanged**, so this is additive for every healthy deployment and
-    /// no existing query breaks.
+    /// unchanged**, so this is additive for every healthy deployment.
+    ///
+    /// It is additive for *rows*, not for *questions*: before this,
+    /// every operator pin emitted `"operator"`, so a pre-existing
+    /// `WHERE payload->>'timeout_basis' = 'operator'` meaning "which
+    /// hosts pin their guard timeout?" still runs, still returns rows,
+    /// and now silently omits exactly the out-of-band ones — the hosts
+    /// worth counting. Use `LIKE 'operator%'` to count all pins.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InBand => "operator",
@@ -255,7 +261,24 @@ impl TimeoutBasis {
                  is the call that just failed -- expect it to fail OPEN on all of them. \
                  The cause was logged by `guard boot probe failed` above.",
             ),
-            _ => None,
+            // The quiet half, enumerated rather than caught by a
+            // wildcard. `error_kind.rs` argues this exact point for
+            // `GuardErrorKind::Other` -- "a wildcard would silently file
+            // it under `other`" -- and #619's review pointed out that the
+            // same PR left the wildcard standing here, in the one match
+            // whose default is "nothing to report". A new `PinBand` arm or
+            // a fourth `Clamped` state would have compiled straight into
+            // `coverage_finding: null`: a host that screens less than it
+            // looks like it does, reported as routine. Now it is a build
+            // error and whoever adds the state has to decide.
+            Self::Operator { band: PinBand::InBand } => None,
+            Self::Probed { clamped: Clamped::No | Clamped::ToFloor, .. } => None,
+            Self::Unprobed {
+                reason:
+                    UnprobedReason::Nonsensical
+                    | UnprobedReason::TooFewUncachedTokens
+                    | UnprobedReason::NoTokenCount,
+            } => None,
         }
     }
 }

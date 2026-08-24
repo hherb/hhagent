@@ -93,7 +93,7 @@ pub const PAYLOAD_MAX_BYTES: usize = 4096;
 ///    is exactly the half D5 needs.
 ///
 /// `guard` is the wiring slice's per-dispatch guard-tier report
-/// (`{state, p, tau, ms, body_byte_len, truncated}`). Before it was listed
+/// (`{state, p, tau, ms, body_byte_len, truncated, error_kind}`). Before it was listed
 /// here, a tool result over the cap took the score with it — measured live
 /// on 2026-08-23 at 85,352 bytes — which silently inverted spec D5: blocked
 /// dispatches kept their score (their result is a short placeholder) while
@@ -345,7 +345,8 @@ pub struct AuditRow {
 /// [`DROPPED_PRESERVED_KEY`]. Nothing in this workspace can produce an
 /// oversized preserved key — the one producer is
 /// `core::tool_host::post_process`, via `GuardReport::audit_value`, which
-/// emits six scalars — but the signature permits one, and
+/// emits a fixed handful of small scalars — but the signature permits one,
+/// and
 /// [`preserve_onto`] is tested against multi-key lists that exercise it.
 ///
 /// The budget postcondition is therefore structural rather than checked

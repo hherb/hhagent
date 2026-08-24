@@ -11,11 +11,88 @@
 > [`archive/handover_20260823_wiring-slice_pre-prune.md`](archive/handover_20260823_wiring-slice_pre-prune.md))
 > the measurement-3, weights-pin and ask-containment ones.
 
-**Last updated:** 2026-08-24 · **`main` HEAD:** `45d5f6c2` ([#614](https://github.com/hherb/kastellan/pull/614), merged 2026-08-24) · **ONE OPEN BRANCH: `fix/615-616-618-guard-diagnostics`** — the guard tier's three diagnostics follow-ups from #614's round-two review; Mac gate **175 suites, 3748 / 0 / 25, `TEST_EXIT=0`**, 26 `[SKIP]` (all Apple-`container` + gliner-relex, unchanged); cold clippy `-D warnings` exit 0 over **213** `Checking` lines. The count reconciles exactly: predicted `main` 3732 **+16** `#[test]`s counted from the diff. **NOT DGX-gated** — the changes are platform-neutral, but say so rather than imply otherwise · **GATE GREEN ON THE DGX AT `8cb8cfb7`, the branch tip squash-merged as `45d5f6c2`: 175 suites, 3854 / 0 / 55, `TEST_EXIT=0`, `--no-fail-fast --nocapture`; cold clippy `-D warnings` exit 0 over 245 `Checking` lines.** 8 `[SKIP]`, all gliner-relex — **not** the bwrap-userns skip, so containment really ran. **The count reconciles exactly and by measurement, not subtraction:** 3840 at `09c6231f` **+ 4** (`a1c10da3` added four `db::audit` tests and was never DGX-gated — that was the open gap) **+ 10** (the second review round, all in `db::audit`; `audit::tests` goes 15 → 25). Mac at `a1c10da3`: 175 suites, 3721 / 1 / 25 — the one failure is `ask_subprocess_completes_planned_task_end_to_end`, which waits ≤ 10 s for the daemon's `scheduler spawned` line and blew that under full-sweep load; it passes in **4 s** in isolation. **The Mac has not been re-gated since `8cb8cfb7`**, whose changes are platform-neutral. · **THE GUARD TIER RAN LIVE FOR THE FIRST TIME** (DGX, 2026-08-23). It booted with a **probed** 21 752 ms budget at 6 073 tok/s, scored a cleared document at `p = 0.0074`, and **blocked a real attack document at `p = 0.9199` where the deterministic catalogue scored `0.0`** — the tier's whole thesis, demonstrated rather than argued. **The bring-up found in an hour what seventeen e2e cases and a five-agent review did not:** the 4 KiB audit cap was replacing whole payloads, so any tool result past ~4 KiB took D5's guard score with it — biased the wrong way, since blocks kept their score and *clears* lost theirs. Fixed here (`db::audit::PRESERVED_KEYS`), mutation-proven. **Two review rounds then hardened the fix rather than the key:** the first found it kept half the defect (a preserved key too large to afford was dropped *silently*); the second found the *class* still open — every `AuditSink` double recorded the payload its caller PASSED and never the one Postgres STORED, which is why the original loss survived seventeen e2e cases, so `AuditSink::insert` is now a provided method applying `truncate_payload` before delegating to `insert_stored`. Four issues filed from that round: [#615](https://github.com/hherb/kastellan/issues/615), [#616](https://github.com/hherb/kastellan/issues/616), [#617](https://github.com/hherb/kastellan/issues/617), [#618](https://github.com/hherb/kastellan/issues/618). Also filed, **not** fixed: [#612](https://github.com/hherb/kastellan/issues/612) — D9's boot probe extrapolates linearly from ~1 KiB, which is flat on CUDA but **4.4× optimistic on Metal**, where a worst-case document takes 171 s against a derived 91 s and so **fails OPEN** without ever firing the ceiling-clamp warning. **The tier remains ADVISORY defence-in-depth at 65% recall, not a gate**, and nothing downstream may relax on it. · ⚠️ **#614's merge silently auto-CLOSED #612 and #615** — its body heading and commit message both read "Filed, **not fixed**: #N", and GitHub matches the `fixed: #N` substring while ignoring the negation. Both were reopened on 2026-08-24 with the evidence that they are unfixed at `45d5f6c2`. The same trap took #539 on 2026-08-11 via #540, so it is now a standing hazard below: **never write any inflection of fix/close/resolve immediately before `#N` for work you are not doing** — write "deferred to #N".
+**Last updated:** 2026-08-24 · **`main` HEAD:** `e258ad3c` ([#619](https://github.com/hherb/kastellan/pull/619), merged 2026-08-24; #614 before it as `45d5f6c2`) · **ONE OPEN BRANCH: `fix/619-review-connect-timeout-and-wiring`** — the retrospective review of #619, which was merged before it was reviewed; see the section directly below. Mac gate **175 suites, 3748 / 4 / 25, `TEST_EXIT=101` — the 4 are load flakes that re-run clean in isolation, so 3752 / 0 / 25 honestly**; cold clippy `-D warnings` exit 0 over **218** `Checking` lines; mutation-proven **3 for 3**. **NOT DGX-gated** — the changes are platform-neutral and nothing is `cfg`-gated, but say so rather than imply otherwise · **PREVIOUS BRANCH (merged): `fix/615-616-618-guard-diagnostics`** — the guard tier's three diagnostics follow-ups from #614's round-two review; Mac gate **175 suites, 3748 / 0 / 25, `TEST_EXIT=0`**, 26 `[SKIP]` (all Apple-`container` + gliner-relex, unchanged); cold clippy `-D warnings` exit 0 over **213** `Checking` lines. The count reconciles exactly: predicted `main` 3732 **+16** `#[test]`s counted from the diff. **NOT DGX-gated** — the changes are platform-neutral, but say so rather than imply otherwise · **GATE GREEN ON THE DGX AT `8cb8cfb7`, the branch tip squash-merged as `45d5f6c2`: 175 suites, 3854 / 0 / 55, `TEST_EXIT=0`, `--no-fail-fast --nocapture`; cold clippy `-D warnings` exit 0 over 245 `Checking` lines.** 8 `[SKIP]`, all gliner-relex — **not** the bwrap-userns skip, so containment really ran. **The count reconciles exactly and by measurement, not subtraction:** 3840 at `09c6231f` **+ 4** (`a1c10da3` added four `db::audit` tests and was never DGX-gated — that was the open gap) **+ 10** (the second review round, all in `db::audit`; `audit::tests` goes 15 → 25). Mac at `a1c10da3`: 175 suites, 3721 / 1 / 25 — the one failure is `ask_subprocess_completes_planned_task_end_to_end`, which waits ≤ 10 s for the daemon's `scheduler spawned` line and blew that under full-sweep load; it passes in **4 s** in isolation. **The Mac has not been re-gated since `8cb8cfb7`**, whose changes are platform-neutral. · **THE GUARD TIER RAN LIVE FOR THE FIRST TIME** (DGX, 2026-08-23). It booted with a **probed** 21 752 ms budget at 6 073 tok/s, scored a cleared document at `p = 0.0074`, and **blocked a real attack document at `p = 0.9199` where the deterministic catalogue scored `0.0`** — the tier's whole thesis, demonstrated rather than argued. **The bring-up found in an hour what seventeen e2e cases and a five-agent review did not:** the 4 KiB audit cap was replacing whole payloads, so any tool result past ~4 KiB took D5's guard score with it — biased the wrong way, since blocks kept their score and *clears* lost theirs. Fixed here (`db::audit::PRESERVED_KEYS`), mutation-proven. **Two review rounds then hardened the fix rather than the key:** the first found it kept half the defect (a preserved key too large to afford was dropped *silently*); the second found the *class* still open — every `AuditSink` double recorded the payload its caller PASSED and never the one Postgres STORED, which is why the original loss survived seventeen e2e cases, so `AuditSink::insert` is now a provided method applying `truncate_payload` before delegating to `insert_stored`. Four issues filed from that round: [#615](https://github.com/hherb/kastellan/issues/615), [#616](https://github.com/hherb/kastellan/issues/616), [#617](https://github.com/hherb/kastellan/issues/617), [#618](https://github.com/hherb/kastellan/issues/618). Also filed, **not** fixed: [#612](https://github.com/hherb/kastellan/issues/612) — D9's boot probe extrapolates linearly from ~1 KiB, which is flat on CUDA but **4.4× optimistic on Metal**, where a worst-case document takes 171 s against a derived 91 s and so **fails OPEN** without ever firing the ceiling-clamp warning. **The tier remains ADVISORY defence-in-depth at 65% recall, not a gate**, and nothing downstream may relax on it. · ⚠️ **#614's merge silently auto-CLOSED #612 and #615** — its body heading and commit message both read "Filed, **not fixed**: #N", and GitHub matches the `fixed: #N` substring while ignoring the negation. Both were reopened on 2026-08-24 with the evidence that they are unfixed at `45d5f6c2`. The same trap took #539 on 2026-08-11 via #540, so it is now a standing hazard below: **never write any inflection of fix/close/resolve immediately before `#N` for work you are not doing** — write "deferred to #N".
 
 ---
 
 ## Current state
+
+### #619 reviewed after the fact — the connect-timeout fold, and three unpinned wirings (branch `fix/619-review-connect-timeout-and-wiring`)
+
+#619 was merged before it was reviewed, so the review ran retrospectively against
+`45d5f6c2..1920ed58`. Five reviewers; the code held up well and its headline claims all
+verified against the tree. What they found was one real defect, three gaps where a
+well-tested pure function reached the durable row through wiring nothing pinned, and a
+batch of prose that had drifted from the code beside it.
+
+- **The defect: a connect *timeout* was counted as `timeout`.** `classify_transport` folded
+  the both-flags-set case into `GuardErrorKind::Timeout`, matching
+  `llm_router::error::transport_kind_tag` — the wrong precedent, because that function makes
+  a **display suffix** (picking the more actionable of two labels is free) and this makes a
+  **count** an operator acts on. Worse, it put `classify_transport` in direct contradiction
+  with `boot::is_timeout` ~300 lines away, which excludes the connect timeout deliberately
+  and spends 14 lines explaining why. Two answers to one question about one `reqwest` pair,
+  in one crate, with nothing able to notice.
+  **What it cost:** a black-holed SYN (firewall DROP, dead route) sets both flags, so every
+  dispatch reads `error_kind = "timeout"`; the operator runs the query the field exists for,
+  follows #612 and pins ~350 s — which cannot help, because `Router::with_policy` caps
+  connect at `min(timeout, 5 s)` *independently* of the request budget. Meanwhile
+  `guard_tier.boot` says `probe-failed` for the identical error. Two contradictory diagnoses
+  of one cause in one audit log.
+  **Fix:** a fourth arm, `GuardErrorKind::ConnectTimeout` (token `connect_timeout`), so all
+  four flag pairs map to four distinct tokens — the precedence question is *removed* rather
+  than arbitrated. `boot::is_timeout` is now `matches!(classify(e), GuardErrorKind::Timeout)`:
+  one classification, two readings, and reordering the classifier can no longer silently
+  change what the probe measures.
+- **Three wirings that no gate pinned.** #619's own mutation table conceded that mutating
+  `classify`'s `Transport` arm was killed by "**only** the two new real-socket e2e cases" —
+  and `guard_tier_e2e` is in no CI job (`linux-check.yml` runs `--lib guard`, not this
+  integration test) and self-skips to a silent PASS without Postgres. So the single
+  distinction #612 turns on was pinned by nothing any gate runs. Separately, deleting
+  `screen_fetched_data(v)` from `tool_dispatch.rs` left the whole workspace green: the only
+  test reaching that arm stashes a benign body.
+  Both are closed here **hermetically**, in suites CI already runs: two `#[tokio::test]`s
+  drive the real `GuardClient` → `Router` → `probability` chain at a loopback port — one
+  **bound and never accepted** (the kernel completes the handshake from the listen backlog,
+  so the connect succeeds and only the response never comes; a request timeout *by
+  construction*, not by timing) and one bound-then-dropped for the refused connect — plus an
+  injection fixture in `handoff_dispatch_e2e.rs` with a non-vacuity guard.
+  `ConnectTimeout` has **no** hermetic fixture and the test doc says so: a black-holed SYN
+  needs a firewall rule, not a socket. It is pinned by the two-boolean table, which is the
+  whole reason the classifier takes two booleans.
+- **`Unmeasured` was the silent fail-open.** `probability()` ends in `Ok(...and_then(...))`,
+  so a 2xx that carries no YES/NO logit pair collapses to `Ok(None)` → the `Unmeasured` door
+  → the document goes through unjudged. The `Err` arm has warned since #616; this arm warned
+  nowhere, so the most likely *whole-deployment* failure (logprobs off, wrong quant served, a
+  chat template that shifts the verdict token) produced a clean boot and a per-dispatch
+  silence. Now it warns. `error_kind` stays `null` there — correctly, no call *failed* — and
+  the honest whole-fail-open query is **`state NOT IN ('clear','block')`**, not
+  `error_kind IS NULL`.
+- **`coverage_finding`'s `_ => None` is gone.** `error_kind.rs` argues at length that a
+  wildcard is wrong because a new variant lands silently — and the same PR left the wildcard
+  standing in the one match whose default is "nothing to report". A new `PinBand` or fourth
+  `Clamped` would have compiled straight into `coverage_finding: null`. Now a build error.
+- **Prose that had drifted.** `main.rs` still said "the **three** bases that qualify" at the
+  live emission site the two new bands reach (`basis.rs` was updated to five; keeping the
+  count in two places is what let them drift). The `error_kind IS NULL` doc claimed the two
+  quiet doors "involved no call at all" — only `NoScannableText` did. The mutation-survivor
+  comment said the asserted phrase crosses "THREE" continuation joins; it crosses **two of
+  four**, and the literal's first and last stay unpinned. "Pinned per-finding" covered 2 of
+  the 5 findings. `audit.rs`'s wire-contract doc omitted `error_kind`. `fetch_screen`
+  promised a `note` key it does not emit. `basis.rs` claimed "no existing query breaks" —
+  true for rows, false for questions, since `= 'operator'` now silently omits exactly the
+  out-of-band hosts (use `LIKE 'operator%'`).
+
+**Filed rather than fixed** (each changes a type or a contract beyond this branch):
+[#620](https://github.com/hherb/kastellan/issues/620) — `GuardReport.error_kind`'s
+biconditional is documented but not structural; the test named for it builds reports by hand,
+so it pins `audit_value`'s rendering and not the constructor's pairing. Proposed:
+`Unadjudicated::RouterError { kind }`, which is the shape `PinBand` already uses one file
+over. [#621](https://github.com/hherb/kastellan/issues/621) — a withheld `fetch_handoff`
+slice is audited `outcome: "ok"` with no injection fields and no `injection.blocked` row;
+the label is computed from `FetchResult` *before* screening runs.
+[#622](https://github.com/hherb/kastellan/issues/622) — `guard_tier_e2e` is in no gate and
+self-skips to a silent PASS when it is run.
 
 ### The guard tier's diagnostics — #615, #616, #618 (branch `fix/615-616-618-guard-diagnostics`)
 
@@ -122,8 +199,19 @@ and in [`ROADMAP.md`](../ROADMAP.md), which carries the whole write-up. Kept her
   transform before delegating to `insert_stored`, so a double cannot skip it
   [[audit-sink-doubles-hide-storage-transforms]]. The allowlist and its producer both read
   `db::audit::GUARD_KEY`, so a rename is a compile error.
-- **Deployment**: the DGX ran `8736f559` when this was found, so it kept losing the score until
-  `45d5f6c2` was deployed. Redeploy with `scripts/upgrade_from_git.sh`.
+- **Deployment — NOT DONE, verified live 2026-08-24.** The prune turned a pending action into a
+  past-tense claim; it was wrong. The DGX daemon still runs the `8736f559`-era build
+  (`ExecMainStartTimestamp` 2026-08-23 17:50 AEST, same mtime as
+  `~/.local/lib/kastellan/kastellan`, and `/proc/<MainPID>/exe` resolves to it). Its `strings`
+  carry `guard_tier.boot` but **neither `_dropped_preserved` (#614) nor `error_kind` (#619)** — so
+  the live host **is still losing the guard score on every tool result past 4 KiB**, which is the
+  defect #614 fixed. The checkout sits at `8cb8cfb7`, but that commit is dated ~18 h *after* the
+  binary was built: the tree was updated and the daemon never rebuilt, which is exactly how a
+  checkout hash reads as a deployed version and is not one.
+  **Redeploy with `scripts/upgrade_from_git.sh`** (hardcoded to `main`), then re-verify by
+  `strings`-ing the installed binary rather than by reading `git log` — and re-add the tuned
+  `kastellan.env` keys, which `install` regenerates [[dgx-deploy-env-clobber-and-missing-workers]],
+  [[handover-claims-verify-before-carrying]].
 - **The Mac daemon still does not run the tier.** It boots fine there (91.4 s derived, `n_ctx`
   66 048) but #612 means it fails open on large documents — a decision to take knowingly, not a
   step to tick off. Deploy with a pinned timeout and say so, or settle #612 first.
@@ -138,6 +226,7 @@ and in [`ROADMAP.md`](../ROADMAP.md), which carries the whole write-up. Kept her
 >
 > | host | 1 KiB | 8 KiB | 64 KiB | 64 KiB wall | boot-probe tok/s | derived budget |
 > | --- | --- | --- | --- | --- | --- | --- |
+| **Mac** (aarch64 darwin, Seatbelt + Postgres.app 18 via `KASTELLAN_PG_BIN_DIR`) | tip of **`fix/619-review-connect-timeout-and-wiring`** | **3748 / 4 / 25**, 175 suites, `TEST_EXIT=101`, `--no-fail-fast --nocapture` — and **the 4 are load flakes, re-run clean in isolation**, so the honest reading is **3752 / 0 / 25**. Said as measured rather than as rounded: `cli_ask_e2e`'s two (`ask_subprocess_completes_planned_task_end_to_end`, `ask_subprocess_fails_after_plan_iteration_cap`) are the documented signature — a 10 s wait for the daemon's `scheduler spawned` line against a log file that was still **empty**; the suite re-ran **2 / 0 in 6.66 s**. `cli_memory_l3py_run_daemon_e2e`'s two are `PROTOCOL_ERROR: worker exited before responding` with five sibling tests simultaneously logging "running for over 60 seconds", and that daemon's own log says `guard tier NOT configured` — this branch's changes are not on that path at all; the suite re-ran **6 / 0 in 14.56 s**. **Reconciles exactly:** #619's 3748 **+4** `#[test]`s from the diff (3 `error_kind`, 1 `handoff_dispatch_e2e`) = **3752** run, measured. Ignored unchanged at 25 | exit 0 over **218** `Checking` lines from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-619fix`), zero warnings — an honest full-workspace lint in the historical Mac range. **The in-place run first reported exit 0 over 3 `Checking` lines**, a warm-dir incremental count over the changed crates and not a sweep; recorded because it is the false green this repo keeps meeting [[mac-cargo-buildlock-prefer-dgx]] | **26**, all Apple-`container` (service not started) + gliner-relex — unchanged from #619 |
 > | DGX (CUDA) | 3 177 | 6 327 | 2 907 tok/s | 15.4 s | 6 073 | 21.8 s — **covered** |
 > | Mac (Metal) | 1 137 | 1 209 | **260 tok/s** | **171.5 s** | ~1 445 | **91.4 s — times out** |
 >

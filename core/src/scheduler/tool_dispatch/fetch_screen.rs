@@ -18,9 +18,9 @@ use serde_json::Value;
 
 /// Screen the `data` field of a `fetch_handoff` result `Value`. On a `Block`
 /// verdict the `data` is replaced with a small placeholder that names why the
-/// content was withheld (a human-readable `note` string so the planner gets an
-/// intelligible signal, plus the structured `injection_blocked`/`score`/
-/// `reason_codes` for audit-shape parity with the `tool_host` placeholder); all
+/// content was withheld (the human-readable sentence is the *value of `data`*
+/// itself — there is no `note` key here, unlike `tool_host`'s placeholder —
+/// plus the structured `injection_blocked`/`score`/`reason_codes`); all
 /// other fields (`handoff_ref`, `offset`, `eof`, …) are preserved so the planner
 /// can still reason about position/continuation. An `Allow` verdict (or a value
 /// with no string `data`) returns `v` unchanged.
@@ -44,11 +44,11 @@ pub fn screen_fetched_data(v: Value) -> Value {
 /// live inside `if let Some(obj) = v.as_object_mut()` with **no `else`**
 /// (issue [#618]): a `v` that was not a JSON object returned the
 /// unredacted blocked data, with no log and no error. That branch was
-/// unreachable — `v.get("data")` three lines up already establishes that
-/// `v` is an object — but it is a silent fail-open *shape* on a screening
-/// path, and the guard that makes it unreachable sits in a different
-/// `if`, so a refactor that moves or loosens it restores reachability
-/// with nothing failing.
+/// unreachable — [`screen_fetched_data`]'s `v.get("data")` guard already
+/// establishes that `v` is an object before this is reached — but it is a
+/// silent fail-open *shape* on a screening path, and after the extraction
+/// that guard sits in a **different function** entirely, so a refactor
+/// that moves or loosens it restores reachability with nothing failing.
 ///
 /// Two things follow from that, and both are the point of this function
 /// existing:
@@ -143,7 +143,9 @@ mod tests {
     /// guard establishes objecthood before the verdict is taken — which is
     /// exactly why the branch is tested through `withhold` directly. An
     /// untested arm that exists to prevent a leak proves nothing about the
-    /// leak; this one asserts the blocked text is gone in *both* shapes.
+    /// leak; this one asserts the blocked text is gone for every
+    /// **non-object** shape. The object shape is pinned next door by
+    /// `an_object_keeps_its_other_fields`.
     ///
     /// [#618]: https://github.com/hherb/kastellan/issues/618
     #[test]

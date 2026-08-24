@@ -14,7 +14,10 @@ use kastellan_llm_router::{RouterConfig, RouterError};
 use super::super::context_pin::{self, GuardContextError};
 use super::super::timeout::{self, GuardTimeout, ProbeOutcome};
 use super::super::GuardClient;
-use super::{outcome_and_score, resolve, validate_tau, GuardOutcome, GuardReading, TauError};
+use super::{
+    error_kind, outcome_and_score, resolve, validate_tau, GuardErrorKind, GuardOutcome,
+    GuardReading, TauError,
+};
 
 /// Why the guard tier could not be built.
 ///
@@ -128,7 +131,7 @@ pub struct GuardReport {
     ///
     /// [#612]: https://github.com/hherb/kastellan/issues/612
     /// [#616]: https://github.com/hherb/kastellan/issues/616
-    pub error_kind: Option<super::GuardErrorKind>,
+    pub error_kind: Option<GuardErrorKind>,
     /// Did `SCAN_BYTE_CAP` cut the document short?
     ///
     /// **Recorded on the ALLOW half, which is the half that needed it.**
@@ -316,6 +319,29 @@ impl GuardTier {
             // the call — see there for why that difference is load
             // bearing, and for the invariant it pins.
             Ok(raw) => {
+                // **An `Ok(None)` is a fail-open too, and it used to be
+                // the silent one.** The call reached the backend and came
+                // back 2xx, but carried no usable YES/NO verdict pair, so
+                // `decide` takes the `Unmeasured` door and the document
+                // goes through unjudged. The `Err` arm below has warned
+                // since #616; this arm warned nowhere, which meant the
+                // most likely *whole-deployment* failure — logprobs off,
+                // the wrong quant served, a chat template that shifts the
+                // verdict token — produced a clean boot and a per-dispatch
+                // silence. `error_kind` stays `None` because no call
+                // FAILED; the door is named by `guard.state = "unmeasured"`,
+                // which is what counts these.
+                if raw.is_none() {
+                    tracing::warn!(
+                        target: "kastellan::guard_model",
+                        ms,
+                        body_byte_len = body.len(),
+                        "guard adjudication returned no usable verdict pair; failing OPEN \
+                         to catalogue-only screening. The backend answered but produced no \
+                         YES/NO logit pair -- check that logprobs are enabled and that the \
+                         served model is the calibrated one"
+                    );
+                }
                 let (outcome, p) = outcome_and_score(raw, self.tau);
                 (outcome, p, None)
             }
@@ -327,7 +353,7 @@ impl GuardTier {
                 // no bytes a backend chose, and without it every failure
                 // mode reads as one `router_error` string and the
                 // fail-open #612 is about cannot be counted.
-                let kind = super::error_kind::classify(&e);
+                let kind = error_kind::classify(&e);
                 tracing::warn!(
                     target: "kastellan::guard_model",
                     error = %e,
@@ -434,8 +460,18 @@ async fn run_probe(client: &GuardClient, cache_buster: &str) -> ProbeOutcome {
 /// backend is slow*, which is a measurement. A connect timeout says
 /// *the backend was not reachable*, which says nothing about its
 /// throughput and must take the floor with every other failure.
+///
+/// **Defined through [`error_kind::classify`] rather than re-deriving
+/// the predicate.** #619's review found this function and
+/// `classify_transport` answering the *same* question about the *same*
+/// reqwest pair two different ways, ~300 lines apart, with nothing able
+/// to notice — the audit row said `timeout` where this said "not a
+/// timeout". Now there is one classification and two readings of it:
+/// [`GuardErrorKind::ConnectTimeout`] is a distinct arm, and this asks
+/// only for the request-budget one. Reordering the classifier can no
+/// longer silently change what the probe measures.
 fn is_timeout(e: &RouterError) -> bool {
-    matches!(e, RouterError::Transport(inner) if inner.is_timeout() && !inner.is_connect())
+    matches!(error_kind::classify(e), GuardErrorKind::Timeout)
 }
 
 /// Refuse to run without a tier when the operator demanded one.

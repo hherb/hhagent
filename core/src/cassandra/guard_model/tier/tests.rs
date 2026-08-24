@@ -315,9 +315,12 @@ fn no_scannable_text_allows_but_is_never_reported_as_clear() {
 /// Build a report by hand, so the audit shape can be asserted without a
 /// backend.
 ///
-/// `adjudicate_document` is the only production constructor and it needs
-/// a live client; `audit_value` is a pure method on the struct, so the
-/// shape it emits is testable directly. That split is the reason the
+/// The two production constructors — `adjudicate_document` and
+/// `no_scannable_text` — need a live `GuardTier`; `audit_value` is a pure
+/// method on the struct, so the shape it emits is testable directly.
+/// **This helper therefore pins the RENDERING, not the pairing**: it lets
+/// the author choose `error_kind` freely, so it cannot catch a constructor
+/// that pairs the wrong door with the wrong kind (see issue #620). That split is the reason the
 /// field was added to the struct rather than assembled at the emission
 /// site.
 fn report(outcome: GuardOutcome, p: Option<f32>, error_kind: Option<GuardErrorKind>) -> GuardReport {
@@ -363,9 +366,15 @@ fn the_guard_audit_object_has_a_fixed_key_set() {
 ///
 /// The biconditional the field exists to support: a query for
 /// `error_kind = 'timeout'` counts #612's fail-opens exactly, and a query
-/// for `error_kind IS NULL` counts the dispatches where the call did not
-/// fail — including the two unadjudicated doors that involved no call at
-/// all, which must not be swept in with the failures.
+/// for `error_kind IS NULL` counts the dispatches where no call *failed*.
+///
+/// That is not the same as "the tier worked", and the difference is worth
+/// stating because #619's review found this doc claiming the two
+/// unadjudicated doors below "involved no call at all". Only
+/// `NoScannableText` did. `Unmeasured` **made a call that succeeded** and
+/// carried no usable verdict pair — a fail-open with a null `error_kind`,
+/// countable as `guard.state = 'unmeasured'` and not as an error. The
+/// honest whole-fail-open query is `state NOT IN ('clear','block')`.
 #[test]
 fn error_kind_is_present_exactly_when_the_call_failed() {
     let failed = report(
@@ -405,6 +414,7 @@ fn every_error_kind_reaches_the_audit_row_verbatim() {
     for kind in [
         GuardErrorKind::Timeout,
         GuardErrorKind::Connect,
+        GuardErrorKind::ConnectTimeout,
         GuardErrorKind::Transport,
         GuardErrorKind::HttpStatus,
         GuardErrorKind::Decode,
