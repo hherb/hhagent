@@ -423,11 +423,14 @@ fn a_pin_below_the_floor_is_honoured_and_reported() {
     );
     assert_eq!(t.basis.kind(), "operator-below-floor");
     let finding = t.basis.coverage_finding().expect("below the floor is a finding");
-    // The phrase spans THREE `\`-continuation boundaries in the literal.
-    // A continuation that loses its trailing space welds two words
-    // together, and `every_coverage_finding_reads_as_prose` cannot see
-    // that -- a double space it can, a missing one it cannot. Pinning a
-    // sentence that crosses the joins is what covers the other half.
+    // The phrase crosses TWO of the literal's four `\`-continuation
+    // joins (it spans three source lines). A continuation that loses its
+    // trailing space welds two words together, and
+    // `every_coverage_finding_reads_as_prose` cannot see that -- a double
+    // space it can, a missing one it cannot. Pinning a sentence that
+    // crosses joins is what covers the other half, for the joins it
+    // crosses: the literal's first and last remain unpinned, which is the
+    // honest scope rather than the flattering one.
     assert!(
         finding.contains(
             "an adjudication that runs out of budget does not error -- it fails OPEN \
@@ -498,9 +501,16 @@ fn the_two_pin_findings_are_distinct() {
 ///
 /// **What this does NOT catch: welding.** A continuation that *loses*
 /// its trailing space joins two words, and no general assertion can
-/// distinguish `adjudicationthat` from a long identifier. That half is
-/// covered per-finding, by asserting a phrase that crosses the
-/// continuation joins -- see `a_pin_below_the_floor_is_honoured_and_reported`.
+/// distinguish `adjudicationthat` from a long identifier.
+///
+/// That half is covered per-finding by asserting a phrase that crosses
+/// the continuation joins -- but only for the **two** findings #615 added
+/// (`a_pin_below_the_floor_is_honoured_and_reported` and
+/// `a_pin_above_the_ceiling_is_honoured_and_reported`), and only for the
+/// joins those phrases happen to cross. The three older findings in the
+/// array below -- the ceiling clamp, `Saturated` and `Unprobed::Failed`
+/// -- have no weld coverage at all. #619's review caught this doc, and
+/// the ROADMAP entry fed from it, claiming "pinned per-finding" flatly.
 /// Saying so here rather than letting the name imply full coverage.
 #[test]
 fn every_coverage_finding_reads_as_prose() {
