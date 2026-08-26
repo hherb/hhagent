@@ -55,6 +55,7 @@ use super::GuardAdjudication;
 use crate::cassandra::injection_guard::{decision_for_score, InjectionDecision};
 
 pub mod boot;
+pub mod probe;
 pub mod error_kind;
 
 pub use boot::{GuardReport, GuardTier, GuardTierError, SharedGuardTier};
