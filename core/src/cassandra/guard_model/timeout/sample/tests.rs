@@ -279,6 +279,13 @@ fn a_single_measuring_sample_reports_no_spread_rather_than_a_fake_one() {
 /// `Saturated` takes the CEILING and fires a coverage finding, so this
 /// rung decides whether one 20 s stall on an otherwise fast host
 /// announces that the host cannot screen. It must not.
+///
+/// **What this does NOT cover**, stated rather than implied by the
+/// name: it cannot tell `informativeness`'s ranking apart from
+/// `summarise`'s rate tie-break, because only a measuring sample has a
+/// rate and the tie-break alone would produce this same result. The
+/// ranking is pinned separately by
+/// [`the_informativeness_ranking_is_strictly_ordered`].
 #[test]
 fn one_saturated_sample_does_not_outrank_a_real_measurement() {
     let s = summarise(&[
@@ -419,4 +426,39 @@ const _: () = assert!(
 fn the_sample_count_is_pinned_to_its_documented_value() {
     assert_eq!(PROBE_SAMPLES, 3);
     assert_eq!(PROBE_TOTAL_BUDGET_MS, 20_000);
+}
+
+/// The ranking table itself, asked directly rather than through
+/// [`summarise`].
+///
+/// **Written because a mutation survived.** Collapsing `Saturated`'s
+/// rank to `Measured`'s changed nothing observable in `summarise`:
+/// only a measuring sample has a rate, so the tie-break already puts
+/// every non-measuring outcome at negative infinity and `Measured` wins
+/// that rung whatever its rank says. The rung is real, it is simply
+/// held twice — and a test named
+/// `one_saturated_sample_does_not_outrank_a_real_measurement` implies
+/// coverage the tie-break was actually providing.
+///
+/// So this asks [`informativeness`] itself. It is the only assertion
+/// here that can see the ranking as distinct from the tie-break, and it
+/// is what makes the other three rungs — which `summarise` genuinely
+/// does decide — a table rather than four coincidences.
+#[test]
+fn the_informativeness_ranking_is_strictly_ordered() {
+    let ranked = [
+        ProbeOutcome::Measured { uncached_tokens: 810, elapsed_ms: 159 },
+        ProbeOutcome::Saturated { budget_ms: PROBE_BUDGET_MS },
+        ProbeOutcome::Failed { why: "refused".to_string() },
+        ProbeOutcome::TooFewUncachedTokens { uncached_tokens: 1, elapsed_ms: 38 },
+        ProbeOutcome::NoTokenCount,
+    ];
+    for pair in ranked.windows(2) {
+        assert!(
+            informativeness(&pair[0]) > informativeness(&pair[1]),
+            "{:?} must outrank {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
 }

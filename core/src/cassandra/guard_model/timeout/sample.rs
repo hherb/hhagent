@@ -360,7 +360,17 @@ pub struct ProbeSummary {
 ///
 /// * `Measured` over `Saturated`: contention and a cold model can stall
 ///   one sample to the budget on a host that is otherwise fast, and a
-///   real rate is strictly more informative than an upper bound.
+///   real rate is strictly more informative than an upper bound. **This
+///   rung is held twice**, and a reader should know that rather than
+///   discover it: [`summarise`]'s tie-break orders by
+///   [`sample_tok_per_s`], which is `None` for every non-measuring
+///   outcome, so a `Measured` sample would beat a `Saturated` one even
+///   if their ranks here were equal. Mutating this line alone is
+///   therefore invisible to `summarise` — it is pinned by
+///   `the_informativeness_ranking_is_strictly_ordered`, which asks this
+///   function directly. The redundancy is kept rather than removed: the
+///   thing it protects is whether a false ceiling finding fires, and
+///   both mechanisms are one line each.
 /// * `Saturated` over the failures: it is the only non-measuring outcome
 ///   that says something about throughput, and it takes the ceiling.
 /// * `Failed` over the two thin outcomes, which is the one genuinely
