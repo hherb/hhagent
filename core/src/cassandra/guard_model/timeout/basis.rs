@@ -289,3 +289,6 @@ pub struct GuardTimeout {
     pub timeout: Duration,
     pub basis: TimeoutBasis,
 }
+
+#[cfg(test)]
+mod tests;
