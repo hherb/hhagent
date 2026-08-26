@@ -522,6 +522,41 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   #615**, whose "Filed, not fixed: #N" phrasing GitHub read as `fixed: #N`; both reopened the same day. **#612 remains open design work; #615 was then
   fixed by [#619](https://github.com/hherb/kastellan/pull/619) and is closed** — the claim that
   both stayed open was written before that merge and did not survive it.
+  **THE BOOT PROBE MEASURED THE BOOT, NOT THE HOST — [#624](https://github.com/hherb/kastellan/issues/624),
+  branch `fix/624-boot-probe-samples` (2026-08-26).** Found while deploying #623. D9's probe took
+  ONE sample ~3 s into daemon startup, with Postgres, 15 workers, the Matrix channel and the audit
+  mirror still coming up — so it measured startup contention. Three consecutive boots on one
+  unchanged DGX backend derived 21 752 / 120 000 / 83 489 ms from 6 073 / 269.6 / 1 582 tok/s,
+  while that same backend measured a reproducible **6 953 / 6 995 / 7 026 tok/s** directly and
+  uncontended minutes later. A **26x** under-measurement, and the 269.6 boot clamped to the ceiling
+  and fired a **false** "this host cannot adjudicate a worst-case document" finding — the tier's
+  loudest signal, spent on a host that adjudicates one in ~19 s. So `timeout_basis: "probed"` was
+  not reproducible across boots of one unchanged host.
+  **Fix: `PROBE_SAMPLES` (3) samples, keep the FASTEST** (spec **D11**, which amends D9). Prompt
+  processing has a hardware ceiling and no floor, so contention can only make an observation
+  *slower*; the maximum is the best estimator and a mean is wrong for a one-sided error (the three
+  real rates average 2 647, still 2.6x below the truth). This moves the budget **down**, toward the
+  fail-open edge, deliberately: `PROBE_SAFETY_FACTOR`'s 2x is *already* the margin for runtime
+  contention, and folding startup contention into the rate spends it twice.
+  **Each sample carries its own cache-buster, and that is load-bearing** — N samples sharing one
+  send N byte-identical prompts, which on a backend reporting no `cached_tokens` read as enormous
+  throughputs that the fastest-wins rule would then *prefer*: a fail-open manufactured by the fix.
+  Stopping rule is one rule (`taken < PROBE_SAMPLES && elapsed < PROBE_TOTAL_BUDGET_MS`); an
+  explicit stop-on-saturation was written and rejected because it reintroduces the same defect, and
+  the elapsed check already ends a saturating first sample at exactly one budget (e2e-pinned).
+  `TimeoutBasis::Probed` now carries `slowest_tok_per_s` + `measured_samples`, so one boot row
+  distinguishes a quiet host from a busy one — deliberately **not** a coverage finding, since #624's
+  own complaint is that channel's credibility being spent on noise.
+  **Gate at the branch tip `37961f43`: DGX 175 suites, 3889 / 0 / 55, `TEST_EXIT=0`, 8 `[SKIP]`
+  (all gliner-relex), cold clippy exit 0 over 244 `Checking` lines.**
+  **Mutation-proven seven for seven**, the seventh only after a survivor was closed: collapsing
+  `Saturated`'s rank to `Measured`'s was invisible, because the rate tie-break already held that
+  rung — the ranking is now asked directly. `timeout.rs`/`timeout/tests.rs` were split
+  three ways first, movement-only, 27 tests before and after.
+  **#624 does NOT close [#612](https://github.com/hherb/kastellan/issues/612)** and the two must not
+  be merged: #624 is that the sample was taken under load on any host, #612 that extrapolating from
+  ~1 KiB is non-linear on Metal whatever the load. Both point at the same eventual remedy — measure
+  from the `ms` / `body_byte_len` the guard rows carry since #616.
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one
