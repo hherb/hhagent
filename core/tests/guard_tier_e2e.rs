@@ -960,9 +960,20 @@ async fn a_pinned_timeout_of_zero_refuses_to_build() {
 /// answers fast, so the derivation lands at the floor — what matters here is
 /// that the probe **ran**, sent the committed probe body, and produced a
 /// budget, none of which the pure tests can observe.
+///
+/// **It is also the live half of issue #624**, and the only place the
+/// per-sample cache-buster is observable. `sample_cache_buster` is pure and
+/// unit-tested, but nothing there can see whether `run_probe` actually calls
+/// it per iteration: a loop that hoisted the buster out would send
+/// `PROBE_SAMPLES` byte-identical prompts, serve all but the first from the
+/// prefix cache, and — on a backend that reports no `cached_tokens` — hand
+/// `summarise` a cache-inflated rate to *prefer*. That is a fail-open, and
+/// the distinct bodies below are what rule it out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn with_no_override_the_boot_probe_runs_and_derives_a_budget() {
-    use kastellan_core::cassandra::guard_model::timeout::{TimeoutBasis, TIMEOUT_FLOOR_MS};
+    use kastellan_core::cassandra::guard_model::timeout::{
+        TimeoutBasis, PROBE_SAMPLES, TIMEOUT_FLOOR_MS,
+    };
 
     let mock = MockGuardServer::spawn(Verdict::Clear).await;
     let cfg = RouterConfig {
@@ -971,12 +982,22 @@ async fn with_no_override_the_boot_probe_runs_and_derives_a_budget() {
     };
     let tier = build_tier(&cfg).await;
 
-    assert_eq!(mock.completions(), 1, "the boot probe made exactly one call");
+    assert_eq!(
+        mock.completions(),
+        PROBE_SAMPLES,
+        "the boot probe takes PROBE_SAMPLES samples (#624), not one"
+    );
     let bodies = mock.bodies();
     assert!(
-        bodies[0].contains(E2E_CACHE_BUSTER),
-        "the probe document must lead with the per-boot varying prefix, or the \
+        bodies.iter().all(|b| b.contains(E2E_CACHE_BUSTER)),
+        "every probe document must lead with the per-boot varying prefix, or the \
          prefix cache makes the sample meaningless"
+    );
+    let distinct: std::collections::BTreeSet<&String> = bodies.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        PROBE_SAMPLES,
+        "every SAMPLE must differ too, or samples 2..N are served from cache"
     );
 
     let budget = tier.timeout();
@@ -1012,9 +1033,14 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
+    // Counts chat completions, so the wall-clock guarantee below is an
+    // assertion rather than a claim.
+    let completions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&completions);
     let handle = tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { return };
+            let counter = std::sync::Arc::clone(&counter);
             tokio::spawn(async move {
                 let Some((head, _body)) = read_request(&mut sock).await else { return };
                 if head.starts_with("GET") && head.contains("/props") {
@@ -1028,6 +1054,7 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
                     let _ = sock.shutdown().await;
                     return;
                 }
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 // The chat completion: hold the socket open and never answer.
                 // Keeping `sock` alive is the whole mechanism — dropping it
                 // would close the connection and produce a transport error
@@ -1058,6 +1085,16 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
     assert!(
         budget.basis.coverage_finding().is_some(),
         "a host this slow is a finding, not a routine value"
+    );
+    // #624's wall-clock guarantee, and the reason `more_samples_wanted` needs
+    // no special case for saturation: a sample that saturates has by
+    // definition spent the whole total budget, so the elapsed check ends the
+    // probe on its own. Without this, going multi-sample would have made the
+    // sickest host pay PROBE_SAMPLES * PROBE_BUDGET_MS of daemon startup.
+    assert_eq!(
+        completions.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a saturating first sample must cost exactly ONE budget, not PROBE_SAMPLES"
     );
     handle.abort();
 }

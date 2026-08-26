@@ -124,6 +124,8 @@ fn the_two_pin_findings_are_distinct() {
     // measured throughput rather than about a configured value.
     let clamped = TimeoutBasis::Probed {
         tok_per_s: 100.0,
+        slowest_tok_per_s: 100.0,
+        measured_samples: 3,
         derived_ms: 1_000_000,
         clamped: Clamped::ToCeiling,
     }
@@ -162,6 +164,8 @@ fn every_coverage_finding_reads_as_prose() {
         TimeoutBasis::Operator { band: PinBand::AboveCeiling },
         TimeoutBasis::Probed {
             tok_per_s: 100.0,
+            slowest_tok_per_s: 100.0,
+            measured_samples: 3,
             derived_ms: 1_000_000,
             clamped: Clamped::ToCeiling,
         },
@@ -178,8 +182,20 @@ fn every_coverage_finding_reads_as_prose() {
     // above is the whole set rather than the ones this test remembered.
     for b in [
         TimeoutBasis::Operator { band: PinBand::InBand },
-        TimeoutBasis::Probed { tok_per_s: 5_000.0, derived_ms: 26_000, clamped: Clamped::No },
-        TimeoutBasis::Probed { tok_per_s: 9e9, derived_ms: 1, clamped: Clamped::ToFloor },
+        TimeoutBasis::Probed {
+            tok_per_s: 5_000.0,
+            slowest_tok_per_s: 5_000.0,
+            measured_samples: 3,
+            derived_ms: 26_000,
+            clamped: Clamped::No,
+        },
+        TimeoutBasis::Probed {
+            tok_per_s: 9e9,
+            slowest_tok_per_s: 9e9,
+            measured_samples: 3,
+            derived_ms: 1,
+            clamped: Clamped::ToFloor,
+        },
         TimeoutBasis::Unprobed { reason: UnprobedReason::Nonsensical },
         TimeoutBasis::Unprobed { reason: UnprobedReason::TooFewUncachedTokens },
         TimeoutBasis::Unprobed { reason: UnprobedReason::NoTokenCount },
@@ -242,7 +258,13 @@ fn every_timeout_basis_token_is_distinct_and_log_shaped() {
         TimeoutBasis::Operator { band: PinBand::InBand },
         TimeoutBasis::Operator { band: PinBand::BelowFloor },
         TimeoutBasis::Operator { band: PinBand::AboveCeiling },
-        TimeoutBasis::Probed { tok_per_s: 5_000.0, derived_ms: 26_000, clamped: Clamped::No },
+        TimeoutBasis::Probed {
+            tok_per_s: 5_000.0,
+            slowest_tok_per_s: 5_000.0,
+            measured_samples: 3,
+            derived_ms: 26_000,
+            clamped: Clamped::No,
+        },
         TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS },
         TimeoutBasis::Unprobed { reason: UnprobedReason::Nonsensical },
         TimeoutBasis::Unprobed { reason: UnprobedReason::TooFewUncachedTokens },

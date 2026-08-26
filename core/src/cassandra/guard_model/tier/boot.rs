@@ -12,7 +12,7 @@ use std::time::Duration;
 use kastellan_llm_router::{RouterConfig, RouterError};
 
 use super::super::context_pin::{self, GuardContextError};
-use super::super::timeout::{self, GuardTimeout, ProbeOutcome};
+use super::super::timeout::{self, GuardTimeout, ProbeOutcome, ProbeSummary};
 use super::super::GuardClient;
 use super::{
     error_kind, outcome_and_score, resolve, validate_tau, GuardErrorKind, GuardOutcome,
@@ -400,15 +400,51 @@ impl GuardTier {
     }
 }
 
-/// Run the boot probe and classify what came back.
+/// Run the boot probe — [`timeout::PROBE_SAMPLES`] samples — and fold
+/// them into one summary.
 ///
-/// The IO half of D9. A transport failure here is
-/// [`ProbeOutcome::Failed`] — **except** the request timeout that
-/// [`timeout::PROBE_BUDGET_MS`] imposes, which is
+/// The IO half of D9, and the only part of issue [#624]'s fix that
+/// touches IO: everything about *which* sample wins and *when to stop*
+/// is pure and lives in [`timeout::summarise`] and
+/// [`timeout::more_samples_wanted`], so this function contributes a
+/// loop and a clock and nothing else worth testing with a server.
+///
+/// **Each sample gets its own cache-buster.** Reusing one across
+/// samples would send byte-identical prompts and serve every sample
+/// after the first from the prefix cache — which on a backend that does
+/// not report `cached_tokens` reads as an enormous throughput that
+/// [`timeout::summarise`] would then *prefer*. See
+/// [`timeout::sample_cache_buster`].
+///
+/// [#624]: https://github.com/hherb/kastellan/issues/624
+async fn run_probe(client: &GuardClient, cache_buster: &str) -> ProbeSummary {
+    let started = std::time::Instant::now();
+    let mut samples = Vec::with_capacity(timeout::PROBE_SAMPLES);
+    while timeout::more_samples_wanted(samples.len(), elapsed_ms(started)) {
+        let buster = timeout::sample_cache_buster(cache_buster, samples.len());
+        samples.push(run_one_sample(client, &buster).await);
+    }
+    timeout::summarise(&samples)
+}
+
+/// Wall clock since `started`, saturating at [`u64::MAX`] ms.
+///
+/// Split out so the cast is in one place: `Duration::as_millis` is
+/// `u128` and [`timeout::more_samples_wanted`] takes `u64`, and an
+/// `as u64` truncation of a value that large would wrap a very long
+/// probe back under the budget and loop again.
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// One probe sample: send the document, classify what came back.
+///
+/// A transport failure here is [`ProbeOutcome::Failed`] — **except** the
+/// request timeout that [`timeout::PROBE_BUDGET_MS`] imposes, which is
 /// [`ProbeOutcome::Saturated`], because an overrun budget is a
 /// measurement of slowness rather than a missing measurement. A
 /// *connect* timeout is `Failed`, not `Saturated`: see [`is_timeout`].
-async fn run_probe(client: &GuardClient, cache_buster: &str) -> ProbeOutcome {
+async fn run_one_sample(client: &GuardClient, cache_buster: &str) -> ProbeOutcome {
     let document = timeout::probe_document(cache_buster);
     match client.timed_probe(&document).await {
         Ok(reading) => timeout::probe_sample(reading),

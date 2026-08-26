@@ -16,7 +16,7 @@ budget: kastellan targets **high-risk environments such as healthcare**.
 so this spec is unparked — and three obligations it could not have anticipated. Two are
 correctness and both are attacker-reachable; the third is honesty about what the tier buys.
 They are **D8**, **D9** and **D10**, added below, together with the measurement **M2** that
-D9 rests on. **D2 is superseded by D9** and kept for its derivation. Operator decisions
+D9 rests on. **D9 is amended by D11** (multi-sample probe, issue #624). **D2 is superseded by D9** and kept for its derivation. Operator decisions
 recorded 2026-08-23: fail open at runtime *plus* a boot-time context check (D8), and derive
 the timeout per host from a boot probe (D9).
 
@@ -398,10 +398,12 @@ one-directional and silent — too short a timeout does not error, it *fails ope
 **`KASTELLAN_LLM_GUARD_TIMEOUT_MS`, when set, is an operator override and no probe runs.**
 Explicit beats measured; it keeps the value pinnable and every timeout test deterministic.
 
-**When unset, one probe runs at boot**, after the D8 checks, against the same endpoint:
+**When unset, the probe runs at boot**, after the D8 checks, against the same endpoint.
+**Amended by D11 (below) to take `PROBE_SAMPLES` samples rather than one**; the steps
+below describe one sample, and D11 says how several become one number:
 
 1. Send one adjudication of `PROBE_BYTES` (1024) of committed dense text, prefixed by a
-   per-boot **cache-buster**. That prefix is what makes the sample cold (M2, fact 1); the body
+   per-**sample** **cache-buster** (per-*boot* until D11). That prefix is what makes the sample cold (M2, fact 1); the body
    is a constant so the measurement is comparable across boots. It is deliberately **not**
    called a nonce — it is not secret, authenticates nothing, and guards no replay, and naming
    it one both overstates its role and trips CodeQL's `rust/hard-coded-cryptographic-value`
@@ -455,6 +457,88 @@ floor would give the slowest hosts the shortest timeout, which is precisely back
 **The derivation is a pure function of the outcome.** All the arithmetic, the clamping and
 the basis reporting live in `guard_model/timeout.rs` over the enum above, so every row of
 both tables is a unit test with no server. The IO half only produces the sample.
+
+### D11 — The probe takes **several samples and keeps the fastest** — amends D9
+
+D9 took one sample. Measured on the DGX on 2026-08-25 (issue
+[#624](https://github.com/hherb/kastellan/issues/624)), one sample was not a measurement of
+the host. The probe runs ~3 s into daemon startup, while Postgres, 15 workers, the Matrix
+channel and the audit mirror are all still coming up, so it measures the host **under
+startup contention**:
+
+| boot | `timeout_ms` | `tok_per_s` | `coverage_finding` |
+| --- | --- | --- | --- |
+| 2026-08-23 17:50 | 21 752 | 6 072.99 | null |
+| 2026-08-25 14:54 | **120 000** | **269.60** | *"this host cannot adjudicate a worst-case document…"* |
+| 2026-08-25 14:58 | 83 489 | 1 582.21 | null |
+
+Same host, same `llama-server` process, unchanged throughout. Measured directly against the
+backend minutes later with `cache_prompt: false`, uncontended: **6 953 / 6 995 / 7 026
+tok/s** — tightly reproducible, and *higher* than the best of the three. The host did not
+regress; the probe was measuring the boot. Worst error **26x**, and the 269.6 run clamped to
+the ceiling and fired a **false** coverage finding — the loudest signal the tier has, spent
+on a host that adjudicates a worst-case document in ~19 s.
+
+**The fix is `PROBE_SAMPLES` (3) samples, keeping the FASTEST.** Prompt processing has a
+hardware ceiling and no floor: contention, a cold model and a busy daemon can only make an
+observation *slower* than the host is capable of, never faster. The maximum is therefore the
+best available estimator, and a mean is wrong for a one-sided error (the three real rates
+average 2 647 — still 2.6x below the truth).
+
+**This moves the derived budget DOWN, toward the fail-open edge, deliberately.** A contended
+sample derives a *longer* timeout, which is the safe direction, so correcting it needs an
+argument: `PROBE_SAFETY_FACTOR`'s 2x is *already* the designed margin for runtime contention
+(M1 open risk 3 — the guard shares the GPU with the planner). Folding startup contention
+into the measured rate spends that margin twice and pays for it in a `timeout_basis:
+"probed"` that no two boots of one host agree on. The dangerous direction stays guarded
+where it always was: an *over*-measured rate can only come from a cache hit, which the
+cache-buster and the `cached_tokens` subtraction handle.
+
+**Each sample carries its own cache-buster, and that is load-bearing.** N samples sharing
+one buster send N byte-identical prompts. On a backend reporting `cached_tokens` the repeats
+collapse to `TooFewUncachedTokens` and the multi-sample probe silently degenerates to a
+single-sample one; on a backend that does **not** report it (Ollama's OpenAI front door
+omits `usage` entirely) they read as enormous throughputs — and since the fastest sample
+wins, the probe would *prefer* the most cache-contaminated reading and derive a timeout
+several times too short. That is a fail-open manufactured by the fix. The index leads the
+buster so consecutive samples diverge as early as the prompt allows.
+
+| constant | value | why |
+| --- | --- | --- |
+| `PROBE_SAMPLES` | 3 | two cannot show a spread; each costs real boot time |
+| `PROBE_TOTAL_BUDGET_MS` | 20 000 (= `PROBE_BUDGET_MS`) | a healthy boot pays nothing extra: a DGX sample is ~160 ms |
+
+**Stopping rule: one rule, not two** — `taken < PROBE_SAMPLES && elapsed < PROBE_TOTAL_BUDGET_MS`,
+checked before each sample. An explicit "stop as soon as a sample saturates" was rejected: it
+reintroduces exactly this defect, since one 20 s stall (a cold `llama-server` warming its
+weights) would end the probe at one unrepresentative sample and fire the ceiling finding,
+with the samples that would have contradicted it never taken. The elapsed check already ends
+a genuinely saturating first sample — saturating *means* spending the whole budget — so a
+saturating first sample costs exactly one budget, which is pinned by an e2e assertion. A
+sample returning just *under* the budget buys one more, so the true bound is
+`PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS`, reachable only on a host already emitting a
+coverage finding.
+
+**With no measuring sample, the most informative failure wins:** `Saturated` > `Failed` >
+`TooFewUncachedTokens` > `NoTokenCount`. The lower three all derive the same floor, so this
+ranking decides one thing only — whether a coverage finding fires. `Failed` outranks a thin
+sample because a failure means a call to the backend did not complete (a fact about the
+*backend*, and evidence for the finding's prediction that every dispatch will fail the same
+way) while a thin sample means the call completed and only the *measurement* was unusable.
+
+**The row now carries the spread.** `TimeoutBasis::Probed` gains `slowest_tok_per_s` and
+`measured_samples` beside `tok_per_s`, so `policy / guard_tier.boot` distinguishes a quiet
+host from a busy one from a single row — which is what #624 needed three boots and a direct
+backend measurement to establish. `slowest_tok_per_s < tok_per_s / 2` is the query for "this
+host was contended when it measured itself". It is deliberately **not** a coverage finding:
+a busy boot with a good fastest sample is not a reduction in coverage, and #624's own
+complaint is that the finding channel's credibility gets spent on noise.
+
+**D11 does not close #612, and the two must not be merged.** #624 is that the *sample* was
+taken under load on any host; #612 is that extrapolating from a ~1 KiB sample is non-linear
+on Metal whatever the load (a quiet Mac still reads 1 137 tok/s at 1 KiB and 260 at 64 KiB).
+Both make `probed` mean less than it looks like it means, and both point at the same eventual
+remedy — measure from the `ms` / `body_byte_len` the guard rows carry since #616.
 
 ### D10 — The tier is advisory defence-in-depth, not a gate
 

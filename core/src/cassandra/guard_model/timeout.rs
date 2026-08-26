@@ -72,8 +72,10 @@ pub mod sample;
 
 pub use basis::{classify_pin, Clamped, GuardTimeout, PinBand, TimeoutBasis, UnprobedReason};
 pub use sample::{
-    probe_document, probe_error_outcome, probe_sample, ProbeOutcome, ProbeReading,
-    MIN_UNCACHED_PROBE_TOKENS, PROBE_BUDGET_MS, PROBE_BYTES,
+    more_samples_wanted, probe_document, probe_error_outcome, probe_sample,
+    sample_cache_buster, sample_tok_per_s, summarise, ProbeOutcome, ProbeReading,
+    ProbeSummary, MIN_UNCACHED_PROBE_TOKENS, PROBE_BUDGET_MS, PROBE_BYTES, PROBE_SAMPLES,
+    PROBE_TOTAL_BUDGET_MS,
 };
 
 /// Multiplier applied to the derived worst case.
@@ -120,7 +122,15 @@ fn clamp_derived(derived_ms: u64) -> (u64, Clamped) {
     }
 }
 
-/// Derive a guard timeout from a probe outcome.
+/// Derive a guard timeout from a probe summary.
+///
+/// **The summary's `best` is the FASTEST of [`PROBE_SAMPLES`] samples,
+/// not a single observation** (issue [#624]) — see [`summarise`] for why
+/// the maximum is the right estimator and why correcting toward it is
+/// worth moving the budget down. Everything below is unchanged by that:
+/// the arithmetic acts on one sample either way, and the spread rides
+/// along on the basis so a later reader can see how much the samples
+/// disagreed.
 ///
 /// ```text
 /// tok_per_s  = uncached_tokens / (elapsed_ms / 1000)
@@ -152,6 +162,12 @@ fn clamp_derived(derived_ms: u64) -> (u64, Clamped) {
 /// does not error but **fails open**. [`PROBE_SAFETY_FACTOR`]'s 2x does
 /// not cover a 4.4x error, and the knee sits above the 8 KiB sample, so a
 /// cheap second probe would not find it.
+///
+/// Multi-sampling does **not** close #612, and the two must not be
+/// confused: #624 is that the *sample* was taken under load, #612 is
+/// that extrapolating from a ~1 KiB sample is non-linear on Metal
+/// whatever the load. A perfectly quiet Mac still reads ~1 137 tok/s at
+/// 1 KiB and 260 at 64 KiB.
 ///
 /// Until #612 is settled a Metal host should pin
 /// `KASTELLAN_LLM_GUARD_TIMEOUT_MS` rather than trust the probe — at
@@ -192,12 +208,12 @@ fn clamp_derived(derived_ms: u64) -> (u64, Clamped) {
 /// about the host, and the floor is the value D2 shipped.
 ///
 /// Pure.
-pub fn derive_guard_timeout(outcome: &ProbeOutcome) -> GuardTimeout {
+pub fn derive_guard_timeout(summary: &ProbeSummary) -> GuardTimeout {
     let floor = |reason| GuardTimeout {
         timeout: Duration::from_millis(TIMEOUT_FLOOR_MS),
         basis: TimeoutBasis::Unprobed { reason },
     };
-    match outcome {
+    match &summary.best {
         ProbeOutcome::Measured { uncached_tokens, elapsed_ms } => {
             let tok_per_s = f64::from(*uncached_tokens) / (*elapsed_ms as f64 / 1000.0);
             // `Measured` is only constructed with a positive token
@@ -222,7 +238,23 @@ pub fn derive_guard_timeout(outcome: &ProbeOutcome) -> GuardTimeout {
             let (timeout_ms, clamped) = clamp_derived(derived_ms);
             GuardTimeout {
                 timeout: Duration::from_millis(timeout_ms),
-                basis: TimeoutBasis::Probed { tok_per_s: tok_per_s as f32, derived_ms, clamped },
+                basis: TimeoutBasis::Probed {
+                    tok_per_s: tok_per_s as f32,
+                    // `summarise` never reports a slowest without a
+                    // rate to go with it, and never reports zero
+                    // measuring samples beside a `Measured` best. Both
+                    // are guarded rather than asserted: a hand-built
+                    // summary must not be able to write a
+                    // self-contradicting durable row, and the honest
+                    // reading of "no recorded slowest" is that this is
+                    // the only rate there is.
+                    slowest_tok_per_s: summary
+                        .slowest_tok_per_s
+                        .unwrap_or(tok_per_s as f32),
+                    measured_samples: summary.measured_samples.max(1),
+                    derived_ms,
+                    clamped,
+                },
             }
         }
         // An overrun budget IS a measurement of slowness, so it takes the

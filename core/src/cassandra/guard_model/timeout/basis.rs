@@ -165,8 +165,33 @@ pub enum TimeoutBasis {
     /// `info!` line — see [`PinBand`] and issue #615. The value itself
     /// is still honoured verbatim.
     Operator { band: PinBand },
-    /// Derived from a boot probe that produced a real sample.
-    Probed { tok_per_s: f32, derived_ms: u64, clamped: Clamped },
+    /// Derived from a boot probe that produced at least one real
+    /// sample.
+    ///
+    /// `tok_per_s` is the **fastest** of [`super::PROBE_SAMPLES`]
+    /// samples, and `slowest_tok_per_s` the slowest of the ones that
+    /// measured — together the contention spread (issue [#624]). Before
+    /// the probe took more than one sample, a single figure here was not
+    /// reproducible across boots of one unchanged host: the DGX derived
+    /// 6 073 / 269.6 / 1 582 tok/s on three consecutive boots of the
+    /// same backend, and a reader treating `probed` as a property of the
+    /// host was reading noise. A row whose two rates are close is a
+    /// measurement; one whose rates differ by 26x is a busy host, and
+    /// now says so.
+    ///
+    /// `measured_samples` is at least 1 whenever this variant exists,
+    /// and `slowest_tok_per_s == tok_per_s` when it is exactly 1 — one
+    /// sample observed one rate, which is honest rather than a
+    /// fabricated spread.
+    ///
+    /// [#624]: https://github.com/hherb/kastellan/issues/624
+    Probed {
+        tok_per_s: f32,
+        slowest_tok_per_s: f32,
+        measured_samples: u32,
+        derived_ms: u64,
+        clamped: Clamped,
+    },
     /// The probe overran [`PROBE_BUDGET_MS`] without answering.
     ///
     /// **A basis of its own, carrying no throughput and no derivation.**
