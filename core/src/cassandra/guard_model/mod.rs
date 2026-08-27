@@ -113,7 +113,7 @@ impl GuardClient {
     /// One adjudication, timed, reporting the backend's own token
     /// accounting alongside the wall clock.
     ///
-    /// The IO half of the boot probe (wiring-spec D9); `boot::run_probe`
+    /// The IO half of the boot probe (wiring-spec D9); `probe::run_probe`
     /// is its only caller. The **verdict is discarded** — this call exists to
     /// measure how fast the backend processes a prompt, not to judge
     /// the probe document.

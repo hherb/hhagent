@@ -40,7 +40,7 @@ pub enum Clamped {
 /// Why a probe produced no usable sample.
 ///
 /// A closed set, so an enum — the same argument
-/// [`super::tier::Unadjudicated`] makes one module over. As a
+/// [`super::super::tier::Unadjudicated`] makes one module over. As a
 /// `&'static str` the "short, stable, whitespace-free" promise
 /// [`TimeoutBasis::kind`] makes was a promise about a *caller-supplied*
 /// string, an external caller could collide with `Operator`'s own token,
@@ -48,7 +48,8 @@ pub enum Clamped {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnprobedReason {
     /// A `Measured` sample whose arithmetic came out non-finite or
-    /// non-positive. Unreachable via [`probe_sample`]; guarded anyway.
+    /// non-positive. Unreachable via [`super::probe_sample`]; guarded
+    /// anyway.
     Nonsensical,
     /// Too little genuinely-processed work to divide by.
     TooFewUncachedTokens,
@@ -182,13 +183,24 @@ pub enum TimeoutBasis {
     /// `measured_samples` is at least 1 whenever this variant exists,
     /// and `slowest_tok_per_s == tok_per_s` when it is exactly 1 — one
     /// sample observed one rate, which is honest rather than a
-    /// fabricated spread.
+    /// fabricated spread. **Both hold of a summary built by
+    /// [`super::summarise`]; neither is enforced by this type**, whose
+    /// fields are `pub`, so read them as a description of the producer
+    /// rather than as a guarantee of the row.
+    ///
+    /// `attempted_samples` is the denominator, without which
+    /// `measured_samples: 1` reads three ways at once — see
+    /// [`super::ProbeSummary::attempted_samples`]. A row with
+    /// `attempted_samples > measured_samples` and no coverage finding is
+    /// a backend that failed or stalled on some of its boot calls and
+    /// measured on the rest; the reason is in that boot's `warn!` lines.
     ///
     /// [#624]: https://github.com/hherb/kastellan/issues/624
     Probed {
         tok_per_s: f32,
         slowest_tok_per_s: f32,
         measured_samples: u32,
+        attempted_samples: u32,
         derived_ms: u64,
         clamped: Clamped,
     },
@@ -204,11 +216,23 @@ pub enum TimeoutBasis {
     /// `kind()` answered `"probed"` for a probe that produced no sample.
     ///
     /// The overrun is still a measurement of *slowness* — that is why it
-    /// takes the ceiling — but the only honest number it carries is the
-    /// budget it exceeded.
-    Saturated { budget_ms: u64 },
+    /// takes the ceiling — but the only throughput-shaped number it
+    /// carries is the budget it exceeded.
+    ///
+    /// **`budget_ms` is ONE sample's budget, not the probe's.** It was
+    /// the same thing until #624 made the probe multi-sample; now the
+    /// probe as a whole may have spent up to `PROBE_TOTAL_BUDGET_MS +
+    /// PROBE_BUDGET_MS` across `attempted_samples` calls. The count is
+    /// carried so the row says how much evidence the ceiling rests on:
+    /// one call that stalled is weaker than three.
+    Saturated { budget_ms: u64, attempted_samples: u32 },
     /// The probe could not produce a usable sample.
-    Unprobed { reason: UnprobedReason },
+    ///
+    /// `attempted_samples` matters most on this variant: the
+    /// [`UnprobedReason::Failed`] finding predicts that *every* dispatch
+    /// will fail the same way, and three failed calls are much stronger
+    /// evidence for that than one.
+    Unprobed { reason: UnprobedReason, attempted_samples: u32 },
 }
 
 impl TimeoutBasis {
@@ -218,7 +242,7 @@ impl TimeoutBasis {
             Self::Operator { band } => band.as_str(),
             Self::Probed { .. } => "probed",
             Self::Saturated { .. } => "probe-saturated",
-            Self::Unprobed { reason } => reason.as_str(),
+            Self::Unprobed { reason, .. } => reason.as_str(),
         }
     }
 
@@ -280,7 +304,7 @@ impl TimeoutBasis {
                  measure (issue #612) -- recorded here so it is a decision on the \
                  record rather than a silent one.",
             ),
-            Self::Unprobed { reason: UnprobedReason::Failed } => Some(
+            Self::Unprobed { reason: UnprobedReason::Failed, .. } => Some(
                 "the guard boot probe FAILED while /props answered. The tier is \
                  configured and verified, but the call it will make on every dispatch \
                  is the call that just failed -- expect it to fail OPEN on all of them. \
@@ -303,6 +327,7 @@ impl TimeoutBasis {
                     UnprobedReason::Nonsensical
                     | UnprobedReason::TooFewUncachedTokens
                     | UnprobedReason::NoTokenCount,
+                ..
             } => None,
         }
     }

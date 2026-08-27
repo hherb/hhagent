@@ -483,7 +483,9 @@ on a host that adjudicates a worst-case document in ~19 s.
 hardware ceiling and no floor: contention, a cold model and a busy daemon can only make an
 observation *slower* than the host is capable of, never faster. The maximum is therefore the
 best available estimator, and a mean is wrong for a one-sided error (the three real rates
-average 2 647 — still 2.6x below the truth).
+average 2 642 — still 2.6x below the truth; the 2 647 in the unit tests is the mean of the
+same three rates expressed at the probe's own 810-token sample size, which is what that test
+asserts).
 
 **This moves the derived budget DOWN, toward the fail-open edge, deliberately.** A contended
 sample derives a *longer* timeout, which is the safe direction, so correcting it needs an
@@ -506,18 +508,35 @@ buster so consecutive samples diverge as early as the prompt allows.
 | constant | value | why |
 | --- | --- | --- |
 | `PROBE_SAMPLES` | 3 | two cannot show a spread; each costs real boot time |
-| `PROBE_TOTAL_BUDGET_MS` | 20 000 (= `PROBE_BUDGET_MS`) | a healthy boot pays nothing extra: a DGX sample is ~160 ms |
+| `PROBE_TOTAL_BUDGET_MS` | 20 000 (= `PROBE_BUDGET_MS`) | a healthy boot pays nothing extra: 3 x 160 ms on the DGX is ~42x of headroom, 3 x ~560 ms on the Mac ~12x |
 
-**Stopping rule: one rule, not two** — `taken < PROBE_SAMPLES && elapsed < PROBE_TOTAL_BUDGET_MS`,
-checked before each sample. An explicit "stop as soon as a sample saturates" was rejected: it
-reintroduces exactly this defect, since one 20 s stall (a cold `llama-server` warming its
-weights) would end the probe at one unrepresentative sample and fire the ceiling finding,
-with the samples that would have contradicted it never taken. The elapsed check already ends
-a genuinely saturating first sample — saturating *means* spending the whole budget — so a
-saturating first sample costs exactly one budget, which is pinned by an e2e assertion. A
-sample returning just *under* the budget buys one more, so the true bound is
-`PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS`, reachable only on a host already emitting a
-coverage finding.
+**Stopping rule: one rule, not two — because a second would be dead code.**
+`taken < PROBE_SAMPLES && elapsed < PROBE_TOTAL_BUDGET_MS`, checked before each sample. An
+explicit "stop as soon as a sample saturates" was written and dropped: `Saturated` is
+produced only when the per-request budget expired, and `PROBE_TOTAL_BUDGET_MS` *equals*
+`PROBE_BUDGET_MS`, so a saturating sample always leaves `elapsed >= PROBE_TOTAL_BUDGET_MS`
+and the elapsed check already returns false. The extra clause could never have fired. What
+the shipped rule adds over it is the other direction: a sample that came *close* to the
+budget without spending it buys one more look.
+
+**So a saturating FIRST sample still ends the probe at one unrepresentative sample, and D11
+does not fix that** — issue [#626](https://github.com/hherb/kastellan/issues/626). A cold
+`llama-server` paging in its weights derives the ceiling and fires the false coverage finding
+on a host that adjudicates a worst-case document in ~19 s. D11 removes the *contention* case
+of #624's defect; the *cold-model* case needs a total budget larger than one sample's, which
+costs daemon startup on the host that is already sickest and is a decision rather than a
+cleanup. It costs exactly one budget today, pinned by an e2e assertion.
+
+*(Until #625's review this paragraph said the explicit rule was **rejected** because it
+"would end the probe at one unrepresentative sample and fire the ceiling finding" — which is
+what the shipped rule does too. Corrected in place rather than quietly: that claim was the
+design record in three other documents.)*
+
+A sample returning just *under* the budget buys one more, so the true bound is
+`PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS`. **The FULL overrun** is reachable only on a host
+already emitting a coverage finding; a *smaller* one is ordinary and carries no such
+reassurance — two 100 ms samples then a saturating third spend 20.2 s on a host whose `best`
+is a fast `Measured`, with no clamp and no finding.
 
 **With no measuring sample, the most informative failure wins:** `Saturated` > `Failed` >
 `TooFewUncachedTokens` > `NoTokenCount`. The lower three all derive the same floor, so this
@@ -526,8 +545,16 @@ sample because a failure means a call to the backend did not complete (a fact ab
 *backend*, and evidence for the finding's prediction that every dispatch will fail the same
 way) while a thin sample means the call completed and only the *measurement* was unusable.
 
-**The row now carries the spread.** `TimeoutBasis::Probed` gains `slowest_tok_per_s` and
-`measured_samples` beside `tok_per_s`, so `policy / guard_tier.boot` distinguishes a quiet
+**The row now carries the spread, and its denominator.** `TimeoutBasis::Probed` gains
+`slowest_tok_per_s`, `measured_samples` and `attempted_samples` beside `tok_per_s`, and
+`Saturated`/`Unprobed` gain `attempted_samples` too — on those it is the strength of the
+evidence behind the finding, since one failed call predicts a wholly fail-open tier far more
+weakly than three. Without the denominator `measured_samples: 1` reads three ways at once
+(one sample that worked / three with two served from cache / three with two failed calls),
+and `PROBE_SAMPLES` is not recoverable from the row at all;
+`attempted_samples > measured_samples` with no `coverage_finding` is the query that says
+"read that boot's `warn!` lines", and since #625's review every non-measuring sample writes
+one. `TimeoutBasis::Probed` also gains, so `policy / guard_tier.boot` distinguishes a quiet
 host from a busy one from a single row — which is what #624 needed three boots and a direct
 backend measurement to establish. `slowest_tok_per_s < tok_per_s / 2` is the query for "this
 host was contended when it measured itself". It is deliberately **not** a coverage finding:

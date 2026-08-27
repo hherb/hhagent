@@ -55,8 +55,10 @@ use super::GuardAdjudication;
 use crate::cassandra::injection_guard::{decision_for_score, InjectionDecision};
 
 pub mod boot;
-pub mod probe;
 pub mod error_kind;
+// Internal: the only item is `pub(super)`, so a `pub mod` here would
+// publish an empty module and document its private links.
+pub(crate) mod probe;
 
 pub use boot::{GuardReport, GuardTier, GuardTierError, SharedGuardTier};
 pub use error_kind::GuardErrorKind;

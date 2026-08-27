@@ -33,7 +33,7 @@
 //!    with `cached_tokens: 809`, which a naive `tokens / elapsed` reads
 //!    as **21,094 tok/s** against the same server's true ~5,000 — a 4x
 //!    over-estimate, deriving a timeout 4x too short. Two defences: the
-//!    probe document carries a per-boot cache-busting **prefix** (measured to
+//!    probe document carries a per-sample cache-busting **prefix** (measured to
 //!    give `cached_tokens: 0` on consecutive cold runs, agreeing within
 //!    3%), and throughput is computed over **uncached** tokens only, so
 //!    a cache hit shrinks the sample rather than inflating the rate.
@@ -44,21 +44,24 @@
 //!
 //! # The shape of this module
 //!
-//! Everything here is **pure**, and it is three files because it is
-//! three questions:
+//! Everything here is **pure**, and it is four files because it is four
+//! questions:
 //!
 //! * [`sample`] — what ONE measurement of this backend is. The IO half
 //!   produces a [`ProbeReading`]; [`probe_sample`] turns that into a
 //!   [`ProbeOutcome`].
+//! * [`summary`] — how SEVERAL of those become the one the timeout is
+//!   derived from ([`summarise`]), and when to stop taking them
+//!   ([`more_samples_wanted`]). Issue #624's half.
 //! * this file — how an outcome becomes a budget
 //!   ([`derive_guard_timeout`]), and what an operator's own number is
 //!   allowed to be ([`validate_operator_timeout`]).
 //! * [`basis`] — how that budget describes its own provenance.
 //!
 //! Every row of both tables in D9 is therefore a unit test with no
-//! server. The two child modules are re-exported here, so
-//! `timeout::probe_sample` and every other historic path still
-//! resolves.
+//! server. All three child modules are re-exported here, so
+//! `timeout::probe_sample`, `timeout::summarise` and every other
+//! historic path still resolve.
 //!
 //! [#586]: https://github.com/hherb/kastellan/issues/586
 //! [#604]: https://github.com/hherb/kastellan/issues/604
@@ -69,13 +72,16 @@ use super::context_pin::REQUIRED_GUARD_N_CTX;
 
 pub mod basis;
 pub mod sample;
+pub mod summary;
 
 pub use basis::{classify_pin, Clamped, GuardTimeout, PinBand, TimeoutBasis, UnprobedReason};
 pub use sample::{
-    more_samples_wanted, probe_document, probe_error_outcome, probe_sample,
-    sample_cache_buster, sample_tok_per_s, summarise, ProbeOutcome, ProbeReading,
-    ProbeSummary, MIN_UNCACHED_PROBE_TOKENS, PROBE_BUDGET_MS, PROBE_BYTES, PROBE_SAMPLES,
-    PROBE_TOTAL_BUDGET_MS,
+    probe_document, probe_error_outcome, probe_sample, ProbeOutcome, ProbeReading,
+    MIN_UNCACHED_PROBE_TOKENS, PROBE_BUDGET_MS, PROBE_BYTES,
+};
+pub use summary::{
+    more_samples_wanted, sample_cache_buster, sample_tok_per_s, summarise, ProbeSummary,
+    PROBE_SAMPLES, PROBE_TOTAL_BUDGET_MS,
 };
 
 /// Multiplier applied to the derived worst case.
@@ -124,8 +130,11 @@ fn clamp_derived(derived_ms: u64) -> (u64, Clamped) {
 
 /// Derive a guard timeout from a probe summary.
 ///
-/// **The summary's `best` is the FASTEST of [`PROBE_SAMPLES`] samples,
-/// not a single observation** (issue [#624]) — see [`summarise`] for why
+/// **The summary's `best` is the FASTEST of up to [`PROBE_SAMPLES`]
+/// samples, not a single observation** (issue [#624]) — "up to", because
+/// [`PROBE_TOTAL_BUDGET_MS`] can stop the run early on exactly the slow
+/// host these budgets exist for; `summary.attempted_samples` says how
+/// many were actually taken — see [`summarise`] for why
 /// the maximum is the right estimator and why correcting toward it is
 /// worth moving the budget down. Everything below is unchanged by that:
 /// the arithmetic acts on one sample either way, and the spread rides
@@ -211,16 +220,28 @@ fn clamp_derived(derived_ms: u64) -> (u64, Clamped) {
 pub fn derive_guard_timeout(summary: &ProbeSummary) -> GuardTimeout {
     let floor = |reason| GuardTimeout {
         timeout: Duration::from_millis(TIMEOUT_FLOOR_MS),
-        basis: TimeoutBasis::Unprobed { reason },
+        basis: TimeoutBasis::Unprobed {
+            reason,
+            attempted_samples: summary.attempted_samples,
+        },
     };
     match &summary.best {
-        ProbeOutcome::Measured { uncached_tokens, elapsed_ms } => {
-            let tok_per_s = f64::from(*uncached_tokens) / (*elapsed_ms as f64 / 1000.0);
-            // `Measured` is only constructed with a positive token
-            // count and a non-zero wall clock (see `probe_sample`), so
-            // `tok_per_s` is finite and positive here. Guarded anyway:
-            // this is a security control, and "unreachable" is a
-            // property of another function.
+        ProbeOutcome::Measured { .. } => {
+            // **The same function `summarise` used**, not a second copy
+            // of the division. `TimeoutBasis::Probed` documents
+            // `slowest_tok_per_s == tok_per_s` when one sample measured,
+            // and until #625's review that held only because two
+            // expressions in two files happened to be textually
+            // identical; editing either would have separated them by an
+            // ulp and put `slowest > fastest` in a durable row.
+            //
+            // `sample_tok_per_s` returns `None` for a zero wall clock,
+            // which `Measured` is never built with (see `probe_sample`)
+            // — guarded anyway, because this is a security control and
+            // "unreachable" is a property of another function.
+            let Some(tok_per_s) = sample_tok_per_s(&summary.best) else {
+                return floor(UnprobedReason::Nonsensical);
+            };
             if !tok_per_s.is_finite() || tok_per_s <= 0.0 {
                 return floor(UnprobedReason::Nonsensical);
             }
@@ -236,22 +257,39 @@ pub fn derive_guard_timeout(summary: &ProbeSummary) -> GuardTimeout {
                 derived.ceil() as u64
             };
             let (timeout_ms, clamped) = clamp_derived(derived_ms);
+            let fastest = tok_per_s as f32;
+            // **One repair, not three independent ones.** `summarise`
+            // never reports a slowest without a rate to go with it,
+            // never reports zero measuring samples beside a `Measured`
+            // best, and never reports a slowest above the fastest. All
+            // three are guarded rather than asserted, because
+            // `ProbeSummary`'s fields are `pub` and a hand-built summary
+            // must not be able to write a self-contradicting durable
+            // row.
+            //
+            // Written jointly because #625's review found the earlier
+            // per-field defaults (`unwrap_or` beside `max(1)`) could not
+            // catch a *joint* contradiction: `measured_samples: 0` with
+            // `slowest_tok_per_s: Some(999.0)` emitted
+            // `measured_samples: 1` beside a slowest that is not the
+            // fastest, which is exactly the row
+            // `TimeoutBasis::Probed`'s own doc promises is impossible.
+            // The honest reading of "no recorded slowest" is that this
+            // is the only rate there is, so repair both to say that.
+            let (measured_samples, slowest_tok_per_s) = match summary.measured_samples {
+                0 => (1, fastest),
+                n => (n, summary.slowest_tok_per_s.unwrap_or(fastest).min(fastest)),
+            };
             GuardTimeout {
                 timeout: Duration::from_millis(timeout_ms),
                 basis: TimeoutBasis::Probed {
-                    tok_per_s: tok_per_s as f32,
-                    // `summarise` never reports a slowest without a
-                    // rate to go with it, and never reports zero
-                    // measuring samples beside a `Measured` best. Both
-                    // are guarded rather than asserted: a hand-built
-                    // summary must not be able to write a
-                    // self-contradicting durable row, and the honest
-                    // reading of "no recorded slowest" is that this is
-                    // the only rate there is.
-                    slowest_tok_per_s: summary
-                        .slowest_tok_per_s
-                        .unwrap_or(tok_per_s as f32),
-                    measured_samples: summary.measured_samples.max(1),
+                    tok_per_s: fastest,
+                    slowest_tok_per_s,
+                    measured_samples,
+                    // A summary cannot have measured more samples than
+                    // it took; a hand-built one saying so is repaired
+                    // rather than published.
+                    attempted_samples: summary.attempted_samples.max(measured_samples),
                     derived_ms,
                     clamped,
                 },
@@ -262,7 +300,10 @@ pub fn derive_guard_timeout(summary: &ProbeSummary) -> GuardTimeout {
         // reports none: see `TimeoutBasis::Saturated`.
         ProbeOutcome::Saturated { budget_ms } => GuardTimeout {
             timeout: Duration::from_millis(TIMEOUT_CEILING_MS),
-            basis: TimeoutBasis::Saturated { budget_ms: *budget_ms },
+            basis: TimeoutBasis::Saturated {
+                budget_ms: *budget_ms,
+                attempted_samples: summary.attempted_samples,
+            },
         },
         ProbeOutcome::TooFewUncachedTokens { .. } => floor(UnprobedReason::TooFewUncachedTokens),
         ProbeOutcome::NoTokenCount => floor(UnprobedReason::NoTokenCount),

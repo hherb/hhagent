@@ -999,8 +999,26 @@ async fn with_no_override_the_boot_probe_runs_and_derives_a_budget() {
         PROBE_SAMPLES,
         "every SAMPLE must differ too, or samples 2..N are served from cache"
     );
-
     let budget = tier.timeout();
+    // **And every reading must reach `summarise`.** Sending three distinct
+    // documents proves the LOOP runs three times; it says nothing about
+    // whether the fold sees more than one of them. #625's review applied
+    // `summarise(&samples[..1])` -- which silently reverts #624, the probe
+    // measuring the boot again -- and every guard test in the tree stayed
+    // green, because nothing read the counts. This is that assertion.
+    match budget.basis {
+        TimeoutBasis::Probed { measured_samples, attempted_samples, .. } => {
+            assert_eq!(
+                attempted_samples, PROBE_SAMPLES as u32,
+                "the probe must TAKE PROBE_SAMPLES samples"
+            );
+            assert_eq!(
+                measured_samples, PROBE_SAMPLES as u32,
+                "and all of them must reach summarise, not just the first"
+            );
+        }
+        ref other => panic!("a healthy mock must derive a probed basis, got {other:?}"),
+    }
     assert!(
         matches!(budget.basis, TimeoutBasis::Probed { .. }),
         "the basis must record that this was measured, got {:?}",
@@ -1078,9 +1096,11 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
     );
     assert_eq!(
         budget.basis,
-        TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS },
+        TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS, attempted_samples: 1 },
         "an overrun probe reports the budget it exceeded and NO throughput -- \
-         reporting `Probed` forced a fabricated tok_per_s into guard_tier.boot"
+         reporting `Probed` forced a fabricated tok_per_s into guard_tier.boot. \
+         attempted_samples is 1 because a saturating sample spends the whole \
+         total budget, so the durable row says how much the ceiling rests on"
     );
     assert!(
         budget.basis.coverage_finding().is_some(),
@@ -1257,7 +1277,9 @@ async fn the_pinned_budget_is_what_the_adjudication_client_actually_spends() {
 /// which deleting those three lines changes nothing observable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cache_contaminated_probe_is_rejected_rather_than_believed() {
-    use kastellan_core::cassandra::guard_model::timeout::{TimeoutBasis, UnprobedReason};
+    use kastellan_core::cassandra::guard_model::timeout::{
+        TimeoutBasis, UnprobedReason, PROBE_SAMPLES,
+    };
 
     let mock = MockGuardServer::spawn(Verdict::CacheHit).await;
     let cfg = RouterConfig { guard_timeout_ms: None, ..pinned_cfg(&mock.base_url) };
@@ -1265,8 +1287,13 @@ async fn a_cache_contaminated_probe_is_rejected_rather_than_believed() {
 
     assert_eq!(
         tier.timeout().basis,
-        TimeoutBasis::Unprobed { reason: UnprobedReason::TooFewUncachedTokens },
-        "810 tokens with 809 cached is ONE token of real work -- far below the floor"
+        TimeoutBasis::Unprobed {
+            reason: UnprobedReason::TooFewUncachedTokens,
+            attempted_samples: PROBE_SAMPLES as u32,
+        },
+        "810 tokens with 809 cached is ONE token of real work -- far below the \
+         floor, and a backend that answers thin every time is asked all \
+         PROBE_SAMPLES times before the probe gives up"
     );
     assert!(
         !matches!(tier.timeout().basis, TimeoutBasis::Probed { .. }),
@@ -1283,7 +1310,7 @@ async fn a_cache_contaminated_probe_is_rejected_rather_than_believed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_probe_is_not_fatal_and_says_the_tier_will_fail_open() {
     use kastellan_core::cassandra::guard_model::timeout::{
-        TimeoutBasis, UnprobedReason, TIMEOUT_FLOOR_MS,
+        TimeoutBasis, UnprobedReason, PROBE_SAMPLES, TIMEOUT_FLOOR_MS,
     };
 
     let mock = MockGuardServer::spawn(Verdict::ServerError).await;
@@ -1294,7 +1321,13 @@ async fn a_failing_probe_is_not_fatal_and_says_the_tier_will_fail_open() {
 
     assert_eq!(
         tier.timeout().basis,
-        TimeoutBasis::Unprobed { reason: UnprobedReason::Failed }
+        TimeoutBasis::Unprobed {
+            reason: UnprobedReason::Failed,
+            // Three failed calls, not one. The finding predicts that EVERY
+            // dispatch fails the same way, and the durable row now carries
+            // the evidence that prediction rests on.
+            attempted_samples: PROBE_SAMPLES as u32,
+        }
     );
     assert_eq!(tier.timeout().timeout.as_millis() as u64, TIMEOUT_FLOOR_MS);
     assert!(

@@ -221,7 +221,7 @@ impl GuardTier {
     ///
     /// Two clients are built: the probe spends
     /// [`timeout::PROBE_BUDGET_MS`], which is also what makes
-    /// [`ProbeOutcome::Saturated`] observable — a probe that overruns
+    /// [`timeout::ProbeOutcome::Saturated`] observable — a probe that overruns
     /// its budget arrives as a transport timeout, and that *is* the
     /// measurement.
     pub async fn from_router_config(

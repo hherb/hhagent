@@ -144,7 +144,10 @@ fn a_saturated_probe_derives_the_ceiling_and_never_the_floor() {
         Duration::from_millis(TIMEOUT_FLOOR_MS),
         "the floor would be exactly inverted"
     );
-    assert_eq!(t.basis, TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS });
+    assert_eq!(
+        t.basis,
+        TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS, attempted_samples: 1 }
+    );
 }
 
 /// A saturated probe reports **no throughput and no derivation**, and
@@ -339,24 +342,63 @@ fn the_basis_carries_the_spread_the_samples_disagreed_by() {
 
 /// A hand-built summary cannot write a self-contradicting durable row.
 ///
-/// `summarise` never pairs a `Measured` best with zero measuring samples
-/// or with no slowest rate — but `ProbeSummary`'s fields are public, and
-/// a row claiming `measured_samples: 0` beside a measured `tok_per_s`
-/// would be unreadable. The guard is the same shape as the `is_finite`
-/// one beside it: cheap, and "unreachable" is a property of another
-/// function.
+/// `summarise` never pairs a `Measured` best with zero measuring samples,
+/// with no slowest rate, or with a slowest ABOVE the fastest — but
+/// `ProbeSummary`'s fields are public, and a row claiming
+/// `measured_samples: 0` beside a measured `tok_per_s` would be
+/// unreadable. The guard is the same shape as the `is_finite` one beside
+/// it: cheap, and "unreachable" is a property of another function.
+///
+/// **The second case is the one #625's review found.** The repair used to
+/// be two independent defaults — `slowest_tok_per_s.unwrap_or(..)` beside
+/// `measured_samples.max(1)` — which cannot catch a *joint* contradiction:
+/// `measured_samples: 0` with `slowest_tok_per_s: Some(999.0)` sailed past
+/// both and emitted `measured_samples: 1` beside a slowest that is not the
+/// fastest, contradicting the invariant `TimeoutBasis::Probed` documents.
+/// The fields are now repaired together.
 #[test]
 fn a_summary_built_by_hand_still_reports_a_coherent_row() {
-    let t = derive_guard_timeout(&ProbeSummary {
+    let probed = |summary: &ProbeSummary| match derive_guard_timeout(summary).basis {
+        TimeoutBasis::Probed {
+            tok_per_s,
+            slowest_tok_per_s,
+            measured_samples,
+            attempted_samples,
+            ..
+        } => (tok_per_s, slowest_tok_per_s, measured_samples, attempted_samples),
+        other => panic!("expected a probed basis, got {other:?}"),
+    };
+
+    // Nothing recorded: the only rate there is, reported once.
+    let (fastest, slowest, measured, attempted) = probed(&ProbeSummary {
         best: DGX_MEASURED,
+        attempted_samples: 0,
         measured_samples: 0,
         slowest_tok_per_s: None,
     });
-    match t.basis {
-        TimeoutBasis::Probed { tok_per_s, slowest_tok_per_s, measured_samples, .. } => {
-            assert_eq!(measured_samples, 1, "a measured best came from at least one sample");
-            assert_eq!(slowest_tok_per_s, tok_per_s, "the only rate there is");
-        }
-        other => panic!("expected a probed basis, got {other:?}"),
-    }
+    assert_eq!(measured, 1, "a measured best came from at least one sample");
+    assert_eq!(slowest, fastest, "the only rate there is");
+    assert_eq!(attempted, 1, "and it cannot have measured more than it took");
+
+    // A slowest recorded beside a zero count -- the joint contradiction.
+    let (fastest, slowest, measured, _) = probed(&ProbeSummary {
+        best: DGX_MEASURED,
+        attempted_samples: 0,
+        measured_samples: 0,
+        slowest_tok_per_s: Some(999.0),
+    });
+    assert_eq!(measured, 1);
+    assert_eq!(
+        slowest, fastest,
+        "a count of zero means there is one rate, whatever a slowest field claims"
+    );
+
+    // A slowest FASTER than the fastest is not a spread, it is nonsense.
+    let (fastest, slowest, ..) = probed(&ProbeSummary {
+        best: DGX_MEASURED,
+        attempted_samples: 2,
+        measured_samples: 2,
+        slowest_tok_per_s: Some(9e9),
+    });
+    assert!(slowest <= fastest, "slowest {slowest} must never exceed fastest {fastest}");
 }

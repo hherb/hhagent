@@ -5,14 +5,23 @@
 //! 500-LOC cap — the same movement `timeout.rs` made at 503 when it
 //! pushed `classify_pin` down to `basis.rs`, and for the same reason
 //! beyond the line count: [`super::boot`] is about whether a configured
-//! tier is **usable**, and this is about **measuring** one. The boot
-//! sequence calls [`run_probe`] once and is otherwise free of sockets.
+//! tier is **usable**, and this is about **measuring** one. `boot.rs`
+//! verifies, this file measures. It is deliberately *not* "boot.rs is
+//! now free of sockets" — that file still calls `/props` (fatally) and
+//! `probability` — only that the sampling loop is no longer its
+//! business.
 //!
 //! Almost nothing here is worth a test with a server, and that is by
 //! design: which sample wins and when to stop are pure and live in
 //! [`timeout::summarise`] and [`timeout::more_samples_wanted`]. What is
 //! left is a loop, a clock, and the one predicate only the transport can
-//! answer ([`is_timeout`]).
+//! answer (`is_timeout`).
+//!
+//! The exception is the per-sample cache-buster, which only a server can
+//! see. `guard_tier_e2e`'s
+//! `with_no_override_the_boot_probe_runs_and_derives_a_budget` asserts
+//! [`timeout::PROBE_SAMPLES`] *distinct* bodies, and that all of them
+//! reach [`timeout::summarise`] rather than only the first.
 //!
 //! [#624]: https://github.com/hherb/kastellan/issues/624
 
@@ -22,8 +31,12 @@ use super::super::timeout::{self, ProbeOutcome, ProbeSummary};
 use super::super::GuardClient;
 use super::{error_kind, GuardErrorKind};
 
-/// Run the boot probe — [`timeout::PROBE_SAMPLES`] samples — and fold
-/// them into one summary.
+/// Run the boot probe — up to [`timeout::PROBE_SAMPLES`] samples — and
+/// fold them into one summary.
+///
+/// "Up to", because [`timeout::more_samples_wanted`] also stops on the
+/// total wall-clock budget; the count that was actually taken rides on
+/// [`ProbeSummary::attempted_samples`] into the durable boot row.
 ///
 /// The IO half of D9, and the only part of issue [#624]'s fix that
 /// touches IO: everything about *which* sample wins and *when to stop*
@@ -65,11 +78,37 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
 /// request timeout that [`timeout::PROBE_BUDGET_MS`] imposes, which is
 /// [`ProbeOutcome::Saturated`], because an overrun budget is a
 /// measurement of slowness rather than a missing measurement. A
-/// *connect* timeout is `Failed`, not `Saturated`: see [`is_timeout`].
+/// *connect* timeout is `Failed`, not `Saturated`: see `is_timeout`.
 async fn run_one_sample(client: &GuardClient, cache_buster: &str) -> ProbeOutcome {
     let document = timeout::probe_document(cache_buster);
     match client.timed_probe(&document).await {
-        Ok(reading) => timeout::probe_sample(reading),
+        Ok(reading) => {
+            let outcome = timeout::probe_sample(reading);
+            // **A sample can be useless without failing**, and until
+            // #625's review that produced no output at all. With one
+            // sample the outcome became the basis and reached the
+            // durable row; with `PROBE_SAMPLES` a single measuring
+            // sample buries the others, and `attempted_samples` then
+            // says only *that* something was unusable, not what.
+            //
+            // This matters most for `TooFewUncachedTokens`, which is the
+            // runtime detector for cache contamination: if a proxy or a
+            // backend ever normalises the per-sample cache-buster away,
+            // samples 2..N collapse to it and the multi-sample probe
+            // silently degenerates to a single-sample one. That is the
+            // fail-open `sample_cache_buster` exists to prevent, and it
+            // should not be silent.
+            if !matches!(outcome, ProbeOutcome::Measured { .. }) {
+                tracing::warn!(
+                    target: "kastellan::guard_model",
+                    outcome = ?outcome,
+                    prompt_tokens = ?reading.prompt_tokens,
+                    cached_tokens = ?reading.cached_tokens,
+                    "guard boot probe sample produced no usable measurement"
+                );
+            }
+            outcome
+        }
         Err(e) => {
             // **Logged here, because this is the only place the reason
             // exists.** `ProbeOutcome::Failed` carries it, and
