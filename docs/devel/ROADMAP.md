@@ -523,7 +523,7 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   fixed by [#619](https://github.com/hherb/kastellan/pull/619) and is closed** — the claim that
   both stayed open was written before that merge and did not survive it.
   **THE BOOT PROBE MEASURED THE BOOT, NOT THE HOST — [#624](https://github.com/hherb/kastellan/issues/624),
-  branch `fix/624-boot-probe-samples` (2026-08-26).** Found while deploying #623. D9's probe took
+  MERGED as `4aee83ad` ([#625](https://github.com/hherb/kastellan/pull/625), 2026-08-27).** Found while deploying #623. D9's probe took
   ONE sample ~3 s into daemon startup, with Postgres, 15 workers, the Matrix channel and the audit
   mirror still coming up — so it measured startup contention. Three consecutive boots on one
   unchanged DGX backend derived 21 752 / 120 000 / 83 489 ms from 6 073 / 269.6 / 1 582 tok/s,
