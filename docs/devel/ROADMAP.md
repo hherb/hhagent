@@ -607,8 +607,10 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   Ten unit tests, **mutation-proven nine for nine** by executing each mutant. The **seam** is pinned
   separately, per #625's own lesson: `cli_ask_e2e` reads the row a real daemon boot stored in real
   Postgres and asserts byte-equality with `not_configured_payload()`, confirmed to fail when
-  `main.rs` is mutated back to an inline copy. `main.rs` 824 -> 771. **Mac gate 3778 / 0 / 25**, 175
-  suites, `TEST_EXIT=0`, cold clippy exit 0 over 214 `Checking` lines; **not yet DGX-gated**. The
+  `main.rs` is mutated back to an inline copy. `main.rs` 824 -> 771. **Gated on BOTH hosts at `33029e32`: DGX 3900 / 0 / 55 and Mac
+  3778 / 0 / 25**, 175 suites each, `TEST_EXIT=0`, cold clippy exit 0 (DGX 236 `Checking` lines over
+  all 27 workspace crates, Mac 214). The DGX count reconciles exactly and on both sides — 3890 at
+  `b65e44ab`, the tip that merged as `4aee83ad`, **+10**. The
   *configured* arm's seam stays unpinned by any gate — it needs a live guard endpoint, so only
   `guard_tier_e2e` reaches it, and [#622](https://github.com/hherb/kastellan/issues/622) says that
   suite is in no gate and self-skips to a silent PASS.
