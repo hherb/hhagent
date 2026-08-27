@@ -960,9 +960,20 @@ async fn a_pinned_timeout_of_zero_refuses_to_build() {
 /// answers fast, so the derivation lands at the floor — what matters here is
 /// that the probe **ran**, sent the committed probe body, and produced a
 /// budget, none of which the pure tests can observe.
+///
+/// **It is also the live half of issue #624**, and the only place the
+/// per-sample cache-buster is observable. `sample_cache_buster` is pure and
+/// unit-tested, but nothing there can see whether `run_probe` actually calls
+/// it per iteration: a loop that hoisted the buster out would send
+/// `PROBE_SAMPLES` byte-identical prompts, serve all but the first from the
+/// prefix cache, and — on a backend that reports no `cached_tokens` — hand
+/// `summarise` a cache-inflated rate to *prefer*. That is a fail-open, and
+/// the distinct bodies below are what rule it out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn with_no_override_the_boot_probe_runs_and_derives_a_budget() {
-    use kastellan_core::cassandra::guard_model::timeout::{TimeoutBasis, TIMEOUT_FLOOR_MS};
+    use kastellan_core::cassandra::guard_model::timeout::{
+        TimeoutBasis, PROBE_SAMPLES, TIMEOUT_FLOOR_MS,
+    };
 
     let mock = MockGuardServer::spawn(Verdict::Clear).await;
     let cfg = RouterConfig {
@@ -971,15 +982,43 @@ async fn with_no_override_the_boot_probe_runs_and_derives_a_budget() {
     };
     let tier = build_tier(&cfg).await;
 
-    assert_eq!(mock.completions(), 1, "the boot probe made exactly one call");
+    assert_eq!(
+        mock.completions(),
+        PROBE_SAMPLES,
+        "the boot probe takes PROBE_SAMPLES samples (#624), not one"
+    );
     let bodies = mock.bodies();
     assert!(
-        bodies[0].contains(E2E_CACHE_BUSTER),
-        "the probe document must lead with the per-boot varying prefix, or the \
+        bodies.iter().all(|b| b.contains(E2E_CACHE_BUSTER)),
+        "every probe document must lead with the per-boot varying prefix, or the \
          prefix cache makes the sample meaningless"
     );
-
+    let distinct: std::collections::BTreeSet<&String> = bodies.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        PROBE_SAMPLES,
+        "every SAMPLE must differ too, or samples 2..N are served from cache"
+    );
     let budget = tier.timeout();
+    // **And every reading must reach `summarise`.** Sending three distinct
+    // documents proves the LOOP runs three times; it says nothing about
+    // whether the fold sees more than one of them. #625's review applied
+    // `summarise(&samples[..1])` -- which silently reverts #624, the probe
+    // measuring the boot again -- and every guard test in the tree stayed
+    // green, because nothing read the counts. This is that assertion.
+    match budget.basis {
+        TimeoutBasis::Probed { measured_samples, attempted_samples, .. } => {
+            assert_eq!(
+                attempted_samples, PROBE_SAMPLES as u32,
+                "the probe must TAKE PROBE_SAMPLES samples"
+            );
+            assert_eq!(
+                measured_samples, PROBE_SAMPLES as u32,
+                "and all of them must reach summarise, not just the first"
+            );
+        }
+        ref other => panic!("a healthy mock must derive a probed basis, got {other:?}"),
+    }
     assert!(
         matches!(budget.basis, TimeoutBasis::Probed { .. }),
         "the basis must record that this was measured, got {:?}",
@@ -1012,9 +1051,14 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
+    // Counts chat completions, so the wall-clock guarantee below is an
+    // assertion rather than a claim.
+    let completions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&completions);
     let handle = tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { return };
+            let counter = std::sync::Arc::clone(&counter);
             tokio::spawn(async move {
                 let Some((head, _body)) = read_request(&mut sock).await else { return };
                 if head.starts_with("GET") && head.contains("/props") {
@@ -1028,6 +1072,7 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
                     let _ = sock.shutdown().await;
                     return;
                 }
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 // The chat completion: hold the socket open and never answer.
                 // Keeping `sock` alive is the whole mechanism — dropping it
                 // would close the connection and produce a transport error
@@ -1051,13 +1096,25 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
     );
     assert_eq!(
         budget.basis,
-        TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS },
+        TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS, attempted_samples: 1 },
         "an overrun probe reports the budget it exceeded and NO throughput -- \
-         reporting `Probed` forced a fabricated tok_per_s into guard_tier.boot"
+         reporting `Probed` forced a fabricated tok_per_s into guard_tier.boot. \
+         attempted_samples is 1 because a saturating sample spends the whole \
+         total budget, so the durable row says how much the ceiling rests on"
     );
     assert!(
         budget.basis.coverage_finding().is_some(),
         "a host this slow is a finding, not a routine value"
+    );
+    // #624's wall-clock guarantee, and the reason `more_samples_wanted` needs
+    // no special case for saturation: a sample that saturates has by
+    // definition spent the whole total budget, so the elapsed check ends the
+    // probe on its own. Without this, going multi-sample would have made the
+    // sickest host pay PROBE_SAMPLES * PROBE_BUDGET_MS of daemon startup.
+    assert_eq!(
+        completions.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a saturating first sample must cost exactly ONE budget, not PROBE_SAMPLES"
     );
     handle.abort();
 }
@@ -1220,7 +1277,9 @@ async fn the_pinned_budget_is_what_the_adjudication_client_actually_spends() {
 /// which deleting those three lines changes nothing observable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cache_contaminated_probe_is_rejected_rather_than_believed() {
-    use kastellan_core::cassandra::guard_model::timeout::{TimeoutBasis, UnprobedReason};
+    use kastellan_core::cassandra::guard_model::timeout::{
+        TimeoutBasis, UnprobedReason, PROBE_SAMPLES,
+    };
 
     let mock = MockGuardServer::spawn(Verdict::CacheHit).await;
     let cfg = RouterConfig { guard_timeout_ms: None, ..pinned_cfg(&mock.base_url) };
@@ -1228,8 +1287,13 @@ async fn a_cache_contaminated_probe_is_rejected_rather_than_believed() {
 
     assert_eq!(
         tier.timeout().basis,
-        TimeoutBasis::Unprobed { reason: UnprobedReason::TooFewUncachedTokens },
-        "810 tokens with 809 cached is ONE token of real work -- far below the floor"
+        TimeoutBasis::Unprobed {
+            reason: UnprobedReason::TooFewUncachedTokens,
+            attempted_samples: PROBE_SAMPLES as u32,
+        },
+        "810 tokens with 809 cached is ONE token of real work -- far below the \
+         floor, and a backend that answers thin every time is asked all \
+         PROBE_SAMPLES times before the probe gives up"
     );
     assert!(
         !matches!(tier.timeout().basis, TimeoutBasis::Probed { .. }),
@@ -1246,7 +1310,7 @@ async fn a_cache_contaminated_probe_is_rejected_rather_than_believed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_probe_is_not_fatal_and_says_the_tier_will_fail_open() {
     use kastellan_core::cassandra::guard_model::timeout::{
-        TimeoutBasis, UnprobedReason, TIMEOUT_FLOOR_MS,
+        TimeoutBasis, UnprobedReason, PROBE_SAMPLES, TIMEOUT_FLOOR_MS,
     };
 
     let mock = MockGuardServer::spawn(Verdict::ServerError).await;
@@ -1257,7 +1321,13 @@ async fn a_failing_probe_is_not_fatal_and_says_the_tier_will_fail_open() {
 
     assert_eq!(
         tier.timeout().basis,
-        TimeoutBasis::Unprobed { reason: UnprobedReason::Failed }
+        TimeoutBasis::Unprobed {
+            reason: UnprobedReason::Failed,
+            // Three failed calls, not one. The finding predicts that EVERY
+            // dispatch fails the same way, and the durable row now carries
+            // the evidence that prediction rests on.
+            attempted_samples: PROBE_SAMPLES as u32,
+        }
     );
     assert_eq!(tier.timeout().timeout.as_millis() as u64, TIMEOUT_FLOOR_MS);
     assert!(

@@ -113,9 +113,36 @@ async fn report_guard_tier(
     let basis = budget.basis.kind();
     // The measured throughput, when there was one — the number a later session
     // needs to re-derive this timeout without re-running the probe.
-    let tok_per_s = match budget.basis {
-        TimeoutBasis::Probed { tok_per_s, .. } => Some(tok_per_s),
-        _ => None,
+    //
+    // Since #624 the probe takes `PROBE_SAMPLES` samples and this is the
+    // FASTEST of them, so it is reported beside the slowest and the count.
+    // A single figure was not reproducible: one unchanged DGX backend gave
+    // 6073 / 269.6 / 1582 tok/s on three consecutive boots, and the reader
+    // of any one of those rows had no way to tell. Two rates that agree are
+    // a measurement of the host; two that differ by 26x are a measurement
+    // of how busy it was at boot, and the row now distinguishes them.
+    let (tok_per_s, slowest_tok_per_s, measured_samples) = match budget.basis {
+        TimeoutBasis::Probed { tok_per_s, slowest_tok_per_s, measured_samples, .. } => {
+            (Some(tok_per_s), Some(slowest_tok_per_s), Some(measured_samples))
+        }
+        _ => (None, None, None),
+    };
+    // How many boot calls the probe actually made -- the DENOMINATOR
+    // `measured_samples` is a numerator of. Present on every basis a probe
+    // produced, not only the measuring one: on `Saturated`/`Unprobed` it is
+    // the strength of the evidence behind the finding, and one failed call
+    // predicts a wholly fail-open tier far more weakly than three.
+    //
+    // Without it `measured_samples: 1` reads three ways at once (one sample
+    // that worked / three with two served from cache / three with two failed
+    // calls), and a reader cannot even recover PROBE_SAMPLES, which is a
+    // tunable. `attempted_samples > measured_samples` with no
+    // `coverage_finding` is the row that says "read that boot's warn! lines".
+    let attempted_samples = match budget.basis {
+        TimeoutBasis::Probed { attempted_samples, .. }
+        | TimeoutBasis::Saturated { attempted_samples, .. }
+        | TimeoutBasis::Unprobed { attempted_samples, .. } => Some(attempted_samples),
+        TimeoutBasis::Operator { .. } => None,
     };
 
     info!(
@@ -124,6 +151,10 @@ async fn report_guard_tier(
         tau = tier.tau(),
         timeout_ms,
         timeout_basis = basis,
+        tok_per_s,
+        slowest_tok_per_s,
+        measured_samples,
+        attempted_samples,
         n_ctx = tier.n_ctx(),
         policy_digest = %kastellan_core::cassandra::guard_model::policy::policy_digest(),
         "guard tier configured -- ADVISORY defence-in-depth, not a gate (65% recall at \
@@ -150,6 +181,14 @@ async fn report_guard_tier(
             // No `unwrap_or(0.0)`: a fabricated zero would be logged as if
             // it were measured. Only a real `Probed` basis has a rate.
             tok_per_s = tok_per_s,
+            // The spread and the counts belong HERE too, not only in the
+            // durable row below. For a ceiling finding these are the
+            // diagnostic that separates "slow host" from "busy boot" --
+            // which is the whole of #624 -- and this `warn!` is the line an
+            // operator actually reads.
+            slowest_tok_per_s = slowest_tok_per_s,
+            measured_samples = measured_samples,
+            attempted_samples = attempted_samples,
             "{finding}"
         );
     }
@@ -160,6 +199,15 @@ async fn report_guard_tier(
         "timeout_ms":    timeout_ms,
         "timeout_basis": basis,
         "tok_per_s":     tok_per_s,
+        // The contention spread (#624). `null` on every non-probed basis,
+        // and equal to `tok_per_s` when exactly one sample measured — so
+        // `slowest_tok_per_s < tok_per_s / 2` is the query for "this host
+        // was busy when it measured itself".
+        "slowest_tok_per_s": slowest_tok_per_s,
+        "measured_samples":  measured_samples,
+        // The denominator (#625's review). `null` only for an operator pin,
+        // which runs no probe at all.
+        "attempted_samples": attempted_samples,
         "n_ctx":         tier.n_ctx(),
         "policy_digest": kastellan_core::cassandra::guard_model::policy::policy_digest(),
         // The finding belongs in the DURABLE record, not only in the
