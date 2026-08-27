@@ -83,7 +83,19 @@ async fn report_guard_tier(
     cfg: &kastellan_llm_router::RouterConfig,
     pool: &sqlx::PgPool,
 ) {
-    use kastellan_core::cassandra::guard_model::timeout::TimeoutBasis;
+    use kastellan_core::cassandra::guard_model::boot_report::{
+        boot_payload, not_configured_payload, timeout_ms, BootRates,
+    };
+
+    // One helper for both arms: the row is non-fatal by design — a guard
+    // tier that boots correctly must not be prevented from running by an
+    // audit sink that cannot take its boot row.
+    async fn record(pool: &sqlx::PgPool, payload: serde_json::Value) {
+        if let Err(e) = kastellan_db::audit::insert(pool, "policy", "guard_tier.boot", payload).await
+        {
+            tracing::warn!(error = %e, "guard_tier.boot audit insert failed (non-fatal)");
+        }
+    }
 
     let Some(tier) = tier else {
         info!(
@@ -91,59 +103,21 @@ async fn report_guard_tier(
              catalogue only. Set KASTELLAN_LLM_GUARD_URL, KASTELLAN_LLM_GUARD_MODEL and \
              KASTELLAN_LLM_GUARD_TAU to enable it."
         );
-        // The SAME token the per-dispatch `guard.state` vocabulary uses, so
-        // "no tier ran" has one spelling across the audit log rather than a
-        // live half and an orphaned half. This boot row is deliberately the
-        // ONLY producer of it: a per-dispatch `not_configured` field would be
-        // a constant on every row of an unconfigured host.
-        let payload = serde_json::json!({
-            "configured": false,
-            "state": kastellan_core::cassandra::guard_model::Unadjudicated::NotConfigured.as_str(),
-        });
-        if let Err(e) =
-            kastellan_db::audit::insert(pool, "policy", "guard_tier.boot", payload).await
-        {
-            tracing::warn!(error = %e, "guard_tier.boot audit insert failed (non-fatal)");
-        }
+        record(pool, not_configured_payload()).await;
         return;
     };
 
     let budget = tier.timeout();
-    let timeout_ms = budget.timeout.as_millis() as u64;
+    // Every number below comes from `boot_report`, so the `info!` line,
+    // the `warn!` finding and the durable row cannot disagree about any
+    // of them (#627). This function decides none of them any more.
+    let timeout_ms = timeout_ms(budget);
     let basis = budget.basis.kind();
-    // The measured throughput, when there was one — the number a later session
-    // needs to re-derive this timeout without re-running the probe.
-    //
-    // Since #624 the probe takes `PROBE_SAMPLES` samples and this is the
-    // FASTEST of them, so it is reported beside the slowest and the count.
-    // A single figure was not reproducible: one unchanged DGX backend gave
-    // 6073 / 269.6 / 1582 tok/s on three consecutive boots, and the reader
-    // of any one of those rows had no way to tell. Two rates that agree are
-    // a measurement of the host; two that differ by 26x are a measurement
-    // of how busy it was at boot, and the row now distinguishes them.
-    let (tok_per_s, slowest_tok_per_s, measured_samples) = match budget.basis {
-        TimeoutBasis::Probed { tok_per_s, slowest_tok_per_s, measured_samples, .. } => {
-            (Some(tok_per_s), Some(slowest_tok_per_s), Some(measured_samples))
-        }
-        _ => (None, None, None),
-    };
-    // How many boot calls the probe actually made -- the DENOMINATOR
-    // `measured_samples` is a numerator of. Present on every basis a probe
-    // produced, not only the measuring one: on `Saturated`/`Unprobed` it is
-    // the strength of the evidence behind the finding, and one failed call
-    // predicts a wholly fail-open tier far more weakly than three.
-    //
-    // Without it `measured_samples: 1` reads three ways at once (one sample
-    // that worked / three with two served from cache / three with two failed
-    // calls), and a reader cannot even recover PROBE_SAMPLES, which is a
-    // tunable. `attempted_samples > measured_samples` with no
-    // `coverage_finding` is the row that says "read that boot's warn! lines".
-    let attempted_samples = match budget.basis {
-        TimeoutBasis::Probed { attempted_samples, .. }
-        | TimeoutBasis::Saturated { attempted_samples, .. }
-        | TimeoutBasis::Unprobed { attempted_samples, .. } => Some(attempted_samples),
-        TimeoutBasis::Operator { .. } => None,
-    };
+    // The probe-derived numbers, read out of the basis ONCE and shared by
+    // the `info!` line, the `warn!` finding and the durable row below, so
+    // the three cannot disagree. `BootRates` is where the rate assignment
+    // is decided and tested (#627); this function no longer decides it.
+    let rates = BootRates::from_basis(&budget.basis);
 
     info!(
         url = %cfg.guard_url.as_deref().unwrap_or("<unset>"),
@@ -151,10 +125,10 @@ async fn report_guard_tier(
         tau = tier.tau(),
         timeout_ms,
         timeout_basis = basis,
-        tok_per_s,
-        slowest_tok_per_s,
-        measured_samples,
-        attempted_samples,
+        tok_per_s = rates.tok_per_s,
+        slowest_tok_per_s = rates.slowest_tok_per_s,
+        measured_samples = rates.measured_samples,
+        attempted_samples = rates.attempted_samples,
         n_ctx = tier.n_ctx(),
         policy_digest = %kastellan_core::cassandra::guard_model::policy::policy_digest(),
         "guard tier configured -- ADVISORY defence-in-depth, not a gate (65% recall at \
@@ -178,51 +152,24 @@ async fn report_guard_tier(
         tracing::warn!(
             timeout_ms,
             timeout_basis = basis,
-            // No `unwrap_or(0.0)`: a fabricated zero would be logged as if
-            // it were measured. Only a real `Probed` basis has a rate.
-            tok_per_s = tok_per_s,
+            // No `unwrap_or(0.0)` anywhere in `BootRates`: a fabricated
+            // zero would be logged as if it were measured. Only a real
+            // `Probed` basis carries a rate.
+            //
             // The spread and the counts belong HERE too, not only in the
             // durable row below. For a ceiling finding these are the
             // diagnostic that separates "slow host" from "busy boot" --
-            // which is the whole of #624 -- and this `warn!` is the line an
-            // operator actually reads.
-            slowest_tok_per_s = slowest_tok_per_s,
-            measured_samples = measured_samples,
-            attempted_samples = attempted_samples,
+            // which is the whole of #624 -- and this `warn!` is the line
+            // an operator actually reads.
+            tok_per_s = rates.tok_per_s,
+            slowest_tok_per_s = rates.slowest_tok_per_s,
+            measured_samples = rates.measured_samples,
+            attempted_samples = rates.attempted_samples,
             "{finding}"
         );
     }
 
-    let payload = serde_json::json!({
-        "configured":    true,
-        "tau":           tier.tau(),
-        "timeout_ms":    timeout_ms,
-        "timeout_basis": basis,
-        "tok_per_s":     tok_per_s,
-        // The contention spread (#624). `null` on every non-probed basis,
-        // and equal to `tok_per_s` when exactly one sample measured — so
-        // `slowest_tok_per_s < tok_per_s / 2` is the query for "this host
-        // was busy when it measured itself".
-        "slowest_tok_per_s": slowest_tok_per_s,
-        "measured_samples":  measured_samples,
-        // The denominator (#625's review). `null` only for an operator pin,
-        // which runs no probe at all.
-        "attempted_samples": attempted_samples,
-        "n_ctx":         tier.n_ctx(),
-        "policy_digest": kastellan_core::cassandra::guard_model::policy::policy_digest(),
-        // The finding belongs in the DURABLE record, not only in the
-        // `warn!` above. `kind()` folds `Clamped::ToCeiling` into a bare
-        // "probed", so without this the row for a host that cannot
-        // adjudicate a worst-case document is indistinguishable from a
-        // healthy one unless the reader happens to know that
-        // `timeout_ms == TIMEOUT_CEILING_MS` is meaningful. Tracing logs
-        // rotate; `audit_log` does not. `null` when routine, so a query
-        // for affected hosts is `WHERE payload->>'coverage_finding' IS NOT NULL`.
-        "coverage_finding": budget.basis.coverage_finding(),
-    });
-    if let Err(e) = kastellan_db::audit::insert(pool, "policy", "guard_tier.boot", payload).await {
-        tracing::warn!(error = %e, "guard_tier.boot audit insert failed (non-fatal)");
-    }
+    record(pool, boot_payload(tier.tau(), tier.n_ctx(), budget)).await;
 }
 
 #[tokio::main]
