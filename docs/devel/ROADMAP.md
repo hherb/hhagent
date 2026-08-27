@@ -591,9 +591,27 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   `slowest_tok_per_s: Some(999.0)`; and every non-measuring sample now writes a `warn!`, where
   before only a *failing* one did — which mattered because `TooFewUncachedTokens` is the runtime
   detector for cache contamination. Deferred: [#626](https://github.com/hherb/kastellan/issues/626)
-  above, and [#627](https://github.com/hherb/kastellan/issues/627) (`report_guard_tier` is private
-  to the binary with no `cfg(test)` module, so swapping `tok_per_s` and `slowest_tok_per_s` in the
-  payload — which inverts the documented operator query — is silent).
+  above, and [#627](https://github.com/hherb/kastellan/issues/627).
+  **[#627](https://github.com/hherb/kastellan/issues/627) FIXED on branch
+  `fix/627-guard-tier-boot-payload` (2026-08-27).** `report_guard_tier` was a private `async fn` in
+  `core/src/main.rs` — a binary with no `cfg(test)` module — so the durable
+  `policy / guard_tier.boot` payload was reachable only from a live daemon, and the two tests
+  naming that row asserted its **count**. That left half of #624's fix unguarded: swapping
+  `tok_per_s` with `slowest_tok_per_s` **inverts** the documented operator query
+  `slowest_tok_per_s < tok_per_s / 2` while every key, type and non-null survives. New pure module
+  `cassandra::guard_model::boot_report` — `BootRates::from_basis` (the four probe-derived numbers,
+  read out of the basis **once** and shared by the `info!` line, the `warn!` finding and the row),
+  `boot_payload`, `not_configured_payload`, `timeout_ms`. **`boot_payload` takes `tau` + `n_ctx` as
+  scalars and the budget for provenance rather than a `&GuardTier`, and that IS the fix** —
+  constructing a tier needs a reachable backend, which is precisely why the payload was untestable.
+  Ten unit tests, **mutation-proven nine for nine** by executing each mutant. The **seam** is pinned
+  separately, per #625's own lesson: `cli_ask_e2e` reads the row a real daemon boot stored in real
+  Postgres and asserts byte-equality with `not_configured_payload()`, confirmed to fail when
+  `main.rs` is mutated back to an inline copy. `main.rs` 824 -> 771. **Mac gate 3778 / 0 / 25**, 175
+  suites, `TEST_EXIT=0`, cold clippy exit 0 over 214 `Checking` lines; **not yet DGX-gated**. The
+  *configured* arm's seam stays unpinned by any gate — it needs a live guard endpoint, so only
+  `guard_tier_e2e` reaches it, and [#622](https://github.com/hherb/kastellan/issues/622) says that
+  suite is in no gate and self-skips to a silent PASS.
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one
