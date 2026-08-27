@@ -25,39 +25,89 @@ squash-merged, so **`fix/624-boot-probe-samples` is closed and its content is on
 
 ## Current state
 
-### #624 — the boot probe measured the BOOT, not the host — MERGED `4aee83ad` ([#625](https://github.com/hherb/kastellan/pull/625))
+### #624 — the boot probe measured the BOOT, not the host — **MERGED `4aee83ad`** ([#625](https://github.com/hherb/kastellan/pull/625))
 
-Full prose in [`archive/handover_20260827_625_merged_pre-prune.md`](archive/handover_20260827_625_merged_pre-prune.md).
-Kept here only for what still binds:
+Found while deploying #623. D9's probe took **one** sample ~3 s into daemon startup, with
+Postgres, 15 workers, the Matrix channel and the audit mirror all still coming up — so it
+measured **startup contention**. Three consecutive boots on one unchanged DGX backend:
 
-- **D9's probe took ONE sample ~3 s into daemon startup**, so it measured startup contention.
-  Three consecutive boots on one unchanged DGX backend: 6 073 / 269.6 / 1 582 tok/s, against a
-  reproducible ~7 000 measured directly minutes later. A **26x** under-measurement whose slowest
-  boot fired a **false** ceiling finding — the tier's loudest signal, spent on a host that
-  adjudicates a worst-case document in ~19 s.
-- **Fix (spec D11, amending D9): `PROBE_SAMPLES` (3) samples, keep the FASTEST.** Prompt
+| ts | `timeout_ms` | `tok_per_s` | `coverage_finding` |
+| --- | --- | --- | --- |
+| 2026-08-23 17:50 | 21 752 | 6 072.99 | null |
+| 2026-08-25 14:54 | **120 000** | **269.60** | *"this host cannot adjudicate a worst-case document…"* |
+| 2026-08-25 14:58 | 83 489 | 1 582.21 | null |
+
+That same backend measured a reproducible **~7 000 tok/s** directly, uncontended, minutes
+later — *higher* than the best of the three. A **26x** under-measurement, and the 269.6 boot
+fired a **false** ceiling finding: the tier's loudest signal, spent on a host that adjudicates
+a worst-case document in ~19 s.
+
+- **Fix: `PROBE_SAMPLES` (3) samples, keep the FASTEST** — spec **D11**, amending D9. Prompt
   processing has a hardware ceiling and no floor, so contention can only make an observation
-  *slower*; a mean is wrong for a one-sided error. It moves the budget **down**, toward the
-  fail-open edge, deliberately — `PROBE_SAFETY_FACTOR`'s 2x is already the margin for runtime
-  contention, and folding startup contention into the rate spends it twice.
+  *slower*; the maximum is the best estimator and a mean is wrong for a one-sided error (the
+  three real rates average 2 642, still 2.6x below the truth — that is a test).
+- **It moves the budget DOWN, toward the fail-open edge, deliberately.** `PROBE_SAFETY_FACTOR`'s
+  2x is *already* the margin for runtime contention (M1 open risk 3), and folding startup
+  contention into the rate spends it twice. The dangerous direction stays guarded: an
+  *over*-measured rate can only come from a cache hit.
 - **Each sample carries its OWN cache-buster, and that is load-bearing.** N samples sharing one
-  send N byte-identical prompts, which on a backend that does not report `cached_tokens` read as
-  enormous throughputs — and fastest-wins would then *prefer* them. A fail-open manufactured by
-  the fix; only an e2e can see it, and one does.
-- **The durable row carries the spread AND its denominator.** `TimeoutBasis::Probed` gained
-  `slowest_tok_per_s` + `measured_samples` + `attempted_samples`; `Saturated`/`Unprobed` gained
-  `attempted_samples`. Queries: `slowest_tok_per_s < tok_per_s / 2` = busy boot;
-  `attempted_samples > measured_samples` with no finding = read that boot's `warn!` lines. The
-  spread is deliberately **not** a finding.
-- **The review's CRITICAL, and the rule it left:** `summarise(&samples)` → `summarise(&samples[..1])`
-  silently reverted the whole fix and passed every guard test in the tree. The e2e asserted three
-  completions and three distinct bodies — which proves the LOOP ran three times and says nothing
-  about whether the FOLD saw more than one. **When a fix's value lives in a fold, pin the fold's
-  *inputs*, not just its output shape.** #627 below is the same rule applied one layer out.
-- **Deferred, still open:** [#626](https://github.com/hherb/kastellan/issues/626) — because
-  `PROBE_TOTAL_BUDGET_MS == PROBE_BUDGET_MS`, a **saturating FIRST sample still ends the probe at
-  one sample** and fires the false ceiling finding (the cold-`llama-server` case). #624 fixed the
-  *contention* half only.
+  send N byte-identical prompts; on a backend reporting `cached_tokens` they collapse to
+  `TooFewUncachedTokens` (the multi-sample probe silently becomes single-sample), and on one
+  that does **not** report it they read as enormous throughputs — which fastest-wins would then
+  *prefer*. A fail-open manufactured by the fix. Only an e2e can see it, and one does.
+- **Stopping rule: `taken < PROBE_SAMPLES && elapsed < PROBE_TOTAL_BUDGET_MS`.** An explicit
+  stop-on-saturation was written and dropped **because it would have been dead code** — the two
+  budgets are equal, so a saturating sample always leaves `elapsed >= TOTAL` and the elapsed
+  check already fires. The two rules are behaviourally identical. ⚠️ **So a saturating FIRST
+  sample still ends the probe at one sample and fires the false ceiling finding** — the
+  cold-`llama-server` case, filed as
+  [#626](https://github.com/hherb/kastellan/issues/626), not fixed here: the fix costs up to
+  60 s of startup on the sickest host. (The PR's first draft claimed the *rejected* rule would
+  cause exactly what the shipped rule does; corrected in place in four documents.)
+- **Ranking with no measuring sample:** `Saturated` > `Failed` > `TooFewUncachedTokens` >
+  `NoTokenCount`. The lower three derive the same floor, so this decides one thing — whether a
+  coverage finding fires. Note `Measured` outranks all of them, so one good sample silences the
+  `Saturated`/`Failed` findings; `attempted_samples > measured_samples` is what says so instead.
+- **The durable row carries the spread AND its denominator.** `TimeoutBasis::Probed` gains
+  `slowest_tok_per_s` + `measured_samples` + `attempted_samples`; `Saturated`/`Unprobed` gain
+  `attempted_samples` (there it is the strength of the evidence behind the finding — one failed
+  call predicts a fail-open tier far more weakly than three). Queries:
+  `slowest_tok_per_s < tok_per_s / 2` = busy boot; `attempted_samples > measured_samples` with
+  no finding = read that boot's `warn!` lines. The spread is deliberately **not** a finding.
+- **Every non-measuring sample now warns**, not only a failing one — `TooFewUncachedTokens` is
+  the runtime detector for cache contamination and used to be silent.
+
+**Five-agent review (round one) — one CRITICAL, verified by executing the mutant.**
+`summarise(&samples)` → `summarise(&samples[..1])` **silently reverts the whole fix** and passed
+every guard test in the tree (122 lib / 20 `guard_tier_e2e` / 11 `guard_model_e2e`, all green).
+The e2e asserted three completions and three *distinct bodies* — which proves the LOOP ran three
+times and says nothing about whether the FOLD saw more than one. Closed by asserting
+`attempted_samples == measured_samples == PROBE_SAMPLES` on the basis; confirmed to fail against
+the mutant (`left: 1, right: 3`). **"Mutation-proven seven for seven" covered the pure fold, not
+the `run_probe -> summarise` seam** — when a fix's value lives in a fold, pin the fold's *inputs*,
+not just its output shape. Also fixed: nine stale `boot::is_timeout` / `boot::run_probe`
+references the `tier/probe.rs` lift left across three files it never touched (incl. `llm-router`,
+across a crate boundary, and one inside a live assertion message); `derive_guard_timeout` now
+calls `sample_tok_per_s` instead of a second copy of the same division, making the documented
+`slowest == fastest at one sample` invariant structural; the two per-field repairs became one
+joint repair (`unwrap_or` beside `max(1)` could not catch `measured_samples: 0` with
+`slowest_tok_per_s: Some(999.0)`); rustdoc warnings 146 → **138**, below `main`'s 142.
+Deferred: [#626](https://github.com/hherb/kastellan/issues/626),
+[#627](https://github.com/hherb/kastellan/issues/627) (`report_guard_tier` is private to the
+binary with no `cfg(test)`, so swapping `tok_per_s`/`slowest_tok_per_s` in the payload — which
+inverts the documented operator query — is silent).
+
+**Split first, movement only, three times.** `timeout.rs` (479) + `timeout/tests.rs` (687) three
+ways along the seam production already had (**27 `#[test]` before, the same 27 after, identical
+name set**); then `tier/boot.rs` 497 → 426 with the probe's IO half to `tier/probe.rs`; then, at
+review, `sample.rs` 524 → 227 with the `#624` half to `timeout/summary.rs`, at the divider the
+file already carried. `timeout/` is now four files because it is four questions — `sample` (what
+ONE measurement is) / `summary` (how several become one) / `timeout.rs` (how one becomes a
+budget) / `basis` (how the budget describes itself). Everything is re-exported, so every historic
+path still resolves. The third split is **not** in its own commit — the moved lines are the same
+lines the review pass edited, and reconstructing an intermediate state would have shipped an
+ungated commit; the movement claim is measured instead (test name set 22, exactly one more than
+before, with that one named).
 
 > ⚠️ **#624 does NOT close [#612](https://github.com/hherb/kastellan/issues/612), and merging the
 > two is the mistake to avoid.** #624 is that the *sample* was taken under load on any host; #612
@@ -238,7 +288,7 @@ Full prose in [`archive/handover_20260821_pre-prune.md`](archive/handover_202608
 
 **Next up — operator's choice, each roughly one session:**
 
-- **Three closed, two facts survive them.** ~~#561~~ (fixed upstream in localmail), ~~#506~~ (`cb33005c`), ~~#552~~ (`76ac51f5`); detail in [`archive/handover_20260824_diagnostics_pre-prune.md`](archive/handover_20260824_diagnostics_pre-prune.md). **#506's `floor_resolved` branch could not be exercised by the live gate** (the planner never omits the field on this host), so its PG e2e is that branch's only evidence. And **#561 leaves a latent, unfiled hazard: paging a `mail.search` with a *different* `query`** continues the date walk with the new filter and returns `200`, silently skipping anything newer than the cursor — keyset semantics working as designed, but it means don't change the query while paging.
+- ~~[#561](https://github.com/hherb/kastellan/issues/561)~~ (fixed upstream in localmail, verified live 2026-08-15), ~~[#506](https://github.com/hherb/kastellan/issues/506)~~ (`cb33005c`), ~~[#552](https://github.com/hherb/kastellan/issues/552)~~ (`76ac51f5`) — **all CLOSED**; detail in [`archive/handover_20260824_diagnostics_pre-prune.md`](archive/handover_20260824_diagnostics_pre-prune.md). **Two things from them still bind.** #506's `floor_resolved` branch could **not** be exercised by the live gate (the planner never omits the field on this host), so its PG e2e is that branch's only evidence. And #561 leaves a **latent, unfiled** hazard: paging a `mail.search` with a *different* `query` continues the date walk with the new filter and returns `200`, silently skipping anything newer than the cursor — keyset semantics working as designed, but it means **don't change the query while paging**.
 - **[#560](https://github.com/hherb/kastellan/issues/560) — the planner fabricates a 16-hex `message_id`.** Do **not** close this by rewriting the parameter description: #536 already did exactly that ("not a placeholder"), deployed 2026-08-09, and both later runs still fabricated. The lead worth measuring is in the issue — with keys stripped by `extract_scannable_text`, `"20973"` reaches the planner as a bare line among subjects and dates, with nothing marking it as *the id* [[tool-output-reaches-planner-key-stripped]] [[opaque-ids-are-unusable-tool-params]].
 - **[#550](https://github.com/hherb/kastellan/issues/550) — the *generated* `kastellan.env` gets no end-to-end check.** #531 verifies the optional overlay most hosts do not have and skips the required file every host does have; on a no-overlay host a dropped directive for it renders as the reassuring `none at …` line at `info!`. **The naive fix is wrong** — the overlay legitimately overrides `kastellan.env` keys, so per-file comparison false-positives; it has to compare the *folded* environment (later file wins), which `fold_env_files` already computes for launchd.
 - **[#551](https://github.com/hherb/kastellan/issues/551) — no path directive escapes systemd's `%` specifier.** Pre-existing and workspace-wide (`ExecStart=`, `Environment=`, not just `EnvironmentFile=`): a literal `%` in `$HOME` renders a directive systemd mis-expands, dropping it with the same fail-open shape #530 fixed. Measure first, then either escape `%%` or reject at install.
