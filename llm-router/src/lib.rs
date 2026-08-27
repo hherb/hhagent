@@ -83,7 +83,7 @@ use error::{truncate_for_error, ERROR_BODY_CAP};
 /// throughput) and every other failure as the FLOOR. Swallowing the
 /// timeout here therefore handed the slowest hosts the SHORTEST guard
 /// timeout, which is a fail-open, through the one door
-/// `kastellan_core::cassandra::guard_model::tier::boot::is_timeout`
+/// `kastellan_core::cassandra::guard_model::tier::probe::is_timeout`
 /// structurally cannot watch: it matches on `Transport`, and this path
 /// had already thrown the `Transport` away.
 ///

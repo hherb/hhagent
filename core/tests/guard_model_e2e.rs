@@ -670,8 +670,30 @@ async fn live_boot_probe_derives_this_hosts_timeout() {
         tier.tau(),
         budget.basis.kind(),
     );
-    if let TimeoutBasis::Probed { tok_per_s, .. } = budget.basis {
-        println!("[live] measured throughput: {tok_per_s:.1} uncached prompt tok/s");
+    if let TimeoutBasis::Probed { tok_per_s, slowest_tok_per_s, measured_samples, .. } =
+        budget.basis
+    {
+        // Both ends of the spread, because one figure was not reproducible
+        // (#624): the probe runs while the daemon is still coming up, and
+        // three consecutive boots of one unchanged DGX backend read 6073 /
+        // 269.6 / 1582 tok/s. `tok_per_s` is now the FASTEST of
+        // `PROBE_SAMPLES`; a slowest close to it means the host was quiet
+        // and the number is about the machine, and a slowest far below it
+        // means this boot was busy -- which the operator running this
+        // instrument is the one person able to act on.
+        println!(
+            "[live] measured throughput: {tok_per_s:.1} uncached prompt tok/s \
+             (fastest of {measured_samples} measuring samples; slowest \
+             {slowest_tok_per_s:.1})"
+        );
+        if measured_samples > 1 && slowest_tok_per_s * 2.0 < tok_per_s {
+            println!(
+                "[live] NOTE: the samples disagreed by {:.1}x -- this host was \
+                 contended while it measured itself; the fastest sample is the \
+                 one about the host (#624)",
+                tok_per_s / slowest_tok_per_s
+            );
+        }
     }
 
     // The fact this instrument exists to surface. A finding is never a

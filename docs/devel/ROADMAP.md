@@ -523,6 +523,78 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   #615**, whose "Filed, not fixed: #N" phrasing GitHub read as `fixed: #N`; both reopened the same day. **#612 remains open design work; #615 was then
   fixed by [#619](https://github.com/hherb/kastellan/pull/619) and is closed** — the claim that
   both stayed open was written before that merge and did not survive it.
+  **THE BOOT PROBE MEASURED THE BOOT, NOT THE HOST — [#624](https://github.com/hherb/kastellan/issues/624),
+  branch `fix/624-boot-probe-samples` (2026-08-26).** Found while deploying #623. D9's probe took
+  ONE sample ~3 s into daemon startup, with Postgres, 15 workers, the Matrix channel and the audit
+  mirror still coming up — so it measured startup contention. Three consecutive boots on one
+  unchanged DGX backend derived 21 752 / 120 000 / 83 489 ms from 6 073 / 269.6 / 1 582 tok/s,
+  while that same backend measured a reproducible **6 953 / 6 995 / 7 026 tok/s** directly and
+  uncontended minutes later. A **26x** under-measurement, and the 269.6 boot clamped to the ceiling
+  and fired a **false** "this host cannot adjudicate a worst-case document" finding — the tier's
+  loudest signal, spent on a host that adjudicates one in ~19 s. So `timeout_basis: "probed"` was
+  not reproducible across boots of one unchanged host.
+  **Fix: `PROBE_SAMPLES` (3) samples, keep the FASTEST** (spec **D11**, which amends D9). Prompt
+  processing has a hardware ceiling and no floor, so contention can only make an observation
+  *slower*; the maximum is the best estimator and a mean is wrong for a one-sided error (the three
+  real rates average 2 647, still 2.6x below the truth). This moves the budget **down**, toward the
+  fail-open edge, deliberately: `PROBE_SAFETY_FACTOR`'s 2x is *already* the margin for runtime
+  contention, and folding startup contention into the rate spends it twice.
+  **Each sample carries its own cache-buster, and that is load-bearing** — N samples sharing one
+  send N byte-identical prompts, which on a backend reporting no `cached_tokens` read as enormous
+  throughputs that the fastest-wins rule would then *prefer*: a fail-open manufactured by the fix.
+  Stopping rule is one rule (`taken < PROBE_SAMPLES && elapsed < PROBE_TOTAL_BUDGET_MS`); an
+  explicit stop-on-saturation was written and dropped **because it would have been dead code**, not
+  because it was worse — `PROBE_TOTAL_BUDGET_MS == PROBE_BUDGET_MS`, so a saturating sample always
+  leaves `elapsed >= TOTAL` and the elapsed check already returns false. The two rules are
+  behaviourally identical. A saturating FIRST sample therefore still ends the probe at one
+  unrepresentative sample and fires the false ceiling finding — the cold-`llama-server` case, filed
+  as [#626](https://github.com/hherb/kastellan/issues/626) rather than fixed here, because the fix
+  costs up to 60 s of startup on the sickest host. It costs exactly one budget today (e2e-pinned).
+  `TimeoutBasis::Probed` now carries `slowest_tok_per_s`, `measured_samples` and
+  `attempted_samples`, and `Saturated`/`Unprobed` carry `attempted_samples` too, so one boot row
+  distinguishes a quiet host from a busy one and a clean 3-for-3 from a backend that failed two of
+  its three boot calls. The spread is deliberately **not** a coverage finding, since #624's own
+  complaint is that channel's credibility being spent on noise.
+  **Gate at the branch tip `b65e44ab` (after #625's review round): DGX 175 suites, 3890 / 0 / 55,
+  `TEST_EXIT=0`, 8 `[SKIP]` (all gliner-relex), cold clippy exit 0 over 241 `Checking` lines,
+  `cargo doc` exit 0 at 138 warnings — below `main`'s 142.**
+  **Mutation-proven seven for seven**, the seventh only after a survivor was closed: collapsing
+  `Saturated`'s rank to `Measured`'s was invisible, because the rate tie-break already held that
+  rung — the ranking is now asked directly. **Three movement-only splits**, the first two
+  each in their own commit: `timeout.rs`/`timeout/tests.rs` three ways first (27 tests before
+  and after, identical name set), then `tier/boot.rs` 497 -> 426 with the probe's IO half to
+  `tier/probe.rs`, then at review `sample.rs` 524 -> 227 with the #624 half to
+  `timeout/summary.rs`, at the divider that file already carried. The third rides in the
+  review-fix commit rather than its own, because the moved lines are the same lines that pass
+  edited; the movement claim is measured instead — the test name set across the two test files
+  is 22, exactly one more than before, with that one named. `timeout/` is now four
+  files because it is four questions: what ONE measurement is / how several become one /
+  how one becomes a budget / how the budget describes itself.
+  **#624 does NOT close [#612](https://github.com/hherb/kastellan/issues/612)** and the two must not
+  be merged: #624 is that the sample was taken under load on any host, #612 that extrapolating from
+  ~1 KiB is non-linear on Metal whatever the load. Both point at the same eventual remedy — measure
+  from the `ms` / `body_byte_len` the guard rows carry since #616.
+  **Five-agent review of the PR, round one — one CRITICAL, verified by executing the mutant.**
+  Replacing `summarise(&samples)` with `summarise(&samples[..1])` in `tier/probe.rs` **silently
+  reverts the whole fix** (the probe measures the boot again) and passed every guard test in the
+  tree — 122 lib, 20 `guard_tier_e2e`, 11 `guard_model_e2e`, all green. The e2e asserted three
+  completions and three *distinct bodies*, which proves the LOOP ran three times and says nothing
+  about whether the FOLD saw more than one of them. Closed with four lines asserting
+  `attempted_samples == measured_samples == PROBE_SAMPLES` on the basis, confirmed to fail against
+  the mutant (`left: 1, right: 3`). The "mutation-proven seven for seven" claim covered the pure
+  fold, **not** the `run_probe -> summarise` seam. Also fixed: nine stale `boot::is_timeout` /
+  `boot::run_probe` references the `tier/probe.rs` lift left behind across three files it never
+  touched (including `llm-router`, across a crate boundary, and one inside a live assertion
+  message); `derive_guard_timeout` now calls `sample_tok_per_s` rather than a second copy of the
+  same division, so the documented `slowest == fastest at one sample` invariant is structural
+  rather than a textual coincidence; the two per-field repairs became one joint repair, because
+  `unwrap_or` beside `max(1)` could not catch `measured_samples: 0` with
+  `slowest_tok_per_s: Some(999.0)`; and every non-measuring sample now writes a `warn!`, where
+  before only a *failing* one did — which mattered because `TooFewUncachedTokens` is the runtime
+  detector for cache contamination. Deferred: [#626](https://github.com/hherb/kastellan/issues/626)
+  above, and [#627](https://github.com/hherb/kastellan/issues/627) (`report_guard_tier` is private
+  to the binary with no `cfg(test)` module, so swapping `tok_per_s` and `slowest_tok_per_s` in the
+  payload — which inverts the documented operator query — is silent).
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one

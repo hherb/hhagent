@@ -105,7 +105,7 @@ pub enum GuardErrorKind {
     /// Naming it also removes the precedence question rather than
     /// deciding it: all four flag pairs now map to four distinct arms, so
     /// neither count is contaminated by the other. See
-    /// [`super::boot::is_timeout`], which reads this classification back
+    /// `probe::is_timeout`, which reads this classification back
     /// out for the boot probe and needs exactly the opposite fold.
     ConnectTimeout,
     /// A transport failure that is neither: TLS, a body read that died
@@ -178,11 +178,11 @@ impl GuardErrorKind {
 /// to copy: `transport_kind_tag` produces a **display suffix**, where
 /// picking the more actionable of two labels is free, and this produces
 /// a **count** an operator acts on. It also put this function in direct
-/// contradiction with [`super::boot::is_timeout`] one file over, which
+/// contradiction with `probe::is_timeout` two files over, which
 /// excludes the connect timeout deliberately and explains at length why
 /// — two answers to one question, in one crate, with nothing to notice.
 /// A fourth arm removes the disagreement instead of arbitrating it, and
-/// `boot::is_timeout` is now *defined* in terms of this function so the
+/// `probe::is_timeout` is now *defined* in terms of this function so the
 /// two cannot drift apart again.
 ///
 /// Pure — the live caller passes `reqwest::Error::is_timeout()` and
@@ -231,7 +231,7 @@ mod tests {
     /// rather than being folded into either neighbour. #619's review found
     /// the first cut folding it into `Timeout`: that inflated the one count
     /// #612 turns on with failures no timeout pin can fix, and it
-    /// contradicted `boot::is_timeout`, which excludes the same pair
+    /// contradicted `probe::is_timeout`, which excludes the same pair
     /// deliberately. Asserting all four rows is what makes the fold
     /// unavailable rather than merely discouraged.
     #[test]
@@ -249,12 +249,12 @@ mod tests {
         );
     }
 
-    /// The four transport arms and `boot::is_timeout` read one
+    /// The four transport arms and `probe::is_timeout` read one
     /// classification, and only the request-budget arm is a timeout there.
     ///
     /// The regression #619's review found was two functions answering the
     /// same question about the same reqwest pair differently. They cannot
-    /// now: `boot::is_timeout` is `matches!(classify(e), Timeout)`, so this
+    /// now: `probe::is_timeout` is `matches!(classify(e), Timeout)`, so this
     /// asserts the *guard-side* half of that agreement — the probe must
     /// treat a connect timeout as "not a measurement", and it does exactly
     /// when this arm stays distinct from `Timeout`.
@@ -265,7 +265,7 @@ mod tests {
                 classify_transport(is_timeout, is_connect),
                 GuardErrorKind::Timeout,
                 "({is_timeout}, {is_connect}) must not read as the request-budget timeout: \
-                 `boot::is_timeout` derives ProbeOutcome::Saturated from that arm, which \
+                 `probe::is_timeout` derives ProbeOutcome::Saturated from that arm, which \
                  takes the CEILING and writes a throughput nobody measured"
             );
         }
