@@ -90,10 +90,34 @@ async fn report_guard_tier(
     // One helper for both arms: the row is non-fatal by design — a guard
     // tier that boots correctly must not be prevented from running by an
     // audit sink that cannot take its boot row.
+    //
+    // Non-fatal, but not silent, and the difference is the whole point of
+    // the row. `audit_log` is the ONLY durable record of what the guard
+    // tier's timeout basis was at this boot; tracing logs rotate and the
+    // `warn!` below fires only when there is a coverage finding. So on
+    // the failure path the payload itself goes into the log line — it is
+    // bounded well under a kilobyte by construction (closed-set
+    // `&'static str` findings, a 16-char digest, and scalars) — and at
+    // `error!`, matching `secret_scrub.rs` and `main/email_boot.rs`
+    // rather than the best-effort `cli_audit/*` rows. A lost boot row is
+    // not best-effort bookkeeping: nothing anywhere in the tree reads a
+    // MISSING `guard_tier.boot` row as a signal, so without this line the
+    // loss is terminally silent.
     async fn record(pool: &sqlx::PgPool, payload: serde_json::Value) {
+        // Cloned before the move so the failure arm can report WHICH row
+        // was lost. One `configured` flag distinguishes the two arms; the
+        // full payload makes the loss recoverable by hand.
+        let echo = payload.clone();
         if let Err(e) = kastellan_db::audit::insert(pool, "policy", "guard_tier.boot", payload).await
         {
-            tracing::warn!(error = %e, "guard_tier.boot audit insert failed (non-fatal)");
+            tracing::error!(
+                error = %e,
+                configured = %echo["configured"],
+                timeout_basis = %echo["timeout_basis"],
+                payload = %echo,
+                "guard_tier.boot audit insert failed (non-fatal; the tier still runs, but \
+                 this boot's timeout provenance is now unrecorded)"
+            );
         }
     }
 
@@ -108,22 +132,33 @@ async fn report_guard_tier(
     };
 
     let budget = tier.timeout();
-    // Every number below comes from `boot_report`, so the `info!` line,
-    // the `warn!` finding and the durable row cannot disagree about any
-    // of them (#627). This function decides none of them any more.
-    let timeout_ms = timeout_ms(budget);
+    // What #627 actually moved, stated precisely because the obvious
+    // stronger claim ("every number here now comes from one place") is
+    // false and would mislead the next reader.
+    //
+    // `boot_report` owns the two things that were DECIDED here and are
+    // not decided here any more: the millisecond derivation of the budget
+    // (`timeout_ms`, which the log sites and the payload each used to
+    // spell with their own `as_millis() as u64`) and the rate assignment
+    // (`BootRates::from_basis`, the transposition #627 is about).
+    //
+    // The rest are read twice and agree by coincidence, not by
+    // construction: `kind()` below and again inside `boot_payload`;
+    // `tier.tau()` / `tier.n_ctx()` in the `info!` line and again as
+    // `boot_payload`'s arguments. That is tolerable because each is a
+    // single accessor call with no arithmetic — unlike the two above,
+    // there is no second SPELLING that could drift — but it is not the
+    // same guarantee, and calling it one is how a later session stops
+    // checking.
+    let budget_ms = timeout_ms(budget);
     let basis = budget.basis.kind();
-    // The probe-derived numbers, read out of the basis ONCE and shared by
-    // the `info!` line, the `warn!` finding and the durable row below, so
-    // the three cannot disagree. `BootRates` is where the rate assignment
-    // is decided and tested (#627); this function no longer decides it.
     let rates = BootRates::from_basis(&budget.basis);
 
     info!(
         url = %cfg.guard_url.as_deref().unwrap_or("<unset>"),
         model = %cfg.guard_model.as_deref().unwrap_or("<unset>"),
         tau = tier.tau(),
-        timeout_ms,
+        timeout_ms = budget_ms,
         timeout_basis = basis,
         tok_per_s = rates.tok_per_s,
         slowest_tok_per_s = rates.slowest_tok_per_s,
@@ -150,7 +185,7 @@ async fn report_guard_tier(
     // grep for the number.)
     if let Some(finding) = budget.basis.coverage_finding() {
         tracing::warn!(
-            timeout_ms,
+            timeout_ms = budget_ms,
             timeout_basis = basis,
             // No `unwrap_or(0.0)` anywhere in `BootRates`: a fabricated
             // zero would be logged as if it were measured. Only a real

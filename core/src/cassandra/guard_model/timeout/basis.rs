@@ -177,8 +177,15 @@ pub enum TimeoutBasis {
     /// 6 073 / 269.6 / 1 582 tok/s on three consecutive boots of the
     /// same backend, and a reader treating `probed` as a property of the
     /// host was reading noise. A row whose two rates are close is a
-    /// measurement; one whose rates differ by 26x is a busy host, and
+    /// measurement; one whose rates differ by 22x is a busy host, and
     /// now says so.
+    ///
+    /// (22x — 6 073 / 269.6 — because these are the two rates *this
+    /// row* carries. The 26x quoted in [`super::summarise`] is a
+    /// different ratio: the ~7 000 tok/s measured directly minutes later
+    /// against the 269.6 boot, and the 7 000 never appears in any row.
+    /// Conflating them was corrected here and in
+    /// `boot_report::BootRates` together, so the two stay in step.)
     ///
     /// `measured_samples` is at least 1 whenever this variant exists,
     /// and `slowest_tok_per_s == tok_per_s` when it is exactly 1 — one

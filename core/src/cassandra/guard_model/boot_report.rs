@@ -10,18 +10,26 @@
 //! rather than in the probe. Taking the fastest of several samples is
 //! worth nothing if the row cannot then distinguish a quiet host from a
 //! busy one — and swapping [`BootRates::tok_per_s`] with
-//! [`BootRates::slowest_tok_per_s`] inverts the documented operator
-//! query `slowest_tok_per_s < tok_per_s / 2` in perfect silence: a
-//! contended host stops reporting as contended, and a quiet one starts.
-//! Every key set, type and non-null survives that mutation, so only a
-//! test that reads the two values back can catch it.
+//! [`BootRates::slowest_tok_per_s`] **silences** the documented operator
+//! query `slowest_tok_per_s < tok_per_s / 2`.
 //!
-//! **Pure throughout** — no tier, no pool, no clock, no backend. The
-//! three scalars [`boot_payload`] takes are exactly what the payload
-//! reads, and taking them rather than a `&GuardTier` is the whole point:
-//! constructing a tier needs a [`super::GuardClient`], which needs a
-//! reachable guard endpoint, which is why this code was unreachable from
-//! a unit test in the first place.
+//! Note the failure mode, because it is worse than an inversion and the
+//! obvious guess is wrong. A swap does *not* make quiet hosts report as
+//! busy: since `slowest <= fastest` always holds, a swapped row asks
+//! `fastest < slowest / 2`, which no row can satisfy. The query returns
+//! the **empty set on every host, forever** — a contended host stops
+//! reporting as contended and nothing takes its place. Every key set,
+//! type and non-null survives that mutation, so only a test that reads
+//! the two values back can catch it.
+//!
+//! **Pure throughout** — no tier, no pool, no clock, no backend. The two
+//! scalars and the budget [`boot_payload`] takes are its whole input
+//! apart from [`super::policy::policy_digest`], and taking them rather
+//! than a `&GuardTier` is the whole point: a `GuardTier` has no
+//! constructor but [`super::GuardTier::from_router_config`], whose
+//! `/props` verification is fatal — so building one in a unit test would
+//! need a live guard endpoint. That is why this code was unreachable
+//! from a unit test in the first place.
 //!
 //! [#624]: https://github.com/hherb/kastellan/issues/624
 //! [#627]: https://github.com/hherb/kastellan/issues/627
@@ -34,10 +42,10 @@ use super::timeout::{GuardTimeout, TimeoutBasis};
 
 /// The four probe-derived numbers a boot report carries.
 ///
-/// Derived **once** and shared by the `info!` line, the `warn!` finding
-/// and the durable row, so the three cannot drift apart. Before this
-/// type they were an inline four-tuple destructured in the binary, which
-/// is exactly the shape a transposition hides in.
+/// Read out of the basis by one pure function, [`Self::from_basis`], and
+/// so shared by the `info!` line, the `warn!` finding and the durable
+/// row. Before this type they were an inline four-tuple destructured in
+/// the binary, which is exactly the shape a transposition hides in.
 ///
 /// Every field is an `Option` because every one of them is genuinely
 /// absent on some basis, and absence must reach the row as JSON `null`
@@ -45,23 +53,53 @@ use super::timeout::{GuardTimeout, TimeoutBasis};
 /// `0.0` tok/s, so a zero standing in for "never measured" would be
 /// indistinguishable from an observation.
 ///
-/// The fields are `pub` and nothing here enforces `slowest <= fastest` —
-/// that invariant belongs to [`super::timeout::summarise`], which
-/// produces the basis. This type reports what the basis says; it does
-/// not re-decide it.
+/// ⚠️ That contract depends on a guard **this module does not hold**.
+/// `serde_json` maps a non-finite float to `null` rather than erroring,
+/// so a `NaN` or infinite rate would reach the row as `"tok_per_s":
+/// null` — indistinguishable from "never measured", which is the exact
+/// confusion the `Option` exists to prevent. It cannot happen today
+/// because [`super::timeout::derive_guard_timeout`] rejects a
+/// non-finite rate before any `Probed` basis is built, and that is the
+/// only production constructor of one.
+///
+/// The fields are `pub` within the crate and nothing here enforces
+/// `slowest <= fastest` — that repair belongs to
+/// [`super::timeout::derive_guard_timeout`], which builds the basis and
+/// applies `.min(fastest)` as it does. (Not to [`super::timeout::summarise`],
+/// which returns a [`super::timeout::ProbeSummary`] and never computes a
+/// fastest at all.) The invariant therefore holds of a basis that
+/// function produced; `TimeoutBasis`'s own fields are `pub`, so a
+/// hand-built one — including every fixture in this module's tests —
+/// carries whatever it was given. This type reports what the basis says;
+/// it does not re-decide it.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct BootRates {
     /// The **fastest** of the probe's measuring samples, which is the
     /// one that measures the *host* — prompt processing has a hardware
     /// ceiling and no floor, so contention can only ever make an
     /// observation slower ([#624]'s D11).
     ///
+    /// The bare name is a wart: it says "the rate" where it means "the
+    /// fastest", and it sits next to an explicitly qualified
+    /// [`Self::slowest_tok_per_s`]. That asymmetry is the shape [#627]
+    /// is about, and renaming it to `fastest_tok_per_s` is
+    /// [#632](https://github.com/hherb/kastellan/issues/632) — deferred
+    /// only so the field and [`TimeoutBasis::Probed`]'s upstream field of
+    /// the same name move together rather than drifting apart.
+    ///
     /// [#624]: https://github.com/hherb/kastellan/issues/624
+    /// [#627]: https://github.com/hherb/kastellan/issues/627
     pub tok_per_s: Option<f32>,
     /// The **slowest** of the samples that measured. Together with
     /// [`Self::tok_per_s`] this is the contention spread: two rates that
-    /// agree are a measurement of the host, two that differ by 26x are a
+    /// agree are a measurement of the host, two that differ by 22x are a
     /// measurement of how busy it was at boot.
+    ///
+    /// (22x, not the 26x quoted elsewhere in the guard tree: 26x is
+    /// ~7 000 tok/s measured directly against the 269.6 tok/s boot, and
+    /// the 7 000 never appears in a row. The spread *this row* can show
+    /// is 6 073 / 269.6 = 22.5x.)
     pub slowest_tok_per_s: Option<f32>,
     /// How many samples produced a usable rate — the numerator.
     pub measured_samples: Option<u32>,
@@ -88,25 +126,46 @@ impl BootRates {
     /// Pure and total: every basis maps, and the ones that measured
     /// nothing map to `None` rather than to a stand-in value.
     pub fn from_basis(basis: &TimeoutBasis) -> Self {
-        // Two matches rather than one, because the two questions have
-        // different answers: "did this probe MEASURE anything?" is true
-        // only of `Probed`, while "did a probe RUN at all?" is true of
-        // every basis except an operator pin.
-        let (tok_per_s, slowest_tok_per_s, measured_samples) = match basis {
-            TimeoutBasis::Probed { tok_per_s, slowest_tok_per_s, measured_samples, .. } => {
-                (Some(*tok_per_s), Some(*slowest_tok_per_s), Some(*measured_samples))
-            }
-            TimeoutBasis::Operator { .. }
-            | TimeoutBasis::Saturated { .. }
-            | TimeoutBasis::Unprobed { .. } => (None, None, None),
-        };
-        let attempted_samples = match basis {
-            TimeoutBasis::Probed { attempted_samples, .. }
-            | TimeoutBasis::Saturated { attempted_samples, .. }
-            | TimeoutBasis::Unprobed { attempted_samples, .. } => Some(*attempted_samples),
-            TimeoutBasis::Operator { .. } => None,
-        };
-        Self { tok_per_s, slowest_tok_per_s, measured_samples, attempted_samples }
+        // ONE match building `Self` per arm, rather than two matches
+        // feeding a positional tuple. The tuple form was the first cut
+        // and it reintroduced exactly the hazard this module exists to
+        // close: `(Some(*tok_per_s), Some(*slowest_tok_per_s), ..)` are
+        // same-typed neighbours, so transposing them compiles in
+        // silence. Named field initialisers make the same mistake read
+        // as `tok_per_s: Some(*slowest_tok_per_s)` — wrong on its face.
+        //
+        // The cost is repeating `None` for the quiet arms, and it buys
+        // the three legal shapes being visible in the code rather than
+        // only in the prose above: `Probed` measures and counts,
+        // `Saturated`/`Unprobed` ran a probe that measured nothing, and
+        // an operator pin never probed at all.
+        match basis {
+            TimeoutBasis::Probed {
+                tok_per_s,
+                slowest_tok_per_s,
+                measured_samples,
+                attempted_samples,
+                ..
+            } => Self {
+                tok_per_s: Some(*tok_per_s),
+                slowest_tok_per_s: Some(*slowest_tok_per_s),
+                measured_samples: Some(*measured_samples),
+                attempted_samples: Some(*attempted_samples),
+            },
+            TimeoutBasis::Saturated { attempted_samples, .. }
+            | TimeoutBasis::Unprobed { attempted_samples, .. } => Self {
+                tok_per_s: None,
+                slowest_tok_per_s: None,
+                measured_samples: None,
+                attempted_samples: Some(*attempted_samples),
+            },
+            TimeoutBasis::Operator { .. } => Self {
+                tok_per_s: None,
+                slowest_tok_per_s: None,
+                measured_samples: None,
+                attempted_samples: None,
+            },
+        }
     }
 }
 
@@ -117,8 +176,16 @@ impl BootRates {
 /// and until this existed the log sites computed it from a local while
 /// the payload computed it again. Two copies of `as_millis() as u64`
 /// agree today and are a silent divergence the day one of them changes.
+///
+/// Saturates rather than truncates, matching
+/// [`super::timeout::derive_guard_timeout`]'s deliberate choice three
+/// modules over. Unreachable today — every `GuardTimeout` in the tree is
+/// built with `Duration::from_millis(u64)`, so `as_millis()` returns
+/// exactly that `u64` — but this function is `pub` and takes an
+/// arbitrary budget, and a `Duration::from_secs`-built one would wrap a
+/// bare `as u64` silently into the durable row.
 pub fn timeout_ms(budget: &GuardTimeout) -> u64 {
-    budget.timeout.as_millis() as u64
+    u64::try_from(budget.timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The durable `policy / guard_tier.boot` payload for a **configured**
@@ -138,7 +205,12 @@ pub fn timeout_ms(budget: &GuardTimeout) -> u64 {
 /// * `coverage_finding` is `null` when the boot was routine, so the
 ///   query for affected hosts is
 ///   `WHERE payload->>'coverage_finding' IS NOT NULL`. Tracing logs
-///   rotate; `audit_log` does not.
+///   rotate; `audit_log` does not. It is passed straight through from
+///   [`TimeoutBasis::coverage_finding`] for **every** basis, not only
+///   the clamped one — five of the enum's states carry a finding, and a
+///   row that reported only the `Probed`/`ToCeiling` one would return
+///   the empty set for the three loudest (the probe never returned, the
+///   probe failed, and both out-of-band operator pins).
 /// * The key set never shrinks. A basis that measured nothing still
 ///   carries `tok_per_s`, `slowest_tok_per_s` and `measured_samples`,
 ///   holding `null` — so a reader querying one of them finds the key on
@@ -150,6 +222,13 @@ pub fn boot_payload(tau: f32, n_ctx: u64, budget: &GuardTimeout) -> Value {
         "tau":               tau,
         "timeout_ms":        timeout_ms(budget),
         "timeout_basis":     budget.basis.kind(),
+        // ⚠️ These JSON keys are the DURABLE wire format — rows carrying
+        // them are already in `audit_log` on live hosts, and operator
+        // queries are written against them. They are string literals
+        // here and `BootRates` has no `Serialize` derive, so the Rust
+        // field names and the wire keys are decoupled on purpose: #632
+        // may rename `tok_per_s` the field, and must not rename
+        // `"tok_per_s"` the key.
         "tok_per_s":         rates.tok_per_s,
         "slowest_tok_per_s": rates.slowest_tok_per_s,
         "measured_samples":  rates.measured_samples,

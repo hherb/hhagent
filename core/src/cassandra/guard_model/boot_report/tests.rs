@@ -10,11 +10,16 @@ use std::time::Duration;
 
 use super::super::timeout::{Clamped, PinBand, UnprobedReason};
 
-/// The eleven keys a configured boot row is contracted to carry.
+/// The keys a configured boot row is contracted to carry.
 ///
 /// Spelled out rather than derived from the payload, so *deleting* one
 /// fails here. A `json!` literal cannot lose a key by accident in any
 /// way a test that reads the literal back would notice.
+///
+/// Deliberately not stating the count in prose: the array IS the count,
+/// and a number in the sentence above would be a third place to edit
+/// that nothing enforces — the drift `main.rs`'s "three findings" note
+/// records having already happened once in this tree.
 const CONFIGURED_KEYS: &[&str] = &[
     "attempted_samples",
     "configured",
@@ -30,11 +35,26 @@ const CONFIGURED_KEYS: &[&str] = &[
 ];
 
 /// The contended DGX boot as a basis: three attempts, three measured,
-/// 6 090 tok/s fastest against 270 slowest.
+/// ~6 090 tok/s fastest against 270 slowest.
 ///
-/// Not invented — the three rates one unchanged DGX backend produced on
-/// three consecutive boots, which is what #624 was filed about. The 22x
-/// spread is what the row must be able to show.
+/// Not invented — the fastest and slowest of the three rates one
+/// unchanged DGX backend produced on three consecutive boots
+/// (6 073 / 269.6 / 1 582), which is what #624 was filed about, **the
+/// fastest expressed at the probe's own 810-token sample size** (810 /
+/// 0.133 s = 6 090). That qualifier is load-bearing: 6 090 is not one of
+/// the three recorded figures, and the sibling fixture at
+/// `timeout::summary::tests::contended_dgx_samples` spells it the same
+/// way for the same reason.
+///
+/// The 22.5x spread is what the row must be able to show. (The 26x
+/// quoted elsewhere in the guard tree is a different ratio — the ~7 000
+/// tok/s measured directly minutes later against the 269.6 boot — and
+/// no row ever carries the 7 000.)
+///
+/// `timeout` and `derived_ms` are 21 752, the budget derived from the
+/// recorded 6 073 rather than from this fixture's 6 090; nothing
+/// enforces that coupling on a hand-built basis, and no assertion here
+/// depends on it.
 fn contended_probed() -> GuardTimeout {
     GuardTimeout {
         timeout: Duration::from_millis(21_752),
@@ -46,6 +66,32 @@ fn contended_probed() -> GuardTimeout {
             derived_ms: 21_752,
             clamped: Clamped::No,
         },
+    }
+}
+
+/// The slow host that clamped to the ceiling: 269.6 tok/s derives a
+/// 489 s budget, which the band cuts to [`TIMEOUT_CEILING_MS`].
+///
+/// The only fixture here whose `timeout` and `derived_ms` differ, which
+/// is what makes it the one that can catch `timeout_ms` reading the
+/// wrong one of the two.
+///
+/// [`TIMEOUT_CEILING_MS`]: super::super::timeout::TIMEOUT_CEILING_MS
+fn ceiling_clamped_basis() -> TimeoutBasis {
+    TimeoutBasis::Probed {
+        tok_per_s: 269.6,
+        slowest_tok_per_s: 269.6,
+        measured_samples: 1,
+        attempted_samples: 3,
+        derived_ms: 489_000,
+        clamped: Clamped::ToCeiling,
+    }
+}
+
+fn ceiling_clamped() -> GuardTimeout {
+    GuardTimeout {
+        timeout: Duration::from_millis(120_000),
+        basis: ceiling_clamped_basis(),
     }
 }
 
@@ -68,25 +114,43 @@ fn a_configured_row_carries_exactly_the_documented_key_set() {
 /// The whole of #627: the fastest rate must land in `tok_per_s` and the
 /// slowest in `slowest_tok_per_s`, never the reverse.
 ///
-/// Swapping them keeps every key, every type and every non-null, so the
-/// key-set test above cannot see it. What it breaks is the documented
-/// operator query `slowest_tok_per_s < tok_per_s / 2`: a busy host stops
-/// reporting as busy and a quiet one starts, which is the exact
-/// diagnostic #624 shipped the two fields to provide.
+/// **This is one of only two tests in the file that detect the swap**
+/// (the other is `boot_rates_reads_a_probed_basis_without_transposing_it`,
+/// which asserts it at the struct rather than through the payload). The
+/// key set, the types and the non-nulls all survive a transposition, so
+/// neither the key-set test above nor the quiet-host test below can see
+/// it — do not delete either of the two as redundant.
+///
+/// What a swap breaks is the documented operator query
+/// `slowest_tok_per_s < tok_per_s / 2`, and it breaks it more completely
+/// than "inverted": because `slowest <= fastest` always holds, a swapped
+/// row asks `fastest < slowest / 2`, which NO row can satisfy. The query
+/// returns the empty set on every host forever — a contended host stops
+/// reporting as contended and nothing takes its place.
 #[test]
 fn the_fastest_rate_is_tok_per_s_and_the_slowest_is_slowest_tok_per_s() {
     let p = boot_payload(0.795, 66_048, &contended_probed());
     let fast = p["tok_per_s"].as_f64().expect("a probed row has a rate");
     let slow = p["slowest_tok_per_s"].as_f64().expect("a probed row has a spread");
-    assert!((fast - 6_090.0).abs() < 1.0, "tok_per_s must be the FASTEST sample, got {fast}");
-    assert!((slow - 269.6).abs() < 1.0, "slowest_tok_per_s must be the SLOWEST, got {slow}");
+    // Exact, not tolerance-based: `boot_payload` does no arithmetic on
+    // these, so the only transform is the f32 -> f64 widening, which is
+    // lossless. A tolerance here would be slop with nothing to absorb,
+    // and an invitation to widen it later.
+    assert_eq!(fast, 6_090.0_f32 as f64, "tok_per_s must be the FASTEST sample");
+    assert_eq!(slow, 269.6_f32 as f64, "slowest_tok_per_s must be the SLOWEST");
     assert!(slow < fast, "the slowest sample cannot outrun the fastest");
     // The operator query itself, run against the row it was written for.
-    assert!(slow < fast / 2.0, "a 22x spread must satisfy the busy-boot query");
+    assert!(slow < fast / 2.0, "a 22.5x spread must satisfy the busy-boot query");
 }
 
-/// A quiet host must NOT satisfy the busy-boot query — the other half of
-/// the same contract, and the direction a swap would break loudly.
+/// A quiet host must NOT satisfy the busy-boot query — the accepting
+/// arm's complement, so the query is not trivially true of every row.
+///
+/// ⚠️ This test is **insensitive to the transposition** and must not be
+/// counted as swap coverage: with two near-equal rates, `slow >= fast/2`
+/// holds in either orientation (7 026/6 953 swapped is 6 953/7 026, and
+/// 7 026 >= 3 476.5 either way). `the_fastest_rate_is_...` above is the
+/// only payload-level swap detector.
 #[test]
 fn a_quiet_hosts_row_does_not_satisfy_the_busy_boot_query() {
     let budget = GuardTimeout {
@@ -112,6 +176,12 @@ fn a_quiet_hosts_row_does_not_satisfy_the_busy_boot_query() {
 /// slowest rate, and it was the only one. The invariant is documented on
 /// `TimeoutBasis::Probed`; this pins that the payload does not
 /// special-case it away.
+///
+/// ⚠️ **This is the only fixture in the file where `measured_samples`
+/// and `attempted_samples` DIFFER (1 vs 3), and therefore the only test
+/// that can detect the two being transposed** — every other probed
+/// fixture is 3/3, where a swap is invisible. Do not "simplify" the
+/// counts here to match the others.
 #[test]
 fn one_measured_sample_reports_the_same_rate_at_both_ends() {
     let budget = GuardTimeout {
@@ -207,40 +277,101 @@ fn attempted_samples_is_null_only_for_an_operator_pin() {
     }
 }
 
-/// The finding reaches the DURABLE row, not only the `warn!` line.
+/// A ceiling-clamped host's budget is the CLAMPED one, not the derived
+/// one the clamp threw away.
+///
+/// The only fixture where `timeout` and `derived_ms` differ, and so the
+/// only test that can tell `timeout_ms` reading the budget from a mutant
+/// reading the basis's `derived_ms`. Getting that wrong would put a
+/// 489 s figure in the durable row on the one basis whose whole meaning
+/// is "the derivation was clamped away", and no operator query would
+/// ever match the timeout actually enforced.
+#[test]
+fn a_clamped_row_reports_the_enforced_budget_not_the_derived_one() {
+    let clamped = ceiling_clamped();
+    let p = boot_payload(0.795, 66_048, &clamped);
+    assert_eq!(p["timeout_ms"], 120_000, "the ENFORCED budget, not the 489 000 ms derived");
+    assert_eq!(p["timeout_basis"], "probed", "kind() folds the clamp into a bare probed");
+}
+
+/// The finding reaches the DURABLE row for EVERY basis that has one,
+/// and a routine boot leaves it null.
 ///
 /// `kind()` folds `Clamped::ToCeiling` into a bare `"probed"`, so
 /// without this key the row for a host that cannot adjudicate a
 /// worst-case document is indistinguishable from a healthy one.
+///
+/// Table-driven over the whole enum rather than over the clamped basis
+/// alone, because a payload that routed the finding only for `Probed`
+/// passes a single-basis test while silencing the three LOUDEST states —
+/// the probe never returned, the probe failed (which predicts a tier
+/// that fails open on every dispatch), and both out-of-band operator
+/// pins. `timeout_basis` still reads `"probe-failed"` in that mutant, so
+/// nothing looks wrong; the documented query
+/// `WHERE payload->>'coverage_finding' IS NOT NULL` just returns the
+/// empty set for exactly the hosts it was written to find.
+///
+/// The `bool` is spelled literally rather than derived from
+/// `coverage_finding()`, so this table is an independent statement of
+/// which states are findings — not a restatement of the code under test.
 #[test]
-fn a_coverage_finding_reaches_the_row_and_a_routine_boot_leaves_it_null() {
-    let clamped = GuardTimeout {
-        timeout: Duration::from_millis(120_000),
-        basis: TimeoutBasis::Probed {
-            tok_per_s: 269.6,
-            slowest_tok_per_s: 269.6,
-            measured_samples: 1,
-            attempted_samples: 3,
-            derived_ms: 489_000,
-            clamped: Clamped::ToCeiling,
-        },
-    };
-    let finding = boot_payload(0.795, 66_048, &clamped)["coverage_finding"].clone();
-    assert!(!finding.is_null(), "a ceiling clamp is a finding and must be stored");
-    assert_eq!(
-        finding.as_str(),
-        clamped.basis.coverage_finding(),
-        "the row must carry the basis's own sentence, not a paraphrase"
-    );
-
-    assert!(
-        boot_payload(0.795, 66_048, &contended_probed())["coverage_finding"].is_null(),
-        "a routine boot must leave the finding null so the query for affected hosts is exact"
-    );
+fn every_basis_with_a_finding_reaches_the_row_and_the_quiet_ones_stay_null() {
+    let cases: Vec<(TimeoutBasis, bool)> = vec![
+        // Findings.
+        (ceiling_clamped_basis(), true),
+        (TimeoutBasis::Saturated { budget_ms: 20_000, attempted_samples: 1 }, true),
+        (TimeoutBasis::Operator { band: PinBand::BelowFloor }, true),
+        (TimeoutBasis::Operator { band: PinBand::AboveCeiling }, true),
+        (TimeoutBasis::Unprobed { reason: UnprobedReason::Failed, attempted_samples: 3 }, true),
+        // Routine.
+        (TimeoutBasis::Operator { band: PinBand::InBand }, false),
+        (contended_probed().basis, false),
+        (
+            TimeoutBasis::Unprobed { reason: UnprobedReason::NoTokenCount, attempted_samples: 3 },
+            false,
+        ),
+        (
+            TimeoutBasis::Unprobed {
+                reason: UnprobedReason::TooFewUncachedTokens,
+                attempted_samples: 3,
+            },
+            false,
+        ),
+        (
+            TimeoutBasis::Unprobed { reason: UnprobedReason::Nonsensical, attempted_samples: 3 },
+            false,
+        ),
+    ];
+    for (basis, expects_finding) in cases {
+        let budget = GuardTimeout { timeout: Duration::from_millis(120_000), basis };
+        let kind = budget.basis.kind();
+        let finding = boot_payload(0.795, 66_048, &budget)["coverage_finding"].clone();
+        assert_eq!(
+            !finding.is_null(),
+            expects_finding,
+            "{kind}: expected a finding? {expects_finding}; row carried {finding}"
+        );
+        // And it is the basis's OWN sentence, not a paraphrase — an
+        // operator reading the row and an operator reading the `warn!`
+        // line must be reading the same words.
+        assert_eq!(
+            finding.as_str(),
+            budget.basis.coverage_finding(),
+            "{kind} must carry the basis's own sentence verbatim"
+        );
+    }
 }
 
-/// The three scalars are carried through unaltered, and `timeout_basis`
+/// The scalars are carried through unaltered, and `timeout_basis`
 /// is the basis's own token rather than a second spelling of it.
+///
+/// Asserted at **two different `(tau, n_ctx)` pairs**, and that is the
+/// point rather than thoroughness for its own sake: every other test in
+/// this file passes `0.795` and `66_048`, so a payload that ignored its
+/// arguments and emitted those two as constants would be green
+/// everywhere else in the file. `n_ctx` in particular is host-varying —
+/// `guard_tier_e2e` runs at 131 072 — and a frozen one would silently
+/// misreport which context the D8 check verified.
 #[test]
 fn the_scalars_and_the_basis_token_are_carried_verbatim() {
     let budget = contended_probed();
@@ -260,6 +391,11 @@ fn the_scalars_and_the_basis_token_are_carried_verbatim() {
         super::super::policy::policy_digest(),
         "the row pins the prompt the tier actually ran"
     );
+
+    // The second pair: different tau, different n_ctx, same basis.
+    let q = boot_payload(0.5, 131_072, &budget);
+    assert_eq!(q["tau"].as_f64().unwrap() as f32, 0.5_f32, "tau is the argument, not a constant");
+    assert_eq!(q["n_ctx"], 131_072, "n_ctx is the argument, not a constant");
 }
 
 /// The unconfigured row spells "no tier ran" with the SAME token the
@@ -273,14 +409,27 @@ fn the_unconfigured_row_reuses_the_guard_state_vocabulary() {
     assert_eq!(keys_of(&p), ["configured", "state"]);
     assert_eq!(p["configured"], false);
     assert_eq!(p["state"], Unadjudicated::NotConfigured.as_str());
+    // ...and the token is pinned as a LITERAL, not only against the enum
+    // that produces it. Comparing the row to `NotConfigured.as_str()`
+    // alone moves both sides together under a rename: `tier.rs` holds
+    // the only other occurrence in the tree, so the durable vocabulary
+    // this row is documented to be the sole producer of could change
+    // with nothing failing anywhere.
+    assert_eq!(
+        p["state"], "not_configured",
+        "the durable token is `not_configured`; rows carrying it are already in audit_log"
+    );
 }
 
-/// `BootRates` is derived once and shared by the row, the `info!` line
-/// and the `warn!` finding, so the three cannot disagree.
+/// `BootRates` reads a probed basis without transposing it — the swap
+/// detector at the struct, where the log sites read their values.
 ///
-/// Asserted at the source as well as through the payload: the log sites
-/// read the struct's named fields, and nothing else in the tree can see
-/// them.
+/// The payload-level detector is
+/// `the_fastest_rate_is_tok_per_s_and_the_slowest_is_slowest_tok_per_s`;
+/// these two are the only tests in the file that see a transposition,
+/// and they see it at different layers on purpose. `from_basis` does no
+/// arithmetic, so the exact float equality here is deliberate: it states
+/// "carried verbatim", which is exactly the property under test.
 #[test]
 fn boot_rates_reads_a_probed_basis_without_transposing_it() {
     let rates = BootRates::from_basis(&contended_probed().basis);
