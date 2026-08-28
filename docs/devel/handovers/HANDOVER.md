@@ -8,14 +8,15 @@
 > which holds the verbose pre-prune version of everything summarised here,
 > including the full #619, #615/#616/#618 and live-bring-up write-ups compressed below.
 
-**Last updated:** 2026-08-27 · **`main` HEAD:** `4aee83ad` — [#625](https://github.com/hherb/kastellan/pull/625)
+**Last updated:** 2026-08-29 · **`main` HEAD:** `4aee83ad` — [#625](https://github.com/hherb/kastellan/pull/625)
 squash-merged, so **`fix/624-boot-probe-samples` is closed and its content is on `main`**. ·
-**OPEN BRANCH: `fix/627-guard-tier-boot-payload`** (4 commits: two docs, the #627 fix, a prune). ·
-**Last gate: BOTH hosts at `33029e32` — DGX 3900 / 0 / 55 and Mac 3778 / 0 / 25, 175 suites each,
-`TEST_EXIT=0`, cold clippy exit 0 on both; see [Test baseline](#test-baseline-authoritative).** The
-DGX side reconciles exactly and on both sides: 3890 at `b65e44ab` (the tip that merged as
-`4aee83ad`, so content-identical to this branch's base) **+ 10**, the ten `#[test]`s the diff adds,
-all ten observed running by name.
+**OPEN BRANCH: `fix/627-guard-tier-boot-payload`** (5 commits: two docs, the #627 fix, a prune, and
+the five-agent review's fixes). ·
+**Last gate: DGX at `12809297` — 3901 / 0 / 55, 175 suites, `TEST_EXIT=0`, cold clippy exit 0; see
+[Test baseline](#test-baseline-authoritative).** Reconciles exactly: 3900 at `33029e32` **+ 1**, the
+one net new `#[test]` the review round adds, and all **11** `boot_report::tests::` names observed
+running in the log. **The Mac has NOT been re-gated since `020b0e53`** (3778 / 0 / 25) — the review
+round touches no `cfg`-gated code, but say that rather than round it up.
 
 > ⚠️ **Draft PR [#630](https://github.com/hherb/kastellan/pull/630) (the Headlong cross-project
 > study, docs-only) is based on the pre-merge `a30e11fb` and edits both this file and the ROADMAP.**
@@ -37,34 +38,67 @@ reachable only by starting a daemon against a live guard endpoint. The two tests
 
 - **Why it mattered: half of #624's fix lives in the REPORT, not the probe.** Taking the fastest of
   three samples is worth nothing if the row cannot then tell a quiet host from a busy one — and
-  swapping `tok_per_s` with `slowest_tok_per_s` **inverts** the documented operator query
-  `slowest_tok_per_s < tok_per_s / 2` in silence: a contended host stops reporting as contended and
-  a quiet one starts. Every key, every type and every non-null survives that mutation.
-- **New pure module `cassandra::guard_model::boot_report`** (179 lines + 296 of tests):
-  `BootRates::from_basis` (the four probe-derived numbers, read out of the basis **once** and shared
-  by the `info!` line, the `warn!` finding and the row, so the three cannot drift), `boot_payload`,
-  `not_configured_payload`, and `timeout_ms` (the log sites and the payload each had their own copy
-  of `as_millis() as u64`).
+  swapping `tok_per_s` with `slowest_tok_per_s` **silences** the documented operator query
+  `slowest_tok_per_s < tok_per_s / 2`. Every key, every type and every non-null survives that
+  mutation.
+  > ⚠️ **This said "inverts … a contended host stops reporting as contended and a quiet one starts"
+  > until `12809297`, and the second half is impossible.** Since `slowest <= fastest` always holds,
+  > a swapped row asks `fastest < slowest / 2`, which **no row can satisfy** — the query returns the
+  > empty set on every host, forever. Worse and simpler than an inversion. The same wrong sentence
+  > was in the module doc, a test doc, the PR body and here; all four are fixed.
+- **New pure module `cassandra::guard_model::boot_report`**: `BootRates::from_basis` (the four
+  probe-derived numbers, read out of the basis by one pure function and so shared by the `info!`
+  line, the `warn!` finding and the row), `boot_payload`, `not_configured_payload`, and `timeout_ms`
+  (the log sites and the payload each had their own copy of `as_millis() as u64`).
+  - **`main.rs` does NOT decide "none of them any more"**, which is what its comment claimed until
+    `12809297`. `boot_report` owns exactly two things that were decided there: the ms derivation and
+    the rate assignment. `kind()`, `tau()` and `n_ctx()` are still read twice and agree by
+    coincidence — tolerable (one accessor, no arithmetic, no second *spelling* that can drift) but
+    not the same guarantee, and calling it one is how a later session stops checking.
 - **`boot_payload` takes `tau` + `n_ctx` as scalars and the budget for provenance, NOT a
-  `&GuardTier` — and that IS the fix.** Constructing a tier needs a `GuardClient`, which needs a
-  reachable backend; that dependency is exactly why the payload was untestable. Same move as
-  [[unreachable-success-path-proves-nothing]]: extract the decision until a unit test can reach it.
-- **Mutation-proven nine for nine**, each mutant executed: the rate swap (killed by 2 tests),
-  deleting any of the three #624 keys (3), a fabricated `attempted_samples` on an operator pin,
-  fabricated zero rates on a basis that measured nothing, a drifted unconfigured `state` token, an
-  always-`null` `coverage_finding`, and an inverted `configured` flag.
+  `&GuardTier` — and that IS the fix.** A `GuardTier` has no constructor but `from_router_config`,
+  whose `/props` verification is fatal; that dependency is exactly why the payload was untestable.
+  Same move as [[unreachable-success-path-proves-nothing]]: extract the decision until a unit test
+  can reach it.
+- **Mutation-proven THIRTEEN for thirteen**, each mutant executed. The original nine (rate swap —
+  killed by 2 tests, deleting any of the three #624 keys, a fabricated `attempted_samples` on an
+  operator pin, fabricated zero rates, a drifted unconfigured `state` token, an always-`null`
+  `coverage_finding`, an inverted `configured` flag), all re-proved after `from_basis` was
+  restructured, **plus four the review found surviving**:
+  - `coverage_finding` routed **only for `Probed`** — the worst of the four, because it is
+    *selective* and so invisible on a healthy host. Five basis states carry a finding; only the
+    clamped one was ever read back. The mutant silenced the three loudest (probe never returned,
+    probe FAILED, both out-of-band operator pins) while `timeout_basis` still read `"probe-failed"`,
+    so the documented query returned empty for exactly the hosts it exists to find. Now table-driven
+    over all ten states with the expectation spelled as a literal `bool`.
+  - `timeout_ms` returning the basis's `derived_ms` — no fixture had `timeout != derived_ms`. A
+    ceiling-clamped host would have reported a 489 s budget against a 120 s enforced one.
+  - `n_ctx` frozen to `66 048` — all ten calls passed that one value. (`guard_tier_e2e` runs 131 072.)
+  - the durable `not_configured` token renamed — both assertions compared against the enum, so they
+    moved together. Now pinned as a literal; `tier.rs` holds the only other occurrence in the tree.
 - **The SEAM is pinned separately, and that is #625's lesson applied one layer out.** Unit tests on
   a shared function stay green if the caller stops calling it. `cli_ask_e2e` now reads the row a
-  **real daemon boot stored in real Postgres** and asserts byte-equality with
-  `not_configured_payload()` — confirmed to fail when `main.rs` is mutated back to composing that
-  payload inline (`left: "unconfigured", right: "not_configured"`). Read from the table rather than
-  a sink double, so it asserts what Postgres **stored** [[audit-sink-doubles-hide-storage-transforms]].
+  **real daemon boot stored in real Postgres** and asserts equality with `not_configured_payload()`
+  — confirmed to fail when `main.rs` is mutated back to composing that payload inline
+  (`left: "unconfigured", right: "not_configured"`). Read from the table rather than a sink double,
+  so it asserts what Postgres **stored** [[audit-sink-doubles-hide-storage-transforms]]. The helper
+  uses `fetch_all` + an explicit length assertion, because `fetch_one` returns the FIRST row and
+  errors only on zero — its old `expect("exactly one …")` claimed a check it did not make.
 - **`main.rs` 824 → 771**, which is the lift the file-split backlog already named as the obvious
   first one for that file. Still over the cap; the next lift is the bring-up block.
-- **The configured arm's seam is still unpinned by any gate** — it needs a live guard endpoint, so
-  only `guard_tier_e2e` can reach it, and [#622](https://github.com/hherb/kastellan/issues/622) says
-  that suite is in no gate and self-skips to a silent PASS. The unit tests cover the *payload*; only
-  an unconfigured boot proves `main.rs` calls the shared builder.
+- **The configured arm's seam is still unpinned by any gate — but NOT for the reason this file gave.**
+  > ⚠️ Until `12809297` this said "it needs a live guard endpoint, so only `guard_tier_e2e` can
+  > reach it", and [#622](https://github.com/hherb/kastellan/issues/622) says that suite is in no
+  > gate and self-skips to a silent PASS. **The premise is wrong.** `from_router_config` skips the
+  > probe *entirely* when `KASTELLAN_LLM_GUARD_TIMEOUT_MS` is pinned, so a configured boot needs
+  > only a mock answering `/props` — no live endpoint, no timing flake, a fully deterministic row.
+  > The gap was real; documenting it as *unclosable* was the defect, and that is the version a later
+  > session would have believed. [[handover-claims-verify-before-carrying]] again, on this file's
+  > own text. Recipe filed as [#633](https://github.com/hherb/kastellan/issues/633).
+- **Deferred with recipes filed, not lost:** [#632](https://github.com/hherb/kastellan/issues/632)
+  (rename `tok_per_s` → `fastest_tok_per_s` in `BootRates` **and** `TimeoutBasis::Probed` together —
+  the durable wire key must not move, and there is no `Serialize` derive so the two are already
+  decoupled) and #633 above.
 
 ### #624 — the boot probe measured the BOOT, not the host — MERGED `4aee83ad` ([#625](https://github.com/hherb/kastellan/pull/625))
 
@@ -437,7 +471,8 @@ review round widened it from two invariants to three, in [`archive/handover_2026
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
-| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`33029e32`** — the tip of `fix/627-guard-tier-boot-payload` | **3900 / 0 / 55**, 175 suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly, by counting on both sides:** 3890 at `b65e44ab` **+ 10**, and `b65e44ab` is the tip that merged as `4aee83ad`, so it is content-identical to this branch's base — the rare case where the base is *measured* rather than inferred. All ten `boot_report::tests::` names observed in the log. Ignored unchanged at 55 — no new `#[ignore]` | exit 0 over **236** `Checking` lines from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-627`), zero warnings. **All 27 workspace crates named in the log**, counted `sort -u` — the check that separates an honest full lint from a warm-cache exit 0 | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — *not* the bwrap-userns skip, so containment really ran |
+| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`12809297`** — the tip of `fix/627-guard-tier-boot-payload`, after the five-agent review round | **3901 / 0 / 55**, 175 suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3900 at `33029e32` + 1** — the one *net* new `#[test]` the review round adds (`a_clamped_row_reports_the_enforced_budget_not_the_derived_one`; the coverage-finding test was renamed and table-driven rather than added, so the diff's raw `#[test]` count is misleading and the name set is the honest instrument). All **11** `boot_report::tests::` names observed running. Ignored unchanged at 55 | exit 0 over **236** `Checking` lines from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-631fix`), zero `warning`/`error` lines. **All 27 workspace crates named**, counted `sort -u` | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — *not* the bwrap-userns skip, so containment really ran |
+| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`33029e32`** — the tip of `fix/627-guard-tier-boot-payload` before the review round | **3900 / 0 / 55**, 175 suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly, by counting on both sides:** 3890 at `b65e44ab` **+ 10**, and `b65e44ab` is the tip that merged as `4aee83ad`, so it is content-identical to this branch's base — the rare case where the base is *measured* rather than inferred. All ten `boot_report::tests::` names observed in the log. Ignored unchanged at 55 — no new `#[ignore]` | exit 0 over **236** `Checking` lines from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-627`), zero warnings. **All 27 workspace crates named in the log**, counted `sort -u` — the check that separates an honest full lint from a warm-cache exit 0 | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — *not* the bwrap-userns skip, so containment really ran |
 | **Mac** (aarch64 darwin, Seatbelt + Postgres.app 18 via `KASTELLAN_PG_BIN_DIR`) | **`020b0e53`** — the tip of `fix/627-guard-tier-boot-payload` | **3778 / 0 / 25**, 175 suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **+10 over this branch's base, which is exactly the ten `#[test]`s the diff adds** — all ten observed running by name in the log, so the count is measured on both sides rather than subtracted. `main` itself has **not** been gated on the Mac (the last Mac row is `fix/615-616-618-guard-diagnostics` at 3748, two merges back), so the base is inferred and only the delta is measured; say that rather than round it up. Ignored unchanged at 25 — no new `#[ignore]`. **The first sweep of this tree failed one test** — `scheduler_ask_expiry_e2e::an_unanswered_ask_expires_and_fails_its_task_without_a_restart`, with the PG socket gone (`No such file or directory (os error 2)`) mid-test. That suite names nothing this branch touches; it passed on the re-run. Same family as the standing macOS full-sweep PG bring-up flake below | exit 0 over **214** `Checking` lines from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-627`), zero warnings — an honest full-workspace lint, matching the historical Mac 213 range. `cargo doc -p kastellan-core --no-deps` reports **136** warnings on the Mac, none naming `boot_report`. Deliberately **not** compared to the 138/142/146 figures in the rows below: those are DGX runs of `cargo doc -p kastellan-core` *without* `--no-deps` (which counts 182 here), so the numbers are not commensurable and treating them as a trend would be the mistake | **26**, all Apple-`container` (service not started) + gliner-relex — *not* the sandbox skip |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`b65e44ab`** — the TIP of `fix/624-boot-probe-samples`, after #625's review round | **3890 / 0 / 55**, 175 suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly, by counting:** 3889 at `37961f43` (the pre-review gate, same branch) **+ 1** — the single `#[test]` the review round adds (`the_summary_counts_the_samples_it_took_not_only_the_usable_ones`). The `sample.rs` -> `summary.rs` split in the same commit adds none: the whole-tree name set across both test files is 22 against 21 before, with that one named and nothing removed, which is the honest instrument when `git diff`'s rename detection makes the raw `+`/`-` count misleading. Ignored unchanged at 55 — no new `#[ignore]` | exit 0 over **241** `Checking` lines from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-625r`). Also `cargo doc -p kastellan-core` exit 0 at **138** warnings, below `main`'s 142 and the pre-review tip's 146 | **8**, all gliner-relex — *not* the bwrap-userns skip, so containment really ran |
 | **Mac** (aarch64 darwin, Seatbelt + Postgres.app 18 via `KASTELLAN_PG_BIN_DIR`) | tip of **`fix/615-616-618-guard-diagnostics`** | **3748 / 0 / 25**, 175 suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Measured one line before the tip**: the clippy fix in the next column landed after this sweep and changes a runtime `assert!` in ONE `guard_tier_e2e` test into a `const` assertion, so it cannot reach another suite; `guard_tier_e2e` was re-run at the real tip (**20 / 0**, zero `[SKIP]`) and the cold clippy below IS at the tip. Said exactly rather than rounded up to "gated at the tip". **Reconciles exactly, and the arithmetic closes on both hosts:** the Mac was last measured at `09c6231f` (3718), **+4** for `a1c10da3` (that row reads 3721 passed *plus 1 load-flake*, so 3722 run) and **+10** for round two puts `main` at a predicted **3732**; this branch adds **16** `#[test]`s counted from the diff (2 `fetch_screen`, 5 `timeout/tests`, 4 `error_kind`, 3 `tier/tests`, 2 `guard_tier_e2e`) → 3748, measured. Ignored unchanged at 25 — no new `#[ignore]`. **The Mac has NOT been re-gated at `main` itself**, so 3732 is predicted, not measured; the 3748 is measured | exit 0 over **213** `Checking` lines from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-diag3`), zero warnings — an honest full-workspace lint, matching the historical Mac range. **The first cold run FAILED** on `clippy::assertions_on_constants`: a fixture guard `assert!(5_000 < TIMEOUT_FLOOR_MS)` compares two constants. Now a `const _: () = assert!(..)`, which is strictly better — raising the floor past `pinned_cfg`'s 5 s would silently turn a below-floor test leg into a second in-band one, and this stops the build instead | **26**, all Apple-`container` (service not started) + gliner-relex. `guard_tier_e2e` ran all **20** with zero `[SKIP]`, including both new real-socket cases |
