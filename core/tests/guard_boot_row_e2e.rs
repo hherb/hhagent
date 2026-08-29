@@ -308,8 +308,15 @@ fn a_configured_daemon_boot_stores_the_shared_configured_payload() {
         return;
     }
 
-    // Drop order is reverse declaration order: daemon guards, then the
-    // two mocks' accept-tasks, then the PG cluster.
+    // Drop order is reverse declaration order, and the runtime's place in
+    // it is load-bearing rather than incidental:
+    //   1. `_daemon_guards`  → stops + uninstalls the daemon service
+    //   2. `guard`, `planner` → abort their accept-tasks
+    //   3. `rt`              → shuts the runtime down
+    //   4. `cluster`         → stops PG, wipes the data + log dirs
+    // `ScriptedLlm::drop` calls `JoinHandle::abort`, so both mocks must be
+    // dropped while `rt` is still alive — which is why `rt` is declared
+    // BEFORE them and not after.
     let suffix = unique_suffix();
     let user = current_username();
     let cluster = cluster_for(&suffix);
