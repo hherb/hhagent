@@ -524,7 +524,7 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   fixed by [#619](https://github.com/hherb/kastellan/pull/619) and is closed** — the claim that
   both stayed open was written before that merge and did not survive it.
   **THE BOOT PROBE MEASURED THE BOOT, NOT THE HOST — [#624](https://github.com/hherb/kastellan/issues/624),
-  branch `fix/624-boot-probe-samples` (2026-08-26).** Found while deploying #623. D9's probe took
+  MERGED as `4aee83ad` ([#625](https://github.com/hherb/kastellan/pull/625), 2026-08-27).** Found while deploying #623. D9's probe took
   ONE sample ~3 s into daemon startup, with Postgres, 15 workers, the Matrix channel and the audit
   mirror still coming up — so it measured startup contention. Three consecutive boots on one
   unchanged DGX backend derived 21 752 / 120 000 / 83 489 ms from 6 073 / 269.6 / 1 582 tok/s,
@@ -592,9 +592,61 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   `slowest_tok_per_s: Some(999.0)`; and every non-measuring sample now writes a `warn!`, where
   before only a *failing* one did — which mattered because `TooFewUncachedTokens` is the runtime
   detector for cache contamination. Deferred: [#626](https://github.com/hherb/kastellan/issues/626)
-  above, and [#627](https://github.com/hherb/kastellan/issues/627) (`report_guard_tier` is private
-  to the binary with no `cfg(test)` module, so swapping `tok_per_s` and `slowest_tok_per_s` in the
-  payload — which inverts the documented operator query — is silent).
+  above, and [#627](https://github.com/hherb/kastellan/issues/627).
+  **[#627](https://github.com/hherb/kastellan/issues/627) FIXED on branch
+  `fix/627-guard-tier-boot-payload` (2026-08-27).** `report_guard_tier` was a private `async fn` in
+  `core/src/main.rs` — a binary with no `cfg(test)` module — so the durable
+  `policy / guard_tier.boot` payload was reachable only from a live daemon, and the two tests
+  naming that row asserted its **count**. That left half of #624's fix unguarded: swapping
+  `tok_per_s` with `slowest_tok_per_s` **silences** the documented operator query
+  `slowest_tok_per_s < tok_per_s / 2` while every key, type and non-null survives. New pure module
+  `cassandra::guard_model::boot_report` — `BootRates::from_basis` (the four probe-derived numbers,
+  read out of the basis by one pure function and so shared by the `info!` line, the `warn!` finding
+  and the row), `boot_payload`, `not_configured_payload`, `timeout_ms`. **`boot_payload` takes
+  `tau` + `n_ctx` as scalars and the budget for provenance rather than a `&GuardTier`, and that IS
+  the fix** — a `GuardTier` has no constructor but `from_router_config`, whose `/props` check is
+  fatal, which is precisely why the payload was untestable. Eleven unit tests, **mutation-proven
+  thirteen for thirteen** by executing each mutant. The **seam** is pinned separately, per #625's
+  own lesson: `cli_ask_e2e` reads the row a real daemon boot stored in real Postgres and asserts
+  equality with `not_configured_payload()`, confirmed to fail when `main.rs` is mutated back to an
+  inline copy. `main.rs` 824 -> 771.
+  **A five-agent review found no correctness defect in the lift but four false claims in the prose
+  justifying it, and four surviving mutants (`12809297`).** The claims: a rate swap *silences* the
+  operator query rather than inverting it — `fastest < slowest / 2` is unsatisfiable, so it returns
+  the empty set on every host forever, and "a quiet one starts reporting as contended" was
+  impossible; `a_quiet_hosts_row_does_not_satisfy_the_busy_boot_query` is swap-*insensitive* while
+  its doc claimed the opposite; the `slowest <= fastest` invariant belongs to `derive_guard_timeout`
+  (`.min(fastest)`), not to `summarise`, which returns a `ProbeSummary` and never computes a fastest;
+  and the fixture's "not invented" 6 090 tok/s is the recorded 6 073 *expressed at the probe's
+  810-token sample size*, with the in-row spread 22.5x not 26x (`basis.rs` carried the same
+  conflation and is fixed too). The mutants: `coverage_finding` routed only for `Probed` — the worst,
+  because it is selective and so invisible on a healthy host, silencing the three loudest states
+  while `timeout_basis` still read `"probe-failed"`; `timeout_ms` returning the basis's `derived_ms`;
+  `n_ctx` frozen to the one value every test passed; and the durable `not_configured` token renamed
+  with both assertions moving together. Also: `from_basis` now builds `Self` per match arm rather
+  than via a positional tuple that reintroduced the same-typed-neighbour hazard, `BootRates` is
+  `#[non_exhaustive]`, `timeout_ms` saturates, the lost-boot-row path logs at `error!` with the
+  payload and a `configured`/`basis` discriminator (nothing in the tree reads a *missing* row as a
+  signal, so the loss was terminally silent), and the e2e helper uses `fetch_all` + a length
+  assertion because `fetch_one` takes the FIRST row and errors only on zero.
+  **Gated on BOTH hosts at `33029e32`: DGX 3900 / 0 / 55 and Mac
+  3778 / 0 / 25**, 175 suites each, `TEST_EXIT=0`, cold clippy exit 0 (DGX 236 `Checking` lines over
+  all 27 workspace crates, Mac 214). The DGX count reconciles exactly and on both sides — 3890 at
+  `b65e44ab`, the tip that merged as `4aee83ad`, **+10**. **Re-gated on the DGX after the review
+  round at `12809297`: 3901 / 0 / 55**, 175 suites, `TEST_EXIT=0`, cold clippy exit 0 over 236
+  `Checking` lines and all 27 crates, 8 `[SKIP]` all gliner-relex. Reconciles exactly at +1 — the
+  one *net* new `#[test]`, with all 11 `boot_report::tests::` names observed. The Mac has not been
+  re-gated since `020b0e53`; the review round touches no `cfg`-gated code, but that is stated rather
+  than rounded up.
+  The *configured* arm's seam stays unpinned by any gate — **but not for the reason this file gave
+  until `12809297`.** It said "it needs a live guard endpoint, so only `guard_tier_e2e` reaches it",
+  and [#622](https://github.com/hherb/kastellan/issues/622) says that suite is in no gate and
+  self-skips to a silent PASS. The premise is wrong: `from_router_config` skips the probe *entirely*
+  when `KASTELLAN_LLM_GUARD_TIMEOUT_MS` is pinned, so a configured boot needs only a mock answering
+  `/props`. The gap was real; documenting it as **unclosable** was the defect. Recipe filed as
+  [#633](https://github.com/hherb/kastellan/issues/633); the `tok_per_s` → `fastest_tok_per_s`
+  rename (both `BootRates` and `TimeoutBasis::Probed`, durable wire key unchanged) as
+  [#632](https://github.com/hherb/kastellan/issues/632).
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one

@@ -19,6 +19,7 @@
 //! `docs/superpowers/specs/2026-08-21-shieldstral-guard-slice-1-design.md`;
 //! wiring design: `docs/superpowers/specs/2026-08-22-shieldstral-guard-wiring-design.md`.
 
+pub mod boot_report;
 pub mod context_pin;
 pub mod decide;
 pub mod policy;

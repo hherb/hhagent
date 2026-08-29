@@ -216,6 +216,39 @@ async fn audit_multiset(pool: &sqlx::PgPool) -> HashMap<(String, String), usize>
     m
 }
 
+/// The stored `policy / guard_tier.boot` payload, as Postgres holds it.
+///
+/// Read back from the real table rather than from a sink double, so this
+/// is the payload the daemon actually persisted — `db::audit::insert`
+/// applies `truncate_payload` on the way in, and a double would assert
+/// the row that was PASSED rather than the row that was STORED. (That
+/// transform is inert for the two-key unconfigured payload this
+/// currently reads; the reasoning is right for the class of assertion,
+/// and reading from the table is what makes it stay right if the payload
+/// ever grows.)
+///
+/// `fetch_all` rather than `fetch_one` because `fetch_one` returns the
+/// FIRST row and errors only on zero — it does not reject duplicates —
+/// so the uniqueness has to be asserted here to be asserted at all.
+/// `ORDER BY id` keeps the failure message deterministic rather than
+/// heap-ordered.
+async fn guard_tier_boot_payload(pool: &sqlx::PgPool) -> serde_json::Value {
+    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT payload FROM audit_log \
+         WHERE actor = 'policy' AND action = 'guard_tier.boot' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("select guard_tier.boot rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one guard_tier.boot row (one per daemon start); got {}",
+        rows.len()
+    );
+    rows.into_iter().next().expect("length asserted above").0
+}
+
 /// Build the per-test PG cluster + return the handle (with the
 /// daemon-test-specific service-name infix).
 fn cluster_for(suffix: &str) -> PgCluster {
@@ -378,6 +411,31 @@ fn ask_subprocess_completes_planned_task_end_to_end() {
         // row that is absent for two different reasons.
         assert_eq!(m.get(&("policy".into(), "guard_tier.boot".into())), Some(&1),
                    "expected 1× policy/guard_tier.boot per daemon start; multiset = {m:?}");
+        // ...and the row a real boot STORED equals what the shared pure
+        // builder produces (#627). The count above says the daemon wrote
+        // a row; this says it wrote THAT row, which is the seam
+        // `boot_report`'s unit tests cannot see: they would all stay
+        // green if `main.rs` went back to composing the payload inline
+        // and the two copies drifted. The sibling test below asserts the
+        // count only — the payload is a property of the boot, not of the
+        // task, and pinning it twice would double the maintenance for no
+        // extra coverage.
+        //
+        // Structural equality on two `serde_json::Value`s, not byte
+        // equality: key order and whitespace are irrelevant here, and
+        // JSONB would not round-trip key order anyway. Do not "strengthen"
+        // this into a string comparison — it would fail for the wrong
+        // reason.
+        //
+        // ⚠️ This pins the UNCONFIGURED arm only; both daemons in this
+        // file boot without a guard tier. The configured arm — eleven
+        // keys, the rates, the coverage finding — is pinned by nothing,
+        // and issue #633 carries the recipe for closing it.
+        assert_eq!(
+            guard_tier_boot_payload(&pool).await,
+            kastellan_core::cassandra::guard_model::boot_report::not_configured_payload(),
+            "the daemon must record the shared unconfigured payload verbatim"
+        );
         assert_eq!(m.get(&("cli".into(), "task.submitted".into())), Some(&1),
                    "expected 1× cli/task.submitted (producer-side row from kastellan-cli ask); multiset = {m:?}");
         assert_eq!(m.get(&("agent".into(), "plan.formulate".into())), Some(&2),
