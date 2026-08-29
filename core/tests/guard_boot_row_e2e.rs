@@ -220,12 +220,25 @@ fn bring_up_daemon(
     // `report_guard_tier` runs during bring-up, well before the
     // scheduler is spawned, and it `await`s the insert — so once this
     // line appears the row is durable in Postgres.
-    wait_for_log_match(
+    // Both log paths go into the failure message, and that is not
+    // decoration. A daemon that dies during bring-up leaves stdout
+    // EMPTY -- `tracing_subscriber::fmt` writes there -- so the bare
+    // timeout text ("full content was:") reports the one file that is
+    // guaranteed to say nothing, while the reason sits in stderr. The
+    // first Mac run of this test hit exactly that and cost a round of
+    // guessing.
+    if let Err(e) = wait_for_log_match(
         &stdout_path,
         |s| s.contains("scheduler spawned"),
         Duration::from_secs(20),
-    )
-    .expect("daemon should log 'scheduler spawned' within 20s");
+    ) {
+        panic!(
+            "daemon should log 'scheduler spawned' within 20s: {e}\n\
+             --- daemon stderr ({}) ---\n{}\n",
+            stderr_path.display(),
+            std::fs::read_to_string(&stderr_path).unwrap_or_default(),
+        );
+    }
 
     (
         Daemon {
