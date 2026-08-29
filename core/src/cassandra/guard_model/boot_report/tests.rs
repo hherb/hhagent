@@ -314,9 +314,17 @@ fn a_clamped_row_reports_the_enforced_budget_not_the_derived_one() {
 /// The `bool` is spelled literally rather than derived from
 /// `coverage_finding()`, so this table is an independent statement of
 /// which states are findings — not a restatement of the code under test.
-#[test]
-fn every_basis_with_a_finding_reaches_the_row_and_the_quiet_ones_stay_null() {
-    let cases: Vec<(TimeoutBasis, bool)> = vec![
+/// Every state a [`TimeoutBasis`] can be in, paired with whether it is
+/// contracted to carry a `coverage_finding`.
+///
+/// One table shared by the two tests that must walk *all* of them, so a
+/// state added to the enum is added here once. The alternative -- two
+/// hand-kept lists -- is how a new state ends up covered by one test and
+/// not the other, which is the selective blind spot #627's review found
+/// in the first place: a finding routed only for `Probed` is invisible
+/// on a healthy host.
+fn every_basis_with_expected_finding() -> Vec<(TimeoutBasis, bool)> {
+    vec![
         // Findings.
         (ceiling_clamped_basis(), true),
         (TimeoutBasis::Saturated { budget_ms: 20_000, attempted_samples: 1 }, true),
@@ -341,8 +349,12 @@ fn every_basis_with_a_finding_reaches_the_row_and_the_quiet_ones_stay_null() {
             TimeoutBasis::Unprobed { reason: UnprobedReason::Nonsensical, attempted_samples: 3 },
             false,
         ),
-    ];
-    for (basis, expects_finding) in cases {
+    ]
+}
+
+#[test]
+fn every_basis_with_a_finding_reaches_the_row_and_the_quiet_ones_stay_null() {
+    for (basis, expects_finding) in every_basis_with_expected_finding() {
         let budget = GuardTimeout { timeout: Duration::from_millis(120_000), basis };
         let kind = budget.basis.kind();
         let finding = boot_payload(0.795, 66_048, &budget)["coverage_finding"].clone();
@@ -441,5 +453,63 @@ fn boot_rates_reads_a_probed_basis_without_transposing_it() {
             measured_samples: Some(3),
             attempted_samples: Some(3),
         }
+    );
+}
+
+/// No shape of this row can reach the audit truncation cap.
+///
+/// `guard_tier.boot` has **no key in `db::audit::PRESERVED_KEYS`**, so
+/// an over-cap payload does not merely lose a field — the whole row
+/// collapses to a `{_truncated, sha256, len}` fingerprint, taking the
+/// timeout basis and the coverage finding with it. The tier would boot,
+/// log correctly, and leave a durable record answering none of the
+/// questions the row exists for.
+///
+/// Nothing is close to that today (the largest shape is well under a
+/// kilobyte against a 4 KiB cap), and that is exactly why the check
+/// belongs here rather than in a comment: what would breach it is a
+/// future PR lengthening a `coverage_finding` sentence, which is a
+/// change nobody would think to measure.
+///
+/// Measured with `serde_json::to_vec` — the same serialised form
+/// `truncate_payload` measures and Postgres stores, rather than the
+/// pretty-printed one, which is larger and would make this pass for the
+/// wrong reason if it ever started failing.
+///
+/// The inputs are the largest the row can legitimately carry: `tau` at
+/// full f32 precision, an `n_ctx` an order of magnitude above the
+/// 131 072 the live DGX server reports, and a `u64::MAX`-millisecond
+/// budget so `timeout_ms` renders at its full 20 digits.
+#[test]
+fn no_boot_payload_can_reach_the_audit_truncation_cap() {
+    for (basis, _) in every_basis_with_expected_finding() {
+        let budget = GuardTimeout { timeout: Duration::from_millis(u64::MAX), basis };
+        let kind = budget.basis.kind();
+        let len = serde_json::to_vec(&boot_payload(0.795_526_56, 1_048_576, &budget))
+            .expect("serde_json::Value cannot fail to serialise")
+            .len();
+        assert!(
+            len <= kastellan_db::audit::PAYLOAD_MAX_BYTES,
+            "{kind}: a {len}-byte row would be truncated to a fingerprint by \
+             db::audit::insert (cap {})",
+            kastellan_db::audit::PAYLOAD_MAX_BYTES,
+        );
+    }
+}
+
+/// The unconfigured row is bounded too, and the loop above cannot see it.
+///
+/// [`not_configured_payload`] takes no arguments and shares no code with
+/// [`boot_payload`], so no basis reaches it — and it is the row every
+/// host *without* a guard tier stores, which is most of them.
+#[test]
+fn the_unconfigured_payload_is_bounded_too() {
+    let len = serde_json::to_vec(&not_configured_payload())
+        .expect("serde_json::Value cannot fail to serialise")
+        .len();
+    assert!(
+        len <= kastellan_db::audit::PAYLOAD_MAX_BYTES,
+        "{len} bytes against a cap of {}",
+        kastellan_db::audit::PAYLOAD_MAX_BYTES,
     );
 }
