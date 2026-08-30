@@ -46,7 +46,7 @@ gliner-relex — *not* the bwrap-userns skip, so containment really ran.
 
 ## Current state
 
-### #633 — the CONFIGURED boot row had no seam pin, and the reason it was thought unclosable was wrong (branch `fix/633-configured-boot-arm-seam`)
+### #633 — the CONFIGURED boot row had no seam pin, and the reason it was thought unclosable was wrong — MERGED `d3f8ed3f` ([#635](https://github.com/hherb/kastellan/pull/635))
 
 `report_guard_tier` has two arms. #627 pinned the **unconfigured** one end to end — `cli_ask_e2e`
 reads the row a real daemon boot stored in real Postgres. The **configured** one (eleven keys, both
@@ -113,6 +113,25 @@ without a guard tier, `guard_tier_e2e` never reads `audit_log` for this action, 
   unchanged, and three e2es already using it. The work is a *migration*, and the only real gap is
   the shared helper's hardcoded 10 s log-match budget vs this file's 20 s
   [[handover-claims-verify-before-carrying]].
+- **MERGED `d3f8ed3f` (2026-08-30), and gated on the DGX the following day.** **3908 / 0 / 55**,
+  176 suites, `TEST_EXIT=0`; cold clippy exit 0 over 345 `Checking`+`Compiling` lines with all 27
+  crates named; 8 `[SKIP]`, all gliner-relex. **That run is the first time either
+  `guard_boot_row_e2e` leg has ever executed anywhere** — the branch was merged with both legs
+  compiled but unrun, because the Mac cannot boot a freshly-linked daemon and the DGX was
+  unreachable for the whole review round. Both pass.
+- **The in-band leg is mutation-proven against the exact defect it was written for.** Folding
+  `record(...)` inside `report_guard_tier`'s `if let Some(finding)` block on the live DGX gives:
+
+  ```
+  a_configured_daemon_boot_stores_the_shared_configured_payload ... ok
+  an_in_band_pin_stores_a_configured_row_with_a_null_coverage_finding ... FAILED
+    expected exactly one guard_tier.boot row (one per daemon start); got 0
+  ```
+
+  The above-ceiling leg passes the mutant, because its row always carries a finding. **The new leg
+  is the only thing in the tree that catches it** — which is what the review argued and is now
+  measured. `core/src/main.rs` restored and the tree + index verified clean afterwards
+  [[mutation-testing-contaminates-the-index]].
 - **The four-agent review of this PR found nine issues; all are fixed on the branch.** The two
   that mattered:
   - **`tests_common::daemon::bring_up_daemon` already existed** (above). The PR filed an issue to
@@ -482,8 +501,8 @@ review round widened it from two invariants to three, in [`archive/handover_2026
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
-| **Mac** (aarch64 darwin) | **`4e596cc1`** — the tip of `fix/633-configured-boot-arm-seam` | **PARTIAL, and say so.** Unit legs only: `tests-common --lib` **100 / 0**, with all three new `classify_endpoint` props cases observed by name, and `kastellan-core --lib boot_report` **13 / 0** including both new size bounds. **No daemon e2e ran** — a freshly-linked `kastellan` hangs in `_dyld_start` on this host — as do 13 KB build scripts — and `cli_ask_e2e` fails identically at a commit where it was green, so the blocker is macOS, not the branch (see the header) | `check --all-targets` exit 0 **and** clippy exit 0 over `kastellan-core` + `kastellan-tests-common` `--all-targets`, zero warnings, both in a **warm** dir — the cold run wedged on a hung build script and was killed, which is itself the evidence for the hazard below. **This is the load-bearing Mac leg for this branch**: it is the only thing that compiles the new e2e's `#[cfg(target_os = "macos")] serial_lock()` arm, which the DGX cannot see | n/a — no integration suite ran |
-| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`64587ee9`** — the tip of `fix/633-configured-boot-arm-seam` | **3907 / 0 / 55**, **176** suites (175 + the new `guard_boot_row_e2e` binary), `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3901 at `12809297` + 6**, and the 6 are *measured*, not subtracted — all six names were grepped out of the log (2 `boot_report::tests::` size bounds, 3 `classify_endpoint` props cases, 1 e2e). Ignored unchanged at 55 | exit 0 over **245** `Checking` lines from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-633`), zero `warning`/`error` lines, **all 27 workspace crates named** (counted `sort -u`) | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — *not* the bwrap-userns skip |
+| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`d3f8ed3f`** — merged `main`, #635 including its review round | **3908 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3907 at `64587ee9` + 1 net**, and all three deltas are *measured* rather than subtracted — `the_basis_table_covers_every_state_exactly_once` (+1) and `an_in_band_pin_stores_a_configured_row_with_a_null_coverage_finding` (+1) each grepped out of the log as `... ok`, and `classify_endpoint_wins_over_the_chat_fallthrough` (−1, the deleted tautology) grepped for and confirmed **absent**. **This is the first run in which either `guard_boot_row_e2e` leg has ever executed** — both pass. Ignored unchanged at 55 | exit 0 from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-635main`): **345** `Checking`+`Compiling` lines (238 + 107), zero `warning`/`error` lines, **all 27 workspace crates named** (counted `sort -u`). rustc **1.96.0** — still not CI parity [[local-clippy-not-ci-parity-rust-version]] | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — *not* the bwrap-userns skip, so containment really ran |
+| **Mac** (aarch64 darwin) | **`1e53bc9d`** — the branch tip, tree-identical to `d3f8ed3f` | **PARTIAL, and it stayed partial.** Unit legs only: `tests-common --lib` **99 / 0** (100 − the deleted tautology) with all four `classify_endpoint` cases observed by name, and `kastellan-core --lib` **1979 / 0 / 1**. **No daemon e2e ran** — a freshly-linked `kastellan` hangs in `_dyld_start` on this host, as do 13 KB build scripts, and `cli_ask_e2e` fails identically at a commit where it was green. The DGX row above is what closed that gap | `check --all-targets` exit 0 and clippy exit 0 over `kastellan-core` + `kastellan-tests-common` `--all-targets`, zero warnings, warm dir, both changed crates confirmed present in the `Checking` lines. **Still the load-bearing Mac leg**: the only thing that compiles the e2e's `#[cfg(target_os = "macos")] serial_lock()` arm | n/a — no integration suite ran |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`12809297`** — the tip of `fix/627-guard-tier-boot-payload`, after the five-agent review round | **3901 / 0 / 55**, 175 suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3900 at `33029e32` + 1** — the one *net* new `#[test]` the review round adds (`a_clamped_row_reports_the_enforced_budget_not_the_derived_one`; the coverage-finding test was renamed and table-driven rather than added, so the diff's raw `#[test]` count is misleading and the name set is the honest instrument). All **11** `boot_report::tests::` names observed running. Ignored unchanged at 55 | exit 0 over **236** `Checking` lines from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-631fix`), zero `warning`/`error` lines. **All 27 workspace crates named**, counted `sort -u` | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — *not* the bwrap-userns skip, so containment really ran |
 Older rows (`33029e32` DGX 3900, `020b0e53` Mac 3778, `b65e44ab` DGX 3890, the `fix/615-616-618-guard-diagnostics` Mac 3748, `8cb8cfb7` DGX 3854, `09c6231f` 3840/3718, `69834357` 3823, `0bae6b2c` 3759, `f46c67cf` 3749, `2ab6612c` 3686, `b58edc77` 3668, and 3047 back to 2950) are in the [`archive/`](archive/) snapshots — most recently [`handover_20260830_633_pre-prune.md`](archive/handover_20260830_633_pre-prune.md) § Test baseline.
 
