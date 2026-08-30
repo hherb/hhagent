@@ -317,11 +317,21 @@ Full prose in [`archive/handover_20260821_pre-prune.md`](archive/handover_202608
 > of parity simply by not being updated, silently. That is what bit #573: clippy-clean on the Mac
 > *and* the DGX, then a CI failure on a lint that did not exist in the older toolchain.
 >
-> **State as of 2026-08-31:** stable is **1.98.0** (2026-08-18). The **DGX is on 1.98.0 — CI parity**,
-> updated this session after it had sat two releases behind on 1.96.0 (2026-05-25). The **Mac is
-> still on 1.96.0**, so it is now the stale host. `rustc --version` on both before trusting a clippy
-> gate, and `rustup update stable` if they disagree — nothing pins them, and the update surfaced no
-> new lints in this tree (cold `--workspace --all-targets -D warnings` exit 0 on 1.98, 27 crates).
+> **State as of 2026-08-31: BOTH hosts are on 1.98.0 (2026-08-18) — CI parity**, updated this
+> session from 1.96.0 (2026-05-25), two releases behind. `rustc --version` on the host you are
+> gating on and compare against `rustup check` before trusting a clippy gate; `rustup update stable`
+> if behind. Nothing pins them, so this parity will decay again on its own.
+>
+> The bump surfaced **no new lints on either host**: cold `--workspace --all-targets -D warnings`
+> exit 0 with all 27 crates and zero warnings on the DGX (345 `Checking`+`Compiling`) *and* on the
+> Mac (303 — fewer because the Linux-gated deps compile out). The Mac's 7 rustup targets, including
+> the `aarch64-unknown-linux-gnu` used for cross-checking `cfg(linux)` code, survived the update.
+> `kastellan-supervisor --lib` on the Mac: **113 / 0**, with 44 `launchd` tests observed and **0**
+> `systemd` — the platform split, confirmed rather than assumed [[mac-compiles-zero-systemd-tests]].
+>
+> **Verified against reality the same day:** CI's `cargo check + clippy (linux)` and the
+> matrix-worker job both passed on #636, which is the first time the local gate and CI have run the
+> same compiler. A green DGX clippy now says something about CI; before this it did not.
 > `rust-version = "1.78"` in the root `Cargo.toml` is the MSRV and constrains none of this.
 >
 > The whole gate was re-run on 1.98.0 and is **byte-identical to the 1.96.0 run**: **3908 / 0 / 55**,
