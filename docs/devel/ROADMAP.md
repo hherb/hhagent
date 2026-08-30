@@ -691,9 +691,11 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   which distinguishes an empty log from an unreadable one. Second, the table documented as "every
   state a `TimeoutBasis` can be in" was missing `Probed { clamped: ToFloor }`, so **both**
   consumers skipped it -- the docstring's claim was about a state covered by one test and not the
-  other, and the real hole was a state covered by neither; fixed with the row plus a never-called
-  wildcard-free `state_space_witness` that makes the next variant a build error, mirroring the
-  production `coverage_finding` match. The review also earned a **second band leg**:
+  other, and the real hole was a state covered by neither; fixed with the row plus a wildcard-free
+  `state_key` and an `ALL_STATE_KEYS` set equality. The first version of THAT fix was too weak and
+  a mutant caught it: asserting on distinct `kind()` tokens cannot tell a duplicated row from a
+  fold, because `kind()` collapses all three `Clamped` states into `"probed"`, so a
+  "11 rows, one duplicated" mutant survived it. The review also earned a **second band leg**:
   `Operator { InBand }` is the only configured state with a null `coverage_finding`, no test
   stored one, and `record(...)` sits one line below the `if let Some(finding)` warn block -- so
   folding the two would silence the boot row on every *routine* configured host and pass the whole

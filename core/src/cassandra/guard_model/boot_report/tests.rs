@@ -305,13 +305,12 @@ fn a_clamped_row_reports_the_enforced_budget_not_the_derived_one() {
 /// on a healthy host.
 ///
 /// Sharing the table cannot, on its own, keep it complete: this is a
-/// `vec![]`, so a new variant enters the enum with **both** consumers
+/// `vec![]`, so a state can be missing from it with **both** consumers
 /// silently skipping it — covered by neither rather than by one. That is
 /// not hypothetical; the table shipped without
 /// `Probed { clamped: Clamped::ToFloor }` and neither test noticed.
-/// [`state_space_witness`] is what closes it, and the count assertion in
-/// [`the_basis_table_covers_the_whole_state_space`] is what keeps the
-/// witness and the table from drifting apart.
+/// [`state_key`] and [`ALL_STATE_KEYS`] are what close it, asserted in
+/// [`the_basis_table_covers_every_state_exactly_once`].
 ///
 /// The `bool` is spelled literally rather than derived from
 /// `coverage_finding()`, so this table is an independent statement of
@@ -360,65 +359,110 @@ fn every_basis_with_expected_finding() -> Vec<(TimeoutBasis, bool)> {
     ]
 }
 
-/// Never called: its only job is to fail the **build** when a state is
-/// added to [`TimeoutBasis`] — or to [`PinBand`], [`Clamped`] or
-/// [`UnprobedReason`] — without a row landing in
-/// [`every_basis_with_expected_finding`].
+/// A distinct token per state a [`TimeoutBasis`] can be in.
 ///
-/// The production `TimeoutBasis::coverage_finding` is deliberately
-/// wildcard-free so that a new state is a compile error and whoever adds
-/// it has to decide. Its test-side mirror was a hand-kept `vec![]`, which
-/// gave exactly the opposite property: a new state compiled straight into
-/// "covered by no test". This restores the symmetry.
+/// Finer than `TimeoutBasis::kind()`, which folds all three `Clamped`
+/// states into a bare `"probed"`. That fold is not a detail: a `kind()`
+/// set cannot tell a table holding three `Probed` rows from one holding
+/// a single `Probed` row and two duplicates elsewhere, and a mutant that
+/// did exactly that **survived** a `kind()`-based assertion. This
+/// function exists because of that surviving mutant.
 ///
-/// It constrains **coverage**, not the verdict — the `bool` in the table
+/// Wildcard-free, so a new state is a build error here too. That half is
+/// belt-and-braces rather than novel — production's
+/// `TimeoutBasis::coverage_finding` is already wildcard-free and fails
+/// first — but it is what drags whoever adds a state into *this* file,
+/// where [`ALL_STATE_KEYS`] then tells them what else to update.
+///
+/// It constrains **coverage**, not the verdict: the `bool` in the table
 /// stays an independent literal, so this does not turn the table into a
 /// restatement of the code under test.
-#[allow(dead_code)]
-fn state_space_witness(basis: &TimeoutBasis) {
+fn state_key(basis: &TimeoutBasis) -> &'static str {
     match basis {
-        TimeoutBasis::Operator { band: PinBand::InBand } => {}
-        TimeoutBasis::Operator { band: PinBand::BelowFloor } => {}
-        TimeoutBasis::Operator { band: PinBand::AboveCeiling } => {}
-        TimeoutBasis::Probed { clamped: Clamped::No, .. } => {}
-        TimeoutBasis::Probed { clamped: Clamped::ToFloor, .. } => {}
-        TimeoutBasis::Probed { clamped: Clamped::ToCeiling, .. } => {}
-        TimeoutBasis::Saturated { .. } => {}
-        TimeoutBasis::Unprobed { reason: UnprobedReason::Nonsensical, .. } => {}
-        TimeoutBasis::Unprobed { reason: UnprobedReason::TooFewUncachedTokens, .. } => {}
-        TimeoutBasis::Unprobed { reason: UnprobedReason::NoTokenCount, .. } => {}
-        TimeoutBasis::Unprobed { reason: UnprobedReason::Failed, .. } => {}
+        TimeoutBasis::Operator { band: PinBand::InBand } => "operator/in-band",
+        TimeoutBasis::Operator { band: PinBand::BelowFloor } => "operator/below-floor",
+        TimeoutBasis::Operator { band: PinBand::AboveCeiling } => "operator/above-ceiling",
+        TimeoutBasis::Probed { clamped: Clamped::No, .. } => "probed/unclamped",
+        TimeoutBasis::Probed { clamped: Clamped::ToFloor, .. } => "probed/to-floor",
+        TimeoutBasis::Probed { clamped: Clamped::ToCeiling, .. } => "probed/to-ceiling",
+        TimeoutBasis::Saturated { .. } => "saturated",
+        TimeoutBasis::Unprobed { reason: UnprobedReason::Nonsensical, .. } => {
+            "unprobed/nonsensical"
+        }
+        TimeoutBasis::Unprobed { reason: UnprobedReason::TooFewUncachedTokens, .. } => {
+            "unprobed/too-few-uncached-tokens"
+        }
+        TimeoutBasis::Unprobed { reason: UnprobedReason::NoTokenCount, .. } => {
+            "unprobed/no-token-count"
+        }
+        TimeoutBasis::Unprobed { reason: UnprobedReason::Failed, .. } => "unprobed/failed",
     }
 }
 
-/// The table has one row per state the witness enumerates, and they are
-/// eleven distinct states rather than eleven rows.
+/// Every token [`state_key`] can return, spelled out.
 ///
-/// [`state_space_witness`] makes a *new* variant a build error; it cannot
-/// notice a row that was never written for a variant that already exists,
-/// nor two rows for the same one. The `kind()` set catches the duplicate
-/// half, the count catches the missing half, and together they are what
-/// make the witness's guarantee reach this table rather than stopping at
-/// the enum.
+/// **Add a state to [`TimeoutBasis`] and you must touch this array and
+/// the arm above it, which sit together on purpose.** A bare count would
+/// not do the same work: a new variant whose `state_key` arm was added
+/// but whose table row was forgotten leaves the table at its old length,
+/// so `len() == 11` still passes and the state is covered by nothing.
+/// Comparing SETS makes that omission name itself.
+const ALL_STATE_KEYS: &[&str] = &[
+    "operator/above-ceiling",
+    "operator/below-floor",
+    "operator/in-band",
+    "probed/to-ceiling",
+    "probed/to-floor",
+    "probed/unclamped",
+    "saturated",
+    "unprobed/failed",
+    "unprobed/no-token-count",
+    "unprobed/nonsensical",
+    "unprobed/too-few-uncached-tokens",
+];
+
+/// The table holds every state exactly once.
 ///
-/// `kind()` folds `Clamped` and `PinBand` into a coarser token, so it
-/// cannot separate the three `Probed` states from each other — hence the
-/// count assertion beside it rather than the distinct-set alone.
+/// Two assertions, neither implying the other — a table can be
+/// duplicate-free and short, or complete and padded:
+///
+/// * **no duplicates** — the key set is as large as the table. This is
+///   the half a `kind()`-based set silently failed, because `kind()`
+///   folds the three `Probed` states together and so reads a duplicate
+///   as a fold.
+/// * **no omissions** — the key set is exactly [`ALL_STATE_KEYS`], which
+///   names the missing or unexpected state rather than reporting a
+///   number that has to be decoded.
+///
+/// The literal 11 is asserted on [`ALL_STATE_KEYS`] rather than on the
+/// table, and that is the point: without it, deleting a state's row *and*
+/// its key together leaves both sides agreeing at 10 and the suite green.
+/// Anchoring the count to the enumeration means the two can only shrink
+/// by someone editing the number as well.
 #[test]
-fn the_basis_table_covers_the_whole_state_space() {
-    let table = every_basis_with_expected_finding();
+fn the_basis_table_covers_every_state_exactly_once() {
     assert_eq!(
-        table.len(),
+        ALL_STATE_KEYS.len(),
         11,
-        "the state space is 3 PinBand + 3 Clamped + 1 Saturated + 4 UnprobedReason; \
-         `state_space_witness` is the enumeration this count is of"
+        "3 PinBand + 3 Clamped + 1 Saturated + 4 UnprobedReason; if a state was genuinely \
+         removed from TimeoutBasis, `state_key` stopped compiling before you got here"
     );
-    let kinds: std::collections::BTreeSet<&str> = table.iter().map(|(b, _)| b.kind()).collect();
+    let table = every_basis_with_expected_finding();
+    let keys: std::collections::BTreeSet<&str> = table.iter().map(|(b, _)| state_key(b)).collect();
     assert_eq!(
-        kinds.len(),
-        7,
-        "kind() folds the three Probed states into one token and the two out-of-band \
-         pins into their own; got {kinds:?}"
+        keys.len(),
+        table.len(),
+        "the table lists a state twice: {} rows collapsed to {} distinct states {keys:?}",
+        table.len(),
+        keys.len()
+    );
+    let expected: std::collections::BTreeSet<&str> = ALL_STATE_KEYS.iter().copied().collect();
+    assert_eq!(
+        keys, expected,
+        "the table and ALL_STATE_KEYS disagree; missing from the table: {:?}, unexpected \
+         in it: {:?}",
+        expected.difference(&keys).collect::<Vec<_>>(),
+        keys.difference(&expected).collect::<Vec<_>>(),
     );
 }
 

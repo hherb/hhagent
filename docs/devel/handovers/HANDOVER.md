@@ -125,10 +125,18 @@ without a guard tier, `guard_tier_e2e` never reads `audit_log` for this action, 
   - **The "every state a `TimeoutBasis` can be in" table was missing one.**
     `Probed { clamped: Clamped::ToFloor }` was absent, so *both* consumers skipped it — the
     docstring claimed sharing the table stops a state being "covered by one test and not the
-    other", and the actual failure was covered by **neither**. Added, plus a never-called
-    wildcard-free `state_space_witness` so the next variant is a build error (the symmetry the
-    production `coverage_finding` match already has), plus a count assertion so the witness and
-    the table cannot drift.
+    other", and the actual failure was covered by **neither**. Fixed with the row plus `state_key`
+    (a wildcard-free `TimeoutBasis -> &'static str`) and `ALL_STATE_KEYS`, asserted as a SET.
+    **The first version of this fix was itself too weak and a mutant caught it:** it asserted on
+    distinct `TimeoutBasis::kind()` tokens, and `kind()` folds all three `Clamped` states into a
+    bare `"probed"` — so it reads a duplicated row as a fold and cannot tell one from an omission.
+    A "11 rows, one state duplicated" mutant sailed through it. Second time on this branch that
+    the mutant rather than the reasoning found the weak assertion
+    [[mutation-proof-counts-only-mutants-you-tried]]. Now m1 (omit a row) dies naming the missing
+    state, m2 (duplicate a row) dies naming the collapse, m3 (a 4th `Clamped` variant) is a build
+    error — though m3 is honest belt-and-braces, since production's `coverage_finding` is already
+    wildcard-free and fails first; what `state_key` adds is a second wildcard-free match IN THIS
+    FILE, which is what drags the author to the table.
 - **Added from the review: a second band leg.** `an_in_band_pin_stores_a_configured_row_with_a_null_coverage_finding`.
   `Operator { InBand }` is the ONLY configured state whose `coverage_finding` is null, and no test
   in the tree stored one. `record(...)` sits one line below `report_guard_tier`'s
