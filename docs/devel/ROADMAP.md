@@ -647,8 +647,14 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   [#633](https://github.com/hherb/kastellan/issues/633); the `tok_per_s` → `fastest_tok_per_s`
   rename (both `BootRates` and `TimeoutBasis::Probed`, durable wire key unchanged) as
   [#632](https://github.com/hherb/kastellan/issues/632).
-  **[#633](https://github.com/hherb/kastellan/issues/633) FIXED on branch
-  `fix/633-configured-boot-arm-seam` (2026-08-30).** The recipe held: a configured boot needs a
+  **[#633](https://github.com/hherb/kastellan/issues/633) FIXED and MERGED `d3f8ed3f`
+  ([#635](https://github.com/hherb/kastellan/pull/635), 2026-08-30); gated on the DGX 2026-08-31 at
+  3908 / 0 / 55, 176 suites, cold clippy exit 0 over all 27 crates, 8 `[SKIP]` all gliner-relex.
+  That DGX run is the FIRST execution of either `guard_boot_row_e2e` leg anywhere** -- the PR
+  merged with both compiled but unrun, the Mac being unable to boot a freshly-linked daemon and the
+  DGX unreachable through the review round. Both pass, and the in-band leg is mutation-proven: with
+  `record(...)` folded inside the `if let Some(finding)` block, the above-ceiling leg still passes
+  and only the in-band one fails, so it is the sole detector of the defect it was written for. The recipe held: a configured boot needs a
   mock answering `/props` and nothing else. `tests-common/scripted_llm` gained a third
   `EndpointKind::Props`, matched on `/props` **with its leading slash and before** the chat
   fall-through -- each half its own unit test, because falling through pops a chat envelope a
