@@ -294,26 +294,6 @@ fn a_clamped_row_reports_the_enforced_budget_not_the_derived_one() {
     assert_eq!(p["timeout_basis"], "probed", "kind() folds the clamp into a bare probed");
 }
 
-/// The finding reaches the DURABLE row for EVERY basis that has one,
-/// and a routine boot leaves it null.
-///
-/// `kind()` folds `Clamped::ToCeiling` into a bare `"probed"`, so
-/// without this key the row for a host that cannot adjudicate a
-/// worst-case document is indistinguishable from a healthy one.
-///
-/// Table-driven over the whole enum rather than over the clamped basis
-/// alone, because a payload that routed the finding only for `Probed`
-/// passes a single-basis test while silencing the three LOUDEST states —
-/// the probe never returned, the probe failed (which predicts a tier
-/// that fails open on every dispatch), and both out-of-band operator
-/// pins. `timeout_basis` still reads `"probe-failed"` in that mutant, so
-/// nothing looks wrong; the documented query
-/// `WHERE payload->>'coverage_finding' IS NOT NULL` just returns the
-/// empty set for exactly the hosts it was written to find.
-///
-/// The `bool` is spelled literally rather than derived from
-/// `coverage_finding()`, so this table is an independent statement of
-/// which states are findings — not a restatement of the code under test.
 /// Every state a [`TimeoutBasis`] can be in, paired with whether it is
 /// contracted to carry a `coverage_finding`.
 ///
@@ -323,6 +303,19 @@ fn a_clamped_row_reports_the_enforced_budget_not_the_derived_one() {
 /// not the other, which is the selective blind spot #627's review found
 /// in the first place: a finding routed only for `Probed` is invisible
 /// on a healthy host.
+///
+/// Sharing the table cannot, on its own, keep it complete: this is a
+/// `vec![]`, so a new variant enters the enum with **both** consumers
+/// silently skipping it — covered by neither rather than by one. That is
+/// not hypothetical; the table shipped without
+/// `Probed { clamped: Clamped::ToFloor }` and neither test noticed.
+/// [`state_space_witness`] is what closes it, and the count assertion in
+/// [`the_basis_table_covers_the_whole_state_space`] is what keeps the
+/// witness and the table from drifting apart.
+///
+/// The `bool` is spelled literally rather than derived from
+/// `coverage_finding()`, so this table is an independent statement of
+/// which states are findings — not a restatement of the code under test.
 fn every_basis_with_expected_finding() -> Vec<(TimeoutBasis, bool)> {
     vec![
         // Findings.
@@ -334,6 +327,21 @@ fn every_basis_with_expected_finding() -> Vec<(TimeoutBasis, bool)> {
         // Routine.
         (TimeoutBasis::Operator { band: PinBand::InBand }, false),
         (contended_probed().basis, false),
+        // A fast host: the derivation landed under `TIMEOUT_FLOOR_MS` and
+        // was raised to it. Unremarkable, hence no finding -- but it is a
+        // distinct `Clamped` state that `coverage_finding` enumerates by
+        // name, and it was the one this table was missing.
+        (
+            TimeoutBasis::Probed {
+                tok_per_s: 12_400.0,
+                slowest_tok_per_s: 11_950.0,
+                measured_samples: 3,
+                attempted_samples: 3,
+                derived_ms: 9_000,
+                clamped: Clamped::ToFloor,
+            },
+            false,
+        ),
         (
             TimeoutBasis::Unprobed { reason: UnprobedReason::NoTokenCount, attempted_samples: 3 },
             false,
@@ -352,6 +360,84 @@ fn every_basis_with_expected_finding() -> Vec<(TimeoutBasis, bool)> {
     ]
 }
 
+/// Never called: its only job is to fail the **build** when a state is
+/// added to [`TimeoutBasis`] — or to [`PinBand`], [`Clamped`] or
+/// [`UnprobedReason`] — without a row landing in
+/// [`every_basis_with_expected_finding`].
+///
+/// The production `TimeoutBasis::coverage_finding` is deliberately
+/// wildcard-free so that a new state is a compile error and whoever adds
+/// it has to decide. Its test-side mirror was a hand-kept `vec![]`, which
+/// gave exactly the opposite property: a new state compiled straight into
+/// "covered by no test". This restores the symmetry.
+///
+/// It constrains **coverage**, not the verdict — the `bool` in the table
+/// stays an independent literal, so this does not turn the table into a
+/// restatement of the code under test.
+#[allow(dead_code)]
+fn state_space_witness(basis: &TimeoutBasis) {
+    match basis {
+        TimeoutBasis::Operator { band: PinBand::InBand } => {}
+        TimeoutBasis::Operator { band: PinBand::BelowFloor } => {}
+        TimeoutBasis::Operator { band: PinBand::AboveCeiling } => {}
+        TimeoutBasis::Probed { clamped: Clamped::No, .. } => {}
+        TimeoutBasis::Probed { clamped: Clamped::ToFloor, .. } => {}
+        TimeoutBasis::Probed { clamped: Clamped::ToCeiling, .. } => {}
+        TimeoutBasis::Saturated { .. } => {}
+        TimeoutBasis::Unprobed { reason: UnprobedReason::Nonsensical, .. } => {}
+        TimeoutBasis::Unprobed { reason: UnprobedReason::TooFewUncachedTokens, .. } => {}
+        TimeoutBasis::Unprobed { reason: UnprobedReason::NoTokenCount, .. } => {}
+        TimeoutBasis::Unprobed { reason: UnprobedReason::Failed, .. } => {}
+    }
+}
+
+/// The table has one row per state the witness enumerates, and they are
+/// eleven distinct states rather than eleven rows.
+///
+/// [`state_space_witness`] makes a *new* variant a build error; it cannot
+/// notice a row that was never written for a variant that already exists,
+/// nor two rows for the same one. The `kind()` set catches the duplicate
+/// half, the count catches the missing half, and together they are what
+/// make the witness's guarantee reach this table rather than stopping at
+/// the enum.
+///
+/// `kind()` folds `Clamped` and `PinBand` into a coarser token, so it
+/// cannot separate the three `Probed` states from each other — hence the
+/// count assertion beside it rather than the distinct-set alone.
+#[test]
+fn the_basis_table_covers_the_whole_state_space() {
+    let table = every_basis_with_expected_finding();
+    assert_eq!(
+        table.len(),
+        11,
+        "the state space is 3 PinBand + 3 Clamped + 1 Saturated + 4 UnprobedReason; \
+         `state_space_witness` is the enumeration this count is of"
+    );
+    let kinds: std::collections::BTreeSet<&str> = table.iter().map(|(b, _)| b.kind()).collect();
+    assert_eq!(
+        kinds.len(),
+        7,
+        "kind() folds the three Probed states into one token and the two out-of-band \
+         pins into their own; got {kinds:?}"
+    );
+}
+
+/// The finding reaches the DURABLE row for EVERY basis that has one,
+/// and a routine boot leaves it null.
+///
+/// `kind()` folds `Clamped::ToCeiling` into a bare `"probed"`, so
+/// without this key the row for a host that cannot adjudicate a
+/// worst-case document is indistinguishable from a healthy one.
+///
+/// Table-driven over the whole enum rather than over the clamped basis
+/// alone, because a payload that routed the finding only for `Probed`
+/// passes a single-basis test while silencing the three LOUDEST states —
+/// the probe never returned, the probe failed (which predicts a tier
+/// that fails open on every dispatch), and both out-of-band operator
+/// pins. `timeout_basis` still reads `"probe-failed"` in that mutant, so
+/// nothing looks wrong; the documented query
+/// `WHERE payload->>'coverage_finding' IS NOT NULL` just returns the
+/// empty set for exactly the hosts it was written to find.
 #[test]
 fn every_basis_with_a_finding_reaches_the_row_and_the_quiet_ones_stay_null() {
     for (basis, expects_finding) in every_basis_with_expected_finding() {
@@ -471,15 +557,20 @@ fn boot_rates_reads_a_probed_basis_without_transposing_it() {
 /// future PR lengthening a `coverage_finding` sentence, which is a
 /// change nobody would think to measure.
 ///
-/// Measured with `serde_json::to_vec` — the same serialised form
-/// `truncate_payload` measures and Postgres stores, rather than the
-/// pretty-printed one, which is larger and would make this pass for the
-/// wrong reason if it ever started failing.
+/// Measured with `serde_json::to_vec` — **the exact form
+/// `truncate_payload` measures**, rather than the pretty-printed one,
+/// which is larger and would make this pass for the wrong reason if it
+/// ever started failing. (Not the form Postgres stores: `audit_log.payload`
+/// is `jsonb`, a normalised binary encoding with its own size. The cap is
+/// applied before the insert, so `to_vec` is the right ruler — but it is
+/// the writer's ruler, not the column's.)
 ///
-/// The inputs are the largest the row can legitimately carry: `tau` at
-/// full f32 precision, an `n_ctx` an order of magnitude above the
-/// 131 072 the live DGX server reports, and a `u64::MAX`-millisecond
-/// budget so `timeout_ms` renders at its full 20 digits.
+/// The inputs are chosen to inflate the row, not to be strictly maximal:
+/// a `u64::MAX`-millisecond budget so `timeout_ms` renders at its full
+/// 20 digits, `tau` at full f32 precision, and an `n_ctx` 8x above the
+/// 131 072 the live DGX server reports. A genuinely maximal `n_ctx`
+/// would be `u64::MAX` too; the 13 bytes that buys are noise against a
+/// margin of roughly 3.4 KiB, and the fixed shape is easier to read.
 #[test]
 fn no_boot_payload_can_reach_the_audit_truncation_cap() {
     for (basis, _) in every_basis_with_expected_finding() {
