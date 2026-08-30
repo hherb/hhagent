@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 /// mock task in an unbounded read.
 const MOCK_MAX_REQUEST_BYTES: usize = 1 << 20;
 
-/// The kind of OpenAI-compatible endpoint a captured request targets.
+/// The kind of endpoint a captured request targets.
 ///
 /// Used by the URL-routing mock to dispatch responses from the right
 /// per-endpoint queue and to keep capture lists separate.
@@ -24,9 +24,19 @@ const MOCK_MAX_REQUEST_BYTES: usize = 1 << 20;
 enum EndpointKind {
     Embedding,
     Chat,
+    /// llama.cpp's `GET /props`, which is **not** OpenAI-compatible and
+    /// is not a scripted turn.
+    ///
+    /// It reports a property of the backend (its per-request context
+    /// window), so the mock answers every `/props` with the *same* body
+    /// rather than popping one from a FIFO. A queue would be wrong in
+    /// both directions: a second call would 503 where a real server
+    /// answers, and a caller that never dials `/props` would leave an
+    /// undrained queue that no assertion notices.
+    Props,
 }
 
-/// Classify a request path into one of the two endpoint kinds the
+/// Classify a request path into one of the three endpoint kinds the
 /// daemon actually exercises.
 ///
 /// Production paths look like `/v1/embeddings` and `/v1/chat/completions`,
@@ -35,8 +45,26 @@ enum EndpointKind {
 /// (or adds a trailing `?stream=false`) does not silently break this
 /// classifier. Anything that contains `embeddings` is an embed request;
 /// every other path is treated as a chat-completion. Pure: `&str → Kind`.
+///
+/// `/props` is matched **ahead of the `Chat` fall-through and with its
+/// leading slash**, and both halves of that are deliberate:
+///
+/// * *Ahead of the fall-through*, because the `else` arm is `Chat` — a
+///   `/props` GET that reached it would pop a chat envelope the caller
+///   had counted for a plan iteration, desyncing the queue rather than
+///   erroring. (Being *first* of the three is not itself load-bearing:
+///   `/props` contains no `embeddings`, so the embed arm would decline
+///   it either way. What matters is that it is matched at all.)
+/// * *With the slash*, because the bare substring `props` also appears
+///   in paths that are not this endpoint — `/v1/chat/completions?props=1`
+///   is the realistic one — and misrouting such a path to the stored
+///   props body starves the chat queue, the same silent desync in
+///   reverse. `Router::props` composes the URL as
+///   `<base minus /v1>/props`, so the leading slash is always there.
 fn classify_endpoint(path: &str) -> EndpointKind {
-    if path.contains("embeddings") {
+    if path.contains("/props") {
+        EndpointKind::Props
+    } else if path.contains("embeddings") {
         EndpointKind::Embedding
     } else {
         EndpointKind::Chat
@@ -85,6 +113,24 @@ pub struct ScriptedLlm {
     pub embed_requests: Arc<Mutex<Vec<String>>>,
     /// Captured chat-completion request bodies in arrival order.
     pub chat_requests: Arc<Mutex<Vec<String>>>,
+    /// How many `GET /props` requests this listener **received**.
+    ///
+    /// Received, not answered, and the distinction is worth spelling
+    /// out because it is invisible at the call site: the counter is
+    /// incremented before the stored-body-or-503 decision, so a mock
+    /// spawned by [`spawn_scripted_llm`] (which 503s every `/props`)
+    /// reports the same 1 as one that served a context window. **A
+    /// `props_requests` assertion is therefore evidence that the dial
+    /// happened, never that the guard tier booted** — pair it with an
+    /// assertion on the resulting row, as `guard_boot_row_e2e` does.
+    ///
+    /// A **count**, not a body list like its two neighbours, because a
+    /// `GET` carries no body — there is nothing to capture but the fact
+    /// that it happened. That fact is worth an assertion: one daemon
+    /// boot verifies the guard context exactly once, so a value other
+    /// than 1 means a retry loop or a second tier construction, neither
+    /// of which any other signal in a test would show.
+    pub props_requests: Arc<Mutex<usize>>,
     join: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -96,9 +142,43 @@ impl Drop for ScriptedLlm {
     }
 }
 
+/// Spawn a mock that serves the two OpenAI-compatible endpoints and
+/// **503s every `/props`**.
+///
+/// The 503 is the right default rather than an oversight: a caller that
+/// has not thought about `/props` is not configuring a guard tier, and
+/// a daemon that dials it anyway should fail loudly at boot rather than
+/// receive a fabricated context window.
 pub async fn spawn_scripted_llm(
     embed_responses: Vec<String>,
     chat_responses: Vec<String>,
+) -> ScriptedLlm {
+    spawn_scripted_llm_with_props(embed_responses, chat_responses, None).await
+}
+
+/// Spawn a mock that additionally answers `GET /props` with `props_body`.
+///
+/// Needed by any test that boots a **configured guard tier**:
+/// `GuardTier::from_router_config` treats `/props` as its one fatal
+/// network call, so without an answer here the daemon exits before it
+/// writes a `guard_tier.boot` row at all. Two distinct errors stop it,
+/// and a reader debugging a dead daemon wants to know which:
+/// an unreachable or unparseable `/props` is
+/// `GuardTierError::PropsUnavailable` — the 503 this function's `None`
+/// default produces — while a context below `REQUIRED_GUARD_N_CTX` is
+/// D8's `GuardTierError::Context`.
+///
+/// `None` for `props_body` is exactly [`spawn_scripted_llm`].
+///
+/// **Point the guard at its own listener, not the planner's.** A
+/// configured tier adjudicates tool output on every dispatch, and those
+/// are chat-completions like any other — sharing one mock would have
+/// the guard silently eating envelopes a test counted out for plan
+/// iterations.
+pub async fn spawn_scripted_llm_with_props(
+    embed_responses: Vec<String>,
+    chat_responses: Vec<String>,
+    props_body: Option<String>,
 ) -> ScriptedLlm {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -114,6 +194,8 @@ pub async fn spawn_scripted_llm(
     let embed_requests_for_task = embed_requests.clone();
     let chat_requests = Arc::new(Mutex::new(Vec::<String>::new()));
     let chat_requests_for_task = chat_requests.clone();
+    let props_requests = Arc::new(Mutex::new(0_usize));
+    let props_requests_for_task = props_requests.clone();
 
     let join = tokio::spawn(async move {
         loop {
@@ -177,6 +259,14 @@ pub async fn spawn_scripted_llm(
                         let mut q = chat_queue_for_task.lock().unwrap();
                         if q.is_empty() { None } else { Some(q.remove(0)) }
                     }
+                    // Counted, then answered from the same stored body
+                    // every time — see `EndpointKind::Props`. `body` is
+                    // the empty string for a `GET` and is deliberately
+                    // not captured.
+                    EndpointKind::Props => {
+                        *props_requests_for_task.lock().unwrap() += 1;
+                        props_body.clone()
+                    }
                 }
             } else {
                 None
@@ -210,6 +300,7 @@ pub async fn spawn_scripted_llm(
         base_url,
         embed_requests,
         chat_requests,
+        props_requests,
         join: Some(join),
     }
 }
@@ -251,6 +342,30 @@ pub fn envelope_for(plan_json_string: &str) -> String {
             "finish_reason": "stop"
         }],
         "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+    })
+    .to_string()
+}
+
+/// Build a llama.cpp `/props` body reporting `n_ctx` as the
+/// **per-request** context window.
+///
+/// The nesting under `default_generation_settings` is not decoration:
+/// the live DGX guard server reports the per-request context *only*
+/// there and carries no top-level `n_ctx` at all, so a mock that put it
+/// at the root would pass a test the real backend fails.
+/// `context_pin::n_ctx_from_props` reads the nested key first and falls
+/// back to the root, which is why this envelope pins the harder of the
+/// two shapes.
+///
+/// `model_path` and `total_slots` ride along because a real `/props`
+/// carries them; nothing on the tier's boot path reads either (the
+/// weights pin lives in `guard calibrate`), and they are here so the
+/// fixture looks like the thing it stands in for.
+pub fn props_envelope(n_ctx: u64) -> String {
+    serde_json::json!({
+        "default_generation_settings": {"n_ctx": n_ctx},
+        "total_slots": 1,
+        "model_path": "/models/shieldstral-test.gguf"
     })
     .to_string()
 }
@@ -331,6 +446,39 @@ mod mock_router_unit_tests {
             classify_endpoint("/v2/embeddings?stream=false"),
             EndpointKind::Embedding,
         );
+    }
+
+    #[test]
+    fn classify_endpoint_routes_props_paths_to_props() {
+        // The shape `Router::props` actually composes: the `/v1` compat
+        // segment stripped, `/props` at the server root.
+        //
+        // This is also the whole of the fall-through hazard. Without a
+        // `Props` arm the same path lands on `Chat` and pops an envelope
+        // the caller had counted for a plan iteration — a desynced queue
+        // rather than an error, which is the failure mode the
+        // per-endpoint queues exist to avoid. An `assert_ne!` against
+        // `Chat` would restate this one rather than add to it.
+        assert_eq!(classify_endpoint("/props"), EndpointKind::Props);
+    }
+
+    #[test]
+    fn classify_endpoint_does_not_treat_props_lookalikes_as_props() {
+        // The mirror hazard, and the reason the match carries its
+        // leading slash. Both of these contain the bare substring
+        // `props`, so a `contains("props")` classifier answers them from
+        // the stored props body and starves the chat queue instead —
+        // each therefore fails under that mutant, which is what makes
+        // them worth asserting.
+        //
+        // (`/v1/properties` is NOT such a case and is deliberately not
+        // here: `properties` is `p-r-o-p-e-…`, so it contains no `props`
+        // at all and would pass under either spelling.)
+        assert_eq!(
+            classify_endpoint("/v1/chat/completions?props=1"),
+            EndpointKind::Chat,
+        );
+        assert_eq!(classify_endpoint("/v1/models?props=true"), EndpointKind::Chat);
     }
 
     #[test]

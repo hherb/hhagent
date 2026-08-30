@@ -26,6 +26,7 @@ use kastellan_core::cassandra::guard_model::GuardTier;
 use kastellan_core::secrets::Vault;
 use kastellan_core::tool_host::{dispatch, spawn_worker, WorkerSpec};
 use kastellan_llm_router::RouterConfig;
+use kastellan_tests_common::scripted_llm::props_envelope;
 use kastellan_tests_common::{
     backend, bring_up_pg_cluster, pg_bin_dir_or_skip, policy_for_shell_exec,
     shell_exec_worker_binary, skip_if_no_supervisor, skip_if_sandbox_unavailable, unique_suffix,
@@ -203,13 +204,16 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<(String, Strin
     }
 }
 
+/// The `/props` body this file's mock serves.
+///
+/// Delegates to `tests_common::scripted_llm::props_envelope` rather than
+/// re-spelling the envelope: the nesting under
+/// `default_generation_settings` is the load-bearing part (the live DGX
+/// server carries no top-level `n_ctx`, so a root-only fixture would
+/// pass a test the real backend fails), and two copies of that shape are
+/// two things to keep in step when llama.cpp moves the key.
 fn props_body() -> String {
-    serde_json::json!({
-        "default_generation_settings": {"n_ctx": MOCK_N_CTX},
-        "total_slots": 1,
-        "model_path": "/models/shieldstral-test.gguf"
-    })
-    .to_string()
+    props_envelope(MOCK_N_CTX)
 }
 
 /// A chat-completion body carrying both verdict spellings at position 0,

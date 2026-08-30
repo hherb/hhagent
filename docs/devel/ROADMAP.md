@@ -647,6 +647,77 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   [#633](https://github.com/hherb/kastellan/issues/633); the `tok_per_s` → `fastest_tok_per_s`
   rename (both `BootRates` and `TimeoutBasis::Probed`, durable wire key unchanged) as
   [#632](https://github.com/hherb/kastellan/issues/632).
+  **[#633](https://github.com/hherb/kastellan/issues/633) FIXED on branch
+  `fix/633-configured-boot-arm-seam` (2026-08-30).** The recipe held: a configured boot needs a
+  mock answering `/props` and nothing else. `tests-common/scripted_llm` gained a third
+  `EndpointKind::Props`, matched on `/props` **with its leading slash and before** the chat
+  fall-through -- each half its own unit test, because falling through pops a chat envelope a
+  caller counted for a plan iteration, and a bare `props` substring misroutes
+  `/v1/chat/completions?props=1` the same way in reverse. Answered from one stored body rather than a FIFO, since `/props` reports a
+  property of the backend rather than a scripted turn; `spawn_scripted_llm` is unchanged and
+  delegates with `None`. New `core/tests/guard_boot_row_e2e.rs`: one daemon, two **separate** mock
+  listeners, **no task submitted** -- the row is written before the scheduler spawns, so a task
+  would add minutes of planner traffic and every source of nondeterminism the file otherwise has
+  none of. Asserts the stored row equals
+  `boot_payload(TAU, 131_072, &validate_operator_timeout(350_000))`, read back from the table so it
+  is the row Postgres **stored** rather than the one a sink double was passed. The pin is
+  deliberately **above `TIMEOUT_CEILING_MS`** -- that is #612's own advice to a Metal operator, it
+  yields `PinBand::AboveCeiling`, and it makes this the **largest shape this row can have**, which
+  no test had stored in Postgres at all. Structural equality puts `boot_payload` on both sides, so
+  five **literal** assertions sit beside it; that is not belt-and-braces but the shape that let
+  #627's `not_configured` token mutant survive two assertions moving together, and the mutation run
+  confirms it -- the renamed wire key, the drifted `operator-above-ceiling` token and a silenced
+  `coverage_finding` all pass the equality and die on the literals. `n_ctx` is 131 072, not
+  `REQUIRED_GUARD_N_CTX`, because that constant is what #627's surviving frozen-`n_ctx` mutant was
+  frozen to. Zero chat requests on the guard listener is the direct evidence the pin skipped the
+  probe; exactly one `/props` is the evidence one boot verifies the context once. Also: the
+  ten-state basis table lifted into one shared fixture, and two size bounds over it -- no shape of
+  this row can reach `PAYLOAD_MAX_BYTES`, which matters because `guard_tier.boot` has **no key in
+  `PRESERVED_KEYS`**, so an over-cap payload collapses to a fingerprint and takes the basis and the
+  finding with it. **Mutation-proven eleven for eleven**, each executed; the twelfth attempt is
+  worth recording because it *survived first* -- the overlong-finding mutant padded to only 2.4 KiB
+  against a 4 KiB cap, so it never tested the bound it was aimed at. Re-run at 5.6 KiB it dies.
+  A mutant that does not reach the condition proves nothing, and an under-powered one is
+  indistinguishable from a blind test in the result column. Filed from it:
+  [#634](https://github.com/hherb/kastellan/issues/634) -- this is now the **third** hand-rolled
+  `bring_up_daemon` in `core/tests/`, sharing ~70 identical lines.
+  **A four-agent review of the PR then found nine issues, all fixed on the branch, two of them
+  substantive.** First, #634 as filed was WRONG: `tests_common::daemon::bring_up_daemon` **already
+  exists**, with the exact `extra_env` seam the guard vars needed and three e2es already on it --
+  the PR filed an issue to build a thing sitting in the crate it was editing, and the issue is
+  rewritten as a *migration*. The consequence was concrete rather than cosmetic: the
+  stderr-on-failure diagnostic this branch added went into the private copy only, leaving the
+  shared helper's bare `.expect` in place for three other e2es. Ported as `tests_common::stderr_tail`,
+  which distinguishes an empty log from an unreadable one. Second, the table documented as "every
+  state a `TimeoutBasis` can be in" was missing `Probed { clamped: ToFloor }`, so **both**
+  consumers skipped it -- the docstring's claim was about a state covered by one test and not the
+  other, and the real hole was a state covered by neither; fixed with the row plus a wildcard-free
+  `state_key` and an `ALL_STATE_KEYS` set equality. The first version of THAT fix was too weak and
+  a mutant caught it: asserting on distinct `kind()` tokens cannot tell a duplicated row from a
+  fold, because `kind()` collapses all three `Clamped` states into `"probed"`, so a
+  "11 rows, one duplicated" mutant survived it. The review also earned a **second band leg**:
+  `Operator { InBand }` is the only configured state with a null `coverage_finding`, no test
+  stored one, and `record(...)` sits one line below the `if let Some(finding)` warn block -- so
+  folding the two would silence the boot row on every *routine* configured host and pass the whole
+  tree. Both legs now share one `with_configured_boot` harness. Smaller fixes: the `_truncated`
+  assertion moved above the structural equality (afterwards it could only run in an
+  already-panicked state), the mock-count assertions moved before the row read, a tautological
+  `assert_ne!` deleted, `props_requests` documented as counting requests *received* rather than
+  answered, `guard_tier_e2e` switched onto the shared `props_envelope`, and the `/v1/properties`
+  example corrected in four documents -- it contains no `props` substring, so the unit-test case
+  built on it passed under the mutant it named.
+  **Gated on the DGX at `64587ee9`: 3907 / 0 / 55**, 176 suites (175 + the new e2e binary),
+  `TEST_EXIT=0`, cold clippy exit 0 over 245 `Checking` lines and all 27 crates, 8 `[SKIP]` all
+  gliner-relex. Reconciles exactly at 3901 + 6, with all six names grepped out of the log rather
+  than subtracted. **The Mac leg is PARTIAL and that is stated rather than rounded up:** unit tests
+  and a cold `--all-targets` clippy over the two touched crates (the only thing that compiles the
+  new e2e's `cfg(target_os = "macos")` arm), but **no daemon e2e** — a freshly-linked ~40 MB
+  `kastellan` hangs in `_dyld_start` on that host, and `cli_ask_e2e` fails identically at a commit
+  where it was green, so the blocker is macOS first-launch assessment rather than anything in the
+  tree. The branch touches **no production code**, which is what makes the missing behavioural leg
+  tolerable. The Mac legs that DID run at the final tip: `check --all-targets` exit 0, clippy
+  `--all-targets -D warnings` exit 0 with zero warnings (both warm-dir; the cold run wedged on a
+  hung `build-script-build` and was killed), `tests-common --lib` 100 / 0 and `boot_report` 13 / 0.
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one

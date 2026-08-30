@@ -294,6 +294,178 @@ fn a_clamped_row_reports_the_enforced_budget_not_the_derived_one() {
     assert_eq!(p["timeout_basis"], "probed", "kind() folds the clamp into a bare probed");
 }
 
+/// Every state a [`TimeoutBasis`] can be in, paired with whether it is
+/// contracted to carry a `coverage_finding`.
+///
+/// One table shared by the two tests that must walk *all* of them, so a
+/// state added to the enum is added here once. The alternative -- two
+/// hand-kept lists -- is how a new state ends up covered by one test and
+/// not the other, which is the selective blind spot #627's review found
+/// in the first place: a finding routed only for `Probed` is invisible
+/// on a healthy host.
+///
+/// Sharing the table cannot, on its own, keep it complete: this is a
+/// `vec![]`, so a state can be missing from it with **both** consumers
+/// silently skipping it — covered by neither rather than by one. That is
+/// not hypothetical; the table shipped without
+/// `Probed { clamped: Clamped::ToFloor }` and neither test noticed.
+/// [`state_key`] and [`ALL_STATE_KEYS`] are what close it, asserted in
+/// [`the_basis_table_covers_every_state_exactly_once`].
+///
+/// The `bool` is spelled literally rather than derived from
+/// `coverage_finding()`, so this table is an independent statement of
+/// which states are findings — not a restatement of the code under test.
+fn every_basis_with_expected_finding() -> Vec<(TimeoutBasis, bool)> {
+    vec![
+        // Findings.
+        (ceiling_clamped_basis(), true),
+        (TimeoutBasis::Saturated { budget_ms: 20_000, attempted_samples: 1 }, true),
+        (TimeoutBasis::Operator { band: PinBand::BelowFloor }, true),
+        (TimeoutBasis::Operator { band: PinBand::AboveCeiling }, true),
+        (TimeoutBasis::Unprobed { reason: UnprobedReason::Failed, attempted_samples: 3 }, true),
+        // Routine.
+        (TimeoutBasis::Operator { band: PinBand::InBand }, false),
+        (contended_probed().basis, false),
+        // A fast host: the derivation landed under `TIMEOUT_FLOOR_MS` and
+        // was raised to it. Unremarkable, hence no finding -- but it is a
+        // distinct `Clamped` state that `coverage_finding` enumerates by
+        // name, and it was the one this table was missing.
+        (
+            TimeoutBasis::Probed {
+                tok_per_s: 12_400.0,
+                slowest_tok_per_s: 11_950.0,
+                measured_samples: 3,
+                attempted_samples: 3,
+                derived_ms: 9_000,
+                clamped: Clamped::ToFloor,
+            },
+            false,
+        ),
+        (
+            TimeoutBasis::Unprobed { reason: UnprobedReason::NoTokenCount, attempted_samples: 3 },
+            false,
+        ),
+        (
+            TimeoutBasis::Unprobed {
+                reason: UnprobedReason::TooFewUncachedTokens,
+                attempted_samples: 3,
+            },
+            false,
+        ),
+        (
+            TimeoutBasis::Unprobed { reason: UnprobedReason::Nonsensical, attempted_samples: 3 },
+            false,
+        ),
+    ]
+}
+
+/// A distinct token per state a [`TimeoutBasis`] can be in.
+///
+/// Finer than `TimeoutBasis::kind()`, which folds all three `Clamped`
+/// states into a bare `"probed"`. That fold is not a detail: a `kind()`
+/// set cannot tell a table holding three `Probed` rows from one holding
+/// a single `Probed` row and two duplicates elsewhere, and a mutant that
+/// did exactly that **survived** a `kind()`-based assertion. This
+/// function exists because of that surviving mutant.
+///
+/// Wildcard-free, so a new state is a build error here too. That half is
+/// belt-and-braces rather than novel — production's
+/// `TimeoutBasis::coverage_finding` is already wildcard-free and fails
+/// first — but it is what drags whoever adds a state into *this* file,
+/// where [`ALL_STATE_KEYS`] then tells them what else to update.
+///
+/// It constrains **coverage**, not the verdict: the `bool` in the table
+/// stays an independent literal, so this does not turn the table into a
+/// restatement of the code under test.
+fn state_key(basis: &TimeoutBasis) -> &'static str {
+    match basis {
+        TimeoutBasis::Operator { band: PinBand::InBand } => "operator/in-band",
+        TimeoutBasis::Operator { band: PinBand::BelowFloor } => "operator/below-floor",
+        TimeoutBasis::Operator { band: PinBand::AboveCeiling } => "operator/above-ceiling",
+        TimeoutBasis::Probed { clamped: Clamped::No, .. } => "probed/unclamped",
+        TimeoutBasis::Probed { clamped: Clamped::ToFloor, .. } => "probed/to-floor",
+        TimeoutBasis::Probed { clamped: Clamped::ToCeiling, .. } => "probed/to-ceiling",
+        TimeoutBasis::Saturated { .. } => "saturated",
+        TimeoutBasis::Unprobed { reason: UnprobedReason::Nonsensical, .. } => {
+            "unprobed/nonsensical"
+        }
+        TimeoutBasis::Unprobed { reason: UnprobedReason::TooFewUncachedTokens, .. } => {
+            "unprobed/too-few-uncached-tokens"
+        }
+        TimeoutBasis::Unprobed { reason: UnprobedReason::NoTokenCount, .. } => {
+            "unprobed/no-token-count"
+        }
+        TimeoutBasis::Unprobed { reason: UnprobedReason::Failed, .. } => "unprobed/failed",
+    }
+}
+
+/// Every token [`state_key`] can return, spelled out.
+///
+/// **Add a state to [`TimeoutBasis`] and you must touch this array and
+/// the arm above it, which sit together on purpose.** A bare count would
+/// not do the same work: a new variant whose `state_key` arm was added
+/// but whose table row was forgotten leaves the table at its old length,
+/// so `len() == 11` still passes and the state is covered by nothing.
+/// Comparing SETS makes that omission name itself.
+const ALL_STATE_KEYS: &[&str] = &[
+    "operator/above-ceiling",
+    "operator/below-floor",
+    "operator/in-band",
+    "probed/to-ceiling",
+    "probed/to-floor",
+    "probed/unclamped",
+    "saturated",
+    "unprobed/failed",
+    "unprobed/no-token-count",
+    "unprobed/nonsensical",
+    "unprobed/too-few-uncached-tokens",
+];
+
+/// The table holds every state exactly once.
+///
+/// Two assertions, neither implying the other — a table can be
+/// duplicate-free and short, or complete and padded:
+///
+/// * **no duplicates** — the key set is as large as the table. This is
+///   the half a `kind()`-based set silently failed, because `kind()`
+///   folds the three `Probed` states together and so reads a duplicate
+///   as a fold.
+/// * **no omissions** — the key set is exactly [`ALL_STATE_KEYS`], which
+///   names the missing or unexpected state rather than reporting a
+///   number that has to be decoded.
+///
+/// The literal 11 is asserted on [`ALL_STATE_KEYS`] rather than on the
+/// table, and that is the point: without it, deleting a state's row *and*
+/// its key together leaves both sides agreeing at 10 and the suite green.
+/// Anchoring the count to the enumeration means the two can only shrink
+/// by someone editing the number as well.
+#[test]
+fn the_basis_table_covers_every_state_exactly_once() {
+    assert_eq!(
+        ALL_STATE_KEYS.len(),
+        11,
+        "3 PinBand + 3 Clamped + 1 Saturated + 4 UnprobedReason; if a state was genuinely \
+         removed from TimeoutBasis, `state_key` stopped compiling before you got here"
+    );
+    let table = every_basis_with_expected_finding();
+    let keys: std::collections::BTreeSet<&str> = table.iter().map(|(b, _)| state_key(b)).collect();
+    assert_eq!(
+        keys.len(),
+        table.len(),
+        "the table lists a state twice: {} rows collapsed to {} distinct states {keys:?}",
+        table.len(),
+        keys.len()
+    );
+    let expected: std::collections::BTreeSet<&str> = ALL_STATE_KEYS.iter().copied().collect();
+    assert_eq!(
+        keys, expected,
+        "the table and ALL_STATE_KEYS disagree; missing from the table: {:?}, unexpected \
+         in it: {:?}",
+        expected.difference(&keys).collect::<Vec<_>>(),
+        keys.difference(&expected).collect::<Vec<_>>(),
+    );
+}
+
 /// The finding reaches the DURABLE row for EVERY basis that has one,
 /// and a routine boot leaves it null.
 ///
@@ -310,39 +482,9 @@ fn a_clamped_row_reports_the_enforced_budget_not_the_derived_one() {
 /// nothing looks wrong; the documented query
 /// `WHERE payload->>'coverage_finding' IS NOT NULL` just returns the
 /// empty set for exactly the hosts it was written to find.
-///
-/// The `bool` is spelled literally rather than derived from
-/// `coverage_finding()`, so this table is an independent statement of
-/// which states are findings — not a restatement of the code under test.
 #[test]
 fn every_basis_with_a_finding_reaches_the_row_and_the_quiet_ones_stay_null() {
-    let cases: Vec<(TimeoutBasis, bool)> = vec![
-        // Findings.
-        (ceiling_clamped_basis(), true),
-        (TimeoutBasis::Saturated { budget_ms: 20_000, attempted_samples: 1 }, true),
-        (TimeoutBasis::Operator { band: PinBand::BelowFloor }, true),
-        (TimeoutBasis::Operator { band: PinBand::AboveCeiling }, true),
-        (TimeoutBasis::Unprobed { reason: UnprobedReason::Failed, attempted_samples: 3 }, true),
-        // Routine.
-        (TimeoutBasis::Operator { band: PinBand::InBand }, false),
-        (contended_probed().basis, false),
-        (
-            TimeoutBasis::Unprobed { reason: UnprobedReason::NoTokenCount, attempted_samples: 3 },
-            false,
-        ),
-        (
-            TimeoutBasis::Unprobed {
-                reason: UnprobedReason::TooFewUncachedTokens,
-                attempted_samples: 3,
-            },
-            false,
-        ),
-        (
-            TimeoutBasis::Unprobed { reason: UnprobedReason::Nonsensical, attempted_samples: 3 },
-            false,
-        ),
-    ];
-    for (basis, expects_finding) in cases {
+    for (basis, expects_finding) in every_basis_with_expected_finding() {
         let budget = GuardTimeout { timeout: Duration::from_millis(120_000), basis };
         let kind = budget.basis.kind();
         let finding = boot_payload(0.795, 66_048, &budget)["coverage_finding"].clone();
@@ -441,5 +583,68 @@ fn boot_rates_reads_a_probed_basis_without_transposing_it() {
             measured_samples: Some(3),
             attempted_samples: Some(3),
         }
+    );
+}
+
+/// No shape of this row can reach the audit truncation cap.
+///
+/// `guard_tier.boot` has **no key in `db::audit::PRESERVED_KEYS`**, so
+/// an over-cap payload does not merely lose a field — the whole row
+/// collapses to a `{_truncated, sha256, len}` fingerprint, taking the
+/// timeout basis and the coverage finding with it. The tier would boot,
+/// log correctly, and leave a durable record answering none of the
+/// questions the row exists for.
+///
+/// Nothing is close to that today (the largest shape is well under a
+/// kilobyte against a 4 KiB cap), and that is exactly why the check
+/// belongs here rather than in a comment: what would breach it is a
+/// future PR lengthening a `coverage_finding` sentence, which is a
+/// change nobody would think to measure.
+///
+/// Measured with `serde_json::to_vec` — **the exact form
+/// `truncate_payload` measures**, rather than the pretty-printed one,
+/// which is larger and would make this pass for the wrong reason if it
+/// ever started failing. (Not the form Postgres stores: `audit_log.payload`
+/// is `jsonb`, a normalised binary encoding with its own size. The cap is
+/// applied before the insert, so `to_vec` is the right ruler — but it is
+/// the writer's ruler, not the column's.)
+///
+/// The inputs are chosen to inflate the row, not to be strictly maximal:
+/// a `u64::MAX`-millisecond budget so `timeout_ms` renders at its full
+/// 20 digits, `tau` at full f32 precision, and an `n_ctx` 8x above the
+/// 131 072 the live DGX server reports. A genuinely maximal `n_ctx`
+/// would be `u64::MAX` too; the 13 bytes that buys are noise against a
+/// margin of roughly 3.4 KiB, and the fixed shape is easier to read.
+#[test]
+fn no_boot_payload_can_reach_the_audit_truncation_cap() {
+    for (basis, _) in every_basis_with_expected_finding() {
+        let budget = GuardTimeout { timeout: Duration::from_millis(u64::MAX), basis };
+        let kind = budget.basis.kind();
+        let len = serde_json::to_vec(&boot_payload(0.795_526_56, 1_048_576, &budget))
+            .expect("serde_json::Value cannot fail to serialise")
+            .len();
+        assert!(
+            len <= kastellan_db::audit::PAYLOAD_MAX_BYTES,
+            "{kind}: a {len}-byte row would be truncated to a fingerprint by \
+             db::audit::insert (cap {})",
+            kastellan_db::audit::PAYLOAD_MAX_BYTES,
+        );
+    }
+}
+
+/// The unconfigured row is bounded too, and the loop above cannot see it.
+///
+/// [`not_configured_payload`] takes no arguments and shares no code with
+/// [`boot_payload`], so no basis reaches it — and it is the row every
+/// host *without* a guard tier stores, which is most of them.
+#[test]
+fn the_unconfigured_payload_is_bounded_too() {
+    let len = serde_json::to_vec(&not_configured_payload())
+        .expect("serde_json::Value cannot fail to serialise")
+        .len();
+    assert!(
+        len <= kastellan_db::audit::PAYLOAD_MAX_BYTES,
+        "{len} bytes against a cap of {}",
+        kastellan_db::audit::PAYLOAD_MAX_BYTES,
     );
 }
