@@ -652,8 +652,8 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   mock answering `/props` and nothing else. `tests-common/scripted_llm` gained a third
   `EndpointKind::Props`, matched on `/props` **with its leading slash and before** the chat
   fall-through -- each half its own unit test, because falling through pops a chat envelope a
-  caller counted for a plan iteration, and a bare `props` substring misroutes `/v1/properties` the
-  same way in reverse. Answered from one stored body rather than a FIFO, since `/props` reports a
+  caller counted for a plan iteration, and a bare `props` substring misroutes
+  `/v1/chat/completions?props=1` the same way in reverse. Answered from one stored body rather than a FIFO, since `/props` reports a
   property of the backend rather than a scripted turn; `spawn_scripted_llm` is unchanged and
   delegates with `None`. New `core/tests/guard_boot_row_e2e.rs`: one daemon, two **separate** mock
   listeners, **no task submitted** -- the row is written before the scheduler spawns, so a task
@@ -680,8 +680,30 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   A mutant that does not reach the condition proves nothing, and an under-powered one is
   indistinguishable from a blind test in the result column. Filed from it:
   [#634](https://github.com/hherb/kastellan/issues/634) -- this is now the **third** hand-rolled
-  `bring_up_daemon` in `core/tests/`, sharing ~70 identical lines, and the fix is a
-  `tests-common` builder whose unit tests CI actually runs.
+  `bring_up_daemon` in `core/tests/`, sharing ~70 identical lines.
+  **A four-agent review of the PR then found nine issues, all fixed on the branch, two of them
+  substantive.** First, #634 as filed was WRONG: `tests_common::daemon::bring_up_daemon` **already
+  exists**, with the exact `extra_env` seam the guard vars needed and three e2es already on it --
+  the PR filed an issue to build a thing sitting in the crate it was editing, and the issue is
+  rewritten as a *migration*. The consequence was concrete rather than cosmetic: the
+  stderr-on-failure diagnostic this branch added went into the private copy only, leaving the
+  shared helper's bare `.expect` in place for three other e2es. Ported as `tests_common::stderr_tail`,
+  which distinguishes an empty log from an unreadable one. Second, the table documented as "every
+  state a `TimeoutBasis` can be in" was missing `Probed { clamped: ToFloor }`, so **both**
+  consumers skipped it -- the docstring's claim was about a state covered by one test and not the
+  other, and the real hole was a state covered by neither; fixed with the row plus a never-called
+  wildcard-free `state_space_witness` that makes the next variant a build error, mirroring the
+  production `coverage_finding` match. The review also earned a **second band leg**:
+  `Operator { InBand }` is the only configured state with a null `coverage_finding`, no test
+  stored one, and `record(...)` sits one line below the `if let Some(finding)` warn block -- so
+  folding the two would silence the boot row on every *routine* configured host and pass the whole
+  tree. Both legs now share one `with_configured_boot` harness. Smaller fixes: the `_truncated`
+  assertion moved above the structural equality (afterwards it could only run in an
+  already-panicked state), the mock-count assertions moved before the row read, a tautological
+  `assert_ne!` deleted, `props_requests` documented as counting requests *received* rather than
+  answered, `guard_tier_e2e` switched onto the shared `props_envelope`, and the `/v1/properties`
+  example corrected in four documents -- it contains no `props` substring, so the unit-test case
+  built on it passed under the mutant it named.
   **Gated on the DGX at `64587ee9`: 3907 / 0 / 55**, 176 suites (175 + the new e2e binary),
   `TEST_EXIT=0`, cold clippy exit 0 over 245 `Checking` lines and all 27 crates, 8 `[SKIP]` all
   gliner-relex. Reconciles exactly at 3901 + 6, with all six names grepped out of the log rather

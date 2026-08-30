@@ -68,7 +68,10 @@ without a guard tier, `guard_tier_e2e` never reads `audit_log` for this action, 
 - **`tests-common/scripted_llm` gained a third `EndpointKind::Props`**, matched on `/props` **with
   its leading slash and BEFORE** the chat fall-through. Both halves are load-bearing and each has
   its own unit test: falling through pops a chat envelope a caller counted for a plan iteration,
-  and a bare `props` substring misroutes `/v1/properties` the same way in reverse. Answered from
+  and a bare `props` substring misroutes `/v1/chat/completions?props=1` the same way in reverse.
+  (The first draft cited `/v1/properties` here and in three other documents -- it contains no
+  `props` substring at all, so the assertion built on it passed under the very mutant it named.
+  Caught by the #635 review.) Answered from
   **one stored body, not a FIFO** — `/props` reports a property of the backend, not a scripted
   turn, so a queue would 503 the second call a real server answers. `spawn_scripted_llm` is
   unchanged and delegates with `None`.
@@ -103,12 +106,57 @@ without a guard tier, `guard_tier_e2e` never reads `audit_log` for this action, 
   defence is to compute what the mutant does to the quantity under test rather than trusting that
   "bigger" is big enough. Sharpens [[mutation-proof-counts-only-mutants-you-tried]].
 - **Filed, not folded in:** [#634](https://github.com/hherb/kastellan/issues/634) — this makes the
-  **third** hand-rolled `bring_up_daemon` in `core/tests/`, ~70 lines identical across all three;
-  the fix is a `tests-common` builder, whose unit tests CI actually runs.
+  **third** hand-rolled `bring_up_daemon` in `core/tests/`, ~70 lines identical across all three.
+  **The issue's original text was wrong and has been rewritten:** it proposed *creating* a
+  `tests_common::daemon::DaemonSpec`, but `tests_common::daemon::bring_up_daemon` **already
+  exists** — with an `extra_env: Vec<(String, String)>` seam that carries all four guard vars
+  unchanged, and three e2es already using it. The work is a *migration*, and the only real gap is
+  the shared helper's hardcoded 10 s log-match budget vs this file's 20 s
+  [[handover-claims-verify-before-carrying]].
+- **The four-agent review of this PR found nine issues; all are fixed on the branch.** The two
+  that mattered:
+  - **`tests_common::daemon::bring_up_daemon` already existed** (above). The PR filed an issue to
+    build a thing that was sitting in the crate it was editing. Consequence beyond tidiness: the
+    stderr-on-bring-up-failure diagnostic added in `c1cfed03` was added to the *private* copy
+    only, while the shared helper carrying three other e2es kept the bare `.expect`. Now ported,
+    as `tests_common::stderr_tail`, which distinguishes empty from unreadable — an
+    `unwrap_or_default()` turns "the log is gone" into "the daemon said nothing", and `/tmp` is
+    scrubbed mid-run on both dev hosts [[dgx-run-logs-tmp-scrubbed]].
+  - **The "every state a `TimeoutBasis` can be in" table was missing one.**
+    `Probed { clamped: Clamped::ToFloor }` was absent, so *both* consumers skipped it — the
+    docstring claimed sharing the table stops a state being "covered by one test and not the
+    other", and the actual failure was covered by **neither**. Added, plus a never-called
+    wildcard-free `state_space_witness` so the next variant is a build error (the symmetry the
+    production `coverage_finding` match already has), plus a count assertion so the witness and
+    the table cannot drift.
+- **Added from the review: a second band leg.** `an_in_band_pin_stores_a_configured_row_with_a_null_coverage_finding`.
+  `Operator { InBand }` is the ONLY configured state whose `coverage_finding` is null, and no test
+  in the tree stored one. `record(...)` sits one line below `report_guard_tier`'s
+  `if let Some(finding) { warn!() }` block, so folding the two together — plausible, they are
+  adjacent and both "report the finding" — silences the boot row on every *routine* configured
+  host and passes the whole workspace. The above-ceiling leg cannot see it, because its row always
+  has a finding. Both legs now share one `with_configured_boot` harness rather than a second copy.
+- **Other review fixes:** the `_truncated` check moved ABOVE the structural equality (a
+  fingerprint row fails the equality too, so afterwards it could only run in a state where the
+  test had already panicked — an assertion that could not fail); the mock-count assertions moved
+  BEFORE the row read (a failing payload used to panic first and take the probe evidence with
+  it); `assert_ne!(classify_endpoint("/props"), Chat)` deleted as tautologically implied by the
+  `assert_eq!(.., Props)` above it; `props_requests` documented as counting requests **received**,
+  not answered (it increments before the 503 decision, so it is evidence the dial happened, never
+  that the tier booted); `guard_tier_e2e`'s private `props_body()` switched onto the shared
+  `props_envelope`; and four prose corrections — the stdout/stderr rationale was causally
+  inverted (tracing writes to stdout, so stdout is NOT empty on a guard-tier death; the reason
+  reaches stderr via `Termination`), "the row is durable" softened to "the insert was attempted"
+  (`record` is deliberately non-fatal), the `MOCK_N_CTX` justification destaled, and "the same
+  form Postgres stores" dropped (`jsonb` is a normalised binary encoding, not `to_vec`).
 - **Two files worth stating rather than leaving to be discovered:**
-  `boot_report/tests.rs` **445 → 515** (over the cap by 15; a test file, and the split rule says
-  split *before* the change that grows it, which this PR did not) and the new
-  `guard_boot_row_e2e.rs` at **464** (under). See the file-split backlog.
+  **three files, after the review fixes**: `boot_report/tests.rs` **445 → 606**,
+  `guard_boot_row_e2e.rs` **687** (the review's second band leg roughly doubled it; the first
+  draft of this bullet said 464, which was already stale by 20 lines when written), and
+  `tests-common/src/scripted_llm.rs` **514**. All three are test files over the 500 cap. The split
+  rule says split *before* the change that grows a file, and this PR did not -- doing it now, on
+  top of a review-fix commit, would be the larger movement and would bury the fixes. Recorded in
+  the file-split backlog rather than papered over.
 
 ### #627 — the boot row's key set and rate assignment were untested — MERGED `8040ca83` ([#631](https://github.com/hherb/kastellan/pull/631))
 
