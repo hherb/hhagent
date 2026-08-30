@@ -100,6 +100,26 @@ pub struct DaemonHandle {
 /// drop), the core log dir, and the state dir.
 pub type DaemonGuards = (ServiceGuard, PathGuard, PathGuard);
 
+/// A daemon's stderr, formatted for a panic message.
+///
+/// Distinguishes the three states a reader needs kept apart — content,
+/// genuinely empty, and unreadable. Collapsing the last two into `""`
+/// (which `unwrap_or_default` does) turns "the log is gone" into "the
+/// daemon said nothing", and the second reading sends you looking for a
+/// code defect that is not there.
+pub fn stderr_tail(stderr_path: &Path) -> String {
+    match std::fs::read_to_string(stderr_path) {
+        Ok(s) if s.trim().is_empty() => {
+            format!("\n--- daemon stderr ({}) --- <empty>\n", stderr_path.display())
+        }
+        Ok(s) => format!("\n--- daemon stderr ({}) ---\n{s}\n", stderr_path.display()),
+        Err(e) => format!(
+            "\n--- daemon stderr ({}) --- <unreadable: {e}>\n",
+            stderr_path.display()
+        ),
+    }
+}
+
 /// Install + start a real `kastellan` daemon under the supervisor and wait for
 /// it to log `"scheduler spawned"`.
 ///
@@ -183,20 +203,35 @@ pub fn bring_up_daemon(
     sup.install(&spec).expect("install core");
     sup.start(&spec.name).expect("start core");
 
-    wait_for_status(
+    // Both bring-up waits report the daemon's STDERR on failure, and
+    // that is not decoration. Tracing goes to stdout
+    // (`tracing_subscriber::fmt()`'s default writer), but a bring-up
+    // abort propagates out of `main() -> Result<()>` and is printed by
+    // `Termination` to **stderr** — so stdout holds the boot lines and
+    // stderr holds the one line that names the failure. `wait_for_log_match`'s
+    // own timeout text quotes stdout, which is the half that cannot say
+    // why. Read errors are surfaced rather than defaulted to "": an
+    // unreadable log and an empty one look identical otherwise, and
+    // `/tmp` is scrubbed mid-run on both dev hosts.
+    if let Err(e) = wait_for_status(
         sup.as_ref(),
         &spec.name,
         |s| s == ServiceStatus::Active,
         Duration::from_secs(10),
-    )
-    .expect("core active");
+    ) {
+        panic!("core active: {e}{}", stderr_tail(&stderr_path));
+    }
 
-    wait_for_log_match(
+    if let Err(e) = wait_for_log_match(
         &stdout_path,
         |s| s.contains("scheduler spawned"),
         Duration::from_secs(10),
-    )
-    .expect("daemon should log 'scheduler spawned' within 10s");
+    ) {
+        panic!(
+            "daemon should log 'scheduler spawned' within 10s: {e}{}",
+            stderr_tail(&stderr_path)
+        );
+    }
 
     (
         DaemonHandle {

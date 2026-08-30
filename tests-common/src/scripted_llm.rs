@@ -46,18 +46,21 @@ enum EndpointKind {
 /// classifier. Anything that contains `embeddings` is an embed request;
 /// every other path is treated as a chat-completion. Pure: `&str → Kind`.
 ///
-/// `/props` is matched **with its leading slash and first**, and both
-/// halves of that are deliberate:
+/// `/props` is matched **ahead of the `Chat` fall-through and with its
+/// leading slash**, and both halves of that are deliberate:
 ///
-/// * *First*, because the fall-through arm is `Chat` — a `/props` GET
-///   that reached it would pop a chat envelope the caller had counted
-///   for a plan iteration, desyncing the queue rather than erroring.
-/// * *With the slash*, because the bare substring `props` appears in
-///   plenty of paths that are not this endpoint (`/v1/properties`,
-///   `/v1/chat/completions?props=1`), and misrouting one of those has
-///   the same silent-desync shape in reverse. `Router::props` composes
-///   the URL as `<base minus /v1>/props`, so the leading slash is
-///   always there.
+/// * *Ahead of the fall-through*, because the `else` arm is `Chat` — a
+///   `/props` GET that reached it would pop a chat envelope the caller
+///   had counted for a plan iteration, desyncing the queue rather than
+///   erroring. (Being *first* of the three is not itself load-bearing:
+///   `/props` contains no `embeddings`, so the embed arm would decline
+///   it either way. What matters is that it is matched at all.)
+/// * *With the slash*, because the bare substring `props` also appears
+///   in paths that are not this endpoint — `/v1/chat/completions?props=1`
+///   is the realistic one — and misrouting such a path to the stored
+///   props body starves the chat queue, the same silent desync in
+///   reverse. `Router::props` composes the URL as
+///   `<base minus /v1>/props`, so the leading slash is always there.
 fn classify_endpoint(path: &str) -> EndpointKind {
     if path.contains("/props") {
         EndpointKind::Props
@@ -110,7 +113,16 @@ pub struct ScriptedLlm {
     pub embed_requests: Arc<Mutex<Vec<String>>>,
     /// Captured chat-completion request bodies in arrival order.
     pub chat_requests: Arc<Mutex<Vec<String>>>,
-    /// How many `GET /props` requests this listener answered.
+    /// How many `GET /props` requests this listener **received**.
+    ///
+    /// Received, not answered, and the distinction is worth spelling
+    /// out because it is invisible at the call site: the counter is
+    /// incremented before the stored-body-or-503 decision, so a mock
+    /// spawned by [`spawn_scripted_llm`] (which 503s every `/props`)
+    /// reports the same 1 as one that served a context window. **A
+    /// `props_requests` assertion is therefore evidence that the dial
+    /// happened, never that the guard tier booted** — pair it with an
+    /// assertion on the resulting row, as `guard_boot_row_e2e` does.
     ///
     /// A **count**, not a body list like its two neighbours, because a
     /// `GET` carries no body — there is nothing to capture but the fact
@@ -148,9 +160,13 @@ pub async fn spawn_scripted_llm(
 ///
 /// Needed by any test that boots a **configured guard tier**:
 /// `GuardTier::from_router_config` treats `/props` as its one fatal
-/// network call (D8 refuses to boot a daemon whose guard backend cannot
-/// hold `REQUIRED_GUARD_N_CTX`), so without an answer here the daemon
-/// exits before it writes a `guard_tier.boot` row at all.
+/// network call, so without an answer here the daemon exits before it
+/// writes a `guard_tier.boot` row at all. Two distinct errors stop it,
+/// and a reader debugging a dead daemon wants to know which:
+/// an unreachable or unparseable `/props` is
+/// `GuardTierError::PropsUnavailable` — the 503 this function's `None`
+/// default produces — while a context below `REQUIRED_GUARD_N_CTX` is
+/// D8's `GuardTierError::Context`.
 ///
 /// `None` for `props_body` is exactly [`spawn_scripted_llm`].
 ///
@@ -434,30 +450,35 @@ mod mock_router_unit_tests {
 
     #[test]
     fn classify_endpoint_routes_props_paths_to_props() {
-        // The shape `Router::props` actually composes: the `/v1`
-        // compat segment stripped, `/props` at the server root.
+        // The shape `Router::props` actually composes: the `/v1` compat
+        // segment stripped, `/props` at the server root.
+        //
+        // This is also the whole of the fall-through hazard. Without a
+        // `Props` arm the same path lands on `Chat` and pops an envelope
+        // the caller had counted for a plan iteration — a desynced queue
+        // rather than an error, which is the failure mode the
+        // per-endpoint queues exist to avoid. An `assert_ne!` against
+        // `Chat` would restate this one rather than add to it.
         assert_eq!(classify_endpoint("/props"), EndpointKind::Props);
     }
 
     #[test]
-    fn classify_endpoint_wins_over_the_chat_fallthrough() {
-        // The regression this ordering exists for. Before `/props` was
-        // matched at all it fell through to `Chat`, popping an envelope
-        // a caller had counted for a plan iteration — a desynced queue
-        // rather than an error, which is the failure mode the
-        // per-endpoint queues were introduced to avoid.
-        assert_ne!(classify_endpoint("/props"), EndpointKind::Chat);
-    }
-
-    #[test]
     fn classify_endpoint_does_not_treat_props_lookalikes_as_props() {
-        // The mirror hazard: a bare `props` substring match would route
-        // these to the props body and starve the chat queue instead.
-        assert_eq!(classify_endpoint("/v1/properties"), EndpointKind::Chat);
+        // The mirror hazard, and the reason the match carries its
+        // leading slash. Both of these contain the bare substring
+        // `props`, so a `contains("props")` classifier answers them from
+        // the stored props body and starves the chat queue instead —
+        // each therefore fails under that mutant, which is what makes
+        // them worth asserting.
+        //
+        // (`/v1/properties` is NOT such a case and is deliberately not
+        // here: `properties` is `p-r-o-p-e-…`, so it contains no `props`
+        // at all and would pass under either spelling.)
         assert_eq!(
             classify_endpoint("/v1/chat/completions?props=1"),
             EndpointKind::Chat,
         );
+        assert_eq!(classify_endpoint("/v1/models?props=true"), EndpointKind::Chat);
     }
 
     #[test]

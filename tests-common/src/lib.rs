@@ -84,8 +84,8 @@ pub use binaries::{
     workspace_target_binary,
 };
 pub use daemon::{
-    assert_cli_failure, assert_cli_success, bring_up_daemon, spawn_inert_mock, DaemonGuards,
-    DaemonHandle, MockLlm,
+    assert_cli_failure, assert_cli_success, bring_up_daemon, spawn_inert_mock, stderr_tail,
+    DaemonGuards, DaemonHandle, MockLlm,
 };
 pub use embedding::text_to_embedding;
 pub use env::{env_lock, EnvVarGuard};
