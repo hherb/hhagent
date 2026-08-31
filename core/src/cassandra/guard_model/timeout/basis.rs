@@ -229,9 +229,20 @@ pub enum TimeoutBasis {
     /// **`budget_ms` is ONE sample's budget, not the probe's.** It was
     /// the same thing until #624 made the probe multi-sample; now the
     /// probe as a whole may have spent up to `PROBE_TOTAL_BUDGET_MS +
-    /// PROBE_BUDGET_MS` across `attempted_samples` calls. The count is
-    /// carried so the row says how much evidence the ceiling rests on:
-    /// one call that stalled is weaker than three.
+    /// PROBE_BUDGET_MS` (60 s) across `attempted_samples` calls. The
+    /// count is carried so the row says how much evidence the ceiling
+    /// rests on: one call that stalled is weaker than three.
+    ///
+    /// **Since issue [#626], `attempted_samples: 1` on this variant no
+    /// longer arises from a healthy backend having one bad moment.** The
+    /// total budget is twice one sample's, so a saturating first sample
+    /// leaves a whole budget unspent and the probe takes another — this
+    /// variant surviving to the row therefore means *every* sample the
+    /// probe took stalled, which is the evidence the finding claims. A
+    /// row that still says `1` means the run had already spent the total
+    /// before the second call could start.
+    ///
+    /// [#626]: https://github.com/hherb/kastellan/issues/626
     Saturated { budget_ms: u64, attempted_samples: u32 },
     /// The probe could not produce a usable sample.
     ///

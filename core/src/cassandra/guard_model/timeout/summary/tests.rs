@@ -232,34 +232,82 @@ fn the_probe_stops_at_the_sample_count_or_the_total_budget() {
     assert!(more_samples_wanted(PROBE_SAMPLES - 1, 0), "the last sample is still wanted");
     assert!(!more_samples_wanted(PROBE_SAMPLES, 0), "never more than PROBE_SAMPLES");
 
-    // The budget bound is exclusive, so a sample that spent exactly the
-    // whole budget ends the probe — which is what makes a saturating
-    // FIRST sample cost exactly one budget with no special case.
+    // The budget bound is exclusive, so a run that has spent exactly the
+    // whole total ends the probe.
     assert!(more_samples_wanted(1, PROBE_TOTAL_BUDGET_MS - 1));
     assert!(!more_samples_wanted(1, PROBE_TOTAL_BUDGET_MS));
-    assert!(!more_samples_wanted(1, PROBE_BUDGET_MS), "a saturated first sample stops here");
 }
 
-/// The probe's total budget must not be shorter than one sample's, or
-/// the second sample could never be reached on a host that needs it.
+/// A saturating FIRST sample buys a SECOND one (issue [#626]).
+///
+/// The whole of #626, expressed as the one call that used to answer
+/// `false`. A [`ProbeOutcome::Saturated`] means the per-request budget
+/// expired, so the run stands at exactly [`PROBE_BUDGET_MS`] — and while
+/// [`PROBE_TOTAL_BUDGET_MS`] *equalled* that, the elapsed check ended the
+/// probe there. A cold `llama-server` paging in its weights therefore
+/// derived the ceiling and fired
+/// [`super::super::TimeoutBasis::Saturated`]'s finding on a host that
+/// adjudicates a document in ~19 s a moment later, with the fast samples
+/// that would have contradicted it never taken.
+///
+/// **The retry is what makes the finding evidence rather than noise.**
+/// [`summarise`] ranks `Measured` above `Saturated`, so one fast follow-up
+/// sample replaces the ceiling with a real budget; if the host really is
+/// slow, the second sample saturates too and the finding fires on
+/// `attempted_samples: 2`.
+///
+/// Written as its own test rather than a line in the stopping-rule test
+/// above because it is a different claim: that one pins the *rule*, this
+/// one pins the *consequence* the rule exists for.
+///
+/// [#626]: https://github.com/hherb/kastellan/issues/626
+#[test]
+fn a_saturating_first_sample_still_buys_another() {
+    assert!(
+        more_samples_wanted(1, PROBE_BUDGET_MS),
+        "a probe whose first sample saturated must take another: one stalled call \
+         is a cold model as often as it is a slow host, and stopping there fires \
+         the ceiling finding on evidence of one"
+    );
+}
+
+/// The probe's total budget must be STRICTLY longer than one sample's.
 ///
 /// A `const` assertion rather than a test body: the relation is between
 /// two constants, so it can be a **compile** error.
+///
+/// **Strictly, not `>=`, and that is issue [#626]** — the two were equal,
+/// which made `more_samples_wanted` unable to grant a second sample after
+/// a saturating first one no matter what it was asked. Equality is
+/// therefore not a tunable choice to be re-made later but the defect
+/// itself, and re-making it should not compile.
+///
+/// [#626]: https://github.com/hherb/kastellan/issues/626
 const _: () = assert!(
-    PROBE_TOTAL_BUDGET_MS >= PROBE_BUDGET_MS,
-    "PROBE_TOTAL_BUDGET_MS must be at least one sample's budget"
+    PROBE_TOTAL_BUDGET_MS > PROBE_BUDGET_MS,
+    "PROBE_TOTAL_BUDGET_MS must EXCEED one sample's budget, or a saturating \
+     first sample ends the probe at one unrepresentative measurement (#626)"
 );
 
-/// Three samples, pinned to a literal.
+/// Both boot-cost knobs, pinned to literals: three samples, and a total
+/// budget of two per-sample budgets.
 ///
-/// Every other test here expresses itself in terms of `PROBE_SAMPLES`,
-/// so changing it would move the assertions along with it and nothing
-/// would fail. It is a boot-time cost as well as a measurement-quality
-/// knob, so a change to it should be a visible diff here.
+/// Every other test here expresses itself in terms of [`PROBE_SAMPLES`]
+/// and [`PROBE_TOTAL_BUDGET_MS`], so changing either would move the
+/// assertions along with it and nothing would fail. Both are boot-time
+/// costs as well as measurement-quality knobs, so a change to either
+/// should be a visible diff here.
+///
+/// **The total is asserted as `40_000`, not as `2 * PROBE_BUDGET_MS`**,
+/// and the literal is the point: writing the relation would make this
+/// test move with the definition it exists to pin. The `const _` above
+/// covers the *relation* (strictly greater); this covers the *value*, so
+/// changing the factor to 3x is a failing test rather than a silent 20 s
+/// of extra worst-case daemon startup.
 #[test]
 fn the_sample_count_is_pinned_to_its_documented_value() {
     assert_eq!(PROBE_SAMPLES, 3);
-    assert_eq!(PROBE_TOTAL_BUDGET_MS, 20_000);
+    assert_eq!(PROBE_TOTAL_BUDGET_MS, 40_000);
 }
 
 /// The ranking table itself, asked directly rather than through

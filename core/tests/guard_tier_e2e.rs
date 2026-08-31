@@ -1092,6 +1092,45 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
     };
     let tier = build_tier(&cfg).await;
 
+    // **The socket evidence is asserted FIRST, and the order is the point.**
+    // What the mock counted is the only thing here that no other test can
+    // observe; the basis below is production's own report of the same run, and
+    // a wrong basis panicking first would take the count with it and leave the
+    // failure looking like a payload defect. #635's review made exactly this
+    // fix in `guard_boot_row_e2e` -- the same shape, one file over.
+    //
+    // Two claims in this one number, and it is the only place either meets a
+    // real socket:
+    //
+    // * a saturating first sample DOES buy a second (#626) -- the count must
+    //   not be 1, which is what it was while PROBE_TOTAL_BUDGET_MS equalled
+    //   PROBE_BUDGET_MS, and that is the defect this test now pins;
+    // * the retry is still BOUNDED (#624) -- the count must not be
+    //   PROBE_SAMPLES either, because two saturating samples spend the whole
+    //   total and `more_samples_wanted` refuses a third. Without that half,
+    //   the sickest host would pay PROBE_SAMPLES * PROBE_BUDGET_MS of daemon
+    //   startup. Measured: with the elapsed clause removed this test takes
+    //   60.02 s and reports three, which is the `PROBE_TOTAL_BUDGET_MS +
+    //   PROBE_BUDGET_MS` bound `summary.rs` documents, observed rather than
+    //   asserted.
+    //
+    // It is NOT redundant with `attempted_samples` below, which is what
+    // production *says* it did: this is what the backend *saw*. A probe that
+    // fabricated its second sample instead of dialling would agree with the
+    // basis and disagree with this.
+    //
+    // So this test costs 2 * PROBE_BUDGET_MS of wall clock, up from one.
+    // That is the price of exercising `is_timeout` against a socket that
+    // never answers, and it is deliberate: a mutation making that predicate
+    // always-false survives every other test in this file and hands the
+    // SLOWEST hosts the SHORTEST guard timeout.
+    assert_eq!(
+        completions.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a saturating first sample must buy exactly ONE retry (#626) and no more \
+         (#624): not 1, and not PROBE_SAMPLES"
+    );
+
     let budget = tier.timeout();
     assert_eq!(
         budget.timeout.as_millis() as u64,
@@ -1100,25 +1139,17 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
     );
     assert_eq!(
         budget.basis,
-        TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS, attempted_samples: 1 },
+        TimeoutBasis::Saturated { budget_ms: PROBE_BUDGET_MS, attempted_samples: 2 },
         "an overrun probe reports the budget it exceeded and NO throughput -- \
          reporting `Probed` forced a fabricated tok_per_s into guard_tier.boot. \
-         attempted_samples is 1 because a saturating sample spends the whole \
-         total budget, so the durable row says how much the ceiling rests on"
+         attempted_samples is 2 because #626 made PROBE_TOTAL_BUDGET_MS twice one \
+         sample's, so a saturating sample no longer ends the probe by itself: this \
+         backend stalled BOTH calls, and the durable row says the ceiling rests on \
+         two of them rather than on one"
     );
     assert!(
         budget.basis.coverage_finding().is_some(),
         "a host this slow is a finding, not a routine value"
-    );
-    // #624's wall-clock guarantee, and the reason `more_samples_wanted` needs
-    // no special case for saturation: a sample that saturates has by
-    // definition spent the whole total budget, so the elapsed check ends the
-    // probe on its own. Without this, going multi-sample would have made the
-    // sickest host pay PROBE_SAMPLES * PROBE_BUDGET_MS of daemon startup.
-    assert_eq!(
-        completions.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "a saturating first sample must cost exactly ONE budget, not PROBE_SAMPLES"
     );
     handle.abort();
 }

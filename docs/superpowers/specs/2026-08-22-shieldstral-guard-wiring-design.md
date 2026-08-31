@@ -508,35 +508,63 @@ buster so consecutive samples diverge as early as the prompt allows.
 | constant | value | why |
 | --- | --- | --- |
 | `PROBE_SAMPLES` | 3 | two cannot show a spread; each costs real boot time |
-| `PROBE_TOTAL_BUDGET_MS` | 20 000 (= `PROBE_BUDGET_MS`) | a healthy boot pays nothing extra: 3 x 160 ms on the DGX is ~42x of headroom, 3 x ~560 ms on the Mac ~12x |
+| `PROBE_TOTAL_BUDGET_MS` | 40 000 (= `2 * PROBE_BUDGET_MS`) | strictly more than one sample's, so a saturating first sample cannot end the probe (#626); a healthy boot still pays nothing extra, 3 x 160 ms on the DGX being ~83x of headroom and 3 x ~560 ms on the Mac ~24x |
 
-**Stopping rule: one rule, not two — because a second would be dead code.**
+**Stopping rule: one rule, not two.**
 `taken < PROBE_SAMPLES && elapsed < PROBE_TOTAL_BUDGET_MS`, checked before each sample. An
-explicit "stop as soon as a sample saturates" was written and dropped: `Saturated` is
-produced only when the per-request budget expired, and `PROBE_TOTAL_BUDGET_MS` *equals*
-`PROBE_BUDGET_MS`, so a saturating sample always leaves `elapsed >= PROBE_TOTAL_BUDGET_MS`
-and the elapsed check already returns false. The extra clause could never have fired. What
-the shipped rule adds over it is the other direction: a sample that came *close* to the
-budget without spending it buys one more look.
+explicit "stop as soon as a sample saturates" was written and dropped, and while
+`PROBE_TOTAL_BUDGET_MS` *equalled* `PROBE_BUDGET_MS` the two rules were behaviourally
+identical: `Saturated` is produced only when the per-request budget expired, so a saturating
+sample always left `elapsed >= PROBE_TOTAL_BUDGET_MS` and the elapsed check already returned
+false. The shipped rule therefore had the rejected rule's defect. What it adds over it is the
+other direction: a sample that came *close* to the budget without spending it buys one more
+look.
 
-**So a saturating FIRST sample still ends the probe at one unrepresentative sample, and D11
-does not fix that** — issue [#626](https://github.com/hherb/kastellan/issues/626). A cold
-`llama-server` paging in its weights derives the ceiling and fires the false coverage finding
-on a host that adjudicates a worst-case document in ~19 s. D11 removes the *contention* case
-of #624's defect; the *cold-model* case needs a total budget larger than one sample's, which
-costs daemon startup on the host that is already sickest and is a decision rather than a
-cleanup. It costs exactly one budget today, pinned by an e2e assertion.
+**A saturating FIRST sample now buys a SECOND one — issue
+[#626](https://github.com/hherb/kastellan/issues/626), fixed by raising
+`PROBE_TOTAL_BUDGET_MS` to twice `PROBE_BUDGET_MS`.** Before that, a cold `llama-server`
+paging in its weights stalled its first call past 20 s, ended the probe there, derived the
+ceiling and fired `TimeoutBasis::Saturated`'s finding on a host that adjudicates a worst-case
+document in ~19 s a moment later. (That finding, not `Clamped::ToCeiling`'s — #626 as filed
+quoted the latter's sentence, and the two are different strings on different bases.) D11
+removed the *contention* case of #624's defect; this removes the *cold-model* one. Nothing
+special-cases saturation: the rule is still elapsed wall clock, and what decides the outcome
+afterwards is `summarise`'s ranking, where `Measured` outranks `Saturated` — a fast follow-up
+replaces the ceiling with a derived budget, and a host that really is slow saturates twice and
+fires the same finding on `attempted_samples: 2`.
 
-*(Until #625's review this paragraph said the explicit rule was **rejected** because it
+The `>` relation between the two budgets is a **compile-time** assertion in
+`timeout/summary/tests.rs`, not a convention: re-equalising them is the defect, not a tunable.
+
+*(Until #625's review the first paragraph said the explicit rule was **rejected** because it
 "would end the probe at one unrepresentative sample and fire the ceiling finding" — which is
-what the shipped rule does too. Corrected in place rather than quietly: that claim was the
-design record in three other documents.)*
+what the shipped rule then did too. Corrected in place rather than quietly: that claim was the
+design record in three other documents. #626 is the behaviour catching up with the
+correction.)*
 
 A sample returning just *under* the budget buys one more, so the true bound is
-`PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS`. **The FULL overrun** is reachable only on a host
+`PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS` — now 60 s, and **measured**: with the elapsed
+clause removed, `a_probe_that_overruns_its_budget_derives_the_ceiling` takes 60.02 s and
+reports three samples. **The FULL overrun** is reachable only on a host
 already emitting a coverage finding; a *smaller* one is ordinary and carries no such
 reassurance — two 100 ms samples then a saturating third spend 20.2 s on a host whose `best`
 is a fast `Measured`, with no clamp and no finding.
+
+**What the change costs, per host** — the added wall clock never lands on a host that ends up
+healthy:
+
+| host | before | after |
+| --- | --- | --- |
+| healthy | ~0.5 s | ~0.5 s — the clock is never reached |
+| cold model, then fast | 20 s, ceiling, **false finding** | ~20.4 s, a real rate, no finding |
+| genuinely slow | 20 s, `attempted_samples: 1` | 40 s, `attempted_samples: 2` |
+| pathological (samples land ~19.9 s) | 40 s | 60 s |
+
+The third option #626 offered — keep the budgets and weaken the *finding* when
+`measured_samples == 0 && attempted_samples == 1` — was **rejected**, and not only on cost: it
+would leave the cold host on the 120 s ceiling with a softer message instead of giving it a
+correct budget, and raising the total makes its trigger condition unreachable, so shipping
+both would add a branch no fixture can enter.
 
 **With no measuring sample, the most informative failure wins:** `Saturated` > `Failed` >
 `TooFewUncachedTokens` > `NoTokenCount`. The lower three all derive the same floor, so this

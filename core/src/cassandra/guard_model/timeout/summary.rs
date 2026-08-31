@@ -48,27 +48,45 @@ pub const PROBE_SAMPLES: usize = 3;
 
 /// Wall clock the whole probe may spend, across **all** samples.
 ///
-/// Deliberately equal to [`PROBE_BUDGET_MS`], the budget one sample used
-/// to cost, so that going multi-sample does not lengthen a *healthy*
-/// boot at all: a DGX sample is ~160 ms and a Mac one under a second, so
-/// all [`PROBE_SAMPLES`] fit inside this with room to spare: 3 x 160 ms
-/// against 20 000 is ~42x of headroom on the DGX, and 3 x ~560 ms (the
-/// Mac's ~1 445 tok/s on an 810-token body) is still ~12x. Not two
-/// orders of magnitude, as this said until #625's review counted it —
-/// one and a half, which is what "a healthy boot pays nothing extra"
-/// needs and all it needs.
+/// **Two of [`PROBE_BUDGET_MS`], and the factor is the whole of issue
+/// [#626].** It was *equal* to one sample's budget until then, which
+/// meant a [`ProbeOutcome::Saturated`] first sample — produced only when
+/// the per-request budget expired, so leaving `elapsed_ms` at exactly the
+/// total — ended the probe at one measurement. See
+/// [`more_samples_wanted`] for what that cost.
 ///
-/// **The bound it actually gives is `PROBE_TOTAL_BUDGET_MS +
-/// PROBE_BUDGET_MS`, and that is deliberate rather than sloppy.**
+/// **A healthy boot still pays nothing extra**, which is what the old
+/// equality was protecting and what the factor does not spend: the loop
+/// stops at [`PROBE_SAMPLES`], never on this clock, unless a sample is
+/// pathologically slow. A DGX sample is ~160 ms and a Mac one under a
+/// second, so 3 x 160 ms against 40 000 is ~83x of headroom on the DGX
+/// and 3 x ~560 ms (the Mac's ~1 445 tok/s on an 810-token body) is
+/// ~24x.
+///
+/// **What the factor actually buys, per host:**
+///
+/// | host | before | after |
+/// | --- | --- | --- |
+/// | healthy | ~0.5 s | ~0.5 s — the clock is never reached |
+/// | cold model, then fast | 20 s, ceiling, **false finding** | ~20.4 s, a real rate, no finding |
+/// | genuinely slow | 20 s, `attempted_samples: 1` | 40 s, `attempted_samples: 2` |
+/// | pathological | 40 s | 60 s |
+///
+/// So the added wall clock is not paid by the host this fixes — that one
+/// pays ~0.4 s and gets a measurement instead of a warning. It is paid by
+/// a host whose samples land just under the budget, and such a host
+/// derives the ceiling and earns a coverage finding either way.
+///
+/// **The bound it gives is `PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS`
+/// (60 s), and that is deliberate rather than sloppy.**
 /// [`more_samples_wanted`] is consulted *before* a sample, so a sample
 /// that starts just under the total may still run its own full budget.
-/// Making the guarantee tight would mean either shortening the
-/// per-sample budget (which redefines [`ProbeOutcome::Saturated`] and
-/// would saturate hosts the current budget measures fine) or refusing to
-/// start any sample that could overrun (which, since the two budgets are
-/// equal, means never taking a second one).
+/// Making the guarantee tight would mean shortening the per-sample budget
+/// — which redefines [`ProbeOutcome::Saturated`] and would saturate hosts
+/// the current budget measures fine — or refusing to start any sample
+/// that could overrun, which is the equality this issue removed.
 ///
-/// **The FULL overrun is reachable only when a sample returns just under
+/// **The FULL overrun is reachable only when samples return just under
 /// 20 s** — a host already deriving the ceiling and already emitting a
 /// coverage finding. A *smaller* overrun is ordinary and carries no such
 /// reassurance: two 100 ms samples followed by a saturating third spend
@@ -77,10 +95,12 @@ pub const PROBE_SAMPLES: usize = 3;
 /// found this paragraph offering the ceiling-finding reassurance for
 /// every overrun rather than for the one it holds of.
 ///
-/// **A probe whose FIRST sample saturates costs exactly one budget and
-/// stops**, because the elapsed check then fails on its own, with no
-/// special case needed for it.
-pub const PROBE_TOTAL_BUDGET_MS: u64 = PROBE_BUDGET_MS;
+/// The strict `>` relation to [`PROBE_BUDGET_MS`] is a **compile**-time
+/// assertion in this module's tests, not a convention: re-equalising the
+/// two is the defect, not a tunable.
+///
+/// [#626]: https://github.com/hherb/kastellan/issues/626
+pub const PROBE_TOTAL_BUDGET_MS: u64 = 2 * PROBE_BUDGET_MS;
 
 /// The cache-buster for sample `index` of this boot's probe.
 ///
@@ -117,31 +137,41 @@ pub fn sample_cache_buster(boot_cache_buster: &str, index: usize) -> String {
 /// stop at [`PROBE_SAMPLES`], or when [`PROBE_TOTAL_BUDGET_MS`] of wall
 /// clock has already gone, whichever comes first.
 ///
-/// **One rule, not two — because a second would be dead code.** An
-/// earlier revision added an explicit "stop as soon as a sample
-/// saturates". [`ProbeOutcome::Saturated`] is produced only when the
-/// per-request budget expired, and [`PROBE_TOTAL_BUDGET_MS`] *equals*
-/// [`PROBE_BUDGET_MS`], so a saturating sample always leaves
-/// `elapsed_ms >= PROBE_TOTAL_BUDGET_MS` and the check below already
-/// returns `false`. The extra clause could never have fired. What this
-/// rule adds over it is the other direction: a sample that came *close*
-/// to the budget without spending it buys one more look.
+/// **One rule, not two, and since issue [#626] that is a property of the
+/// budgets rather than a coincidence of them.** An earlier revision added
+/// an explicit "stop as soon as a sample saturates".
+/// [`ProbeOutcome::Saturated`] is produced only when the per-request
+/// budget expired, so a saturating sample leaves `elapsed_ms` at exactly
+/// [`PROBE_BUDGET_MS`] — and while [`PROBE_TOTAL_BUDGET_MS`] *equalled*
+/// that, the check below already returned `false`, making the extra
+/// clause unable to fire. The two rules were behaviourally identical, and
+/// the shipped one had the rejected one's defect.
 ///
-/// **So a saturating FIRST sample does end the probe at one
-/// unrepresentative sample, and that gap is real** — issue [#626]. A
-/// cold `llama-server` paging in its weights derives the ceiling and
-/// fires the "this host cannot adjudicate a worst-case document"
-/// finding on a host that adjudicates one in ~19 s. #624 removed the
-/// *contention* case of that defect; the *cold-model* case needs a total
-/// budget larger than one sample's, which costs daemon startup on the
-/// host that is already sickest and is therefore a decision rather than
-/// a cleanup.
+/// **That defect was the cold-model case of #624, and the budget change
+/// is what removes it.** A cold `llama-server` paging in its weights
+/// stalls its first call past 20 s; the probe stopped there, derived the
+/// ceiling and fired [`super::basis::TimeoutBasis::Saturated`]'s finding
+/// — "the guard boot probe never returned within its budget" — on a host
+/// that adjudicates a document in ~19 s a moment later, with the fast
+/// samples that would have contradicted it never taken. #624 removed the
+/// *contention* case of that defect; this removes the *cold-model* one.
+/// With the total at twice the per-sample budget, one saturating sample
+/// leaves a whole budget unspent and the run gets a second look.
 ///
-/// (Until #625's review this paragraph said the explicit rule was
+/// **Nothing here special-cases saturation, and it must not start to.**
+/// The rule is still elapsed wall clock, which is why a sample that came
+/// merely *close* to the budget buys another look on the same terms. What
+/// decides the outcome afterwards is [`summarise`]'s ranking, where
+/// `Measured` outranks `Saturated`: a fast follow-up sample replaces the
+/// ceiling with a derived budget, and a host that really is slow
+/// saturates twice and fires the same finding on `attempted_samples: 2`.
+///
+/// (Until #625's review the first paragraph said the explicit rule was
 /// *rejected* because it "would end the probe at one unrepresentative
-/// sample and fire the ceiling finding" — which is what this rule does
-/// too. Corrected in place rather than quietly, because that claim was
-/// the design record in three other documents.)
+/// sample and fire the ceiling finding" — which is what the shipped rule
+/// then did too. Corrected in place rather than quietly, because that
+/// claim was the design record in three other documents; #626 is the
+/// behaviour catching up with the correction.)
 ///
 /// [#626]: https://github.com/hherb/kastellan/issues/626
 pub fn more_samples_wanted(taken: usize, elapsed_ms: u64) -> bool {
