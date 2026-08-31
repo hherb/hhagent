@@ -786,9 +786,11 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   of revert, `+1` and `3 *` are now `E0080` from `cargo build --release`. (5) `CHANNEL_WAIT` was
   sized against one leg of two -- `/props` is fatal, uses the same `probe_client` and runs first, so
   the pre-scheduler bound is ~80 s, not 60; raised to 120.
-  **Gated on the DGX at `c0255cd7`: 3909 / 0 / 55**, 176 suites, `TEST_EXIT=0`; cold clippy exit 0
-  over 345 `Checking`+`Compiling` lines with all 27 crates named and zero warnings; 8 `[SKIP]`, all
-  gliner-relex. Reconciles exactly at 3908 + 1. Both hosts on rustc 1.98.0 (CI parity, checked).
+  **Re-gated on the DGX at `8d92c02b` after the second review: 3910 / 0 / 55**, 176 suites,
+  `TEST_EXIT=0`; cold clippy exit 0 over 345 `Checking`+`Compiling` lines with all 27 crates named
+  and zero warnings; 8 `[SKIP]`, all gliner-relex, zero non-gliner (counted from a `--nocapture`
+  run). Reconciles exactly at 3909 + 1, the one new e2e. Both hosts on rustc 1.98.0 (CI parity,
+  checked). The `c0255cd7` gate at 3909 is superseded, not additive.
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one
