@@ -508,7 +508,7 @@ buster so consecutive samples diverge as early as the prompt allows.
 | constant | value | why |
 | --- | --- | --- |
 | `PROBE_SAMPLES` | 3 | two cannot show a spread; each costs real boot time |
-| `PROBE_TOTAL_BUDGET_MS` | 40 000 (= `2 * PROBE_BUDGET_MS`) | strictly more than one sample's, so a saturating first sample cannot end the probe (#626); a healthy boot still pays nothing extra, 3 x 160 ms on the DGX being ~83x of headroom and 3 x ~560 ms on the Mac ~24x |
+| `PROBE_TOTAL_BUDGET_MS` | 40 000 (= `2 * PROBE_BUDGET_MS`) | a whole spare budget, so a saturating first sample cannot end the probe (#626) — *strictly more* would not do it, see the stopping rule below; a healthy boot still pays nothing extra, 3 x 160 ms on the DGX being ~83x of headroom and 3 x ~560 ms on the Mac ~24x |
 
 **Stopping rule: one rule, not two.**
 `taken < PROBE_SAMPLES && elapsed < PROBE_TOTAL_BUDGET_MS`, checked before each sample. An
@@ -533,8 +533,17 @@ afterwards is `summarise`'s ranking, where `Measured` outranks `Saturated` — a
 replaces the ceiling with a derived budget, and a host that really is slow saturates twice and
 fires the same finding on `attempted_samples: 2`.
 
-The `>` relation between the two budgets is a **compile-time** assertion in
-`timeout/summary/tests.rs`, not a convention: re-equalising them is the defect, not a tunable.
+The relation between the two budgets is a **compile-time** assertion beside the constant in
+`timeout/summary.rs`, not a convention: re-equalising them is the defect, not a tunable. It is
+`>= 2 *` and **not** a strict `>`, and #637's review is why. A saturating sample does not leave
+the clock at *exactly* `PROBE_BUDGET_MS` — `run_probe` takes its `Instant` before the loop and a
+tokio timer only ever overshoots (~5 ms measured) — so `PROBE_TOTAL_BUDGET_MS = PROBE_BUDGET_MS + 1`
+satisfies a `>` guard, satisfies every test, and still refuses the second sample at
+`elapsed_ms = 20_005`: #626 restored with the suite green. Requiring a whole spare budget is a 20 s
+*tolerance* against an overshoot nobody bounds, not a proof. The assertion is paired with a `<= 2 *`
+upper bound so raising the factor is a deliberate two-place edit, and it lives beside the constant
+rather than in `summary/tests.rs` because a `#[cfg(test)]` module is stripped from
+`cargo build --release`.
 
 *(Until #625's review the first paragraph said the explicit rule was **rejected** because it
 "would end the probe at one unrepresentative sample and fire the ceiling finding" — which is

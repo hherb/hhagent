@@ -222,6 +222,19 @@ pub fn bring_up_daemon(
         panic!("core active: {e}{}", stderr_tail(&stderr_path));
     }
 
+    // **10s holds only because a test daemon never configures the guard
+    // tier.** `scheduler spawned` is logged AFTER
+    // `GuardTier::from_router_config`, which on a configured tier spends up
+    // to PROBE_BUDGET_MS on the fatal /props call plus
+    // PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS on the boot probe -- ~80s
+    // since #626 doubled the total, where it was ~40s before. Nothing here
+    // sets KASTELLAN_LLM_GUARD_*, and `core_service_spec` passes no
+    // environment files, so `from_router_config` returns `Ok(None)` before
+    // it opens a socket. A caller that DOES configure a guard must pin
+    // KASTELLAN_LLM_GUARD_TIMEOUT_MS (which routes around the probe) or
+    // raise this. Flagged by #637's review; `guard_boot_row_e2e` pins the
+    // timeout for exactly this reason and #634 plans to move it onto this
+    // helper.
     if let Err(e) = wait_for_log_match(
         &stdout_path,
         |s| s.contains("scheduler spawned"),

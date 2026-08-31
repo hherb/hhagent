@@ -231,11 +231,21 @@ fn the_probe_stops_at_the_sample_count_or_the_total_budget() {
     assert!(more_samples_wanted(0, 0), "a probe must always get at least one sample");
     assert!(more_samples_wanted(PROBE_SAMPLES - 1, 0), "the last sample is still wanted");
     assert!(!more_samples_wanted(PROBE_SAMPLES, 0), "never more than PROBE_SAMPLES");
+    // `taken` is compared with `<`, not `!=`. `run_probe` only ever
+    // increments by one from zero, so no other line in the tree presents a
+    // count ABOVE the cap and the two forms are indistinguishable without
+    // this one. Added by #637's review.
+    assert!(!more_samples_wanted(PROBE_SAMPLES + 1, 0), "nor past it");
 
     // The budget bound is exclusive, so a run that has spent exactly the
     // whole total ends the probe.
     assert!(more_samples_wanted(1, PROBE_TOTAL_BUDGET_MS - 1));
     assert!(!more_samples_wanted(1, PROBE_TOTAL_BUDGET_MS));
+    // The exact call that ends an ALL-SATURATING run -- two samples, the
+    // whole total spent, no third -- which is what `guard_tier_e2e`'s
+    // overrun case spends 40 s of wall clock observing against a socket.
+    // Free here; that one is the expensive statement of the same thing.
+    assert!(!more_samples_wanted(2, PROBE_TOTAL_BUDGET_MS));
 }
 
 /// A saturating FIRST sample buys a SECOND one (issue [#626]).
@@ -256,14 +266,22 @@ fn the_probe_stops_at_the_sample_count_or_the_total_budget() {
 /// slow, the second sample saturates too and the finding fires on
 /// `attempted_samples: 2`.
 ///
-/// **Asserted across the whole reachable range, not at one point.** A
-/// saturating sample leaves the clock at `PROBE_BUDGET_MS` *plus* however
-/// long the transport took to give up — never at the boundary exactly (see
-/// the `const _` below) — so a test asking only at `PROBE_BUDGET_MS`
-/// interrogates the one value production is guaranteed never to present,
-/// and a total budget of `PROBE_BUDGET_MS + 1` would pass it while
-/// reinstating the defect. Both ends of the range a saturating first sample
-/// can land in are therefore asked.
+/// **Asked at three points, not one, and the middle one is load-bearing.**
+/// A saturating sample leaves the clock at [`PROBE_BUDGET_MS`] *plus*
+/// however long the transport took to give up, so a test asking only at
+/// `PROBE_BUDGET_MS` interrogates a value production essentially never
+/// presents, and a total budget of `PROBE_BUDGET_MS + 1` would pass it
+/// while reinstating the defect. `PROBE_BUDGET_MS + 5` is the measured
+/// overshoot, and it is the point that kills that mutant.
+///
+/// **This is the interval over which the answer must stay `true`, NOT the
+/// range a saturating sample can land in** — a distinction #637's review
+/// made, because the two had been conflated here. Nothing bounds the
+/// overshoot (see the `const _` beside [`PROBE_TOTAL_BUDGET_MS`]), so the
+/// reachable range is `[PROBE_BUDGET_MS, ∞)` and `2 * PROBE_BUDGET_MS - 1`
+/// is only the last value the predicate still accepts. A sample
+/// overshooting by more than a whole budget would still end the probe at
+/// one; what `>= 2 *` buys is 20 s of tolerance, not a guarantee.
 ///
 /// Written as its own test rather than a line in the stopping-rule test
 /// above because it is a different claim: that one pins the *rule*, this
@@ -283,41 +301,6 @@ fn a_saturating_first_sample_still_buys_another() {
     }
 }
 
-/// The probe's total budget must be at least TWO per-sample budgets.
-///
-/// A `const` assertion rather than a test body: the relation is between
-/// two constants, so it can be a **compile** error.
-///
-/// **Two, not merely "more than one", and the difference is the whole
-/// guarantee.** The tempting form is `PROBE_TOTAL_BUDGET_MS >
-/// PROBE_BUDGET_MS` — re-equalising them is issue [#626]'s defect, so
-/// forbidding equality looks sufficient. It is not, because **a saturating
-/// sample does not leave the clock at *exactly* `PROBE_BUDGET_MS`**.
-/// `run_probe` takes its `Instant` before the loop, so the elapsed value
-/// `more_samples_wanted` sees is request setup + reqwest's timeout + error
-/// propagation, and a tokio timer can only overshoot its deadline, never
-/// undershoot. Measured: the two-saturating-sample e2e takes **40.01 s**,
-/// i.e. ~5 ms of overshoot per sample.
-///
-/// So `PROBE_TOTAL_BUDGET_MS = PROBE_BUDGET_MS + 1` would satisfy a `>`
-/// guard, satisfy every test in this file, and still refuse the second
-/// sample in production at `elapsed_ms = 20_005` — #626, restored, with
-/// the whole suite green. Requiring a *second full budget* is what makes
-/// the guarantee robust to an overshoot nobody bounds.
-///
-/// Under the old equality this distinction did not exist: the check failed
-/// at `20_000` and at `20_005` alike. It became load-bearing the moment the
-/// total moved.
-///
-/// [#626]: https://github.com/hherb/kastellan/issues/626
-const _: () = assert!(
-    PROBE_TOTAL_BUDGET_MS >= 2 * PROBE_BUDGET_MS,
-    "PROBE_TOTAL_BUDGET_MS must be at least TWO per-sample budgets. A saturating \
-     sample overshoots PROBE_BUDGET_MS by however long the transport takes to give \
-     up, so merely EXCEEDING one budget does not guarantee the second sample #626 \
-     is about -- only leaving a whole budget unspent does"
-);
-
 /// Both boot-cost knobs, pinned to literals: three samples, and a total
 /// budget of two per-sample budgets.
 ///
@@ -329,10 +312,27 @@ const _: () = assert!(
 ///
 /// **The total is asserted as `40_000`, not as `2 * PROBE_BUDGET_MS`**,
 /// and the literal is the point: writing the relation would make this
-/// test move with the definition it exists to pin. The `const _` above
-/// covers the *relation* (strictly greater); this covers the *value*, so
-/// changing the factor to 3x is a failing test rather than a silent 20 s
-/// of extra worst-case daemon startup.
+/// test move with the definition it exists to pin. The paired `const _`
+/// assertions beside [`PROBE_TOTAL_BUDGET_MS`] cover the *relation* from
+/// both sides; this covers the *value*.
+///
+/// **What this literal still catches, now that the `const _` pair pins the
+/// FACTOR, is a change to [`PROBE_BUDGET_MS`] itself.** Moving the factor
+/// to 3x no longer reaches this assertion at all — it is an `E0080` from
+/// the upper-bound `const _`, which is the stronger failure. Moving the
+/// per-sample budget to 30 s, though, satisfies both relations and lands
+/// here as `60_000 != 40_000`: a doubled worst-case boot, caught by the
+/// one assertion that names an absolute number.
+///
+/// **And the cost of a 3x factor is 20 s on the ALL-SATURATING host, not
+/// on worst-case daemon startup.** At [`PROBE_SAMPLES`] = 3 the worst case
+/// does not move at all: the sample cap already holds any run to
+/// `3 * PROBE_BUDGET_MS` ≈ 60 s, the coincidence
+/// [`PROBE_TOTAL_BUDGET_MS`]'s own doc establishes. What 3x changes is
+/// that a host stalling *every* call takes three samples instead of two —
+/// 60 s where the current factor spends 40. (This paragraph named the
+/// worst case until #637'''s review, which is the one quantity that does
+/// not move.)
 #[test]
 fn the_sample_count_is_pinned_to_its_documented_value() {
     assert_eq!(PROBE_SAMPLES, 3);

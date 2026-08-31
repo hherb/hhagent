@@ -736,9 +736,10 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   40 s -> 60 s. **Option 3 was rejected on more than cost**: keeping the budgets and weakening the
   finding leaves the cold host on the 120 s ceiling with a softer message rather than a correct
   budget, and raising the total makes its `measured_samples == 0 && attempted_samples == 1`
-  trigger unreachable -- shipping both would add a branch no fixture can enter. **The `>` relation
-  between the two budgets is now a COMPILE-time assertion**, not a convention: re-equalising them
-  is the defect, not a tunable. **Two corrections to the record, carried into the wiring spec:**
+  trigger unreachable -- shipping both would add a branch no fixture can enter. **The relation between
+  the two budgets is now a COMPILE-time assertion** beside the constant, not a convention:
+  re-equalising them is the defect, not a tunable. It is `>= 2 *`, not a strict `>` -- see the
+  review round below. **Two corrections to the record, carried into the wiring spec:**
   #626 as filed quoted `Clamped::ToCeiling`'s sentence, but this path yields `best = Saturated`,
   so the finding that actually fires is `TimeoutBasis::Saturated`'s -- which matters, because
   option 3 named which one to weaken; and `guard_tier_e2e` asserted the basis *before* the socket
@@ -761,13 +762,30 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   why the two-sample e2e reads 40.01 s). Demonstrated rather than argued: with the `>` guard, the
   single-point test and `PROBE_TOTAL_BUDGET_MS = PROBE_BUDGET_MS + 1`, the suite is **green** while
   production answers `more_samples_wanted(1, 20_005) = false` -- #626 fully restored, invisibly. The
-  guard is now `>= 2 * PROBE_BUDGET_MS` and the retry test asks across the whole reachable range.
+  guard is now `>= 2 * PROBE_BUDGET_MS` and the retry test asks at three points rather than one.
   **When a fix moves a threshold, the test must ask at a value the PRODUCER can emit, not at the
   threshold.** The review also corrected m5's attribution (above) and caught a deploy-breaker:
   `scripts/upgrade_from_git.sh` gave channel bring-up ~51 s, and the probe runs *before* channel
   supervision in `main.rs`, so a saturating guard backend now eats 40 s of it and the script would
   `exit 1` blaming **Matrix** on a host whose real problem is the guard endpoint -- `CHANNEL_WAIT`
-  raised to 90 with the interaction documented at the call site.
+  raised with the interaction documented at the call site.
+  **A SECOND review (four agents, against the PR) found five more, two of them defects.** (1)
+  `TimeoutBasis::Saturated`'s new doc claimed the variant "means every sample stalled" -- false,
+  `summarise` returns it whenever NO sample measured and AT LEAST ONE saturated, so
+  `[Saturated, Failed, Failed]` reaches the row as `attempted_samples: 3` off one stall; and it
+  offered a residual reading for `attempted_samples: 1` the current code cannot produce. (2) **The
+  case #626 exists to fix had no test above the pure layer** -- the updated overrun e2e pins the
+  branch where the verdict is UNCHANGED, while the branch the issue is about (stall once, then
+  measure, false finding disappears) was asserted nowhere. New
+  `a_probe_that_stalls_once_then_measures_drops_the_finding`; a saturation-sticky `summarise` fails
+  it while the overrun and healthy cases both pass, and it costs the suite nothing (its 20 s runs
+  concurrently with the overrun case's 40 s: 40.03 s over 21 cases against 40.02 s over 20). (3) The `>` claim had **survived the first review's own
+  fix in six places**, including the wiring spec, which stated the disproven implication as the
+  rationale. (4) The `const _` lived in a `#[cfg(test)]` module, so the "compile error" was only true
+  under `cargo test` -- moved beside the constant and paired with a `<= 2 *` upper bound; all three
+  of revert, `+1` and `3 *` are now `E0080` from `cargo build --release`. (5) `CHANNEL_WAIT` was
+  sized against one leg of two -- `/props` is fatal, uses the same `probe_client` and runs first, so
+  the pre-scheduler bound is ~80 s, not 60; raised to 120.
   **Gated on the DGX at `c0255cd7`: 3909 / 0 / 55**, 176 suites, `TEST_EXIT=0`; cold clippy exit 0
   over 345 `Checking`+`Compiling` lines with all 27 crates named and zero warnings; 8 `[SKIP]`, all
   gliner-relex. Reconciles exactly at 3908 + 1. Both hosts on rustc 1.98.0 (CI parity, checked).

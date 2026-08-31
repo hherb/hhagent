@@ -85,6 +85,15 @@ enum Verdict {
     /// NON-ZERO value. Every other verdict sends `cached_tokens: 0`, under
     /// which dropping the extraction entirely changes nothing observable.
     CacheHit,
+    /// The FIRST completion stalls — socket held open, never answered — and
+    /// every later one answers `Clear`.
+    ///
+    /// A cold `llama-server` paging in its weights, which is issue #626's
+    /// host: the stall is a `Saturated` sample, the two behind it are real
+    /// measurements, and `summarise` must prefer them. The only verdict
+    /// whose behaviour depends on WHICH completion this is, hence the
+    /// `nth` below.
+    StallThenClear,
 }
 
 /// A multi-request mock: serves `/props` and any number of chat completions,
@@ -123,7 +132,7 @@ impl MockGuardServer {
                     let (status, payload) = if is_props {
                         (200, props_body())
                     } else {
-                        c.fetch_add(1, Ordering::SeqCst);
+                        let nth = c.fetch_add(1, Ordering::SeqCst);
                         b.lock().expect("bodies mutex").push(body);
                         // A real backend never answers a 810-token prompt in
                         // under a millisecond, and the boot probe correctly
@@ -138,6 +147,16 @@ impl MockGuardServer {
                             Verdict::Unmeasurable => (200, canned_single_spelling()),
                             Verdict::ServerError => (500, "{\"error\":\"boom\"}".to_string()),
                             Verdict::CacheHit => (200, canned_cache_hit()),
+                            // Hold the socket open and never answer, exactly
+                            // as the overrun case's hand-rolled mock does:
+                            // keeping `sock` alive is the whole mechanism,
+                            // since DROPPING it produces a transport error
+                            // that is not a timeout, which is the other arm.
+                            Verdict::StallThenClear if nth == 0 => {
+                                std::future::pending::<()>().await;
+                                unreachable!("pending() never resolves")
+                            }
+                            Verdict::StallThenClear => (200, canned(-9.0, -0.001)),
                         }
                     };
                     let line = if status == 200 {
@@ -1050,7 +1069,7 @@ async fn with_no_override_the_boot_probe_runs_and_derives_a_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
     use kastellan_core::cassandra::guard_model::timeout::{
-        TimeoutBasis, PROBE_BUDGET_MS, TIMEOUT_CEILING_MS,
+        TimeoutBasis, PROBE_BUDGET_MS, PROBE_TOTAL_BUDGET_MS, TIMEOUT_CEILING_MS,
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1090,7 +1109,25 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
         guard_timeout_ms: None, // no override: the probe must run
         ..pinned_cfg(&format!("http://127.0.0.1:{port}/v1"))
     };
+    // Wall clock across the whole tier build, for two reasons #637's review
+    // gave. It makes the `PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS` bound
+    // that `summary.rs` documents an assertion rather than only an argument
+    // -- this is the only test in the tree that can observe it. And it makes
+    // the count below self-diagnosing: on a badly oversubscribed host the
+    // count could in principle read 1 (it takes 20 s of scheduling delay on
+    // top of the 20 s budget), and without the elapsed in the message that
+    // failure looks exactly like a `more_samples_wanted` regression.
+    let probe_started = std::time::Instant::now();
     let tier = build_tier(&cfg).await;
+    let probe_elapsed = probe_started.elapsed();
+    assert!(
+        probe_elapsed
+            < std::time::Duration::from_millis(PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS),
+        "the documented worst case is PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS (60 s), \
+         because `more_samples_wanted` is consulted BEFORE a sample and one that \
+         starts just under the total may still run its own full budget; took \
+         {probe_elapsed:?}"
+    );
 
     // **The socket evidence is asserted FIRST, and the order is the point.**
     // What the mock counted is the only thing here that no other test can
@@ -1133,7 +1170,7 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
         completions.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "a saturating first sample must buy exactly ONE retry (#626) and no more \
-         (#624): not 1, and not PROBE_SAMPLES"
+         (#624): not 1, and not PROBE_SAMPLES. The probe took {probe_elapsed:?}"
     );
 
     let budget = tier.timeout();
@@ -1157,6 +1194,103 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
         "a host this slow is a finding, not a routine value"
     );
     handle.abort();
+}
+
+/// D9 + #626: a probe that STALLS ONCE and then measures drops the finding.
+///
+/// **The only case where #626 changes an operator-visible verdict, and until
+/// #637's review nothing above the pure layer asserted it.** The overrun case
+/// above pins the branch where the outcome is *unchanged* — still the ceiling,
+/// still a coverage finding, only `attempted_samples` moving 1 to 2. This pins
+/// the branch the issue exists for: a cold `llama-server` paging in its weights
+/// stalls its first call, answers the next two fast, and the false "never
+/// returned within its budget" finding **disappears**.
+///
+/// Three claims, none of which a pure test can make, because each needs the
+/// loop, the fold and the derivation composed:
+///
+/// * **the stall did not end the probe** (#626) — `completions` is
+///   `PROBE_SAMPLES`, not 1;
+/// * **the fast samples reached `summarise`** — `measured_samples: 2` against
+///   `attempted_samples: 3`, so the stall is counted but not measured. This is
+///   the `summarise(&samples[..1])` seam #625's review already caught once,
+///   and a mixed run is the only shape that can see it;
+/// * **`coverage_finding()` is `None`.** On `main` this same mock derives
+///   `TimeoutBasis::Saturated` from one sample and the finding is `Some`. It is
+///   the assertion that fails before the fix and passes after — and a
+///   saturation-sticky `run_probe`, or a `summarise` preferring the stall
+///   whenever one occurred, survives every other test in the tree.
+///
+/// **Costs the SUITE nothing, which is worth knowing before anyone trims it.**
+/// The stall is one `PROBE_BUDGET_MS` (the two samples behind it are ~10 ms
+/// each), but `cargo test` runs this file's cases concurrently and the overrun
+/// case above spends 40 s, so the binary finishes in **40.03 s with 21 cases**
+/// against 40.02 s with 20 — measured on the DGX, not assumed.
+///
+/// Mutation-proven where it counts: a saturation-sticky `summarise` (fold back
+/// to the `Saturated` sample whenever one occurred) fails THIS test while
+/// `a_probe_that_overruns_its_budget_derives_the_ceiling` and
+/// `with_no_override_the_boot_probe_runs_and_derives_a_budget` both pass — the
+/// first has no measuring sample to demote, the second has no stall. Only the
+/// pure `one_saturated_sample_does_not_outrank_a_real_measurement` also
+/// catches it, and that one never sees the loop or a socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_that_stalls_once_then_measures_drops_the_finding() {
+    use kastellan_core::cassandra::guard_model::timeout::{
+        TimeoutBasis, PROBE_SAMPLES, TIMEOUT_FLOOR_MS,
+    };
+
+    let mock = MockGuardServer::spawn(Verdict::StallThenClear).await;
+    let cfg = RouterConfig {
+        guard_timeout_ms: None, // no override: the probe must run
+        ..pinned_cfg(&mock.base_url)
+    };
+    let tier = build_tier(&cfg).await;
+
+    // Socket evidence first, on the same argument as the overrun case above:
+    // this is what the backend SAW, and a wrong basis panicking first would
+    // take it with it.
+    assert_eq!(
+        mock.completions(),
+        PROBE_SAMPLES,
+        "a stalling first sample must not end the probe (#626), and the samples \
+         behind it must actually be dialled rather than fabricated"
+    );
+
+    let budget = tier.timeout();
+    match budget.basis {
+        TimeoutBasis::Probed { measured_samples, attempted_samples, .. } => {
+            assert_eq!(
+                attempted_samples, PROBE_SAMPLES as u32,
+                "the stall is COUNTED -- attempted is every call the probe made"
+            );
+            assert_eq!(
+                measured_samples,
+                PROBE_SAMPLES as u32 - 1,
+                "but not MEASURED: two fast samples and one stall, and the gap \
+                 between the two counts is the query that says `look at the boot log`"
+            );
+        }
+        ref other => panic!(
+            "one stall followed by two measurements must derive a PROBED basis: \
+             `summarise` ranks Measured above Saturated, and that ranking is what \
+             turns #626's retry into a correct budget rather than a second warning. \
+             Got {other:?}"
+        ),
+    }
+    assert!(
+        budget.basis.coverage_finding().is_none(),
+        "THE assertion of #626. A host that stalled once and then measured twice is \
+         not a host that cannot adjudicate a document -- but before the fix the probe \
+         stopped at the stall, derived the ceiling and fired \
+         TimeoutBasis::Saturated's finding on evidence of one call. Got {:?}",
+        budget.basis
+    );
+    // ~10 ms per answered sample is far faster than any real backend, so the
+    // derivation clamps to the FLOOR -- and the floor is what makes this
+    // assertion worth its line beside the finding: the stall alone would have
+    // given the ceiling, the opposite end of the range.
+    assert_eq!(budget.timeout.as_millis() as u64, TIMEOUT_FLOOR_MS);
 }
 
 /// The operator override skips the probe entirely — and, since #615,

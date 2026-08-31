@@ -109,12 +109,68 @@ pub const PROBE_SAMPLES: usize = 3;
 /// found this paragraph offering the ceiling-finding reassurance for
 /// every overrun rather than for the one it holds of.
 ///
-/// The strict `>` relation to [`PROBE_BUDGET_MS`] is a **compile**-time
-/// assertion in this module's tests, not a convention: re-equalising the
-/// two is the defect, not a tunable.
+/// The relation to [`PROBE_BUDGET_MS`] is the `const` assertion directly
+/// below, not a convention: re-equalising the two is the defect, not a
+/// tunable. Note it is `>= 2 *` and **not** a strict `>` — see that
+/// assertion for why forbidding equality alone would let
+/// `PROBE_BUDGET_MS + 1` reinstate #626 with the whole suite green.
 ///
 /// [#626]: https://github.com/hherb/kastellan/issues/626
 pub const PROBE_TOTAL_BUDGET_MS: u64 = 2 * PROBE_BUDGET_MS;
+
+/// The probe's total budget must be at least TWO per-sample budgets.
+///
+/// A `const` assertion rather than a test body: the relation is between
+/// two constants, so it is a **compile** error. It lives here rather than
+/// in `summary/tests.rs`, where #626 first put it, because a `#[cfg(test)]`
+/// module is stripped from `cargo build --release` — so a re-equalised
+/// constant compiled and shipped clean, and only `cargo test` or
+/// `clippy --all-targets` refused it. Found by #637's review.
+///
+/// **Two, not merely "more than one", and the difference is the whole
+/// guarantee.** The tempting form is `PROBE_TOTAL_BUDGET_MS >
+/// PROBE_BUDGET_MS` — re-equalising them is issue [#626]'s defect, so
+/// forbidding equality looks sufficient. It is not, because **a saturating
+/// sample does not leave the clock at *exactly* [`PROBE_BUDGET_MS`]**.
+/// `tier::probe::run_probe` takes its `Instant` before the loop, so the
+/// elapsed value [`more_samples_wanted`] sees is request setup + reqwest's
+/// timeout + error propagation, and a tokio timer can only overshoot its
+/// deadline, never undershoot. Measured: the two-saturating-sample e2e
+/// takes **40.01 s**, i.e. ~5 ms of overshoot per sample.
+///
+/// So `PROBE_TOTAL_BUDGET_MS = PROBE_BUDGET_MS + 1` would satisfy a `>`
+/// guard, satisfy every test in the suite, and still refuse the second
+/// sample in production at `elapsed_ms = 20_005` — #626, restored, with
+/// everything green. Requiring a *second full budget* is what makes the
+/// guarantee robust to an overshoot nobody bounds. **It is a tolerance,
+/// not a proof:** a sample overshooting by more than a whole budget would
+/// still end the probe at one. 20 s of slack against a measured 5 ms is
+/// the margin, and nothing in the transport promises it.
+///
+/// Under the old equality this distinction did not exist: the check failed
+/// at `20_000` and at `20_005` alike. It became load-bearing the moment the
+/// total moved.
+///
+/// The upper bound is asserted too, so raising the factor is a deliberate
+/// two-place edit rather than a silent 20 s added to the all-saturating
+/// host's boot — the literal pin in
+/// `summary/tests.rs::the_sample_count_is_pinned_to_its_documented_value`
+/// is the other place.
+///
+/// [#626]: https://github.com/hherb/kastellan/issues/626
+const _: () = assert!(
+    PROBE_TOTAL_BUDGET_MS >= 2 * PROBE_BUDGET_MS,
+    "PROBE_TOTAL_BUDGET_MS must be at least TWO per-sample budgets. A saturating \
+     sample overshoots PROBE_BUDGET_MS by however long the transport takes to give \
+     up, so merely EXCEEDING one budget does not guarantee the second sample #626 \
+     is about -- only leaving a whole budget unspent does"
+);
+const _: () = assert!(
+    PROBE_TOTAL_BUDGET_MS <= 2 * PROBE_BUDGET_MS,
+    "raising the factor past two lengthens the boot of a host that stalls EVERY \
+     call (three samples, 60 s, where two and 40 s already earn the same coverage \
+     finding). Deliberate changes update the literal pin in summary/tests.rs too"
+);
 
 /// The cache-buster for sample `index` of this boot's probe.
 ///
@@ -158,8 +214,9 @@ pub fn sample_cache_buster(boot_cache_buster: &str, index: usize) -> String {
 /// budget expired, so a saturating sample leaves `elapsed_ms` at **at
 /// least** [`PROBE_BUDGET_MS`] (measured: ~5 ms beyond it) — and while
 /// [`PROBE_TOTAL_BUDGET_MS`] *equalled* that, the check below already
-/// returned `false`, making the extra clause unable to fire. The two rules were behaviourally identical, and
-/// the shipped one had the rejected one's defect.
+/// returned `false`, making the extra clause unable to fire. The two
+/// rules were behaviourally identical, and the shipped one had the
+/// rejected one's defect.
 ///
 /// **That defect was the cold-model case of #624, and the budget change
 /// is what removes it.** A cold `llama-server` paging in its weights

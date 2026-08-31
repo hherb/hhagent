@@ -78,9 +78,13 @@ worst-case document in ~19 s a moment later.
   *unreachable*, so shipping both would add a branch no fixture can enter
   [[unreachable-success-path-proves-nothing]]. Say this if the option resurfaces; the issue still
   lists it as "cheapest, and arguably the most honest".
-- **The `>` relation between the two budgets is now a COMPILE-time assertion** (`const _` in
-  `timeout/summary/tests.rs`), tightened from `>=`. Re-equalising them is the defect, not a tunable,
-  and the message says so by name.
+- **The relation between the two budgets is now a COMPILE-time assertion** — a `const _` pair
+  beside the constant in `timeout/summary.rs`. It is `>= 2 * PROBE_BUDGET_MS`, **not** a strict `>`
+  (see the review round below for why `>` was too weak), paired with a `<= 2 *` upper bound so a
+  factor change is a deliberate two-place edit. Re-equalising them is the defect, not a tunable, and
+  the message says so by name. It moved out of `summary/tests.rs` in the #637 review round because a
+  `#[cfg(test)]` module is stripped from `cargo build --release`, so a re-equalised constant used to
+  compile and ship clean and only `cargo test`/`clippy --all-targets` refused it.
 - **Two corrections to the record, both carried into the wiring spec** — `docs/superpowers/specs/2026-08-22-shieldstral-guard-wiring-design.md`
   had the stale claim in four places [[handover-claims-verify-before-carrying]]:
   - **#626 as filed quotes the wrong finding.** It says the probe fires *"this host cannot adjudicate
@@ -117,9 +121,11 @@ worst-case document in ~19 s a moment later.
     two-sample e2e reads 40.01 s and not 40.00. So `PROBE_TOTAL_BUDGET_MS = PROBE_BUDGET_MS + 1`
     passed the `>` guard, passed every test in the file, and still refused the second sample in
     production at `elapsed_ms = 20_005` — **#626 restored with the suite green.** The guard is now
-    `>= 2 * PROBE_BUDGET_MS`, the retry test asks across the whole reachable range rather than at
-    the one value production is guaranteed never to present, and three "exactly" clauses became
-    "at least". **Generalises:** when a fix moves a threshold, the test must ask at a value the
+    `>= 2 * PROBE_BUDGET_MS`, the retry test asks at three points rather than one, and three
+    "exactly" clauses became "at least". (The "whole reachable range" wording that replaced them was
+    itself wrong and the SECOND review caught it — the overshoot is unbounded, so what the three
+    points span is the interval over which the answer must stay `true`, not the range a saturating
+    sample can land in.) **Generalises:** when a fix moves a threshold, the test must ask at a value the
     *producer* can actually emit, not at the threshold itself.
   - **m5's 60.02 s was attributed to the wrong bound** — see below.
   - **`scripts/upgrade_from_git.sh` had to absorb the longer probe.** The probe runs at
@@ -127,15 +133,78 @@ worst-case document in ~19 s a moment later.
     `channel bus running` line by its full duration — against a `sleep 6` + `CHANNEL_WAIT=45`
     budget of ~51 s. A saturating guard backend now eats 40 s of that (60 s pathological), and the
     script would `exit 1` blaming **Matrix** on a host whose real problem is the guard endpoint.
-    Default raised to 90 and the interaction documented at the call site.
+    Default raised, and the interaction documented at the call site. (Raised to 90 here and to
+    **120** by the second review, which found this sizing counted only one of the two legs — see
+    below.)
+
+- **A SECOND review (four agents, run against the PR) found five more, two of them defects rather
+  than prose.** All fixed on this branch; the gate below is the re-gate after them.
+  - **`TimeoutBasis::Saturated`'s new doc made two false claims about the durable row**, and this is
+    the one that would have misled an operator. It said the variant "means *every* sample the probe
+    took stalled" — but `summarise` returns `Saturated` whenever **no** sample measured and **at
+    least one** saturated, because `informativeness` ranks it above every failure. So
+    `[Saturated, Failed, Failed]` reaches the row as `attempted_samples: 3` off **one** stall, and
+    that mixed shape is also the only way to reach the documented 60 s bound (two saturating samples
+    stop at 40 s). It also offered a residual reading for `attempted_samples: 1` that the current
+    code cannot produce — refusing the second call needs a full extra budget of overshoot on a 20 s
+    deadline. A row saying `1` is a **pre-#626 row, or a bug**, and now says so
+    [[unreachable-success-path-proves-nothing]].
+  - **The `>` claim had SURVIVED the first review's own fix, in six places** — including the wiring
+    spec, which stated the *disproven* implication ("strictly more than one sample's, so a
+    saturating first sample cannot end the probe") as the design rationale and was the only site
+    with no later correction. Exactly [[handover-claims-verify-before-carrying]]: the code was
+    corrected and the record was not.
+  - **The `const _` was in a `#[cfg(test)]` module**, so "re-equalising them is a compile error" was
+    true only under `cargo test`/`clippy --all-targets` — a re-equalised constant compiled and
+    shipped clean in `cargo build --release`. **Moved beside the constant in `summary.rs`** and
+    paired with a `<= 2 *` upper bound. Proven on the DGX: all three of revert-to-equality,
+    `PROBE_BUDGET_MS + 1` and `3 *` are now `error[E0080]` from `cargo build --release`, which none
+    of them was before.
+  - **The case #626 exists to fix had no test above the pure layer.** The updated overrun e2e pins
+    the branch where the verdict is *unchanged* (still the ceiling, still a finding, only
+    `attempted_samples` moving 1 → 2). The branch the issue is about — stall once, then measure, and
+    the false finding **disappears** — was asserted nowhere: every `coverage_finding` assertion in
+    the tree was on an all-stalling run, an operator pin, or a server error. New
+    `a_probe_that_stalls_once_then_measures_drops_the_finding` (a `Verdict::StallThenClear` mock)
+    asserts `completions == PROBE_SAMPLES`, `Probed { measured_samples: 2, attempted_samples: 3 }`
+    and `coverage_finding().is_none()`. **Mutation-proven where it counts:** a saturation-sticky
+    `summarise` fails *this* test while the overrun case and the healthy case both **pass** — the
+    first has no measuring sample to demote, the second has no stall. **It costs the suite nothing**
+    (measured): its 20 s runs concurrently with the overrun case's 40 s, so `guard_tier_e2e` goes
+    from 40.02 s over 20 cases to **40.03 s over 21**. It is **hermetic** — a local `TcpListener` plus an in-process `build_tier`,
+    no Postgres and no `bootstrap()` — so unlike the row-storing cases in that file it cannot
+    silent-skip; but the file is still in **no CI gate** ([#622](https://github.com/hherb/kastellan/issues/622)),
+    so this assertion is DGX-driven like the rest of it.
+  - **`CHANNEL_WAIT` was sized against one leg of two.** `/props` is fatal, uses the *same*
+    `probe_client`, and runs *before* the probe — so it is capped at `PROBE_BUDGET_MS` in its own
+    right and the pre-scheduler bound is ~**80 s**, not 60. Raised to 120 and both legs written out
+    at the call site.
+  - **Smaller:** the 3x-factor cost in the literal pin's doc named worst-case daemon startup, which
+    at `PROBE_SAMPLES = 3` does not move (the sample cap already holds any run to ~60 s) — 3x costs
+    20 s on the *all-saturating* host instead; two free unit assertions added
+    (`!more_samples_wanted(PROBE_SAMPLES + 1, 0)` kills a surviving `<` → `!=` mutant,
+    `!more_samples_wanted(2, PROBE_TOTAL_BUDGET_MS)` is the exact call that ends an all-saturating
+    run); the overrun e2e now asserts the 60 s bound it had only *argued* and carries the elapsed in
+    its count message, so a load-induced failure is self-diagnosing; a 109-column doc line rewrapped;
+    and `tests-common`'s 10 s `scheduler spawned` wait now documents that it holds only because a
+    test daemon never configures a guard tier (latent, pre-existing, relevant to #634).
 - **The Mac ran the e2e itself** — `a_probe_that_overruns_its_budget_derives_the_ceiling` passes in
   **40.01 s**, up from 20, which is the doubled budget observed rather than inferred. Worth knowing
   because it is *not* a daemon e2e (a local `TcpListener` plus an in-process `build_tier`), so the
   `_dyld_start` blocker below does not reach it. Mac unit legs: `kastellan-core --lib` **1980 / 0 / 1**
   (1979 + the one new test, observed by name as `ok`), clippy `-p kastellan-core --all-targets
   -D warnings` exit 0, zero warnings.
-- **File sizes after the change**, none newly over cap: `summary.rs` 359, `summary/tests.rs` 337,
-  `basis.rs` 362. `guard_tier_e2e.rs` is **1419** and was already on the file-split backlog.
+- **File sizes after the change**, none newly over cap: `summary.rs` 430, `summary/tests.rs` 367,
+  `basis.rs` 376. `guard_tier_e2e.rs` is **1558** — over 3x the cap, the largest file in the
+  workspace, and until now "on the file-split backlog" was a HANDOVER sentence backed by no issue.
+  Now [#639](https://github.com/hherb/kastellan/issues/639), which also records the seam worth
+  having for its own sake: the probe cases are hermetic (local `TcpListener` + in-process
+  `build_tier`, no PG, no `bootstrap()`) while the door cases are not, so splitting them is what
+  would let the probe half into a CI gate without a Postgres service container — [#622](https://github.com/hherb/kastellan/issues/622)'s
+  cheapest option.
+  (Measured at the tip. An earlier revision of this line quoted 359 / 337 / 1419, which were
+  `a88691a4`'s numbers — the PRE-review commit — and 337 predated even that
+  [[handover-claims-verify-before-carrying]].)
 
 ### #633 — the CONFIGURED boot row had no seam pin — MERGED `d3f8ed3f` ([#635](https://github.com/hherb/kastellan/pull/635))
 
