@@ -754,6 +754,23 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   is 2); and
   fabricating the retry instead of dialling fails the socket count 1 vs 2, which is what proves
   that count earns its place beside `attempted_samples`.
+  **A review then found the guard around the fix too weak, and its first finding was a mutant that
+  had not been tried.** The `const _` asserted `>`, and three doc comments claimed a saturating
+  sample leaves the clock at *exactly* `PROBE_BUDGET_MS` -- false, because `run_probe` takes its
+  `Instant` before the loop and a tokio timer only overshoots (measured ~5 ms per sample, which is
+  why the two-sample e2e reads 40.01 s). Demonstrated rather than argued: with the `>` guard, the
+  single-point test and `PROBE_TOTAL_BUDGET_MS = PROBE_BUDGET_MS + 1`, the suite is **green** while
+  production answers `more_samples_wanted(1, 20_005) = false` -- #626 fully restored, invisibly. The
+  guard is now `>= 2 * PROBE_BUDGET_MS` and the retry test asks across the whole reachable range.
+  **When a fix moves a threshold, the test must ask at a value the PRODUCER can emit, not at the
+  threshold.** The review also corrected m5's attribution (above) and caught a deploy-breaker:
+  `scripts/upgrade_from_git.sh` gave channel bring-up ~51 s, and the probe runs *before* channel
+  supervision in `main.rs`, so a saturating guard backend now eats 40 s of it and the script would
+  `exit 1` blaming **Matrix** on a host whose real problem is the guard endpoint -- `CHANNEL_WAIT`
+  raised to 90 with the interaction documented at the call site.
+  **Gated on the DGX at `c0255cd7`: 3909 / 0 / 55**, 176 suites, `TEST_EXIT=0`; cold clippy exit 0
+  over 345 `Checking`+`Compiling` lines with all 27 crates named and zero warnings; 8 `[SKIP]`, all
+  gliner-relex. Reconciles exactly at 3908 + 1. Both hosts on rustc 1.98.0 (CI parity, checked).
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one
