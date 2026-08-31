@@ -240,9 +240,9 @@ fn the_probe_stops_at_the_sample_count_or_the_total_budget() {
 
 /// A saturating FIRST sample buys a SECOND one (issue [#626]).
 ///
-/// The whole of #626, expressed as the one call that used to answer
-/// `false`. A [`ProbeOutcome::Saturated`] means the per-request budget
-/// expired, so the run stands at exactly [`PROBE_BUDGET_MS`] — and while
+/// The whole of #626, expressed as the calls that used to answer `false`.
+/// A [`ProbeOutcome::Saturated`] means the per-request budget expired, so
+/// the run stands at **at least** [`PROBE_BUDGET_MS`] — and while
 /// [`PROBE_TOTAL_BUDGET_MS`] *equalled* that, the elapsed check ended the
 /// probe there. A cold `llama-server` paging in its weights therefore
 /// derived the ceiling and fired
@@ -256,6 +256,15 @@ fn the_probe_stops_at_the_sample_count_or_the_total_budget() {
 /// slow, the second sample saturates too and the finding fires on
 /// `attempted_samples: 2`.
 ///
+/// **Asserted across the whole reachable range, not at one point.** A
+/// saturating sample leaves the clock at `PROBE_BUDGET_MS` *plus* however
+/// long the transport took to give up — never at the boundary exactly (see
+/// the `const _` below) — so a test asking only at `PROBE_BUDGET_MS`
+/// interrogates the one value production is guaranteed never to present,
+/// and a total budget of `PROBE_BUDGET_MS + 1` would pass it while
+/// reinstating the defect. Both ends of the range a saturating first sample
+/// can land in are therefore asked.
+///
 /// Written as its own test rather than a line in the stopping-rule test
 /// above because it is a different claim: that one pins the *rule*, this
 /// one pins the *consequence* the rule exists for.
@@ -263,30 +272,50 @@ fn the_probe_stops_at_the_sample_count_or_the_total_budget() {
 /// [#626]: https://github.com/hherb/kastellan/issues/626
 #[test]
 fn a_saturating_first_sample_still_buys_another() {
-    assert!(
-        more_samples_wanted(1, PROBE_BUDGET_MS),
-        "a probe whose first sample saturated must take another: one stalled call \
-         is a cold model as often as it is a slow host, and stopping there fires \
-         the ceiling finding on evidence of one"
-    );
+    for elapsed in [PROBE_BUDGET_MS, PROBE_BUDGET_MS + 5, 2 * PROBE_BUDGET_MS - 1] {
+        assert!(
+            more_samples_wanted(1, elapsed),
+            "a probe whose first sample saturated must take another (elapsed \
+             {elapsed} ms): one stalled call is a cold model as often as it is a \
+             slow host, and stopping there fires the ceiling finding on evidence \
+             of one"
+        );
+    }
 }
 
-/// The probe's total budget must be STRICTLY longer than one sample's.
+/// The probe's total budget must be at least TWO per-sample budgets.
 ///
 /// A `const` assertion rather than a test body: the relation is between
 /// two constants, so it can be a **compile** error.
 ///
-/// **Strictly, not `>=`, and that is issue [#626]** — the two were equal,
-/// which made `more_samples_wanted` unable to grant a second sample after
-/// a saturating first one no matter what it was asked. Equality is
-/// therefore not a tunable choice to be re-made later but the defect
-/// itself, and re-making it should not compile.
+/// **Two, not merely "more than one", and the difference is the whole
+/// guarantee.** The tempting form is `PROBE_TOTAL_BUDGET_MS >
+/// PROBE_BUDGET_MS` — re-equalising them is issue [#626]'s defect, so
+/// forbidding equality looks sufficient. It is not, because **a saturating
+/// sample does not leave the clock at *exactly* `PROBE_BUDGET_MS`**.
+/// `run_probe` takes its `Instant` before the loop, so the elapsed value
+/// `more_samples_wanted` sees is request setup + reqwest's timeout + error
+/// propagation, and a tokio timer can only overshoot its deadline, never
+/// undershoot. Measured: the two-saturating-sample e2e takes **40.01 s**,
+/// i.e. ~5 ms of overshoot per sample.
+///
+/// So `PROBE_TOTAL_BUDGET_MS = PROBE_BUDGET_MS + 1` would satisfy a `>`
+/// guard, satisfy every test in this file, and still refuse the second
+/// sample in production at `elapsed_ms = 20_005` — #626, restored, with
+/// the whole suite green. Requiring a *second full budget* is what makes
+/// the guarantee robust to an overshoot nobody bounds.
+///
+/// Under the old equality this distinction did not exist: the check failed
+/// at `20_000` and at `20_005` alike. It became load-bearing the moment the
+/// total moved.
 ///
 /// [#626]: https://github.com/hherb/kastellan/issues/626
 const _: () = assert!(
-    PROBE_TOTAL_BUDGET_MS > PROBE_BUDGET_MS,
-    "PROBE_TOTAL_BUDGET_MS must EXCEED one sample's budget, or a saturating \
-     first sample ends the probe at one unrepresentative measurement (#626)"
+    PROBE_TOTAL_BUDGET_MS >= 2 * PROBE_BUDGET_MS,
+    "PROBE_TOTAL_BUDGET_MS must be at least TWO per-sample budgets. A saturating \
+     sample overshoots PROBE_BUDGET_MS by however long the transport takes to give \
+     up, so merely EXCEEDING one budget does not guarantee the second sample #626 \
+     is about -- only leaving a whole budget unspent does"
 );
 
 /// Both boot-cost knobs, pinned to literals: three samples, and a total

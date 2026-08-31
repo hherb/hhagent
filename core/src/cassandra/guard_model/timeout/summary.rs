@@ -51,9 +51,13 @@ pub const PROBE_SAMPLES: usize = 3;
 /// **Two of [`PROBE_BUDGET_MS`], and the factor is the whole of issue
 /// [#626].** It was *equal* to one sample's budget until then, which
 /// meant a [`ProbeOutcome::Saturated`] first sample — produced only when
-/// the per-request budget expired, so leaving `elapsed_ms` at exactly the
-/// total — ended the probe at one measurement. See
-/// [`more_samples_wanted`] for what that cost.
+/// the per-request budget expired, so leaving `elapsed_ms` at **at least**
+/// the total — ended the probe at one measurement. See
+/// [`more_samples_wanted`] for what that cost, and this module's
+/// `const _` guard for why the factor must be **two** rather than merely
+/// "more than one": a saturating sample overshoots its budget by however
+/// long the transport takes to give up, so only a whole spare budget
+/// actually guarantees the retry.
 ///
 /// **A healthy boot still pays nothing extra**, which is what the old
 /// equality was protecting and what the factor does not spend: the loop
@@ -67,7 +71,7 @@ pub const PROBE_SAMPLES: usize = 3;
 ///
 /// | host | before | after |
 /// | --- | --- | --- |
-/// | healthy | ~0.5 s | ~0.5 s — the clock is never reached |
+/// | healthy | ~0.5 s (DGX) - 1.7 s (Mac) | unchanged — the clock is never reached |
 /// | cold model, then fast | 20 s, ceiling, **false finding** | 20.3 s (DGX) - 21.1 s (Mac), a real rate, no finding |
 /// | genuinely slow | 20 s, `attempted_samples: 1` | 40 s, `attempted_samples: 2` |
 /// | pathological | 40 s | 60 s |
@@ -86,6 +90,15 @@ pub const PROBE_SAMPLES: usize = 3;
 /// — which redefines [`ProbeOutcome::Saturated`] and would saturate hosts
 /// the current budget measures fine — or refusing to start any sample
 /// that could overrun, which is the equality this issue removed.
+///
+/// **At the current constants that bound no longer does the work, and
+/// saying so avoids a false reading.** With [`PROBE_SAMPLES`] at 3 and the
+/// factor at 2, the sample cap alone allows `3 * PROBE_BUDGET_MS` ≈ 60 s,
+/// so the two limits coincide to within a few milliseconds and this clock
+/// is not what sets the worst case. What it still does — and the reason it
+/// is not redundant — is bound the **all-saturating** run to two samples
+/// (40 s) rather than three (60 s), which is the case the e2e pins. Raise
+/// [`PROBE_SAMPLES`] and the two separate again.
 ///
 /// **The FULL overrun is reachable only when samples return just under
 /// 20 s** — a host already deriving the ceiling and already emitting a
@@ -142,10 +155,10 @@ pub fn sample_cache_buster(boot_cache_buster: &str, index: usize) -> String {
 /// budgets rather than a coincidence of them.** An earlier revision added
 /// an explicit "stop as soon as a sample saturates".
 /// [`ProbeOutcome::Saturated`] is produced only when the per-request
-/// budget expired, so a saturating sample leaves `elapsed_ms` at exactly
-/// [`PROBE_BUDGET_MS`] — and while [`PROBE_TOTAL_BUDGET_MS`] *equalled*
-/// that, the check below already returned `false`, making the extra
-/// clause unable to fire. The two rules were behaviourally identical, and
+/// budget expired, so a saturating sample leaves `elapsed_ms` at **at
+/// least** [`PROBE_BUDGET_MS`] (measured: ~5 ms beyond it) — and while
+/// [`PROBE_TOTAL_BUDGET_MS`] *equalled* that, the check below already
+/// returned `false`, making the extra clause unable to fire. The two rules were behaviourally identical, and
 /// the shipped one had the rejected one's defect.
 ///
 /// **That defect was the cold-model case of #624, and the budget change

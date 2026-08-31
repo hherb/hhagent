@@ -747,8 +747,11 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   constant is a compile error; relaxing the const guard *and* reverting fails both new unit tests;
   pointing `more_samples_wanted` at the per-sample budget fails both stopping tests; `3 *` fails
   the literal pin; removing the elapsed clause fails the e2e at **60.02 s** with
-  `attempted_samples: 3` -- the first direct observation of the documented
-  `PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS` bound, asserted before and now measured; and
+  `attempted_samples: 3` -- which is `PROBE_SAMPLES * PROBE_BUDGET_MS`, the cost the clause
+  exists to prevent, observed rather than asserted (**not** the
+  `PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS` bound: that mutant removes the constant from the
+  predicate, and the two coincide near 60 s only because `PROBE_SAMPLES` is 3 and the factor
+  is 2); and
   fabricating the retry instead of dialling fails the socket count 1 vs 2, which is what proves
   that count earns its place beside `attempted_samples`.
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept

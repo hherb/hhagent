@@ -1110,9 +1110,14 @@ async fn a_probe_that_overruns_its_budget_derives_the_ceiling() {
     //   total and `more_samples_wanted` refuses a third. Without that half,
     //   the sickest host would pay PROBE_SAMPLES * PROBE_BUDGET_MS of daemon
     //   startup. Measured: with the elapsed clause removed this test takes
-    //   60.02 s and reports three, which is the `PROBE_TOTAL_BUDGET_MS +
-    //   PROBE_BUDGET_MS` bound `summary.rs` documents, observed rather than
-    //   asserted.
+    //   60.02 s and reports three, which is exactly that
+    //   `PROBE_SAMPLES * PROBE_BUDGET_MS` -- the quantity the clause exists to
+    //   prevent, observed rather than asserted. (It is NOT an observation of
+    //   the `PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS` bound documented in
+    //   `summary.rs`: that mutant removes PROBE_TOTAL_BUDGET_MS from the
+    //   predicate altogether, and the two coincide near 60 s only because
+    //   PROBE_SAMPLES is 3 and the factor is 2. Move PROBE_SAMPLES to 5 and
+    //   the same mutant reports 100 s while the documented bound stays 60.)
     //
     // It is NOT redundant with `attempted_samples` below, which is what
     // production *says* it did: this is what the backend *saw*. A probe that

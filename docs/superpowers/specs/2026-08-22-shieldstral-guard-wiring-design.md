@@ -543,9 +543,13 @@ design record in three other documents. #626 is the behaviour catching up with t
 correction.)*
 
 A sample returning just *under* the budget buys one more, so the true bound is
-`PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS` — now 60 s, and **measured**: with the elapsed
-clause removed, `a_probe_that_overruns_its_budget_derives_the_ceiling` takes 60.02 s and
-reports three samples. **The FULL overrun** is reachable only on a host
+`PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS` — now 60 s. **At these constants that bound no
+longer does the work**: with `PROBE_SAMPLES` at 3 and the factor at 2, the sample cap alone
+allows `3 * PROBE_BUDGET_MS` ≈ 60 s, so the two coincide to within milliseconds. What the
+clock still does is bound the **all-saturating** run to two samples (40 s) rather than three,
+which is what the e2e pins. (The 60.02 s measured with the elapsed clause removed is
+`PROBE_SAMPLES * PROBE_BUDGET_MS`, not that bound — the mutant takes
+`PROBE_TOTAL_BUDGET_MS` out of the predicate entirely.) **The FULL overrun** is reachable only on a host
 already emitting a coverage finding; a *smaller* one is ordinary and carries no such
 reassurance — two 100 ms samples then a saturating third spend 20.2 s on a host whose `best`
 is a fast `Measured`, with no clamp and no finding.
