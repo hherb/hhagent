@@ -229,9 +229,34 @@ pub enum TimeoutBasis {
     /// **`budget_ms` is ONE sample's budget, not the probe's.** It was
     /// the same thing until #624 made the probe multi-sample; now the
     /// probe as a whole may have spent up to `PROBE_TOTAL_BUDGET_MS +
-    /// PROBE_BUDGET_MS` across `attempted_samples` calls. The count is
-    /// carried so the row says how much evidence the ceiling rests on:
-    /// one call that stalled is weaker than three.
+    /// PROBE_BUDGET_MS` (60 s) across `attempted_samples` calls. The
+    /// count is carried so the row says how much evidence the ceiling
+    /// rests on: one call that stalled is weaker than three.
+    ///
+    /// **Since issue [#626], the current code cannot write
+    /// `attempted_samples: 1` on this variant at all.** The total budget
+    /// is twice one sample's, so a saturating first sample leaves a whole
+    /// budget unspent and the probe takes another. Refusing that second
+    /// call would need a saturating sample to overshoot its 20 s deadline
+    /// by a further 20 s, and `tier::probe::run_probe` takes its `Instant`
+    /// immediately before the loop, with one `format!` between them. So a
+    /// row saying `1` is a **pre-#626 row, or a bug** — not, as this said
+    /// until #637's review, a run that had spent the total before the
+    /// second call could start.
+    ///
+    /// **What the count does NOT say is that every sample stalled.** This
+    /// variant is what [`super::summarise`] returns whenever *no* sample
+    /// measured and *at least one* saturated, because its
+    /// `informativeness` ranking puts `Saturated` above every failure. So
+    /// `[Saturated, Failed, Failed]` reaches this row as
+    /// `attempted_samples: 3` off **one** stall — and that mixed shape is
+    /// also the only way to reach the 60 s bound above, since two
+    /// saturating samples spend the whole total and stop at 40 s. The
+    /// count is how many calls the probe made, not how many stalled; the
+    /// per-sample `warn!` in `tier::probe::run_one_sample` says which was
+    /// which.
+    ///
+    /// [#626]: https://github.com/hherb/kastellan/issues/626
     Saturated { budget_ms: u64, attempted_samples: u32 },
     /// The probe could not produce a usable sample.
     ///

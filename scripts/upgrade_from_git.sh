@@ -158,7 +158,29 @@ if [ -n "$HS" ] && [ -n "$MX_USER" ] && [ -f "$CORE_LOG" ]; then
   # is a snapshot, not a verdict. Poll until the channel is up or a fatal line
   # lands. CHANNEL_WAIT covers ~1+2+4+8+16s of backoff with room to spare; a
   # login failure still failing after that really is broken, not transient.
-  CHANNEL_WAIT="${CHANNEL_WAIT:-45}"
+  #
+  # It ALSO has to absorb the whole guard tier bring-up, and that is why 45 was
+  # raised (issue #626). GuardTier::from_router_config runs in main.rs BEFORE
+  # the scheduler and before channel supervision, so it delays the
+  # "channel bus running" line by its full duration. Two legs, not one -- #637's
+  # review found this comment costing only the second:
+  #
+  #   * /props, which is FATAL and uses the same probe_client, so it is capped
+  #     at PROBE_BUDGET_MS = 20s;
+  #   * the probe, capped at PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS = 60s since
+  #     #626 doubled the total (40s for a backend that stalls every call, 60s
+  #     only for one whose samples land just under the budget).
+  #
+  # So a sick guard endpoint can hold the daemon for ~80s before the scheduler
+  # even spawns, where pre-#626 it was ~40s. At the old 6 + 45 = 51s budget that
+  # left NOTHING, and the script would exit 1 reporting that MATRIX did not come
+  # up -- on a host whose actual problem is the guard endpoint. 6 + 120 leaves
+  # ~46s for Postgres, migrations, 15 workers and the Matrix login (itself
+  # capped at MATRIX_LOGIN_TIMEOUT = 60s, though it normally takes seconds).
+  #
+  # If you see the Matrix message, check the guard_tier.boot row and the
+  # "guard boot probe" warn lines FIRST.
+  CHANNEL_WAIT="${CHANNEL_WAIT:-120}"
   last=""
   for _ in $(seq 1 "$CHANNEL_WAIT"); do
     last="$(matrix_status_line)"

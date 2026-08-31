@@ -14,14 +14,12 @@ squash-merged (the #635 DGX-gate write-up), on top of `d3f8ed3f`
 ([#631](https://github.com/hherb/kastellan/pull/631), #627). ·
 **OPEN BRANCH: `fix/626-probe-total-budget`** — the saturating-first-sample defect; the probe's total
 budget is now twice one sample's, so a cold model no longer ends the probe at one measurement. ·
-**Last gate: DGX at `8d92c02b` — 3910 / 0 / 55, 176 suites, `TEST_EXIT=0`; cold clippy exit 0 over
+**Last gate: DGX at `a88691a4` — 3909 / 0 / 55, 176 suites, `TEST_EXIT=0`; cold clippy exit 0 over
 345 `Checking`+`Compiling` lines with all 27 crates named, zero warnings; see
-[Test baseline](#test-baseline-authoritative).** Reconciles exactly: 3909 at `c0255cd7` **+ 1**, the
-one new e2e (`a_probe_that_stalls_once_then_measures_drops_the_finding`), grepped out of the log as
-`ok` rather than subtracted. 8 `[SKIP]`, all gliner-relex — *not* the bwrap-userns skip, so
-containment really ran. Both hosts on rustc **1.98.0** (CI parity, checked this session).
-**Gated three times**: `a88691a4`, then `c0255cd7` after the first review round, then `8d92c02b`
-after the second — each supersedes the last rather than adding to it.
+[Test baseline](#test-baseline-authoritative).** Reconciles exactly: 3908 at `d3f8ed3f` **+ 1**, the
+single new `#[test]`, grepped out of the log as `ok` rather than subtracted. 8 `[SKIP]`, all
+gliner-relex — *not* the bwrap-userns skip, so containment really ran. Both hosts on rustc **1.98.0**
+(CI parity, checked this session).
 
 > ⚠️ **The Mac cannot currently run ANY daemon e2e, and it is a macOS host condition — not this
 > branch, and not kastellan.** `guard_boot_row_e2e` failed with **both** daemon logs empty; so does
@@ -66,7 +64,7 @@ worst-case document in ~19 s a moment later.
 
   | host | before | after |
   | --- | --- | --- |
-  | healthy | ~0.5 s (DGX) – 1.7 s (Mac) | unchanged — the loop stops at `PROBE_SAMPLES`, never on this clock |
+  | healthy | ~0.5 s | ~0.5 s — the loop stops at `PROBE_SAMPLES`, never on this clock |
   | cold model, then fast | 20 s, ceiling, **false finding** | 20.3 s (DGX) – 21.1 s (Mac), a real rate, no finding |
   | genuinely slow | 20 s, `attempted_samples: 1` | 40 s, `attempted_samples: 2` |
   | pathological | 40 s | 60 s |
@@ -79,13 +77,9 @@ worst-case document in ~19 s a moment later.
   *unreachable*, so shipping both would add a branch no fixture can enter
   [[unreachable-success-path-proves-nothing]]. Say this if the option resurfaces; the issue still
   lists it as "cheapest, and arguably the most honest".
-- **The relation between the two budgets is now a COMPILE-time assertion** — a `const _` pair
-  beside the constant in `timeout/summary.rs`. It is `>= 2 * PROBE_BUDGET_MS`, **not** a strict `>`
-  (see the review round below for why `>` was too weak), paired with a `<= 2 *` upper bound so a
-  factor change is a deliberate two-place edit. Re-equalising them is the defect, not a tunable, and
-  the message says so by name. It moved out of `summary/tests.rs` in the #637 review round because a
-  `#[cfg(test)]` module is stripped from `cargo build --release`, so a re-equalised constant used to
-  compile and ship clean and only `cargo test`/`clippy --all-targets` refused it.
+- **The `>` relation between the two budgets is now a COMPILE-time assertion** (`const _` in
+  `timeout/summary/tests.rs`), tightened from `>=`. Re-equalising them is the defect, not a tunable,
+  and the message says so by name.
 - **Two corrections to the record, both carried into the wiring spec** — `docs/superpowers/specs/2026-08-22-shieldstral-guard-wiring-design.md`
   had the stale claim in four places [[handover-claims-verify-before-carrying]]:
   - **#626 as filed quotes the wrong finding.** It says the probe fires *"this host cannot adjudicate
@@ -104,134 +98,158 @@ worst-case document in ~19 s a moment later.
   `2 *` → the literal pin fails; m5 remove the elapsed clause → the e2e fails at **60.02 s** with
   `attempted_samples: 3`; m6 fabricate the retry instead of dialling → the e2e's socket count reads
   1 against 2.
-  - **m5 measures `PROBE_SAMPLES * PROBE_BUDGET_MS`** — the cost the elapsed clause exists to
-    prevent — observed rather than asserted. **It is NOT an observation of the
-    `PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS` bound**, which the first draft of this section
-    claimed: that mutant takes `PROBE_TOTAL_BUDGET_MS` out of the predicate altogether, and the two
-    coincide near 60 s only because `PROBE_SAMPLES` is 3 and the factor is 2. Move `PROBE_SAMPLES`
-    to 5 and the same mutant reports 100 s while the documented bound stays 60. Caught by the
-    review [[handover-claims-verify-before-carrying]].
+  - **m5 is the first direct observation of the `PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS` = 60 s
+    worst case** the module has documented since #624. It was asserted before and is now measured.
   - **m6 is what earns the socket count its place.** It fabricates a second sample without dialling,
     so `attempted_samples` reads a truthful-looking 2 while the backend saw one call. Without a
     separate count of what the socket observed, that mutant passes.
-- **A review then found the change under-guarded, and its first finding is a mutant I never tried**
-  [[mutation-proof-counts-only-mutants-you-tried]]:
-  - **The `const _` asserted `>`, but the invariant is `>= 2 *`.** A saturating sample does **not**
-    leave the clock at *exactly* `PROBE_BUDGET_MS`: `run_probe` takes its `Instant` before the loop,
-    and a tokio timer only ever overshoots — measured at ~5 ms per sample, which is why the
-    two-sample e2e reads 40.01 s and not 40.00. So `PROBE_TOTAL_BUDGET_MS = PROBE_BUDGET_MS + 1`
-    passed the `>` guard, passed every test in the file, and still refused the second sample in
-    production at `elapsed_ms = 20_005` — **#626 restored with the suite green.** The guard is now
-    `>= 2 * PROBE_BUDGET_MS`, the retry test asks at three points rather than one, and three
-    "exactly" clauses became "at least". (The "whole reachable range" wording that replaced them was
-    itself wrong and the SECOND review caught it — the overshoot is unbounded, so what the three
-    points span is the interval over which the answer must stay `true`, not the range a saturating
-    sample can land in.) **Generalises:** when a fix moves a threshold, the test must ask at a value the
-    *producer* can actually emit, not at the threshold itself.
-  - **m5's 60.02 s was attributed to the wrong bound** — see below.
-  - **`scripts/upgrade_from_git.sh` had to absorb the longer probe.** The probe runs at
-    `main.rs:346`, *before* the scheduler and channel supervision, so it delays the
-    `channel bus running` line by its full duration — against a `sleep 6` + `CHANNEL_WAIT=45`
-    budget of ~51 s. A saturating guard backend now eats 40 s of that (60 s pathological), and the
-    script would `exit 1` blaming **Matrix** on a host whose real problem is the guard endpoint.
-    Default raised, and the interaction documented at the call site. (Raised to 90 here and to
-    **120** by the second review, which found this sizing counted only one of the two legs — see
-    below.)
-
-- **A SECOND review (four agents, run against the PR) found five more, two of them defects rather
-  than prose.** All fixed on this branch; the gate below is the re-gate after them.
-  - **`TimeoutBasis::Saturated`'s new doc made two false claims about the durable row**, and this is
-    the one that would have misled an operator. It said the variant "means *every* sample the probe
-    took stalled" — but `summarise` returns `Saturated` whenever **no** sample measured and **at
-    least one** saturated, because `informativeness` ranks it above every failure. So
-    `[Saturated, Failed, Failed]` reaches the row as `attempted_samples: 3` off **one** stall, and
-    that mixed shape is also the only way to reach the documented 60 s bound (two saturating samples
-    stop at 40 s). It also offered a residual reading for `attempted_samples: 1` that the current
-    code cannot produce — refusing the second call needs a full extra budget of overshoot on a 20 s
-    deadline. A row saying `1` is a **pre-#626 row, or a bug**, and now says so
-    [[unreachable-success-path-proves-nothing]].
-  - **The `>` claim had SURVIVED the first review's own fix, in six places** — including the wiring
-    spec, which stated the *disproven* implication ("strictly more than one sample's, so a
-    saturating first sample cannot end the probe") as the design rationale and was the only site
-    with no later correction. Exactly [[handover-claims-verify-before-carrying]]: the code was
-    corrected and the record was not.
-  - **The `const _` was in a `#[cfg(test)]` module**, so "re-equalising them is a compile error" was
-    true only under `cargo test`/`clippy --all-targets` — a re-equalised constant compiled and
-    shipped clean in `cargo build --release`. **Moved beside the constant in `summary.rs`** and
-    paired with a `<= 2 *` upper bound. Proven on the DGX: all three of revert-to-equality,
-    `PROBE_BUDGET_MS + 1` and `3 *` are now `error[E0080]` from `cargo build --release`, which none
-    of them was before.
-  - **The case #626 exists to fix had no test above the pure layer.** The updated overrun e2e pins
-    the branch where the verdict is *unchanged* (still the ceiling, still a finding, only
-    `attempted_samples` moving 1 → 2). The branch the issue is about — stall once, then measure, and
-    the false finding **disappears** — was asserted nowhere: every `coverage_finding` assertion in
-    the tree was on an all-stalling run, an operator pin, or a server error. New
-    `a_probe_that_stalls_once_then_measures_drops_the_finding` (a `Verdict::StallThenClear` mock)
-    asserts `completions == PROBE_SAMPLES`, `Probed { measured_samples: 2, attempted_samples: 3 }`
-    and `coverage_finding().is_none()`. **Mutation-proven where it counts:** a saturation-sticky
-    `summarise` fails *this* test while the overrun case and the healthy case both **pass** — the
-    first has no measuring sample to demote, the second has no stall. **It costs the suite nothing**
-    (measured): its 20 s runs concurrently with the overrun case's 40 s, so `guard_tier_e2e` goes
-    from 40.02 s over 20 cases to **40.03 s over 21**. It is **hermetic** — a local `TcpListener` plus an in-process `build_tier`,
-    no Postgres and no `bootstrap()` — so unlike the row-storing cases in that file it cannot
-    silent-skip; but the file is still in **no CI gate** ([#622](https://github.com/hherb/kastellan/issues/622)),
-    so this assertion is DGX-driven like the rest of it.
-  - **`CHANNEL_WAIT` was sized against one leg of two.** `/props` is fatal, uses the *same*
-    `probe_client`, and runs *before* the probe — so it is capped at `PROBE_BUDGET_MS` in its own
-    right and the pre-scheduler bound is ~**80 s**, not 60. Raised to 120 and both legs written out
-    at the call site.
-  - **Smaller:** the 3x-factor cost in the literal pin's doc named worst-case daemon startup, which
-    at `PROBE_SAMPLES = 3` does not move (the sample cap already holds any run to ~60 s) — 3x costs
-    20 s on the *all-saturating* host instead; two free unit assertions added
-    (`!more_samples_wanted(PROBE_SAMPLES + 1, 0)` kills a surviving `<` → `!=` mutant,
-    `!more_samples_wanted(2, PROBE_TOTAL_BUDGET_MS)` is the exact call that ends an all-saturating
-    run); the overrun e2e now asserts the 60 s bound it had only *argued* and carries the elapsed in
-    its count message, so a load-induced failure is self-diagnosing; a 109-column doc line rewrapped;
-    and `tests-common`'s 10 s `scheduler spawned` wait now documents that it holds only because a
-    test daemon never configures a guard tier (latent, pre-existing, relevant to #634).
 - **The Mac ran the e2e itself** — `a_probe_that_overruns_its_budget_derives_the_ceiling` passes in
   **40.01 s**, up from 20, which is the doubled budget observed rather than inferred. Worth knowing
   because it is *not* a daemon e2e (a local `TcpListener` plus an in-process `build_tier`), so the
   `_dyld_start` blocker below does not reach it. Mac unit legs: `kastellan-core --lib` **1980 / 0 / 1**
   (1979 + the one new test, observed by name as `ok`), clippy `-p kastellan-core --all-targets
   -D warnings` exit 0, zero warnings.
-- **File sizes after the change**, none newly over cap: `summary.rs` 430, `summary/tests.rs` 367,
-  `basis.rs` 376. `guard_tier_e2e.rs` is **1558** — over 3x the cap, the largest file in the
-  workspace, and until now "on the file-split backlog" was a HANDOVER sentence backed by no issue.
-  Now [#639](https://github.com/hherb/kastellan/issues/639), which also records the seam worth
-  having for its own sake: the probe cases are hermetic (local `TcpListener` + in-process
-  `build_tier`, no PG, no `bootstrap()`) while the door cases are not, so splitting them is what
-  would let the probe half into a CI gate without a Postgres service container — [#622](https://github.com/hherb/kastellan/issues/622)'s
-  cheapest option.
-  (Measured at the tip. An earlier revision of this line quoted 359 / 337 / 1419, which were
-  `a88691a4`'s numbers — the PRE-review commit — and 337 predated even that
-  [[handover-claims-verify-before-carrying]].)
+- **File sizes after the change**, none newly over cap: `summary.rs` 359, `summary/tests.rs` 337,
+  `basis.rs` 362. `guard_tier_e2e.rs` is **1419** and was already on the file-split backlog.
 
-### #633 — the CONFIGURED boot row had no seam pin — MERGED `d3f8ed3f` ([#635](https://github.com/hherb/kastellan/pull/635))
+### #633 — the CONFIGURED boot row had no seam pin, and the reason it was thought unclosable was wrong — MERGED `d3f8ed3f` ([#635](https://github.com/hherb/kastellan/pull/635))
 
-Full prose in [`archive/handover_20260831_626_pre-prune.md`](archive/handover_20260831_626_pre-prune.md).
-Kept here only for what still binds:
+`report_guard_tier` has two arms. #627 pinned the **unconfigured** one end to end — `cli_ask_e2e`
+reads the row a real daemon boot stored in real Postgres. The **configured** one (eleven keys, both
+rates, both counts, the coverage finding) was pinned by nothing: both daemons in that file boot
+without a guard tier, `guard_tier_e2e` never reads `audit_log` for this action, and
+`report_guard_tier` is private to a binary crate.
 
-- **The premise that kept it open was FALSE, and correcting it was most of the work.** #631's PR body
-  and this file both said the configured arm "needs a live guard endpoint". It does not:
-  `from_router_config` **skips the probe entirely** when `KASTELLAN_LLM_GUARD_TIMEOUT_MS` is pinned,
-  so a configured boot needs only a mock answering `/props` — fully deterministic. The gap was real;
-  documenting it as *unclosable* was the defect [[handover-claims-verify-before-carrying]].
-- **`tests-common/scripted_llm` gained `EndpointKind::Props`**, matched on `/props` **with its
-  leading slash and BEFORE** the chat fall-through — both halves load-bearing, each with its own
-  unit test. Answered from **one stored body, not a FIFO**.
-- **Literal assertions must sit beside a structural equality.** Equality puts `boot_payload` on
-  *both* sides, so a defect inside it moves the two together and passes.
-- **An UNDER-POWERED mutant is indistinguishable from a blind test in the result column.** The
-  overlong-finding mutant survived first because it padded to 2.4 KiB against a 4 KiB cap — it never
-  reached the condition it was aimed at. Compute what a mutant does to the quantity under test
-  rather than trusting that "bigger" is big enough [[mutation-proof-counts-only-mutants-you-tried]].
-- **Gated on the DGX 2026-08-31 at 3908 / 0 / 55** — the first execution of either
-  `guard_boot_row_e2e` leg anywhere; the PR merged with both compiled but unrun.
-- **Still open from it:** [#634](https://github.com/hherb/kastellan/issues/634) — a *migration*, not a
-  build: `tests_common::daemon::bring_up_daemon` already exists with the `extra_env` seam. Three
-  hand-rolled copies now share ~70 identical lines. Three files remain over the 500-LOC cap
-  (`boot_report/tests.rs` 650, `guard_boot_row_e2e.rs` 687, `scripted_llm.rs` 514).
+- **The worst case was not a transposition.** It was deleting the `record(...)` call outright,
+  after which a configured host writes no boot row and "the security tier is off on this host"
+  reverts to an inference from an absent row — the exact inference `not_configured_payload` exists
+  to make unnecessary. That mutant is `m1`, and it now fails.
+- **The premise that kept this open was false, and correcting it was most of the work.** #631's PR
+  body and this file both said the configured arm "needs a live guard endpoint". It does not:
+  `from_router_config` **skips the probe entirely** when `KASTELLAN_LLM_GUARD_TIMEOUT_MS` is
+  pinned, so a configured boot needs only a mock answering `/props` — no timing, no throughput, no
+  flake, a fully deterministic row. The gap was real; documenting it as *unclosable* was the
+  defect, and that is the version a later session would have believed
+  [[handover-claims-verify-before-carrying]].
+- **`tests-common/scripted_llm` gained a third `EndpointKind::Props`**, matched on `/props` **with
+  its leading slash and BEFORE** the chat fall-through. Both halves are load-bearing and each has
+  its own unit test: falling through pops a chat envelope a caller counted for a plan iteration,
+  and a bare `props` substring misroutes `/v1/chat/completions?props=1` the same way in reverse.
+  (The first draft cited `/v1/properties` here and in three other documents -- it contains no
+  `props` substring at all, so the assertion built on it passed under the very mutant it named.
+  Caught by the #635 review.) Answered from
+  **one stored body, not a FIFO** — `/props` reports a property of the backend, not a scripted
+  turn, so a queue would 503 the second call a real server answers. `spawn_scripted_llm` is
+  unchanged and delegates with `None`.
+- **New `core/tests/guard_boot_row_e2e.rs`: one daemon, two SEPARATE listeners, no task submitted.**
+  The row is written before the scheduler spawns, so a task would buy nothing and cost every source
+  of nondeterminism the file otherwise has none of. It asserts the stored row equals
+  `boot_payload(TAU, 131_072, &validate_operator_timeout(350_000))`, read from the **table** rather
+  than a sink double [[audit-sink-doubles-hide-storage-transforms]].
+- **The pin is deliberately ABOVE `TIMEOUT_CEILING_MS`.** 350 s is roughly what #612 tells a Metal
+  operator to pin, so it is the configuration this project's own advice produces. It yields
+  `PinBand::AboveCeiling`, hence a non-null `coverage_finding`, hence **the largest shape this row
+  can have** — which no test had stored in Postgres at all.
+- **Five literal assertions sit beside the structural equality, and the mutation run is what
+  justifies them.** Equality puts `boot_payload` on *both* sides, so a defect inside it moves the
+  two together and passes — the shape that let #627's `not_configured` token mutant survive two
+  assertions. Confirmed rather than assumed: a renamed wire key, a drifted `operator-above-ceiling`
+  token and a silenced `coverage_finding` each pass the equality and die on a literal.
+  `n_ctx` is **131 072, not `REQUIRED_GUARD_N_CTX`** — that constant is what #627's surviving
+  frozen-`n_ctx` mutant was frozen to.
+- **Zero chat requests on the guard listener is the direct evidence the pin skipped the probe**, and
+  exactly one `/props` is the evidence one boot verifies the context once. Both are pinned by
+  mutants of their own (`m10`, `m11`) that leave the row byte-identical, so neither assertion is
+  carried by the equality.
+- **`boot_report/tests.rs`: the ten-state basis table lifted into one shared fixture**, plus two
+  size bounds over it. `guard_tier.boot` has **no key in `PRESERVED_KEYS`**, so an over-cap payload
+  does not lose a field — the whole row collapses to a `{_truncated, sha256, len}` fingerprint,
+  taking the basis and the finding with it.
+- **Mutation-proven ELEVEN for eleven, each executed — and the twelfth attempt matters more than
+  the eleven.** The overlong-finding mutant **survived first**: it padded to 2.4 KiB against a
+  4 KiB cap, so it never reached the condition it was aimed at. Re-run at 5.6 KiB it dies. **An
+  under-powered mutant is indistinguishable from a blind test in the result column**, and the only
+  defence is to compute what the mutant does to the quantity under test rather than trusting that
+  "bigger" is big enough. Sharpens [[mutation-proof-counts-only-mutants-you-tried]].
+- **Filed, not folded in:** [#634](https://github.com/hherb/kastellan/issues/634) — this makes the
+  **third** hand-rolled `bring_up_daemon` in `core/tests/`, ~70 lines identical across all three.
+  **The issue's original text was wrong and has been rewritten:** it proposed *creating* a
+  `tests_common::daemon::DaemonSpec`, but `tests_common::daemon::bring_up_daemon` **already
+  exists** — with an `extra_env: Vec<(String, String)>` seam that carries all four guard vars
+  unchanged, and three e2es already using it. The work is a *migration*, and the only real gap is
+  the shared helper's hardcoded 10 s log-match budget vs this file's 20 s
+  [[handover-claims-verify-before-carrying]].
+- **MERGED `d3f8ed3f` (2026-08-30), and gated on the DGX the following day.** **3908 / 0 / 55**,
+  176 suites, `TEST_EXIT=0`; cold clippy exit 0 over 345 `Checking`+`Compiling` lines with all 27
+  crates named; 8 `[SKIP]`, all gliner-relex. **That run is the first time either
+  `guard_boot_row_e2e` leg has ever executed anywhere** — the branch was merged with both legs
+  compiled but unrun, because the Mac cannot boot a freshly-linked daemon and the DGX was
+  unreachable for the whole review round. Both pass.
+- **The in-band leg is mutation-proven against the exact defect it was written for.** Folding
+  `record(...)` inside `report_guard_tier`'s `if let Some(finding)` block on the live DGX gives:
+
+  ```
+  a_configured_daemon_boot_stores_the_shared_configured_payload ... ok
+  an_in_band_pin_stores_a_configured_row_with_a_null_coverage_finding ... FAILED
+    expected exactly one guard_tier.boot row (one per daemon start); got 0
+  ```
+
+  The above-ceiling leg passes the mutant, because its row always carries a finding. **The new leg
+  is the only thing in the tree that catches it** — which is what the review argued and is now
+  measured. `core/src/main.rs` restored and the tree + index verified clean afterwards
+  [[mutation-testing-contaminates-the-index]].
+- **The four-agent review of this PR found nine issues; all are fixed on the branch.** The two
+  that mattered:
+  - **`tests_common::daemon::bring_up_daemon` already existed** (above). The PR filed an issue to
+    build a thing that was sitting in the crate it was editing. Consequence beyond tidiness: the
+    stderr-on-bring-up-failure diagnostic added in `c1cfed03` was added to the *private* copy
+    only, while the shared helper carrying three other e2es kept the bare `.expect`. Now ported,
+    as `tests_common::stderr_tail`, which distinguishes empty from unreadable — an
+    `unwrap_or_default()` turns "the log is gone" into "the daemon said nothing", and `/tmp` is
+    scrubbed mid-run on both dev hosts [[dgx-run-logs-tmp-scrubbed]].
+  - **The "every state a `TimeoutBasis` can be in" table was missing one.**
+    `Probed { clamped: Clamped::ToFloor }` was absent, so *both* consumers skipped it — the
+    docstring claimed sharing the table stops a state being "covered by one test and not the
+    other", and the actual failure was covered by **neither**. Fixed with the row plus `state_key`
+    (a wildcard-free `TimeoutBasis -> &'static str`) and `ALL_STATE_KEYS`, asserted as a SET.
+    **The first version of this fix was itself too weak and a mutant caught it:** it asserted on
+    distinct `TimeoutBasis::kind()` tokens, and `kind()` folds all three `Clamped` states into a
+    bare `"probed"` — so it reads a duplicated row as a fold and cannot tell one from an omission.
+    A "11 rows, one state duplicated" mutant sailed through it. Second time on this branch that
+    the mutant rather than the reasoning found the weak assertion
+    [[mutation-proof-counts-only-mutants-you-tried]]. Now m1 (omit a row) dies naming the missing
+    state, m2 (duplicate a row) dies naming the collapse, m3 (a 4th `Clamped` variant) is a build
+    error — though m3 is honest belt-and-braces, since production's `coverage_finding` is already
+    wildcard-free and fails first; what `state_key` adds is a second wildcard-free match IN THIS
+    FILE, which is what drags the author to the table.
+- **Added from the review: a second band leg.** `an_in_band_pin_stores_a_configured_row_with_a_null_coverage_finding`.
+  `Operator { InBand }` is the ONLY configured state whose `coverage_finding` is null, and no test
+  in the tree stored one. `record(...)` sits one line below `report_guard_tier`'s
+  `if let Some(finding) { warn!() }` block, so folding the two together — plausible, they are
+  adjacent and both "report the finding" — silences the boot row on every *routine* configured
+  host and passes the whole workspace. The above-ceiling leg cannot see it, because its row always
+  has a finding. Both legs now share one `with_configured_boot` harness rather than a second copy.
+- **Other review fixes:** the `_truncated` check moved ABOVE the structural equality (a
+  fingerprint row fails the equality too, so afterwards it could only run in a state where the
+  test had already panicked — an assertion that could not fail); the mock-count assertions moved
+  BEFORE the row read (a failing payload used to panic first and take the probe evidence with
+  it); `assert_ne!(classify_endpoint("/props"), Chat)` deleted as tautologically implied by the
+  `assert_eq!(.., Props)` above it; `props_requests` documented as counting requests **received**,
+  not answered (it increments before the 503 decision, so it is evidence the dial happened, never
+  that the tier booted); `guard_tier_e2e`'s private `props_body()` switched onto the shared
+  `props_envelope`; and four prose corrections — the stdout/stderr rationale was causally
+  inverted (tracing writes to stdout, so stdout is NOT empty on a guard-tier death; the reason
+  reaches stderr via `Termination`), "the row is durable" softened to "the insert was attempted"
+  (`record` is deliberately non-fatal), the `MOCK_N_CTX` justification destaled, and "the same
+  form Postgres stores" dropped (`jsonb` is a normalised binary encoding, not `to_vec`).
+- **Two files worth stating rather than leaving to be discovered:**
+  **three files, after the review fixes**: `boot_report/tests.rs` **445 → 606**,
+  `guard_boot_row_e2e.rs` **687** (the review's second band leg roughly doubled it; the first
+  draft of this bullet said 464, which was already stale by 20 lines when written), and
+  `tests-common/src/scripted_llm.rs` **514**. All three are test files over the 500 cap. The split
+  rule says split *before* the change that grows a file, and this PR did not -- doing it now, on
+  top of a review-fix commit, would be the larger movement and would bury the fixes. Recorded in
+  the file-split backlog rather than papered over.
 
 ### #627 — the boot row's key set and rate assignment were untested — MERGED `8040ca83` ([#631](https://github.com/hherb/kastellan/pull/631))
 
@@ -257,21 +275,27 @@ and in the ROADMAP's guard block. Kept here only for what still binds:
 
 ### #624, #619, #615/#616/#618 — merged, compressed
 
-Full prose in [`archive/handover_20260830_633_pre-prune.md`](archive/handover_20260830_633_pre-prune.md).
-What still binds:
+Full prose in [`archive/handover_20260830_633_pre-prune.md`](archive/handover_20260830_633_pre-prune.md) and, further back,
+[`archive/handover_20260826_624_pre-prune.md`](archive/handover_20260826_624_pre-prune.md). Kept
+here only for what still binds:
 
-- **#624 (`4aee83ad`) — the probe measured the BOOT, not the host.** One sample ~3 s into startup
-  measured *startup contention*: 6 073 / 269.6 / 1 582 tok/s on three consecutive boots of one
-  unchanged DGX backend, against a reproducible ~7 000 minutes later — a **26x** under-measurement
-  whose slowest boot fired a **false** ceiling finding. Fix: sample `PROBE_SAMPLES` times and keep
-  the **FASTEST**, because prompt processing has a hardware ceiling and no floor, so contention can
-  only make an observation slower and a mean is wrong for a one-sided error. **Each sample carries
-  its OWN cache-buster**, or N identical prompts read as enormous throughputs on a backend that does
-  not report `cached_tokens` — a fail-open manufactured by the fix. **The review's CRITICAL, and the
-  rule it left:** `summarise(&samples)` → `summarise(&samples[..1])` silently reverted the whole fix
-  and passed every guard test in the tree. **When a fix's value lives in a fold, pin the fold's
-  *inputs*, not just its output shape.** Its remnant #626 is now fixed — see
-  [Current state](#current-state).
+- **#624 (`4aee83ad`, [#625](https://github.com/hherb/kastellan/pull/625)) — the probe measured the
+  BOOT, not the host.** One sample ~3 s into startup measured *startup contention*: 6 073 / 269.6 /
+  1 582 tok/s on three consecutive boots of one unchanged DGX backend, against a reproducible
+  ~7 000 minutes later. A **26x** under-measurement whose slowest boot fired a **false** ceiling
+  finding. Fix (D11): `PROBE_SAMPLES` (3) samples, keep the **FASTEST** — prompt processing has a
+  hardware ceiling and no floor, so contention can only make an observation slower, and a mean is
+  wrong for a one-sided error. **Each sample carries its OWN cache-buster**, or N identical prompts
+  read as enormous throughputs on a backend that does not report `cached_tokens` — a fail-open
+  manufactured by the fix. `TimeoutBasis::Probed` gained `slowest_tok_per_s` + `measured_samples` +
+  `attempted_samples`; the queries are `slowest_tok_per_s < tok_per_s / 2` (busy boot) and
+  `attempted_samples > measured_samples` with no finding (read that boot's `warn!`s).
+  **The review's CRITICAL, and the rule it left:** `summarise(&samples)` → `summarise(&samples[..1])`
+  silently reverted the whole fix and passed every guard test in the tree. **When a fix's value
+  lives in a fold, pin the fold's *inputs*, not just its output shape.** Its remnant
+  ~~[#626](https://github.com/hherb/kastellan/issues/626)~~ — a **saturating FIRST sample ended the
+  probe at one sample**, because `PROBE_TOTAL_BUDGET_MS == PROBE_BUDGET_MS` — is **DONE on
+  `fix/626-probe-total-budget`**; #624 had fixed the *contention* half only.
 - **#619 (`3bd45a36`)** — `classify_transport` folded the both-reqwest-flags-set case (a **connect
   timeout**) into `Timeout`, so a black-holed SYN read as 100% timeouts and sent an operator to
   #612's ~350 s pin, which cannot help: connect is capped at `min(timeout, 5 s)` independently.
@@ -281,51 +305,60 @@ What still binds:
   [#620](https://github.com/hherb/kastellan/issues/620),
   [#621](https://github.com/hherb/kastellan/issues/621),
   [#622](https://github.com/hherb/kastellan/issues/622) (`guard_tier_e2e` is in no gate and
-  self-skips to a silent PASS — note it *did* run in this session's full sweep).
+  self-skips to a silent PASS).
 - **#615/#616/#618 (`e258ad3c`)** — `guard.error_kind` is a **closed discriminant** beside
-  `guard.state` (never the backend's error text); `TimeoutBasis::Operator` carries a `PinBand` so an
+  `guard.state` (never the backend's error text), so a timeout is countable by equality rather than
+  inferred from `ms` and `body_byte_len`; `TimeoutBasis::Operator` carries a `PinBand` so an
   out-of-band pin reaches the `warn!` and the boot row while still being honoured verbatim (an
   **in-band** pin keeps the historic `"operator"` token — use `LIKE 'operator%'` to count all pins);
-  `fetch_screen`'s Block arm withholds through a **total** function. **#616 is what unblocked #612's
-  favoured option.** [#617](https://github.com/hherb/kastellan/issues/617) stays out of scope.
+  `fetch_screen`'s Block arm withholds through a **total** function. **#616 is what unblocked
+  #612's favoured option.** [#617](https://github.com/hherb/kastellan/issues/617) stays out of scope.
 
 > ⚠️ **#624 does NOT close [#612](https://github.com/hherb/kastellan/issues/612), and merging the
 > two is the mistake to avoid.** #624 is that the *sample* was taken under load on any host; #612 is
 > that extrapolating from a ~1 KiB sample is non-linear on Metal *whatever* the load — a quiet Mac
-> still reads 1 137 tok/s at 1 KiB and 260 at 64 KiB. **#626 narrowed it further and closes it no
-> more than #624 did.** Both point at the same eventual remedy: measure from the `ms` /
-> `body_byte_len` the guard rows carry since #616.
+> still reads 1 137 tok/s at 1 KiB and 260 at 64 KiB. Both point at the same eventual remedy:
+> measure from the `ms` / `body_byte_len` the guard rows carry since #616.
 
 > ⚠️ **#614's merge wrongly CLOSED #612 and #615** via "Filed, **not fixed**: #N" — GitHub matches
 > the `fixed: #N` substring and ignores the negation. Now in
 > [Standing hazards](#standing-hazards-that-have-each-cost-a-session).
 
-
 ### #614's review rounds, the wiring slice, and the guard-model arc — compressed
 
-Full prose in [`archive/handover_20260830_633_pre-prune.md`](archive/handover_20260830_633_pre-prune.md)
-and [`archive/handover_20260823_wiring-slice_pre-prune.md`](archive/handover_20260823_wiring-slice_pre-prune.md).
+Full prose in [`archive/handover_20260830_633_pre-prune.md`](archive/handover_20260830_633_pre-prune.md), and for the
+earlier slices [`archive/handover_20260823_wiring-slice_pre-prune.md`](archive/handover_20260823_wiring-slice_pre-prune.md)
+and [`archive/handover_20260824_diagnostics_pre-prune.md`](archive/handover_20260824_diagnostics_pre-prune.md).
 What still binds:
 
-- **`AuditSink::insert` is a provided method applying `truncate_payload` before delegating to
-  `insert_stored`**, so no sink double can record a payload Postgres never stored
-  [[audit-sink-doubles-hide-storage-transforms]]. That closed the CLASS; round one had kept half the
-  defect by dropping an unaffordable preserved key *silently*.
-- **The stated mitigation for an issue can disarm the instrument built to check it** — the live probe
-  passed having measured nothing under a *pinned* timeout, precisely the configuration #612 tells a
-  Metal operator to use. It now refuses a pin outright.
+- **The audit cap was eating the tier's scores, and round one kept half the defect.** An
+  unaffordable preserved key was dropped *silently*, giving a row with the same key set as one whose
+  dispatch never ran a tier. Keys are now admitted individually against the budget less
+  `DROP_MARKER_RESERVE`, refusals are named under `DROPPED_PRESERVED_KEY`, and a `const` block makes
+  a member shadowing `_truncated`/`sha256`/`len` a **compile** error. Round two closed the CLASS:
+  `AuditSink::insert` is a **provided method** applying `truncate_payload` before delegating to
+  `insert_stored`, so no sink double can record a payload Postgres never stored
+  [[audit-sink-doubles-hide-storage-transforms]].
+- **The stated mitigation for an issue can be the exact thing that disarms the instrument built to
+  check it** — the live probe passed having measured nothing under a *pinned* timeout, precisely the
+  configuration #612 tells a Metal operator to use. It now refuses a pin outright.
 - **D10 — the tier is ADVISORY defence-in-depth, NOT a gate.** 65% recall (36/55) at FP-0; 6/6 on
-  bare imperatives but **5/8 missed** on narrative framing. **Nothing downstream may relax on it** —
-  no catalogue weight lowered, no allowlist widened, no sandbox constraint loosened.
+  bare imperatives at median 0.9955 but **5/8 missed** on narrative framing at median 0.0797; τ
+  pinned by ~4 documents. **Nothing downstream may relax on it** — no catalogue weight lowered, no
+  allowlist widened, no sandbox constraint loosened.
 - **τ = 0.79552656 is a REQUIRED operator input with no default**, and **five misconfigurations STOP
   THE DAEMON** (D6): half-configured keys, τ outside `(0.0, 1.0]`, a pinned timeout of 0, an
-  unreachable `/props`, and a context below `SCAN_BYTE_CAP + 512 = 66 048` (D8).
-  `KASTELLAN_REQUIRE_GUARD=1` makes the *unconfigured* case fatal too, because `install`
-  regenerating `kastellan.env` drops all three keys at once and lands on the one non-fatal arm.
-- **Measurement 3 ([#606](https://github.com/hherb/kastellan/pull/606))** — 133 cases, τ =
-  0.79552656, FP-0 on both hosts. `best_tau` returns **NONE**: real captured content overlaps at
-  every threshold. Its security-prose stratum was **catalogue-selected**, which is why **corpus
-  growth from production is now the cheap path** — harvest it before designing another campaign.
+  unreachable `/props`, and a context below `SCAN_BYTE_CAP + 512 = 66 048` (D8, which turns #604's
+  attacker-reachable HTTP 400 into a boot refusal). Unconfigured is silent by design;
+  `KASTELLAN_REQUIRE_GUARD=1` makes *that* fatal too, because `install` regenerating `kastellan.env`
+  drops all three keys at once and lands on the one non-fatal arm.
+- **Measurement 3 ([#606](https://github.com/hherb/kastellan/pull/606), `d51c9b20`)** — 133 cases,
+  109 captured through the real `web.fetch` path: **τ = 0.79552656**, FP-0 on both hosts.
+  `best_tau` returns **NONE**: real captured content overlaps at every threshold. Its security-prose
+  stratum was **catalogue-selected** (15 of 121 captures refused under the production `Relaxed`
+  profile), and nothing about that is true of the production distribution — which is why **corpus
+  growth from production is now the cheap path** (D5's per-dispatch `p` is live and survives on
+  large documents since the audit-cap fix). Harvest it before designing another capture campaign.
 - **`RouterConfig` lost its `Eq` derive** — `guard_tau: Option<f32>` can hold a NaN.
 - **The other four `screen` call sites** (`fetch_screen`, `inner_loop/summary`, `channel/ingest`,
   `recall_assembly/pg_builder`) keep catalogue-only behaviour, as does the core-initiated
@@ -411,16 +444,10 @@ then [#634](https://github.com/hherb/kastellan/issues/634) (migrate the three ha
 `bring_up_daemon` copies onto the shared helper that already exists); then
 [#612](https://github.com/hherb/kastellan/issues/612), which is the one that matters and is a design
 call rather than a patch — **#616 unblocked its favoured option**, so it is now reachable rather than
-merely filed. **The DGX redeploy is SEQUENCED, not overdue — do not jump it.** The operator's call
-(2026-08-31) is that the deploy happens **after [#637](https://github.com/hherb/kastellan/pull/637)
-is code-reviewed and any resulting fixes land**, so the whole guard arc
-(`4aee83ad`/`8040ca83`/`d3f8ed3f` + #626) ships in one movement rather than four. Until then no live
-`guard_tier.boot` row carries `slowest_tok_per_s` / `measured_samples` / `attempted_samples`, and
-that is expected rather than a gap. When it does happen: `install` REGENERATES `kastellan.env` and
-silently reverts tuned values, so re-add the four keys and repair the model tag afterwards
-[[dgx-deploy-env-clobber-and-missing-workers]]; then verify at the **installed binary** with
-`strings`, never at the checkout [[handover-claims-verify-before-carrying]]. The first cold-backend
-boot after it is also the first chance to watch #626's retry on a real stalled `/v1/chat/completions`.
+merely filed. **One operator action is still outstanding and no longer has any code excuse: the DGX
+has not been redeployed** onto `4aee83ad`/`8040ca83`/`d3f8ed3f`, so no live `guard_tier.boot` row has
+yet carried `slowest_tok_per_s` / `measured_samples` / `attempted_samples`. Verify at the *installed
+binary* with `strings`, not at the checkout [[handover-claims-verify-before-carrying]].
 
 **Next up — operator's choice, each roughly one session:**
 
@@ -503,40 +530,75 @@ boot after it is also the first chance to watch #626's retry on a real stalled `
 
 ---
 
-## Load-bearing findings that still bind
+## Load-bearing findings from the last two sessions
 
-Full prose in the [`archive/`](archive/) snapshots — most recently
-[`archive/handover_20260831_626_pre-prune.md`](archive/handover_20260831_626_pre-prune.md).
+### The four faults (2026-08-02) — compressed, full prose in [`archive/handover_20260823_pre-prune.md`](archive/handover_20260823_pre-prune.md)
 
-- **The four faults (2026-08-02).** Driven end to end from one real Matrix message: **four
-  independent faults, only one a kastellan bug in the layer everyone suspected**, each masking the
-  next. The durable lesson is the shape, not the four — a green stack with a silent output means
-  look at every layer, and fix them one at a time so each fix's evidence is separable.
-- **The fail-open `data_ceiling` correction — CLOSED, kept for the shape.** A cap that silently
-  dropped what it could not fit produced a row indistinguishable from one where the thing never
-  happened. **Absence and loss must not render identically**; name the refusal.
-- **Egress / MITM traps (from #491–#503) — read before touching the proxy.** The proxy's MITM
-  upstream trusts **webpki roots only**, so no hermetic self-signed origin is possible for a MITM'd
-  worker's e2e; `extra_ca` is worker-side, for transparent-tunnel workers
-  [[egress-proxy-upstream-trusts-webpki-only]]. A force-routed loopback endpoint needs an **IP SAN**
-  — a DNSName holding an IP literal never matches, and the symptom looks like a sandbox failure
-  [[macos-force-routed-loopback-needs-ip-san]]. A bare-host `Net::Allowlist` entry with no `:port`
-  is an **all-port grant** [[bare-host-net-allowlist-is-all-port-grant]].
-- **Deployment facts (DGX).** `install` REGENERATES `kastellan.env` and silently reverts tuned
-  values; re-add the four keys and repair the model tag afterwards
-  [[dgx-deploy-env-clobber-and-missing-workers]]. Force-routing IS baked into the generated unit and
-  survives install [[dgx-force-routing-deploy-facts]]. Daemon logs are in
-  `~/.local/state/kastellan/*.out`, not the journal. `scripts/upgrade_from_git.sh` does the whole
-  build+install+restart+verify and is hardcoded to `main`. A kernel upgrade can drop the NVIDIA
-  module and silently put Ollama on CPU, which looks exactly like a router bug
-  [[dgx-apt-upgrade-drops-nvidia-module]].
-- **Process lessons that have each cost a re-run.** A truncated gate log is not a gate — keep the
-  full sweep in a file under `$HOME` and parse `test result:` with a regex
-  [[truncated-gate-log-is-not-a-gate]]. Mutation testing contaminates the git **index**; `git diff
-  --stat` afterwards is the only proof index == tree [[mutation-testing-contaminates-the-index]], and
-  revert by copying the file, never `git checkout` [[mutation-revert-never-git-checkout]]. A PR body
-  saying "not fixed: #N" **auto-closes** #N [[pr-body-not-fixed-autocloses-issue]]. Plan text is a
-  defect source: subagents transcribe brief prose verbatim [[plan-text-is-a-defect-source]].
+Driven end to end from one real Matrix message. **Four independent faults, only one a
+kastellan bug in the layer everyone suspected**, each masking the next:
+
+1. **The NVIDIA driver was gone** after an `apt upgrade` — Ollama ran a 26B model 100% on
+   CPU. Diagnose first, in one line:
+   `ssh dgx 'lsmod | grep -c nvidia; curl -s 127.0.0.1:11434/api/ps | grep -o "size_vram[^,]*"'`.
+   [[dgx-apt-upgrade-drops-nvidia-module]]
+2. **kastellan did not survive a reboot on Linux** — missing `systemctl --user enable`,
+   fixed in [#509](https://github.com/hherb/kastellan/pull/509).
+3. **The local model thought until the request timed out.** `chat_template_kwargs` +
+   `disable_thinking` (default ON) measured **222 s → 51 s**. Raising
+   `KASTELLAN_LLM_TIMEOUT_MS` is NOT a fix — tried, failed.
+4. **`plan_parser` hid all three.** `parse_plan_lenient` re-emitted the *strict* error, so
+   every reader was pointed at a markdown fence while the real error was
+   `missing field 'steps'`. **Cost the entire session** until the raw output was logged.
+   `steps` is deliberately NOT defaulted — an empty `steps` marks a terminal plan.
+
+**Do not benchmark the agent against a loaded DGX**: the same question took 77 s on a quiet
+box and timed out at 283 s under a concurrent `cargo test --workspace`.
+
+### The fail-open `data_ceiling` correction — CLOSED, kept for the shape
+
+`data_ceiling` is a **ceiling**, so the most *sensitive* `DataClass` is the most *permissive*
+value it can hold. #505 defaulted an absent field to `Secret` — rank 3, the maximum — and
+shipped it documented as fail-**closed**, which left a plan omitting the field not
+ceiling-constrained at all. Behavioural fix in #506 (`cb33005c`). Severity was bounded:
+the invariants it disabled only ever catch a model contradicting *its own* declarations, a
+competence signal rather than an attack barrier. Full analysis, including why the second
+review round widened it from two invariants to three, in [`archive/handover_20260823_pre-prune.md`](archive/handover_20260823_pre-prune.md).
+
+
+### Egress / MITM traps (from #491–#503) — read before touching the proxy
+
+1. **A `CA:TRUE` self-signed *leaf* is rejected at handshake** with rustls' `CaUsedAsEndEntity`, even though `openssl verify` accepts it — and `openssl req -x509` commonly produces exactly that shape. It fails **late and opaquely** as a `mitm_failed: …` egress decision, not at startup. The live DGX localmail cert WAS this shape; regenerated `CA:FALSE` on 2026-07-26 (backups `~/.config/localmail/tls/*.cabak-20260726-173651`) and the tier then passed. Working shapes: a non-CA leaf (`CA:FALSE`) or a real CA that signed a separate leaf. Verify with `openssl x509 -in <cert.pem> -noout -text | grep -A1 'Basic Constraints'`.
+2. **The upstream anchor is trusted for EVERY host that sidecar can reach**, not just the keyed origin. #492 therefore *enforces* single-private-origin rather than trusting operator discipline: an anchor is handed out only when the worker's allowlist resolves to a single private origin written as an **IP literal** (privateness via `kastellan-net-classify::is_denied_range`, the proxy's own SSRF predicate, so the two can't drift), and **a refusal fails the spawn**. **Known limitation, documented and test-pinned, not closed:** keying is per-**host**, not per-service, so two private services sharing one address (the DGX's actual shape: localmail `:8443` + SearxNG `:8888` on `10.0.0.3`) are one origin to the rule and the second worker's sidecar also receives the first's anchor. Closing it needs `host:port` keying or a per-host rustls verifier (#492's explicit non-goal); mitigation is operational — give co-located private services distinct addresses.
+3. **`tls_intercepted: true` is weaker than it reads** — emitted when the proxy takes the MITM branch, *before* the upstream handshake. **Round-tripped bytes are the load-bearing assertion.**
+4. **The decision-ingest thread is deliberately DETACHED**, so reading captured rows right after `worker.close()` races its drain — worst for a connection's LAST decision. Any test asserting on a *terminal* egress decision must poll to quiescence (the shared helper does).
+5. **UDS path length:** a merely descriptive scratch-dir prefix under macOS `$TMPDIR` pushes `<scratch>/egress.sock` past `sun_path` (`SUN_LEN` error) and the sidecar dies before reading the CA. Use `tests-common::short_scratch_root`.
+6. **The proxy's upstream leg trusts webpki roots ONLY** unless the operator sets an anchor — so **no hermetic self-signed origin is possible for a MITM'd worker's e2e**; real-origin tiers are structural, not lazy ([[egress-proxy-upstream-trusts-webpki-only]]).
+7. **Egress-decision assertions must match `host:port`, not a bare host** — a bare-host check passes on any decision mentioning it, and on the DGX loopback SearxNG and the embed endpoint share an address (cost a #448 round-trip; the convention is `is_allowed_row_for` / `is_for_origin`).
+
+### Deployment facts (DGX)
+- **Deploy history** (the `fix/531` branch build, `ddda13dc`, `6e22a470`) is in [`archive/handover_20260823_pre-prune.md`](archive/handover_20260823_pre-prune.md) § Deployment facts. The host has not been redeployed this session; measurement 3 ran from the dev tree, not the installed build.
+
+- **#492 live confirmation DONE 2026-08-01** (audit_log, task 114): the force-routed mail tool reached the **self-signed** localmail through the MITM sidecar using the operator anchor — `egress.allowed {worker:"mail", host:"10.0.0.3", port:8443, tls_intercepted:true}` then `mail.search` returning **25 533 bytes**, which is the load-bearing evidence. Contrast in the same table: `worker:"matrix"` rows carry `tls_intercepted:false` (transparent tunnel), exactly as designed.
+- **Deploying a BRANCH is a hand-roll**, because `upgrade_from_git.sh` hardcodes `git switch main`. The working sequence, mirroring the script's steps 2–5: `bash scripts/build-release.sh` (NOT a bare `cargo build --release --workspace` — the Matrix worker needs its `live-matrix` feature or the channel dies at spawn), then **`./target/release/kastellan-cli install --matrix-homeserver-url <url> --matrix-user <user>`**. Two traps, both live-confirmed on 2026-08-11: the CLI **must** be the `./target/release/` one (`~/.local/bin/kastellan-cli` is a symlink into the install dir, so it copies the installed binaries onto themselves and still prints `installed 15 binaries`), and the Matrix flags **must** be re-passed because those three keys live in the *generated* `kastellan.env`, not the `.local` overlay. The overlay's five keys (extra-CA, `LLM_LOCAL_MODEL`, `LLM_TIMEOUT_MS`, mail endpoint + token file) survive untouched — verified in `/proc/<MainPID>/environ`, including the `-ctx64k` model tag and the 180 s timeout that older deploys used to clobber. Force-routing is baked into the generated unit and came back `=1` without intervention.
+- **A hand-rolled branch deploy must install from `./target/release/kastellan-cli`, NOT `~/.local/bin/kastellan-cli`.** That symlink resolves into `~/.local/lib/kastellan/`, and `install` defaults `--from` to `current_exe()`'s directory — so it copies the installed binaries **onto themselves**, prints `installed 15 binaries`, and changes nothing. Cost a false negative on 2026-08-10 (the live test appeared to show the fix not working; it was testing the old build). It must also re-pass `--matrix-homeserver-url` / `--matrix-user`, which `upgrade_from_git.sh` reads back from the env files first — omitting them regenerates `kastellan.env` without the three `KASTELLAN_MATRIX_*` keys and takes the channel down.
+- **A branch deploy must build with `scripts/build-release.sh`, NOT a bare `cargo build --release`.** That script builds the matrix worker with `--features live-matrix`; without it the worker exits immediately and the channel never comes up — `matrix.init: worker exited before responding`, retried forever, `CHANNEL STILL DOWN` after 5 min. Cost one deploy cycle on 2026-08-09. `upgrade_from_git.sh` calls the script (it is hardcoded to `main`, which is why a branch deploy is hand-rolled at all). Silver lining: the failure was *loud and correctly attributed* within 5 minutes — #516/#517/#525's supervision working exactly as designed on a defect it had never seen.
+- **Deploy timestamps are AEST (UTC+10) in `systemctl` output and UTC in the daemon log** — the same install reads `08:29 AEST 09-08` and `22:29Z 08-08`. Comparing the two without converting makes a current start look like a stale one; it is the cheapest way to misread this host.
+- **The env clobber is FIXED and the manual re-add procedure is GONE** ([#458](https://github.com/hherb/kastellan/issues/458), merged `6e22a470`, live on the DGX since 2026-08-08 22:29 UTC). Tuned settings live in the operator-owned overlay `~/.config/kastellan/kastellan.env.local`, listed *after* the generated file, so `install` may freely regenerate `kastellan.env` and the overlay still wins. **The five settings on this host** — `KASTELLAN_LLM_LOCAL_MODEL` (`gemma4:26b-a4b-it-q8_0-ctx64k`; the bare 4096-ctx tag is what made tasks 111–113 die on `plan decode failed`), `KASTELLAN_LLM_TIMEOUT_MS`, `KASTELLAN_MAIL_ENDPOINT`, `KASTELLAN_MAIL_TOKEN_FILE`, `KASTELLAN_EGRESS_UPSTREAM_EXTRA_CA` — are already in it, and nothing needs re-adding after an install. **What to check instead of what to re-do:** `install` prints `dropped:`/`changed:` key *names* (never values) and writes `kastellan.env.bak`, `.bak.1`, … the first time each destructive install runs; on a steady-state reinstall it correctly prints and writes **nothing**, because the generated file is already the stripped one. The one verification still worth doing is the old one — **`tr '\0' '\n' < /proc/$(systemctl --user show -p MainPID --value kastellan-core.service)/environ`** — since a file being right is still not the same as the process having it. Editing the overlay needs a **restart** on systemd and a full **`install`** on launchd (which must carry the original flags); the warning says which.
+- **Force-routing needs no re-add** — the generated `kastellan-core.service` carries `Environment=KASTELLAN_EGRESS_FORCE_ROUTING=1` from `core_service_spec` (verified live 2026-08-01). [[dgx-force-routing-deploy-facts]]
+- **localmail:** bound to **`10.0.0.3:8443` ONLY** (not loopback); cert SANs `IP 10.0.0.3 / IP 127.0.0.1 / DNS spark-0d2d / DNS localhost`, verified `CA:FALSE`. api-user `kastellan-mail`, granted `horst-gmail`; bearer token `~/.config/kastellan/mail-token` (0600), password `~/.config/kastellan/mail-apipw`. **The token expires 2026-08-30** — re-mint via `POST /v1/auth/login`. The running `localmail-serve.service` started **2026-07-27**, three days *before* the server-side-cursor merge ([hherb/localmail#223](https://github.com/hherb/localmail/pull/223), `0b6c5e05`) it depends on — **restart it before any live email-channel deployment.**
+- `scripts/upgrade_from_git.sh` does the whole build+install+restart+verify and is hardcoded to `main`. Daemon logs live in `~/.local/state/kastellan/*.out`, **not** the journal.
+- The live DGX bot is **eval-only** (just the two of us, no external users), so transient downtime is fine and restarts need no confirmation — but containment controls still get re-added after an install. [[dgx-eval-only-experiment-freely]]
+
+### Process lessons that have each cost a re-run
+
+- **Write long-run logs to `$HOME`, never `/tmp` — on BOTH hosts.** `/tmp` is scrubbed mid-run on the DGX *and* on the Mac; macOS deleted a completed `cargo test --workspace` log plus the harness task-output files, forcing a second 45-minute gate. Include an explicit exit-code line and a DONE sentinel. [[dgx-run-logs-tmp-scrubbed]]
+- **Each host is structurally blind to the other's `cfg` arms.** Mac clippy compiles `#[cfg(target_os="linux")]` items out, so an unused cfg-linux helper passes on the Mac and fails the DGX `-D dead-code` gate; the mirror direction is real too (the DGX is blind to DE-gated items in dual-platform files). Gate both hosts after scripted edits. [[cfg-linux-e2e-deadcode-dgx-clippy]]
+- **Don't race sidecar tests against a build.** The 5 s sidecar-readiness budget is load-sensitive: `email_mitm_e2e` took 28.6 s loaded vs 8.2 s quiet, and `egress_force_routing_e2e::forced_coupling_…` fails under full-workspace load but passes 3/3 standalone in ~0.11 s. **Don't "fix" it by inflating a production timeout.** Adjacent: [#328](https://github.com/hherb/kastellan/issues/328). (The *leaked* sidecar children were a different thing — #502, fixed in PR #516.)
+- **Subagent-driven sessions: tell the implementer to pass `timeout: 600000` on the Bash call, not just "run cargo in the foreground".** Six agents stalled identically across one 9-task plan (#564 slice 1b): the Bash tool's default timeout is **120 s**, this repo's builds and PG e2e runs exceed it, the call auto-backgrounds, and the agent then reaches for `Monitor` and parks waiting for a notification that its own instructions forbade it to wait for. Repeating the rule did not work; naming the mechanism did. Each stall cost 20+ minutes. The controller should run long gates itself via a backgrounded Bash call, which notifies on exit — that is the mechanism the subagents kept mis-reaching for.
+- **Mac CLI cargo blocks on the IDE's rust-analyzer** holding `target/debug/.cargo-lock` — use a scratch `CARGO_TARGET_DIR` (e.g. `$HOME/.cache/kastellan-sdd-target`) or iterate on the DGX. Never pipe background cargo through `| tail` (masks the exit code, buffers output). [[mac-cargo-buildlock-prefer-dgx]]
+- **Verify deployment claims before carrying them forward** — issue comments and handovers go stale; check the live host before repeating a claim in a spec, PR or ROADMAP. [[handover-claims-verify-before-carrying]]
+
+---
 
 ## Working state
 
@@ -544,8 +606,7 @@ Full prose in the [`archive/`](archive/) snapshots — most recently
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
-| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`8d92c02b`** — the tip of `fix/626-probe-total-budget`, after the SECOND review round | **3910 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--nocapture`. **Reconciles exactly: 3909 at `c0255cd7` + 1**, the one new e2e `a_probe_that_stalls_once_then_measures_drops_the_finding`, grepped out of the log as `... ok`. Its sibling `a_probe_that_overruns_its_budget_derives_the_ceiling` also observed `ok`. `guard_tier_e2e` went 40.02 s / 20 cases → **40.03 s / 21**: the new case's 20 s runs concurrently with the overrun case's 40 s, so the suite absorbs it for 10 ms. Ignored unchanged at 55 | exit 0 from a **cold** private dir (`CARGO_TARGET_DIR=~/626r-clippy-target`, `rm -rf`d first): **345** `Checking`+`Compiling` lines, **zero** `warning` and **zero** `error` lines, **all 27 workspace crates named** (counted `sort -u`). 345 is the same figure the `c0255cd7` and `d3f8ed3f` cold runs produced, which is what says this was a real full-workspace lint rather than a cached pass. rustc **1.98.0** on both hosts, checked rather than assumed | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — **zero** non-gliner skips, counted from a `--nocapture` run so the count is evidence rather than an artifact of captured output |
-| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | `c0255cd7` — superseded by the row above, kept for the reconciliation chain | **3909 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3908 at `d3f8ed3f` + 1**, the single new `#[test]`, grepped out of the log as `... ok` rather than subtracted. **Unchanged from the pre-review gate at `a88691a4`, and that is structural rather than luck** — the review fix turned one assertion into a three-value loop instead of adding a test, so a stable count is what a correct fix looks like here. All four affected names observed running, including `a_probe_that_overruns_its_budget_derives_the_ceiling`, the one test whose *wall clock* moved (20 s → 40 s) and which carries no skip guard. Ignored unchanged at 55 | exit 0 from a **cold** private dir (`CARGO_TARGET_DIR=~/clippy-cold-626b`, `rm -rf`d first): **345** `Checking`+`Compiling` lines, **zero** `warning`/`error` lines, **all 27 workspace crates named** (counted `sort -u`). 345 is the same figure the `d3f8ed3f` cold run produced, which is what says this was a real full-workspace lint rather than a cached pass. rustc **1.98.0** on both hosts — CI parity, checked this session rather than assumed | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — **zero** non-gliner skips, counted; *not* the bwrap-userns skip, so containment really ran |
+| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`a88691a4`** — the tip of `fix/626-probe-total-budget` | **3909 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3908 at `d3f8ed3f` + 1**, the single new `#[test]` (`a_saturating_first_sample_still_buys_another`), grepped out of the log as `... ok` rather than subtracted. `a_probe_that_overruns_its_budget_derives_the_ceiling` also observed `ok` — it is the one test whose *wall clock* changed (20 s → 40 s), and it is not skip-guarded, so it really ran. Ignored unchanged at 55 | exit 0 from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-626`): **345** `Checking`+`Compiling` lines, **zero** `warning`/`error` lines, **all 27 workspace crates named** (counted `sort -u`). 345 is the same figure the `d3f8ed3f` cold run produced, which is what says this was a real full-workspace lint rather than a cached pass. rustc **1.98.0** — CI parity, checked rather than assumed | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — *not* the bwrap-userns skip, so containment really ran |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`d3f8ed3f`** — merged `main`, #635 including its review round | **3908 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3907 at `64587ee9` + 1 net**, and all three deltas are *measured* rather than subtracted — `the_basis_table_covers_every_state_exactly_once` (+1) and `an_in_band_pin_stores_a_configured_row_with_a_null_coverage_finding` (+1) each grepped out of the log as `... ok`, and `classify_endpoint_wins_over_the_chat_fallthrough` (−1, the deleted tautology) grepped for and confirmed **absent**. **This is the first run in which either `guard_boot_row_e2e` leg has ever executed** — both pass. Ignored unchanged at 55 | exit 0 from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-635main`): **345** `Checking`+`Compiling` lines (238 + 107), zero `warning`/`error` lines, **all 27 workspace crates named** (counted `sort -u`). rustc **1.96.0**; re-run at CI parity on **1.98.0** after `rustup update` — also exit 0, 0 warnings, 27 crates, 345 lines, so the two-release gap was hiding nothing here | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — *not* the bwrap-userns skip, so containment really ran |
 | **Mac** (aarch64 darwin) | **`1e53bc9d`** — the branch tip, tree-identical to `d3f8ed3f` | **PARTIAL, and it stayed partial.** Unit legs only: `tests-common --lib` **99 / 0** (100 − the deleted tautology) with all four `classify_endpoint` cases observed by name, and `kastellan-core --lib` **1979 / 0 / 1**. **No daemon e2e ran** — a freshly-linked `kastellan` hangs in `_dyld_start` on this host, as do 13 KB build scripts, and `cli_ask_e2e` fails identically at a commit where it was green. The DGX row above is what closed that gap | `check --all-targets` exit 0 and clippy exit 0 over `kastellan-core` + `kastellan-tests-common` `--all-targets`, zero warnings, warm dir, both changed crates confirmed present in the `Checking` lines. **Still the load-bearing Mac leg**: the only thing that compiles the e2e's `#[cfg(target_os = "macos")] serial_lock()` arm | n/a — no integration suite ran |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`12809297`** — the tip of `fix/627-guard-tier-boot-payload`, after the five-agent review round | **3901 / 0 / 55**, 175 suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3900 at `33029e32` + 1** — the one *net* new `#[test]` the review round adds (`a_clamped_row_reports_the_enforced_budget_not_the_derived_one`; the coverage-finding test was renamed and table-driven rather than added, so the diff's raw `#[test]` count is misleading and the name set is the honest instrument). All **11** `boot_report::tests::` names observed running. Ignored unchanged at 55 | exit 0 over **236** `Checking` lines from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-631fix`), zero `warning`/`error` lines. **All 27 workspace crates named**, counted `sort -u` | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — *not* the bwrap-userns skip, so containment really ran |
@@ -590,10 +651,35 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ### The tree — 27 crates
 
-Full layout in the root [`README.md`](../../../README.md) § Layout, and the load-bearing crates in
-[`CLAUDE.md`](../../../CLAUDE.md) § Project shape. Not duplicated here — it drifts, and the README is
-the one a fresh reader finds first.
+> One line per crate: what it owns and the invariants a change must not break. Exhaustive per-module detail (function names, wire shapes, every flag) lives in [`archive/handover_20260803_pre-prune.md`](archive/handover_20260803_pre-prune.md) and in the code. The root `README.md` Layout section is the user-facing version.
 
+**Core & shared libraries**
+
+- **`core`** (`kastellan-core`) — lib + 2 bins (`kastellan` daemon, `kastellan-cli`). Owns: the `tool_host` dispatch chokepoint (spawn-under-sandbox, lockdown-env derivation, wall-clock watchdog, secret-ref substitution in, output secret-scrub + injection screen out, three audit-emission arms), the scheduler + inner loop, CASSANDRA review stages, three-lane memory + recall + the L0/L1/L3 arcs, `worker_lifecycle` (SingleUse / IdleTimeout / `PersistentWorker`) and `force_route`, the `egress/` host side (sidecar spawn, policy rewrite, decision→audit, leak-scanner provisioning, upstream extra-CA selection), `channel/` (Matrix + gated email inbound, pairing, bus, and since #514 the `boot_supervisor` retry loop both channels bring up through), the secrets vault, the audit mirror, `workers/*` host-side manifests, `registry_build`, the handoff cache, and the installer. **Startup is fail-closed:** `db::probe::run` → `connect_runtime_pool` → `spawn_mirror` before `wait_for_shutdown`.
+- **`db`** (`kastellan-db`) — Postgres layer + embedded migrations 0001–0021. Pure builders (initdb/auto_conf/bin-dir), `probe::run`, runtime-role separation, `audit`, `memories` (three lanes + `truncate_to_embedding_dim`, **EMBEDDING_DIM = 256**, Matryoshka), `graph`, `tool_allowlists` (argv0 vs domain kinds), `pairings`, `secrets` (AES-256-GCM + OS keyring). **`sqlx::migrate!` embeds at COMPILE time** — `touch db/src/lib.rs` after adding a migration ([[sqlx-migrate-embeds-at-compile-time]]).
+- **`sandbox`** (`kastellan-sandbox`) — `SandboxPolicy` (+ `proxy_uds`, `persistent_store`) + `Net {Deny | Allowlist | ProxyEgress}` + `Profile {WorkerStrict | WorkerNetClient | WorkerBrowserClient | WorkerMlClient}` + the `dyn`-safe `SandboxBackend` trait. Backends: `LinuxBwrap` (in a `systemd-run --scope` cgroup), `MacosSeatbelt`, `MacosContainer` (opt-in), `LinuxFirecracker` (opt-in; guest kernel sha256-verified at every boot). **Invariants:** `build_argv()` stays a pure `SandboxPolicy → Vec<String>`; always `--unshare-all --die-with-parent --new-session --as-pid-1 --clearenv`; env only via `policy.env`; `fs_read` paths must be absolute; **`Net::Allowlist` + `proxy_uds` ⇒ private netns + UDS bind (no `--share-net`)**, legacy `Allowlist` without `proxy_uds` ⇒ `--share-net`.
+- **`protocol`** — JSON-RPC 2.0 over stdio, MCP-stdio compatible. The sole IPC between core and workers.
+- **`supervisor`** — `systemd --user` + launchd drivers and unit/plist generation; `core_service_spec` bakes `KASTELLAN_EGRESS_FORCE_ROUTING=1` into the generated unit. **Contract: install implies auto-start** — systemd via `systemctl --user enable` (added in #508), launchd via the unconditional `RunAtLoad=true`; `uninstall` must undo it. Honouring it on one OS only is a parity break. The contract stops at *arming* the unit: getting a per-user manager up on a host nobody logs into is the host's job on **both** platforms (linger on Linux, a GUI session on macOS), so "survives a reboot" is this contract plus a host-level arrangement. Both backends publish through **one** `cfg`-free `atomic_write` module (`.tmp.<pid>.<n>` staging name, `create_new`, cleanup after a failed publish) — deliberately shared, not per-backend, so its tests run on both hosts; a destination-derived tmp name races between concurrent writers.
+- **`llm-router`** — the sole core-side LLM egress. `Router::send`/`embed`, `Backend {Local, Frontier}`, `PolicyGate` (Frontier denied until Phase 5), `RouterConfig::from_env`, `disable_thinking` default-ON.
+- **`leak-scan`** — pure credential-leak scanner: `fingerprint` (Rabin + SHA-256), `RollingMatcher` (streaming, used by the proxy to BLOCK), `redact` (all-hits, used by core to SCRUB).
+- **`net-classify`** — the pure SSRF/denied-range predicate `is_denied_range` + its 12 tests. Sole consumer today: egress-proxy.
+- **`tests-common`** — shared dev-dep harness (`publish = false`, never linked into a runtime binary): `PgCluster`, RAII guards, skip helpers, sandbox factory, binary discovery, `daemon.rs`, `scripted_llm`, `mock_localmail`, `egress_forcing`, `microvm`, `short_scratch_root`.
+
+**Workers (18 Rust + 2 Python)** — one process, one sandbox each; no shared process or jail.
+
+- **`prelude`** — Linux Landlock + seccomp `lock_down` (no-op on macOS) + cross-platform `setrlimit`. Profiles: Strict / NetClient / BrowserClient / MlClient / MatrixClient. **The filter installs with `SECCOMP_FILTER_FLAG_TSYNC`** so it covers every thread — without it the filter was a no-op on the Matrix worker's tokio threads. Also ships `kastellan-worker-lockdown-exec`, the exec-shim giving pure-Python venv workers worker-side seccomp + Landlock.
+- **`egress-proxy`** — the per-worker egress boundary, all four slices done. Per CONNECT: allowlist → self-resolved DNS → `is_denied_range` → pin+dial → 200 → peek first byte → MITM or transparent tunnel. Owns the ephemeral per-instance CA, the leaf cache, the leak-scanning relay, TLS pinning, and the upstream extra-CA seam. **Builds + validates the upstream TLS config BEFORE binding the UDS or exporting `ca.pem`** (the readiness signal) — reversing that order returns a healthy handle for a dying proxy.
+- **`shell-exec`** — argv-allowlisted execve wrapper. Entries must be **absolute paths**; the daemon loads the allowlist **once at startup**; the jail has no PATH, so the agent must emit an absolute `argv[0]` ([[shell-exec-allowlist-operational]]).
+- **`mail`** — six read-only `mail.*` tools over localmail `/v1`; `get_attachment` delivers to a durable per-task out dir. Live-verified against the real 37 k-message archive.
+- **`email-in`** — the Phase-2 email fallback channel's inbound poller (`email.init`/`poll`/`ack`) over localmail's server-side subscription cursors; no IMAP crate in-jail, no mail credentials in a kastellan sandbox; `POLL_INTERVAL` 5 s. Gate + channel are core-side (`core/src/channel/email/`); unset `KASTELLAN_EMAIL_*` ⇒ byte-identical daemon, misconfig ⇒ loud `EMAIL CHANNEL DISABLED` with the daemon still running.
+- **`web-common`** — shared lib for net workers: `HostAllowlist` (host-only + port-scoped), the `HttpGet` seam + `ReqwestGet` + `ProxyConnectGet` (CONNECT-over-UDS, end-to-end TLS), and the feature-gated `search` / `fetch` / `extract` logic the three web workers share.
+- **`web-fetch`** / **`web-search`** / **`web-research`** — HTTPS-only `web.fetch`; `web.search` against an operator-set SearxNG endpoint; and the composite `web.research` (search → filter → fetch top-N → chunk → BM25-rank passages). **`web-research`'s `from_env` fails closed if the endpoint host is off-allowlist** — a force-routed e2e that omits it times out looking like a transport bug ([[web-research-e2e-endpoint-must-be-allowlisted]]).
+- **`python-exec`** — the Phase-4 executor for agent-authored Python (opt-in). Strictest policy of any worker: `Net::Deny` + `WorkerStrict` + `fs_write=[]` + curated stdlib (`-I -S -B`), cpu 10 s / mem 512 MiB / wall 30 s, SingleUse. Params ≤64 KiB ride an env var, larger go to a 0600 scratch file, over-ceiling fails closed.
+- **`matrix`** + **`matrix-wire`** — the live Matrix inbound worker (`LiveSdk` behind the `live-matrix` feature, restore-or-login persisted session, `ProxyBridge` for egress) and its shared wire types.
+- **`microvm-run`** + **`microvm-init`** — the Firecracker launcher (pure-std, is the Child) and the guest PID1 vsock-stdio adapter.
+- **`embed-broker`** / **`search-broker`** — the two trusted worker-side exceptions to "no worker talks to the model layer".
+- **`kv-demo`** / **`net-demo`** — long-lived-worker fixtures for the 5b/5c VM arcs (persistent store; net-in-a-VM through a transparent-tunnel sidecar).
+- **Python, outside Cargo:** `browser-driver` (Playwright read-only render; in-jail `ProxyShim` bridges Chromium's CONNECT to the sidecar UDS) and `gliner-relex` (relation extraction; `WorkerMlClient`).
 
 ### Integration-suite map
 
@@ -639,24 +725,32 @@ Older rows (3668 back to 3327, covering the guard slice-1 arc, #587, #579 and #5
 
 ## Recently merged
 
-Newest first. Older entries live in the [`archive/`](archive/) snapshots and in git history.
+Newest first, one line each. Full narrative in git, the linked PRs, and [`archive/handover_20260803_pre-prune.md`](archive/handover_20260803_pre-prune.md).
 
-- **`fix/626-probe-total-budget`** — #626, the saturating-first-sample defect. See
-  [Current state](#current-state).
-- **`d3f8ed3f`** ([#635](https://github.com/hherb/kastellan/pull/635)) — #633, the configured
-  `guard_tier.boot` seam pin.
-- **`8040ca83`** ([#631](https://github.com/hherb/kastellan/pull/631)) — #627, `boot_report` extracted
-  as a pure module.
-- **`4aee83ad`** ([#625](https://github.com/hherb/kastellan/pull/625)) — #624, the probe takes up to
-  three samples and keeps the fastest.
-- **`3bd45a36`** ([#623](https://github.com/hherb/kastellan/pull/623)) — the connect-timeout fold.
-- **`e258ad3c`** ([#619](https://github.com/hherb/kastellan/pull/619)) — `guard.error_kind` as a
-  closed discriminant; `TimeoutBasis::Operator` carries a `PinBand`.
-- **`8736f559`** ([#607](https://github.com/hherb/kastellan/pull/607)) — the guard tier WIRED and
-  running live on the DGX.
-- **`bb937df7`** ([#579](https://github.com/hherb/kastellan/pull/579)) — #564 slice 2, the ask channel.
-- **`af3e7e66`** ([#578](https://github.com/hherb/kastellan/pull/578)) — #564 slice 1b, the ask path.
+- **2026-08-29 `8040ca83` — [#631](https://github.com/hherb/kastellan/pull/631): the boot row's key set and rate assignment were untested** (closes [#627](https://github.com/hherb/kastellan/issues/627)). `report_guard_tier` was a private `async fn` in a **binary with no `#[cfg(test)]` module**, so the durable `policy / guard_tier.boot` payload was reachable only by booting a daemon against a live guard endpoint, and the two tests naming that row asserted its **count**. That left half of #624's fix unguarded: swapping `tok_per_s` with `slowest_tok_per_s` **silences** the documented `slowest_tok_per_s < tok_per_s / 2` query — `fastest < slowest / 2` is unsatisfiable, so it returns the empty set on every host forever — while every key, type and non-null survives. New pure module `cassandra::guard_model::boot_report`, taking `tau`/`n_ctx` as scalars rather than a `&GuardTier`, which **is** the fix. Seam pinned separately in `cli_ask_e2e` against real Postgres. Five-agent review found no correctness defect in the lift but **four false claims in the prose and four surviving mutants** — the worst being `coverage_finding` routed only for `Probed`, *selective* and so invisible on a healthy host. Mutation-proven thirteen for thirteen. `main.rs` 824 → 771. Gated at the tip `12809297`: **DGX 3901 / 0 / 55**, 175 suites, cold clippy exit 0 over 236 `Checking` lines. Deferred: [#632](https://github.com/hherb/kastellan/issues/632), [#633](https://github.com/hherb/kastellan/issues/633) (the latter fixed the next day — see [Current state](#current-state)).
+- **2026-08-28 `1d848e13` — [#630](https://github.com/hherb/kastellan/pull/630): what kastellan should take from Headlong** ([`laude-institute/headlong`](https://github.com/laude-institute/headlong), Apache-2.0, <10K lines of Bash). **Docs only — no code, nothing to re-gate.** Write-up in [`docs/devel/notes/2026-08-27-headlong-borrowings.md`](../notes/2026-08-27-headlong-borrowings.md); two issues filed with ROADMAP entries, [#628](https://github.com/hherb/kastellan/issues/628) (`audit_log` causal columns) and [#629](https://github.com/hherb/kastellan/issues/629) (fill `MemoryLayer::L4` with a logarithmic rollup pyramid), plus three borrowings noted and deliberately not filed (loop pacing, liveness-as-a-dispatcher-guarantee, blob spilling). Its threat model is the **inverse** of ours and four of its defining features are things kastellan exists to refuse — read it for memory and pacing, never for containment.
+- **2026-08-27 `4aee83ad` — [#625](https://github.com/hherb/kastellan/pull/625): the boot probe measured the boot, not the host** (closes [#624](https://github.com/hherb/kastellan/issues/624)). D9's probe took one sample ~3 s into daemon startup and measured **startup contention**: three consecutive boots on one unchanged DGX backend read 6 073 / 269.6 / 1 582 tok/s where the same backend measured a reproducible ~7 000 uncontended — a 26x under-measurement whose slowest boot fired a **false** ceiling finding. Fixed by D11: `PROBE_SAMPLES` (3) samples, keep the **fastest**, each with its own cache-buster. `TimeoutBasis::Probed` gained `slowest_tok_per_s` + `measured_samples` + `attempted_samples` so one row distinguishes a quiet host from a busy one. Three movement-only splits (`timeout/` is now four files, `tier/probe.rs` lifted out of `tier/boot.rs`). Five-agent review found one CRITICAL — `summarise(&samples[..1])` silently reverted the whole fix and passed every guard test in the tree. Gated at the branch tip `b65e44ab`: **DGX 3890 / 0 / 55**, 175 suites, cold clippy exit 0 over 241 `Checking` lines. Deferred: [#626](https://github.com/hherb/kastellan/issues/626), [#627](https://github.com/hherb/kastellan/issues/627). **Not yet deployed to the DGX.**
+- **2026-08-24 `45d5f6c2` — [#614](https://github.com/hherb/kastellan/pull/614): the guard tier's first live bring-up, and the audit cap that was eating its scores.** The tier ran in production for the first time (DGX): probed 21 752 ms budget at 6 073 tok/s, a cleared document at `p = 0.0074`, and **a real attack document blocked at `p = 0.9199` where the deterministic catalogue scored `0.0`**. The bring-up found in an hour what seventeen e2e cases and a five-agent review had not: `truncate_payload` replaced any over-cap payload *in its entirety*, so every tool result past ~4 KiB took D5's guard score with it — biased the wrong way, since blocks keep their score and *clears* lose theirs. Fixed by `db::audit::PRESERVED_KEYS` + `preserve_onto`, with `AuditSink::insert` now a **provided method** applying the transform before delegating to `insert_stored`, so no sink double can record a payload Postgres never stored. Two four-agent review rounds, mutation-proven six for six in round two. Gated at the branch tip `8cb8cfb7`: **DGX 3854 / 0 / 55**, 175 suites, cold clippy exit 0 over 245 `Checking` lines. Filed out of it: [#612](https://github.com/hherb/kastellan/issues/612) and [#615](https://github.com/hherb/kastellan/issues/615)–[#618](https://github.com/hherb/kastellan/issues/618) — **and the merge itself wrongly auto-closed #612 and #615**, since reopened; see the header and [Standing hazards](#standing-hazards-that-have-each-cost-a-session).
+- **2026-08-23 `8736f559` — [#607](https://github.com/hherb/kastellan/pull/607): the guard tier wired to the `tool_host` chokepoint** (closes [#586](https://github.com/hherb/kastellan/issues/586)). `ToolHostStepDispatcher` carries `guard: Option<Arc<GuardTier>>`; catalogue first and a catalogue Block short-circuits; escalate-up only. D8 turns #604's attacker-reachable HTTP 400 into a **boot refusal** (`/props` must report a per-request context ≥ 66 048), D9 **probes** the timeout at boot instead of assuming D2's 15 s, D10 pins the tier as **advisory** at 65% recall. Eleven post-review fixes, all mutation-proven; deferred [#608](https://github.com/hherb/kastellan/issues/608)–[#611](https://github.com/hherb/kastellan/issues/611). Gated at `31a05e00`: **DGX 3834 / 0 / 54**, **Mac 3712 / 0 / 24**. **Never yet run live** — see [Current state](#current-state).
+- **2026-08-22 `abb3d3a7` — [#598](https://github.com/hherb/kastellan/pull/598): the guard weights pinned by BYTES, checked at use** (closes [#592](https://github.com/hherb/kastellan/issues/592)). `guard calibrate` GETs `/props`, takes `model_path`, hashes that file itself, and refuses **before scoring anything** on any of five distinct failures; `--weights-unpinned` keeps a candidate model calibratable and stamps the report `UNPINNED`. Gated at the branch tip `f46c67cf`: **3749 / 0 / 54**, whose tree differs from `abb3d3a7` only in HANDOVER + ROADMAP. Deferred to [#599](https://github.com/hherb/kastellan/issues/599) + [#600](https://github.com/hherb/kastellan/issues/600); [#597](https://github.com/hherb/kastellan/issues/597) filed for the projector. Full detail in [Current state](#current-state).
+- **2026-08-22 `2ab6612c` — [#596](https://github.com/hherb/kastellan/pull/596): the four fail-opens #593's review found after it merged.** `--record` disabled every hash check; an empty budget scope made D7's criterion vacuous; τ printed at `{:.6}`, which does not round-trip an f32; the HTTP status was never checked, so a 404 page could be pinned wearing the label of the page it replaced. +18 tests. **Merged on a Mac gate only — the DGX gate was run afterwards, at `2ab6612c`: 3686 / 0 / 54.**
+- **2026-08-22 `b58edc77` — [#593](https://github.com/hherb/kastellan/pull/593): measurement-3 Tasks 1–4 + the live pilot.** D7's `operating_point` + `BudgetScope`, the operating point rendered once corpus-wide, the metadata-only `manifest` module, and `guard capture` through the real chokepoint. M1 discharged; both slices specced.
+- **2026-08-22 `47ba5b4f` — [#587](https://github.com/hherb/kastellan/pull/587): exact ask containment, honest UX, diagnosable rejections** (closes [#582](https://github.com/hherb/kastellan/issues/582) + [#583](https://github.com/hherb/kastellan/issues/583) + [#584](https://github.com/hherb/kastellan/issues/584)). `handle_inbound`'s two ask arms became four; containment is an exact peer-scoped live-nonce lookup sharing `resolve_with_nonce`'s own `WHERE` fragment (`live_ask_for_claimant!`), `looks_like_ask_command` survives demoted to the cheap DB-free gate, and every `channel.ask_answer_rejected` row names its arm. Full narrative — including the two fail-open Criticals the five-agent review found, and why one of them was a regression against `main` that no agent found — in [Current state](#current-state). Deferred: [#588](https://github.com/hherb/kastellan/issues/588)–[#591](https://github.com/hherb/kastellan/issues/591).
+- **2026-08-21 `f90631da` — [#585](https://github.com/hherb/kastellan/pull/585): the Shieldstral adjudicator, guard-model slice 1.** Guard endpoint seam (`RouterConfig::{guard_url,guard_model}` + the pure `for_guard`, which never falls back to `local_url`), the adjudicator (`cassandra::guard_model`: digest-pinned prompt artefact, pure three-valued `decide`, thin async shell), and an offline calibration harness (`core::guard_calibration` + `kastellan-cli guard calibrate` + 24 seeded corpus cases). **No production wiring** — five chokepoint files byte-identical to `main`, verified as a merge gate. DGX **3599 / 0 / 54**. Full detail in [Current state](#current-state); the wiring slice's three preconditions are in [Next TODO](#next-todo).
+- **2026-08-20 `bb937df7` — [#579](https://github.com/hherb/kastellan/pull/579): [#564](https://github.com/hherb/kastellan/issues/564) slice 2, the ask channel.** An escalated plan's question reaches the operator's Matrix room; they answer `/approve <token>` / `/deny <token>`. `channel::outbox::ChannelOutbox` (shared `Arc` registry created in `main` before both scheduler and channel supervisors), D16's peer-scoped `EXISTS` predicate *inside* `resolve_with_nonce`'s guarded UPDATE (the nonce is a **bearer** token, so reading — not guessing — was the real threat), D17's `NONCE_BYTES` 32 → 5. Gated **3527 / 0 / 53** DGX. **Dormant in production: nothing constructs `Verdict::Escalate`** — see the warning at the top of this file.
+- **2026-08-19 `af3e7e66` — [#578](https://github.com/hherb/kastellan/pull/578): [#564](https://github.com/hherb/kastellan/issues/564) slice 1b, the ask path.** `Verdict::Escalate` stops degrading to `Block`; `Outcome::{AwaitingOperator, Denied}`, `final_state() -> Option<&'static str>`, the 60 s expiry sweep, `kastellan-cli inbox`, and D11's `asks.resume_state` (migration 0024) so a resumed task does not re-execute steps it already ran. Closes [#571](https://github.com/hherb/kastellan/issues/571). Gated **3462 / 0 / 53** DGX.
+- **2026-08-18 `fbe91c4d` + `e8ea4339` — [#572](https://github.com/hherb/kastellan/pull/572) / [#573](https://github.com/hherb/kastellan/pull/573): mail attachments addressed by `{message_id, filename}`,** plus the nine defects the post-gate review found. `method_qualify` completes an omitted namespace at dispatch; `qualify_plan_methods` normalises `plan.steps` **once** so the output cap, the digest and both audit payloads agree. Carries #574, the `/tmp`-wipe fix. Gated **3416 / 0 / 53** DGX; live-verified on both hosts.
+- **2026-08-16 `07b6451e` — [#569](https://github.com/hherb/kastellan/pull/569): the guard tier's measurement 2 + the Q8 re-measurement, and `logprobs` plumbing.** Pinned runtime + quantisation: llama.cpp + `Shieldstral-1.0-3B-Q8_0` on **both** hosts, so one fitted τ transfers. Additive only — no existing caller passes the new fields.
+- **2026-08-13 `d8f6acfd` — [#555](https://github.com/hherb/kastellan/pull/555), closes [#545](https://github.com/hherb/kastellan/issues/545) + [#541](https://github.com/hherb/kastellan/issues/541) + [#544](https://github.com/hherb/kastellan/issues/544) + [#542](https://github.com/hherb/kastellan/issues/542).** The `<tools>` advertisement made bounded (4 KiB over the *escaped* text, whole entries only), kind-correct (a row whose `kind` disagrees with its tool's is withheld from the *advertisement* only — enforcement stays kind-blind, [#554](https://github.com/hherb/kastellan/issues/554)), unforgeable (`char::is_control()` + separators + bidi, replacing `< 0x20`) and unrepresentable-when-half-declared (one `AllowlistDecl`). `/fixall` added a third advertisement state (`with_opaque_allowlist`) so an all-mismatched-kind allowlist stops reading as "nothing is permitted". Gated on both hosts — and the DGX gate caught that `cargo test --workspace` **did not compile on Linux**, because #541's type change reached two `cfg(target_os = "linux")` `ResolveCtx` fakes the Mac never compiles. Eleven mutations, all killed. Details in [Current state](#current-state).
+**July 2026 and earlier, one line each** (full entries in [`archive/handover_20260824_diagnostics_pre-prune.md`](archive/handover_20260824_diagnostics_pre-prune.md) § Recently merged, and in the linked PRs):
 
+- `bf8e850b` [#496](https://github.com/hherb/kastellan/pull/496) — Phase-2 email fallback channel, slice 1 (gated inbound). Nine pre-merge review fixes, two High: a live DMARC-gate bypass via a legal RFC 8601 `method-version`, and 401/403 treated as permanent, which **destroyed mail**.
+- `0be03b30` [#495](https://github.com/hherb/kastellan/pull/495) + `c0ac4e62` [#493](https://github.com/hherb/kastellan/pull/493) — the egress-proxy **upstream extra-CA** seam and the force-routed mail round trip; also a real ordering bug (the proxy validated upstream TLS *after* publishing readiness, so a fail-closed abort returned a healthy handle for a dying proxy). See [Egress / MITM traps](#egress--mitm-traps-from-491503).
+- `efc1001b` [#490](https://github.com/hherb/kastellan/pull/490) — mail-worker live-test coverage; `ce144513`/`87afd8b2` [#483](https://github.com/hherb/kastellan/pull/483)/[#487](https://github.com/hherb/kastellan/pull/487) — `kastellan-worker-mail`, first LIVE run against the real archive [[mail-worker-localmail-verification]].
+- `e1d37633` [#486](https://github.com/hherb/kastellan/pull/486) — install-dir trust probe, keyring read-back-verify, merged secret-scrub spans. **The audit-remediation family is FULLY closed.**
+- `06700212` [#482](https://github.com/hherb/kastellan/pull/482) — bwrap binds canonical-src → original-dest (TOCTOU-safe). Host-source paths only; guest-side paths stay lexical.
+- `dd10bd68` → `c1fdb07c` → `4c03929f` — the **provisioning-integrity family**: guest kernel sha256-pinned in one shared `lib/guest-kernel.sh` and verified **at every VM boot**, image dir `root:<worker-group>` 1775. Sums are TOFU — documented honestly.
+- `61890c48` / `1f353dd8` / `02ef016c` — the **VM-entry arc COMPLETE**: first real page rendered inside a micro-VM through a real sidecar, both slice-2 budgets measured. **Correction that keeps being needed:** this does NOT fix macOS [#286](https://github.com/hherb/kastellan/issues/286) — Firecracker is Linux-only; #286's named fix is the `MacosContainer` VM-netns backend ([#55](https://github.com/hherb/kastellan/issues/55)).
 
 ### Earlier history
 
@@ -676,7 +770,6 @@ Beyond those already listed under [Next TODO](#next-todo). Only currently-open i
 - **From [#614](https://github.com/hherb/kastellan/pull/614)'s round-two review, four filed rather than folded in because each changes behaviour beyond the branch:** [#615](https://github.com/hherb/kastellan/issues/615) — an operator-pinned `KASTELLAN_LLM_GUARD_TIMEOUT_MS` **below `TIMEOUT_FLOOR_MS` or above `TIMEOUT_CEILING_MS` is accepted in silence** (`validate_operator_timeout` refuses only `0`, and `TimeoutBasis::Operator` yields no `coverage_finding`). Not clamping is deliberate and should stay; saying *nothing* is the defect — sharpened by #612 telling Metal operators to pin ~3× the ceiling. [#616](https://github.com/hherb/kastellan/issues/616) — `guard.state` collapses timeout / connect / HTTP-status / decode into `"router_error"`, so the durable record **cannot count the fail-open** that #612 is entirely about; a closed enum discriminant (`error_kind`) carries no attacker-controlled bytes and would fix it without weakening the no-backend-text rule. [#617](https://github.com/hherb/kastellan/issues/617) — `req` is still lost wholesale above the cap, and for `shell.exec` **`req.argv` *is* the audited act**; the allowlist is the wrong tool (unbounded), a bounded producer-side summary is the right one. [#618](https://github.com/hherb/kastellan/issues/618) — `fetch_screen`'s Block arm has an else-less `as_object_mut`, a silent fail-open *shape* on a screening path (unreachable today via the `get("data")` guard three lines up).
 - **From the Headlong cross-project study (2026-08-27), both design-input rather than defects:** [#628](https://github.com/hherb/kastellan/issues/628) — `audit_log`'s causal structure lives in payload prose, not columns: `task_id` is a payload key in 58 places across 19 files, enforced nowhere, and there is no grouping key for one plan iteration and no link from a row to the row that caused it. This is the #616 defect one level up ("could not be counted — only inferred, by correlating…"), and #619's `LIKE 'operator%'` is the same shape again; proposed fix is `task_id` + a generic `caused_by` stamped in `audit::insert`, with Headlong's reader rule — *readers must tolerate absent fields, never reconstruct membership heuristically* — landing **with** the migration. Also hands Phase 5's audit UI a tree for free. [#629](https://github.com/hherb/kastellan/issues/629) — `MemoryLayer::L4` (session digests) is declared, accepted by the DB, and **written by nothing**, while `prompt_assembly::assemble` has no episodic block at all, so a task started today knows nothing of yesterday beyond whatever L2 row someone wrote. Fill it with `tiered_memory.md`'s logarithmic rollup pyramid over `audit_log` (fanout 10, tier *k* covers 10^k rows, built forward-only from a start marker, coarse tiers cite `audit_log.id` ranges and are *an index, not testimony*). Depends on #628 for cheap citation. The `<history>` block is model-authored, so it escapes like `<recalled>`, not verbatim like `<l0_meta_rules>`.
 - [#634](https://github.com/hherb/kastellan/issues/634) — **a third hand-rolled `bring_up_daemon` now exists in `core/tests/`** (`cli_ask_e2e`, `observation_capture`, and #633's new `guard_boot_row_e2e`), sharing ~70 identical lines: the log + state dirs behind `PathGuard`s, the `core_service_spec` naming, four env vars, install/start, `wait_for_status(Active)` and `wait_for_log_match("scheduler spawned")`. Every divergence is one `env()` call, so a `tests_common::daemon::DaemonSpec` builder covers all three with no `cfg`. Two copies was arguably under the threshold; three is not, and #530 is the worked example of the cost — a bring-up fix landing in one copy and not the other. Bonus: `tests-common`'s unit tests are the one thing CI runs on every PR.
-- [#638](https://github.com/hherb/kastellan/issues/638) — **`cargo doc --workspace` emits 214 rustdoc warnings** and exits 0, so nothing has ever forced a look. 115 private-link, **67 broken intra-doc links**, 6 function/module ambiguities that may already resolve to the wrong item, 4 unclosed HTML tags that can corrupt rendering; `core/src` holds 135. Matters here more than in most trees because doc comments *are* the design record and `[`intra-doc`]` links are how a reader moves between them. **Not** proposing a CI gate or fixing the 115 first — the issue carries a cheapest-signal-first order. Found while checking #626's own new links resolved; none of it comes from that branch. ⚠️ **A warm target dir under-reports this badly** — one run said 3 errors having documented 4 of 27 crates; count the `Documenting` lines, same rule as clippy.
 - [#597](https://github.com/hherb/kastellan/issues/597) — **#592's shape one artefact along:** the two hosts hold different *projectors* (Mac `mmproj-F16`, DGX `mmproj-BF16`, different sizes), and ROADMAP claimed they matched. Inert while the guard tier runs `vision:false`; pin it the same way if a guard path ever loads one. The mechanism already exists — `require_guard_weights` takes a path.
 - [#564](https://github.com/hherb/kastellan/issues/564) — also carries a [Next TODO](#next-todo) bullet; listed here too because it is the blocker under `ask_user`, plan-approval, and the deferred `Escalate` severity-split alike.
 - [#515](https://github.com/hherb/kastellan/issues/515) — the channel supervisor awaits its audit sink (deliberately: row ordering + test determinism), and the Postgres sink inherits sqlx's 30 s pool-acquire timeout, so an unreachable PG can delay daemon shutdown by that much. Fix is a 5 s `tokio::time::timeout` around the sink call; testable with a `std::future::pending()` sink.

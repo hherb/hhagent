@@ -544,12 +544,11 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   throughputs that the fastest-wins rule would then *prefer*: a fail-open manufactured by the fix.
   Stopping rule is one rule (`taken < PROBE_SAMPLES && elapsed < PROBE_TOTAL_BUDGET_MS`); an
   explicit stop-on-saturation was written and dropped **because it would have been dead code**, not
-  because it was worse — `PROBE_TOTAL_BUDGET_MS == PROBE_BUDGET_MS`, so a saturating sample always
-  leaves `elapsed >= TOTAL` and the elapsed check already returns false. The two rules are
-  behaviourally identical. A saturating FIRST sample therefore still ends the probe at one
-  unrepresentative sample and fires the false ceiling finding — the cold-`llama-server` case, filed
-  as [#626](https://github.com/hherb/kastellan/issues/626) rather than fixed here, because the fix
-  costs up to 60 s of startup on the sickest host. It costs exactly one budget today (e2e-pinned).
+  because it was worse — while `PROBE_TOTAL_BUDGET_MS == PROBE_BUDGET_MS` a saturating sample always
+  left `elapsed >= TOTAL` and the elapsed check already returned false, so the shipped rule carried
+  the rejected rule's defect: a saturating FIRST sample ended the probe at one unrepresentative
+  sample and fired a false finding on the cold-`llama-server` host.
+  **[#626](https://github.com/hherb/kastellan/issues/626) FIXED** — see the entry below.
   `TimeoutBasis::Probed` now carries `slowest_tok_per_s`, `measured_samples` and
   `attempted_samples`, and `Saturated`/`Unprobed` carry `attempted_samples` too, so one boot row
   distinguishes a quiet host from a busy one and a clean 3-for-3 from a backend that failed two of
@@ -724,6 +723,74 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   tolerable. The Mac legs that DID run at the final tip: `check --all-targets` exit 0, clippy
   `--all-targets -D warnings` exit 0 with zero warnings (both warm-dir; the cold run wedged on a
   hung `build-script-build` and was killed), `tests-common --lib` 100 / 0 and `boot_report` 13 / 0.
+  **[#626](https://github.com/hherb/kastellan/issues/626) FIXED on branch
+  `fix/626-probe-total-budget`** -- `PROBE_TOTAL_BUDGET_MS` raised from `PROBE_BUDGET_MS` to
+  `2 * PROBE_BUDGET_MS`, so a saturating first sample leaves a whole budget unspent and the run
+  gets a second look. Nothing special-cases saturation; the rule is still elapsed wall clock, and
+  `summarise`'s ranking (`Measured` > `Saturated`) is what turns the retry into a correct budget on
+  a host whose model was merely cold. **The added wall clock never lands on a host that ends up
+  healthy** -- a healthy boot is unchanged at ~0.5 s (the loop stops at `PROBE_SAMPLES`, never on
+  this clock), the cold-model host pays two fast samples (0.32 s on the DGX, 1.12 s on the Mac) and gets a rate instead of a warning, a genuinely
+  slow host pays 40 s and reports `attempted_samples: 2`, and only the pathological host (samples
+  landing just under the budget, which derives the ceiling and earns a finding either way) goes
+  40 s -> 60 s. **Option 3 was rejected on more than cost**: keeping the budgets and weakening the
+  finding leaves the cold host on the 120 s ceiling with a softer message rather than a correct
+  budget, and raising the total makes its `measured_samples == 0 && attempted_samples == 1`
+  trigger unreachable -- shipping both would add a branch no fixture can enter. **The relation between
+  the two budgets is now a COMPILE-time assertion** beside the constant, not a convention:
+  re-equalising them is the defect, not a tunable. It is `>= 2 *`, not a strict `>` -- see the
+  review round below. **Two corrections to the record, carried into the wiring spec:**
+  #626 as filed quoted `Clamped::ToCeiling`'s sentence, but this path yields `best = Saturated`,
+  so the finding that actually fires is `TimeoutBasis::Saturated`'s -- which matters, because
+  option 3 named which one to weaken; and `guard_tier_e2e` asserted the basis *before* the socket
+  count, so a wrong payload panicked first and took the probe evidence with it (#635's review made
+  exactly this fix one file over). **Mutation-proven six for six, each executed:** reverting the
+  constant is a compile error; relaxing the const guard *and* reverting fails both new unit tests;
+  pointing `more_samples_wanted` at the per-sample budget fails both stopping tests; `3 *` fails
+  the literal pin; removing the elapsed clause fails the e2e at **60.02 s** with
+  `attempted_samples: 3` -- which is `PROBE_SAMPLES * PROBE_BUDGET_MS`, the cost the clause
+  exists to prevent, observed rather than asserted (**not** the
+  `PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS` bound: that mutant removes the constant from the
+  predicate, and the two coincide near 60 s only because `PROBE_SAMPLES` is 3 and the factor
+  is 2); and
+  fabricating the retry instead of dialling fails the socket count 1 vs 2, which is what proves
+  that count earns its place beside `attempted_samples`.
+  **A review then found the guard around the fix too weak, and its first finding was a mutant that
+  had not been tried.** The `const _` asserted `>`, and three doc comments claimed a saturating
+  sample leaves the clock at *exactly* `PROBE_BUDGET_MS` -- false, because `run_probe` takes its
+  `Instant` before the loop and a tokio timer only overshoots (measured ~5 ms per sample, which is
+  why the two-sample e2e reads 40.01 s). Demonstrated rather than argued: with the `>` guard, the
+  single-point test and `PROBE_TOTAL_BUDGET_MS = PROBE_BUDGET_MS + 1`, the suite is **green** while
+  production answers `more_samples_wanted(1, 20_005) = false` -- #626 fully restored, invisibly. The
+  guard is now `>= 2 * PROBE_BUDGET_MS` and the retry test asks at three points rather than one.
+  **When a fix moves a threshold, the test must ask at a value the PRODUCER can emit, not at the
+  threshold.** The review also corrected m5's attribution (above) and caught a deploy-breaker:
+  `scripts/upgrade_from_git.sh` gave channel bring-up ~51 s, and the probe runs *before* channel
+  supervision in `main.rs`, so a saturating guard backend now eats 40 s of it and the script would
+  `exit 1` blaming **Matrix** on a host whose real problem is the guard endpoint -- `CHANNEL_WAIT`
+  raised with the interaction documented at the call site.
+  **A SECOND review (four agents, against the PR) found five more, two of them defects.** (1)
+  `TimeoutBasis::Saturated`'s new doc claimed the variant "means every sample stalled" -- false,
+  `summarise` returns it whenever NO sample measured and AT LEAST ONE saturated, so
+  `[Saturated, Failed, Failed]` reaches the row as `attempted_samples: 3` off one stall; and it
+  offered a residual reading for `attempted_samples: 1` the current code cannot produce. (2) **The
+  case #626 exists to fix had no test above the pure layer** -- the updated overrun e2e pins the
+  branch where the verdict is UNCHANGED, while the branch the issue is about (stall once, then
+  measure, false finding disappears) was asserted nowhere. New
+  `a_probe_that_stalls_once_then_measures_drops_the_finding`; a saturation-sticky `summarise` fails
+  it while the overrun and healthy cases both pass, and it costs the suite nothing (its 20 s runs
+  concurrently with the overrun case's 40 s: 40.03 s over 21 cases against 40.02 s over 20). (3) The `>` claim had **survived the first review's own
+  fix in six places**, including the wiring spec, which stated the disproven implication as the
+  rationale. (4) The `const _` lived in a `#[cfg(test)]` module, so the "compile error" was only true
+  under `cargo test` -- moved beside the constant and paired with a `<= 2 *` upper bound; all three
+  of revert, `+1` and `3 *` are now `E0080` from `cargo build --release`. (5) `CHANNEL_WAIT` was
+  sized against one leg of two -- `/props` is fatal, uses the same `probe_client` and runs first, so
+  the pre-scheduler bound is ~80 s, not 60; raised to 120.
+  **Re-gated on the DGX at `8d92c02b` after the second review: 3910 / 0 / 55**, 176 suites,
+  `TEST_EXIT=0`; cold clippy exit 0 over 345 `Checking`+`Compiling` lines with all 27 crates named
+  and zero warnings; 8 `[SKIP]`, all gliner-relex, zero non-gliner (counted from a `--nocapture`
+  run). Reconciles exactly at 3909 + 1, the one new e2e. Both hosts on rustc 1.98.0 (CI parity,
+  checked). The `c0255cd7` gate at 3909 is superseded, not additive.
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one
