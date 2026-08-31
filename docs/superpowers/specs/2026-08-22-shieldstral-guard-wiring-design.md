@@ -556,7 +556,7 @@ healthy:
 | host | before | after |
 | --- | --- | --- |
 | healthy | ~0.5 s | ~0.5 s — the clock is never reached |
-| cold model, then fast | 20 s, ceiling, **false finding** | ~20.4 s, a real rate, no finding |
+| cold model, then fast | 20 s, ceiling, **false finding** | 20.3 s (DGX) - 21.1 s (Mac), a real rate, no finding |
 | genuinely slow | 20 s, `attempted_samples: 1` | 40 s, `attempted_samples: 2` |
 | pathological (samples land ~19.9 s) | 40 s | 60 s |
 

@@ -544,12 +544,11 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   throughputs that the fastest-wins rule would then *prefer*: a fail-open manufactured by the fix.
   Stopping rule is one rule (`taken < PROBE_SAMPLES && elapsed < PROBE_TOTAL_BUDGET_MS`); an
   explicit stop-on-saturation was written and dropped **because it would have been dead code**, not
-  because it was worse — `PROBE_TOTAL_BUDGET_MS == PROBE_BUDGET_MS`, so a saturating sample always
-  leaves `elapsed >= TOTAL` and the elapsed check already returns false. The two rules are
-  behaviourally identical. A saturating FIRST sample therefore still ends the probe at one
-  unrepresentative sample and fires the false ceiling finding — the cold-`llama-server` case, filed
-  as [#626](https://github.com/hherb/kastellan/issues/626) rather than fixed here, because the fix
-  costs up to 60 s of startup on the sickest host. It costs exactly one budget today (e2e-pinned).
+  because it was worse — while `PROBE_TOTAL_BUDGET_MS == PROBE_BUDGET_MS` a saturating sample always
+  left `elapsed >= TOTAL` and the elapsed check already returned false, so the shipped rule carried
+  the rejected rule's defect: a saturating FIRST sample ended the probe at one unrepresentative
+  sample and fired a false finding on the cold-`llama-server` host.
+  **[#626](https://github.com/hherb/kastellan/issues/626) FIXED** — see the entry below.
   `TimeoutBasis::Probed` now carries `slowest_tok_per_s`, `measured_samples` and
   `attempted_samples`, and `Saturated`/`Unprobed` carry `attempted_samples` too, so one boot row
   distinguishes a quiet host from a busy one and a clean 3-for-3 from a backend that failed two of
@@ -724,6 +723,34 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   tolerable. The Mac legs that DID run at the final tip: `check --all-targets` exit 0, clippy
   `--all-targets -D warnings` exit 0 with zero warnings (both warm-dir; the cold run wedged on a
   hung `build-script-build` and was killed), `tests-common --lib` 100 / 0 and `boot_report` 13 / 0.
+  **[#626](https://github.com/hherb/kastellan/issues/626) FIXED on branch
+  `fix/626-probe-total-budget`** -- `PROBE_TOTAL_BUDGET_MS` raised from `PROBE_BUDGET_MS` to
+  `2 * PROBE_BUDGET_MS`, so a saturating first sample leaves a whole budget unspent and the run
+  gets a second look. Nothing special-cases saturation; the rule is still elapsed wall clock, and
+  `summarise`'s ranking (`Measured` > `Saturated`) is what turns the retry into a correct budget on
+  a host whose model was merely cold. **The added wall clock never lands on a host that ends up
+  healthy** -- a healthy boot is unchanged at ~0.5 s (the loop stops at `PROBE_SAMPLES`, never on
+  this clock), the cold-model host pays two fast samples (0.32 s on the DGX, 1.12 s on the Mac) and gets a rate instead of a warning, a genuinely
+  slow host pays 40 s and reports `attempted_samples: 2`, and only the pathological host (samples
+  landing just under the budget, which derives the ceiling and earns a finding either way) goes
+  40 s -> 60 s. **Option 3 was rejected on more than cost**: keeping the budgets and weakening the
+  finding leaves the cold host on the 120 s ceiling with a softer message rather than a correct
+  budget, and raising the total makes its `measured_samples == 0 && attempted_samples == 1`
+  trigger unreachable -- shipping both would add a branch no fixture can enter. **The `>` relation
+  between the two budgets is now a COMPILE-time assertion**, not a convention: re-equalising them
+  is the defect, not a tunable. **Two corrections to the record, carried into the wiring spec:**
+  #626 as filed quoted `Clamped::ToCeiling`'s sentence, but this path yields `best = Saturated`,
+  so the finding that actually fires is `TimeoutBasis::Saturated`'s -- which matters, because
+  option 3 named which one to weaken; and `guard_tier_e2e` asserted the basis *before* the socket
+  count, so a wrong payload panicked first and took the probe evidence with it (#635's review made
+  exactly this fix one file over). **Mutation-proven six for six, each executed:** reverting the
+  constant is a compile error; relaxing the const guard *and* reverting fails both new unit tests;
+  pointing `more_samples_wanted` at the per-sample budget fails both stopping tests; `3 *` fails
+  the literal pin; removing the elapsed clause fails the e2e at **60.02 s** with
+  `attempted_samples: 3` -- the first direct observation of the documented
+  `PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS` bound, asserted before and now measured; and
+  fabricating the retry instead of dialling fails the socket count 1 vs 2, which is what proves
+  that count earns its place beside `attempted_samples`.
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one

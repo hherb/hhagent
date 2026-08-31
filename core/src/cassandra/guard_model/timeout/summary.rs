@@ -68,14 +68,15 @@ pub const PROBE_SAMPLES: usize = 3;
 /// | host | before | after |
 /// | --- | --- | --- |
 /// | healthy | ~0.5 s | ~0.5 s — the clock is never reached |
-/// | cold model, then fast | 20 s, ceiling, **false finding** | ~20.4 s, a real rate, no finding |
+/// | cold model, then fast | 20 s, ceiling, **false finding** | 20.3 s (DGX) - 21.1 s (Mac), a real rate, no finding |
 /// | genuinely slow | 20 s, `attempted_samples: 1` | 40 s, `attempted_samples: 2` |
 /// | pathological | 40 s | 60 s |
 ///
 /// So the added wall clock is not paid by the host this fixes — that one
-/// pays ~0.4 s and gets a measurement instead of a warning. It is paid by
-/// a host whose samples land just under the budget, and such a host
-/// derives the ceiling and earns a coverage finding either way.
+/// pays two fast samples (0.32 s on the DGX, 1.12 s on the Mac) and gets a
+/// measurement instead of a warning. It is paid by a host whose samples
+/// land just under the budget, and such a host derives the ceiling and
+/// earns a coverage finding either way.
 ///
 /// **The bound it gives is `PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS`
 /// (60 s), and that is deliberate rather than sloppy.**
