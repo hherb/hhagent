@@ -41,7 +41,7 @@ use kastellan_tests_common::{
     assert_cli_failure, assert_cli_success, bring_up_daemon, bring_up_pg_cluster, cli_binary,
     cli_command, core_binary, current_username, pg_bin_dir_or_skip, seed_tool_allowlist,
     shell_exec_worker_binary, skip_if_no_supervisor, skip_if_sandbox_unavailable, spawn_inert_mock,
-    unique_suffix, PgCluster,
+    unique_suffix, DaemonSpec, LlmEndpoint, PgCluster,
 };
 #[cfg(target_os = "macos")]
 use kastellan_tests_common::serial_lock;
@@ -195,12 +195,14 @@ async fn run_succeeds_against_daemon_registry_without_operator_env() {
 
     let mock = spawn_inert_mock().await;
     let (daemon, _daemon_guards) = bring_up_daemon(
-        "l3run",
-        &suffix,
-        &cluster.data_dir,
-        &mock.base_url,
-        &user,
-        shell_exec_env(),
+        &DaemonSpec::new(
+            "l3run",
+            &suffix,
+            &cluster.data_dir,
+            &user,
+            LlmEndpoint::Base(mock.base_url.clone()),
+        )
+        .envs(shell_exec_env()),
     );
 
     // The operator CLI subprocess: NO KASTELLAN_SHELL_EXEC_BIN. Pre-#179 the
