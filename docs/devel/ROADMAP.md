@@ -592,8 +592,8 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   before only a *failing* one did — which mattered because `TooFewUncachedTokens` is the runtime
   detector for cache contamination. Deferred: [#626](https://github.com/hherb/kastellan/issues/626)
   above, and [#627](https://github.com/hherb/kastellan/issues/627).
-  **[#627](https://github.com/hherb/kastellan/issues/627) FIXED on branch
-  `fix/627-guard-tier-boot-payload` (2026-08-27).** `report_guard_tier` was a private `async fn` in
+  **[#627](https://github.com/hherb/kastellan/issues/627) FIXED and MERGED `8040ca83`
+  ([#631](https://github.com/hherb/kastellan/pull/631), 2026-08-27).** `report_guard_tier` was a private `async fn` in
   `core/src/main.rs` — a binary with no `cfg(test)` module — so the durable
   `policy / guard_tier.boot` payload was reachable only from a live daemon, and the two tests
   naming that row asserted its **count**. That left half of #624's fix unguarded: swapping
@@ -723,8 +723,8 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   tolerable. The Mac legs that DID run at the final tip: `check --all-targets` exit 0, clippy
   `--all-targets -D warnings` exit 0 with zero warnings (both warm-dir; the cold run wedged on a
   hung `build-script-build` and was killed), `tests-common --lib` 100 / 0 and `boot_report` 13 / 0.
-  **[#626](https://github.com/hherb/kastellan/issues/626) FIXED on branch
-  `fix/626-probe-total-budget`** -- `PROBE_TOTAL_BUDGET_MS` raised from `PROBE_BUDGET_MS` to
+  **[#626](https://github.com/hherb/kastellan/issues/626) FIXED and MERGED `44e0f38d`
+  ([#637](https://github.com/hherb/kastellan/pull/637), 2026-08-31)** -- `PROBE_TOTAL_BUDGET_MS` raised from `PROBE_BUDGET_MS` to
   `2 * PROBE_BUDGET_MS`, so a saturating first sample leaves a whole budget unspent and the run
   gets a second look. Nothing special-cases saturation; the rule is still elapsed wall clock, and
   `summarise`'s ranking (`Measured` > `Saturated`) is what turns the retry into a correct budget on
@@ -791,6 +791,53 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   and zero warnings; 8 `[SKIP]`, all gliner-relex, zero non-gliner (counted from a `--nocapture`
   run). Reconciles exactly at 3909 + 1, the one new e2e. Both hosts on rustc 1.98.0 (CI parity,
   checked). The `c0255cd7` gate at 3909 is superseded, not additive.
+
+  **[#632](https://github.com/hherb/kastellan/issues/632) FIXED on branch
+  `fix/632-fastest-tok-per-s-rename` (2026-09-01)** -- `tok_per_s` -> `fastest_tok_per_s` in BOTH
+  `BootRates` and `TimeoutBasis::Probed`, moved together because renaming one alone leaves
+  `fastest_tok_per_s: Some(*tok_per_s)` in `from_basis`, which reads like a bug and invites a
+  later session to "restore" the old name. **The REPORTING vocabulary is deliberately frozen**:
+  the durable `policy / guard_tier.boot` key stays `"tok_per_s"` (live rows carry it and the
+  operator query `slowest_tok_per_s < tok_per_s / 2` is written against it) and so do `main.rs`'s
+  two tracing fields -- a `warn!` line naming this number differently from the audit row it
+  accompanies would read as a second measurement. That decision is now a comment at both reporting
+  sites, and the key/field divergence is visible on the `"tok_per_s": rates.fastest_tok_per_s`
+  line itself. The issue's own site count was low: 62 raw occurrences across 12 files, of which
+  only ~40 are Rust identifiers -- the rest are wire keys, the operator query, tracing field names,
+  a pseudocode symbol in `derive_guard_timeout`'s doc, and a local variable holding ONE sample's
+  rate (correctly left alone, since `fastest` is the f32 that reaches the basis). A blind
+  `sed` would have renamed the wire key and broken every stored row's query; the existing
+  `CONFIGURED_KEYS` array is what makes that a test failure rather than a silent one.
+  **Gate: DGX 3910 / 0 / 55, 176 suites, `TEST_EXIT=0`, 8 `[SKIP]` all gliner-relex** -- byte
+  identical to `8d92c02b`'s baseline, which is what a correct pure rename looks like: it adds and
+  removes no tests.
+
+  **[#634](https://github.com/hherb/kastellan/issues/634) FIXED on the same branch (2026-09-01)** --
+  the three hand-rolled `bring_up_daemon` copies (`cli_ask_e2e`, `observation_capture`,
+  `guard_boot_row_e2e`, ~70 identical lines each) now use `tests_common::daemon`. The parameters
+  became a `DaemonSpec` builder rather than a seventh, eighth and ninth positional argument --
+  three of the existing six were already adjacent `&str`s, the same transposition hazard #632 is
+  about one crate over. **Two divergences the issue's own table missed, both found by reading the
+  copies rather than the issue:** `observation_capture` uses a **15 s** readiness budget (the issue
+  documented only guard_boot_row's 20 against the shared 10, so the real spread is three values,
+  not two); and it passes `KASTELLAN_LLM_LOCAL_URL` **verbatim** -- that variable is
+  operator-supplied and documented as already carrying `/v1`, so the shared helper's unconditional
+  append would have dialled `/v1/v1`. That is the one migration hazard that fails **silently**, and
+  it is now unrepresentable: `LlmEndpoint::{Base, Verbatim}` makes the two shapes distinct types at
+  every call site, and `mail_daemon_e2e`'s `strip_suffix("/v1")` workaround was deleted with it.
+  **11 new `tests-common` unit tests, all 15 mutants killed**, each by the test written for it --
+  including the `/v1/v1` mutant, the extra_env ORDERING transposition (a deletion mutant is weaker
+  and killed two tests instead of the one), a `data_dir`/`user` swap, and removal of the 200-char
+  name cap. They matter out of proportion to their size: `linux-check.yml` runs
+  `cargo test -p kastellan-tests-common` on **every PR** and nothing else, while the six daemon
+  e2es these values configure run on no PR at all. The `extra_env`-later-wins guarantee
+  `mail_daemon_e2e` depends on was a comment at that call site with nothing testing it; it is now a
+  property, verified against both backends' actual rendering (systemd one `Environment=` line per
+  entry, launchd duplicate plist dict keys -- both order-preserving, both last-wins).
+  Also folded in: the character-for-character `guard_tier_boot_payload` duplicate, and #635's
+  stderr-on-failure fix that `cli_ask_e2e`'s private copy had never received. **Three files shrank
+  below or toward the cap**: `guard_boot_row_e2e` 687 -> 537, `cli_ask_e2e` 858 -> 736,
+  `observation_capture` 664 -> 601.
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one

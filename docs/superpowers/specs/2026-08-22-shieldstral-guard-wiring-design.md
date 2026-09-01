@@ -602,6 +602,15 @@ host was contended when it measured itself". It is deliberately **not** a covera
 a busy boot with a good fastest sample is not a reduction in coverage, and #624's own
 complaint is that the finding channel's credibility gets spent on noise.
 
+> ⚠️ **`tok_per_s` in this section, and in the boot-row table above, is the durable JSON KEY —
+> not the Rust field, which [#632](https://github.com/hherb/kastellan/issues/632) renamed to
+> `fastest_tok_per_s` in both `BootRates` and `TimeoutBasis::Probed` (2026-09-01).** The two are
+> decoupled on purpose: `BootRates` has no `Serialize` derive and `boot_payload` writes the keys
+> as string literals, so the field could move and the key could not — live hosts already carry
+> rows under `tok_per_s`, and the operator query above is written against it. `main.rs`'s two
+> tracing fields are frozen for the same reason. **Do not "correct" this spec to match the
+> field names**; the keys here are what an operator queries.
+
 **D11 does not close #612, and the two must not be merged.** #624 is that the *sample* was
 taken under load on any host; #612 is that extrapolating from a ~1 KiB sample is non-linear
 on Metal whatever the load (a quiet Mac still reads 1 137 tok/s at 1 KiB and 260 at 64 KiB).
