@@ -9,7 +9,7 @@
 //! That gap mattered because half of [#624]'s fix lives in the *report*
 //! rather than in the probe. Taking the fastest of several samples is
 //! worth nothing if the row cannot then distinguish a quiet host from a
-//! busy one — and swapping [`BootRates::tok_per_s`] with
+//! busy one — and swapping [`BootRates::fastest_tok_per_s`] with
 //! [`BootRates::slowest_tok_per_s`] **silences** the documented operator
 //! query `slowest_tok_per_s < tok_per_s / 2`.
 //!
@@ -80,19 +80,17 @@ pub struct BootRates {
     /// ceiling and no floor, so contention can only ever make an
     /// observation slower ([#624]'s D11).
     ///
-    /// The bare name is a wart: it says "the rate" where it means "the
-    /// fastest", and it sits next to an explicitly qualified
-    /// [`Self::slowest_tok_per_s`]. That asymmetry is the shape [#627]
-    /// is about, and renaming it to `fastest_tok_per_s` is
-    /// [#632](https://github.com/hherb/kastellan/issues/632) — deferred
-    /// only so the field and [`TimeoutBasis::Probed`]'s upstream field of
-    /// the same name move together rather than drifting apart.
+    /// Read straight off [`TimeoutBasis::Probed::fastest_tok_per_s`],
+    /// whose doc carries the full rationale; the two were renamed
+    /// together in [#632] so they cannot drift apart. **The name is not
+    /// the wire key** — [`boot_payload`] still writes `"tok_per_s"`,
+    /// and so do `main.rs`'s two tracing fields.
     ///
     /// [#624]: https://github.com/hherb/kastellan/issues/624
-    /// [#627]: https://github.com/hherb/kastellan/issues/627
-    pub tok_per_s: Option<f32>,
+    /// [#632]: https://github.com/hherb/kastellan/issues/632
+    pub fastest_tok_per_s: Option<f32>,
     /// The **slowest** of the samples that measured. Together with
-    /// [`Self::tok_per_s`] this is the contention spread: two rates that
+    /// [`Self::fastest_tok_per_s`] this is the contention spread: two rates that
     /// agree are a measurement of the host, two that differ by 22x are a
     /// measurement of how busy it was at boot.
     ///
@@ -129,10 +127,11 @@ impl BootRates {
         // ONE match building `Self` per arm, rather than two matches
         // feeding a positional tuple. The tuple form was the first cut
         // and it reintroduced exactly the hazard this module exists to
-        // close: `(Some(*tok_per_s), Some(*slowest_tok_per_s), ..)` are
-        // same-typed neighbours, so transposing them compiles in
-        // silence. Named field initialisers make the same mistake read
-        // as `tok_per_s: Some(*slowest_tok_per_s)` — wrong on its face.
+        // close: `(Some(*fastest_tok_per_s), Some(*slowest_tok_per_s),
+        // ..)` are same-typed neighbours, so transposing them compiles
+        // in silence. Named field initialisers make the same mistake
+        // read as `fastest_tok_per_s: Some(*slowest_tok_per_s)` — wrong
+        // on its face.
         //
         // The cost is repeating `None` for the quiet arms, and it buys
         // the three legal shapes being visible in the code rather than
@@ -141,26 +140,26 @@ impl BootRates {
         // an operator pin never probed at all.
         match basis {
             TimeoutBasis::Probed {
-                tok_per_s,
+                fastest_tok_per_s,
                 slowest_tok_per_s,
                 measured_samples,
                 attempted_samples,
                 ..
             } => Self {
-                tok_per_s: Some(*tok_per_s),
+                fastest_tok_per_s: Some(*fastest_tok_per_s),
                 slowest_tok_per_s: Some(*slowest_tok_per_s),
                 measured_samples: Some(*measured_samples),
                 attempted_samples: Some(*attempted_samples),
             },
             TimeoutBasis::Saturated { attempted_samples, .. }
             | TimeoutBasis::Unprobed { attempted_samples, .. } => Self {
-                tok_per_s: None,
+                fastest_tok_per_s: None,
                 slowest_tok_per_s: None,
                 measured_samples: None,
                 attempted_samples: Some(*attempted_samples),
             },
             TimeoutBasis::Operator { .. } => Self {
-                tok_per_s: None,
+                fastest_tok_per_s: None,
                 slowest_tok_per_s: None,
                 measured_samples: None,
                 attempted_samples: None,
@@ -226,10 +225,15 @@ pub fn boot_payload(tau: f32, n_ctx: u64, budget: &GuardTimeout) -> Value {
         // them are already in `audit_log` on live hosts, and operator
         // queries are written against them. They are string literals
         // here and `BootRates` has no `Serialize` derive, so the Rust
-        // field names and the wire keys are decoupled on purpose: #632
-        // may rename `tok_per_s` the field, and must not rename
-        // `"tok_per_s"` the key.
-        "tok_per_s":         rates.tok_per_s,
+        // field names and the wire keys are decoupled on purpose. #632
+        // exercised exactly that decoupling: it renamed the FIELD to
+        // `fastest_tok_per_s` and left the KEY at `"tok_per_s"`, which
+        // is why the two differ on the line below. That difference is
+        // deliberate and must survive — `main.rs`'s two tracing fields
+        // are frozen at `tok_per_s` for the same reason, so an operator
+        // correlating a boot log line with its audit row reads one
+        // vocabulary rather than two.
+        "tok_per_s":         rates.fastest_tok_per_s,
         "slowest_tok_per_s": rates.slowest_tok_per_s,
         "measured_samples":  rates.measured_samples,
         "attempted_samples": rates.attempted_samples,

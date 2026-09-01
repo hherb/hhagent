@@ -35,9 +35,9 @@ fn derive_from_one(outcome: &ProbeOutcome) -> GuardTimeout {
     derive_guard_timeout(&summarise(std::slice::from_ref(outcome)))
 }
 
-fn tok_per_s_of(t: &GuardTimeout) -> f32 {
+fn fastest_tok_per_s_of(t: &GuardTimeout) -> f32 {
     match t.basis {
-        TimeoutBasis::Probed { tok_per_s, .. } => tok_per_s,
+        TimeoutBasis::Probed { fastest_tok_per_s, .. } => fastest_tok_per_s,
         ref other => panic!("expected a probed basis, got {other:?}"),
     }
 }
@@ -68,7 +68,7 @@ fn the_budgeted_worst_case_is_the_required_context() {
 fn the_dgx_derives_about_twenty_six_seconds_unclamped() {
     let t = derive_from_one(&DGX_MEASURED);
     assert_eq!(clamped_of(&t), Clamped::No, "26 s is inside the band");
-    let rate = tok_per_s_of(&t);
+    let rate = fastest_tok_per_s_of(&t);
     assert!(
         (4_900.0..5_300.0).contains(&rate),
         "must reproduce M2's ~5,000 tok/s, got {rate}"
@@ -154,7 +154,7 @@ fn a_saturated_probe_derives_the_ceiling_and_never_the_floor() {
 /// that absence is the assertion.
 ///
 /// It used to be reported as `Probed`, which forced two fabrications:
-/// a `tok_per_s` computed from `MIN_UNCACHED_PROBE_TOKENS` — a
+/// a `fastest_tok_per_s` computed from `MIN_UNCACHED_PROBE_TOKENS` — a
 /// sample-rejection floor, not a count of anything the probe processed,
 /// giving 12.8 tok/s against a real upper bound of ~40 — and a
 /// `derived_ms` holding the POST-clamp ceiling while the `Probed` arm's
@@ -327,12 +327,14 @@ fn the_basis_carries_the_spread_the_samples_disagreed_by() {
         ProbeOutcome::Measured { uncached_tokens: 810, elapsed_ms: 3_004 },
     ]));
     match t.basis {
-        TimeoutBasis::Probed { tok_per_s, slowest_tok_per_s, measured_samples, .. } => {
+        TimeoutBasis::Probed {
+            fastest_tok_per_s, slowest_tok_per_s, measured_samples, ..
+        } => {
             assert_eq!(measured_samples, 2);
-            assert!(tok_per_s > 6_000.0, "the fastest sample, got {tok_per_s}");
+            assert!(fastest_tok_per_s > 6_000.0, "the fastest sample, got {fastest_tok_per_s}");
             assert!(slowest_tok_per_s < 300.0, "the slowest sample, got {slowest_tok_per_s}");
             assert!(
-                tok_per_s / slowest_tok_per_s > 20.0,
+                fastest_tok_per_s / slowest_tok_per_s > 20.0,
                 "a 22x spread is what a contended boot looks like"
             );
         }
@@ -345,7 +347,7 @@ fn the_basis_carries_the_spread_the_samples_disagreed_by() {
 /// `summarise` never pairs a `Measured` best with zero measuring samples,
 /// with no slowest rate, or with a slowest ABOVE the fastest — but
 /// `ProbeSummary`'s fields are public, and a row claiming
-/// `measured_samples: 0` beside a measured `tok_per_s` would be
+/// `measured_samples: 0` beside a measured `fastest_tok_per_s` would be
 /// unreadable. The guard is the same shape as the `is_finite` one beside
 /// it: cheap, and "unreachable" is a property of another function.
 ///
@@ -360,12 +362,12 @@ fn the_basis_carries_the_spread_the_samples_disagreed_by() {
 fn a_summary_built_by_hand_still_reports_a_coherent_row() {
     let probed = |summary: &ProbeSummary| match derive_guard_timeout(summary).basis {
         TimeoutBasis::Probed {
-            tok_per_s,
+            fastest_tok_per_s,
             slowest_tok_per_s,
             measured_samples,
             attempted_samples,
             ..
-        } => (tok_per_s, slowest_tok_per_s, measured_samples, attempted_samples),
+        } => (fastest_tok_per_s, slowest_tok_per_s, measured_samples, attempted_samples),
         other => panic!("expected a probed basis, got {other:?}"),
     };
 

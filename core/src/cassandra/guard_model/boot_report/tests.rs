@@ -59,7 +59,7 @@ fn contended_probed() -> GuardTimeout {
     GuardTimeout {
         timeout: Duration::from_millis(21_752),
         basis: TimeoutBasis::Probed {
-            tok_per_s: 6_090.0,
+            fastest_tok_per_s: 6_090.0,
             slowest_tok_per_s: 269.6,
             measured_samples: 3,
             attempted_samples: 3,
@@ -79,7 +79,7 @@ fn contended_probed() -> GuardTimeout {
 /// [`TIMEOUT_CEILING_MS`]: super::super::timeout::TIMEOUT_CEILING_MS
 fn ceiling_clamped_basis() -> TimeoutBasis {
     TimeoutBasis::Probed {
-        tok_per_s: 269.6,
+        fastest_tok_per_s: 269.6,
         slowest_tok_per_s: 269.6,
         measured_samples: 1,
         attempted_samples: 3,
@@ -156,7 +156,7 @@ fn a_quiet_hosts_row_does_not_satisfy_the_busy_boot_query() {
     let budget = GuardTimeout {
         timeout: Duration::from_millis(19_000),
         basis: TimeoutBasis::Probed {
-            tok_per_s: 7_026.0,
+            fastest_tok_per_s: 7_026.0,
             slowest_tok_per_s: 6_953.0,
             measured_samples: 3,
             attempted_samples: 3,
@@ -187,7 +187,7 @@ fn one_measured_sample_reports_the_same_rate_at_both_ends() {
     let budget = GuardTimeout {
         timeout: Duration::from_millis(30_000),
         basis: TimeoutBasis::Probed {
-            tok_per_s: 1_582.0,
+            fastest_tok_per_s: 1_582.0,
             slowest_tok_per_s: 1_582.0,
             measured_samples: 1,
             attempted_samples: 3,
@@ -206,7 +206,7 @@ fn one_measured_sample_reports_the_same_rate_at_both_ends() {
 /// Every basis that measured nothing reports `null`, not `0.0`.
 ///
 /// A fabricated zero would be logged and stored as if it had been
-/// observed, and `tok_per_s = 0` is a perfectly plausible reading for a
+/// observed, and a rate of 0 is a perfectly plausible reading for a
 /// wedged backend — so the two would be indistinguishable.
 #[test]
 fn a_basis_with_no_measurement_reports_null_rates_not_zeroes() {
@@ -332,7 +332,7 @@ fn every_basis_with_expected_finding() -> Vec<(TimeoutBasis, bool)> {
         // name, and it was the one this table was missing.
         (
             TimeoutBasis::Probed {
-                tok_per_s: 12_400.0,
+                fastest_tok_per_s: 12_400.0,
                 slowest_tok_per_s: 11_950.0,
                 measured_samples: 3,
                 attempted_samples: 3,
@@ -578,7 +578,7 @@ fn boot_rates_reads_a_probed_basis_without_transposing_it() {
     assert_eq!(
         rates,
         BootRates {
-            tok_per_s: Some(6_090.0),
+            fastest_tok_per_s: Some(6_090.0),
             slowest_tok_per_s: Some(269.6),
             measured_samples: Some(3),
             attempted_samples: Some(3),

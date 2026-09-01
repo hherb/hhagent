@@ -160,7 +160,17 @@ async fn report_guard_tier(
         tau = tier.tau(),
         timeout_ms = budget_ms,
         timeout_basis = basis,
-        tok_per_s = rates.tok_per_s,
+        // ⚠️ The tracing field stays `tok_per_s` while the struct field
+        // is `fastest_tok_per_s`. #632 renamed the Rust identifiers to
+        // kill a silent transposition between two same-typed
+        // neighbours; it deliberately left the REPORTING vocabulary
+        // alone, because the durable `guard_tier.boot` key cannot move
+        // (live rows carry it, and the operator query
+        // `slowest_tok_per_s < tok_per_s / 2` is written against it) and
+        // a log line naming this number differently from the audit row
+        // it accompanies would read as a second measurement. Same
+        // mapping, same reason, at `boot_report::boot_payload`.
+        tok_per_s = rates.fastest_tok_per_s,
         slowest_tok_per_s = rates.slowest_tok_per_s,
         measured_samples = rates.measured_samples,
         attempted_samples = rates.attempted_samples,
@@ -196,7 +206,7 @@ async fn report_guard_tier(
             // diagnostic that separates "slow host" from "busy boot" --
             // which is the whole of #624 -- and this `warn!` is the line
             // an operator actually reads.
-            tok_per_s = rates.tok_per_s,
+            tok_per_s = rates.fastest_tok_per_s,
             slowest_tok_per_s = rates.slowest_tok_per_s,
             measured_samples = rates.measured_samples,
             attempted_samples = rates.attempted_samples,

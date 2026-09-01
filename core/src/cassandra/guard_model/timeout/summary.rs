@@ -302,7 +302,7 @@ pub struct ProbeSummary {
     pub measured_samples: u32,
     /// The **lowest** throughput among the measuring samples.
     ///
-    /// Beside `tok_per_s` (the highest) this is the contention spread,
+    /// Beside `fastest_tok_per_s` (the highest) this is the contention spread,
     /// and it is the number that would have made #624 visible from a
     /// single boot row rather than from three of them: 6 994 against
     /// 269.6 says "this host was busy", where 6 994 alone says nothing.
