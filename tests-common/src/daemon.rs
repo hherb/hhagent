@@ -1,11 +1,21 @@
 //! Shared real-daemon bring-up for the CLI e2e tests.
 //!
-//! Several integration tests (`cli_memory_l3_run_daemon_e2e`,
-//! `cli_memory_l3py_run_daemon_e2e`, …) drive a *real* `kastellan` daemon under
-//! the supervisor against a per-test Postgres cluster, then exercise it through
-//! the `kastellan-cli` operator subprocess. They previously each carried a
-//! byte-duplicated `MockLlm` + `bring_up_daemon` pair that drifted apart over
-//! time; this module is the single source of truth (issue #15 spirit).
+//! Six integration tests drive a *real* `kastellan` daemon under the
+//! supervisor against a per-test Postgres cluster, most of them then
+//! exercising it through the `kastellan-cli` operator subprocess. They
+//! previously each carried a byte-duplicated `MockLlm` + `bring_up_daemon`
+//! pair that drifted apart over time; this module is the single source of
+//! truth (issue #15 spirit).
+//!
+//! Three of the six were still hand-rolled copies until issue #634 —
+//! `cli_ask_e2e`, `observation_capture` and `guard_boot_row_e2e`, ~70
+//! identical lines each. The drift that argument predicts had already
+//! happened: #635 had to write one stderr-on-failure fix **twice**, here
+//! and in `guard_boot_row_e2e`'s copy, and the other two copies never
+//! received it at all — both of `cli_ask_e2e`'s waits used a bare
+//! `.expect`, so a daemon that died before `main` reported only its last
+//! polled status. What made each of them a copy is now a [`DaemonSpec`]
+//! setter.
 //!
 //! What is *not* here: anything that depends on `kastellan-core` types
 //! (skill factories, the per-OS python interpreter cascade). `tests-common`
@@ -15,13 +25,19 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
 
-use kastellan_supervisor::specs::core_service_spec;
 use kastellan_supervisor::{default_supervisor, ServiceStatus};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::guards::{PathGuard, ServiceGuard};
 use crate::{core_binary, unique_temp_root, wait_for_log_match, wait_for_status};
+
+mod spec;
+
+pub use spec::{
+    DaemonSpec, LlmEndpoint, COMPAT_SEGMENT, DEFAULT_LLM_MODEL, DEFAULT_LLM_TIMEOUT_MS,
+    DEFAULT_READY_TIMEOUT,
+};
 
 // ---------------------------------------------------------------------------
 // Inert LLM mock — the `l3_run` paths NEVER call the LLM (the daemon executes
@@ -34,8 +50,9 @@ use crate::{core_binary, unique_temp_root, wait_for_log_match, wait_for_status};
 /// A live-but-inert local-LLM endpoint. Holds the listener task; aborts it on
 /// drop so no socket leaks between tests.
 pub struct MockLlm {
-    /// `http://127.0.0.1:<ephemeral-port>` — feed this to the daemon's
-    /// `KASTELLAN_LLM_LOCAL_URL` (the caller appends `/v1`).
+    /// `http://127.0.0.1:<ephemeral-port>` — a **base**, carrying no
+    /// compat segment, so it is an [`LlmEndpoint::Base`] and the `/v1`
+    /// is appended there rather than by the caller.
     pub base_url: String,
     join: Option<tokio::task::JoinHandle<()>>,
 }
@@ -123,77 +140,29 @@ pub fn stderr_tail(stderr_path: &Path) -> String {
 /// Install + start a real `kastellan` daemon under the supervisor and wait for
 /// it to log `"scheduler spawned"`.
 ///
-/// `label` distinguishes co-running tests' temp dirs + service names (e.g.
-/// `"l3run"` → `kastellan-supervisor-test-core-l3run-<suffix>`). `extra_env`
-/// carries the *test-specific* worker registration (e.g.
-/// `KASTELLAN_SHELL_EXEC_BIN` or the `KASTELLAN_PYTHON_EXEC_*` trio) on top of
-/// the common data-dir / prompts / inert-LLM config every daemon needs.
+/// Everything configurable lives on [`DaemonSpec`]; see its docs for the
+/// defaults and for why the parameters became a struct (issue #634).
 ///
 /// Panics (rather than skips) on failure: callers are expected to have already
 /// short-circuited on missing host prerequisites.
-pub fn bring_up_daemon(
-    label: &str,
-    suffix: &str,
-    data_dir: &Path,
-    mock_base_url: &str,
-    user: &str,
-    extra_env: Vec<(String, String)>,
-) -> (DaemonHandle, DaemonGuards) {
-    let core_log_dir = unique_temp_root(&format!("cli-{label}-clog"));
+pub fn bring_up_daemon(daemon: &DaemonSpec) -> (DaemonHandle, DaemonGuards) {
+    let core_log_dir = unique_temp_root(&daemon.log_dir_infix());
     std::fs::create_dir_all(&core_log_dir).expect("create core log dir");
     let core_log_guard = PathGuard {
         path: core_log_dir.clone(),
     };
 
-    let state_dir = unique_temp_root(&format!("cli-{label}-state"));
+    let state_dir = unique_temp_root(&daemon.state_dir_infix());
     let state_guard = PathGuard {
         path: state_dir.clone(),
     };
 
-    let binary = core_binary();
-    let mut spec = core_service_spec(&binary, &core_log_dir);
-    spec.name = format!("kastellan-supervisor-test-core-{label}-{suffix}");
-    assert!(spec.name.len() <= 200);
-    let stdout_path = core_log_dir.join(format!("{}.out", spec.name));
-    let stderr_path = core_log_dir.join(format!("{}.err", spec.name));
-    spec.stdout_log = Some(stdout_path.clone());
-    spec.stderr_log = Some(stderr_path.clone());
-
-    spec.env.push((
-        "KASTELLAN_DATA_DIR".into(),
-        data_dir.to_string_lossy().into_owned(),
-    ));
-    spec.env.push(("USER".into(), user.to_string()));
-    spec.env.push((
-        "KASTELLAN_STATE_DIR".into(),
-        state_dir.to_string_lossy().into_owned(),
-    ));
-
-    // Prompts: the daemon's prompt loader fails closed if the dir is missing.
-    // `CARGO_MANIFEST_DIR` is `tests-common/` here, whose parent is the
-    // workspace root — the same `<root>/prompts` a test crate would resolve.
-    let workspace_prompts = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root")
-        .join("prompts");
-    spec.env.push((
-        "KASTELLAN_PROMPTS_DIR".into(),
-        workspace_prompts.to_string_lossy().into_owned(),
-    ));
-
-    // LLM router → inert mock. The l3_run path never dials it, but the daemon
-    // needs a valid-looking config to construct its router at startup.
-    spec.env.push((
-        "KASTELLAN_LLM_LOCAL_URL".into(),
-        format!("{mock_base_url}/v1"),
-    ));
-    spec.env
-        .push(("KASTELLAN_LLM_LOCAL_MODEL".into(), "test-local-model".into()));
-    spec.env.push(("KASTELLAN_LLM_TIMEOUT_MS".into(), "5000".into()));
-
-    // Test-specific worker registration (the daemon's own registry — the
-    // operator CLI subprocess deliberately omits these; the #179 invariant).
-    spec.env.extend(extra_env);
+    let spec = daemon.service_spec(&core_binary(), &core_log_dir, &state_dir);
+    // Read back rather than re-derived: `service_spec` owns the naming, and
+    // a second `join(format!("{name}.out"))` here is exactly the kind of
+    // duplicated derivation that drifts.
+    let stdout_path = spec.stdout_log.clone().expect("service_spec sets stdout_log");
+    let stderr_path = spec.stderr_log.clone().expect("service_spec sets stderr_log");
 
     let sup = default_supervisor();
     let service_guard = ServiceGuard {
@@ -222,26 +191,18 @@ pub fn bring_up_daemon(
         panic!("core active: {e}{}", stderr_tail(&stderr_path));
     }
 
-    // **10s holds only because a test daemon never configures the guard
-    // tier.** `scheduler spawned` is logged AFTER
-    // `GuardTier::from_router_config`, which on a configured tier spends up
-    // to PROBE_BUDGET_MS on the fatal /props call plus
-    // PROBE_TOTAL_BUDGET_MS + PROBE_BUDGET_MS on the boot probe -- ~80s
-    // since #626 doubled the total, where it was ~40s before. Nothing here
-    // sets KASTELLAN_LLM_GUARD_*, and `core_service_spec` passes no
-    // environment files, so `from_router_config` returns `Ok(None)` before
-    // it opens a socket. A caller that DOES configure a guard must pin
-    // KASTELLAN_LLM_GUARD_TIMEOUT_MS (which routes around the probe) or
-    // raise this. Flagged by #637's review; `guard_boot_row_e2e` pins the
-    // timeout for exactly this reason and #634 plans to move it onto this
-    // helper.
+    // The readiness budget is the caller's — see
+    // [`DEFAULT_READY_TIMEOUT`]'s ⚠️ for why 10 s is not universal and
+    // what a configured guard tier does to it.
+    let ready = daemon.ready_timeout_value();
     if let Err(e) = wait_for_log_match(
         &stdout_path,
         |s| s.contains("scheduler spawned"),
-        Duration::from_secs(10),
+        ready,
     ) {
         panic!(
-            "daemon should log 'scheduler spawned' within 10s: {e}{}",
+            "daemon should log 'scheduler spawned' within {}s: {e}{}",
+            ready.as_secs(),
             stderr_tail(&stderr_path)
         );
     }
@@ -253,6 +214,46 @@ pub fn bring_up_daemon(
         },
         (service_guard, core_log_guard, state_guard),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Durable boot-row readback.
+// ---------------------------------------------------------------------------
+
+/// The stored `policy / guard_tier.boot` payload, as Postgres holds it.
+///
+/// Every booted daemon writes exactly one of these rows, so two e2es
+/// carried a character-for-character copy of this query until #634
+/// folded them together.
+///
+/// **Read back from the real table rather than from a sink double.**
+/// `db::audit::insert` applies `truncate_payload` on the way in, so a
+/// double asserts the payload that was *passed* rather than the one that
+/// was *stored* — a distinction that has cost this tree a guard score
+/// once already. It is live for the configured arm in a way it is not
+/// for the two-key unconfigured one: the configured payload is the
+/// larger of the two and the only one carrying a prose finding.
+///
+/// `fetch_all` plus an explicit length assertion rather than
+/// `fetch_one`, because `fetch_one` returns the FIRST row and errors
+/// only on zero — it does not reject duplicates, so uniqueness has to be
+/// asserted here to be asserted at all. `ORDER BY id` keeps the failure
+/// message deterministic rather than heap-ordered.
+pub async fn guard_tier_boot_payload(pool: &sqlx::PgPool) -> serde_json::Value {
+    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT payload FROM audit_log \
+         WHERE actor = 'policy' AND action = 'guard_tier.boot' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("select guard_tier.boot rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one guard_tier.boot row (one per daemon start); got {}",
+        rows.len()
+    );
+    rows.into_iter().next().expect("length asserted above").0
 }
 
 // ---------------------------------------------------------------------------

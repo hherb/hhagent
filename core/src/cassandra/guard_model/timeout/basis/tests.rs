@@ -123,7 +123,7 @@ fn the_two_pin_findings_are_distinct() {
     // And neither is the ceiling-CLAMP finding, which is about the host's
     // measured throughput rather than about a configured value.
     let clamped = TimeoutBasis::Probed {
-        tok_per_s: 100.0,
+        fastest_tok_per_s: 100.0,
         slowest_tok_per_s: 100.0,
         measured_samples: 3,
         attempted_samples: 3,
@@ -164,7 +164,7 @@ fn every_coverage_finding_reads_as_prose() {
         TimeoutBasis::Operator { band: PinBand::BelowFloor },
         TimeoutBasis::Operator { band: PinBand::AboveCeiling },
         TimeoutBasis::Probed {
-            tok_per_s: 100.0,
+            fastest_tok_per_s: 100.0,
             slowest_tok_per_s: 100.0,
             measured_samples: 3,
             attempted_samples: 3,
@@ -185,7 +185,7 @@ fn every_coverage_finding_reads_as_prose() {
     for b in [
         TimeoutBasis::Operator { band: PinBand::InBand },
         TimeoutBasis::Probed {
-            tok_per_s: 5_000.0,
+            fastest_tok_per_s: 5_000.0,
             slowest_tok_per_s: 5_000.0,
             measured_samples: 3,
             attempted_samples: 3,
@@ -193,7 +193,7 @@ fn every_coverage_finding_reads_as_prose() {
             clamped: Clamped::No,
         },
         TimeoutBasis::Probed {
-            tok_per_s: 9e9,
+            fastest_tok_per_s: 9e9,
             slowest_tok_per_s: 9e9,
             measured_samples: 3,
             attempted_samples: 3,
@@ -266,7 +266,7 @@ fn every_timeout_basis_token_is_distinct_and_log_shaped() {
         TimeoutBasis::Operator { band: PinBand::BelowFloor },
         TimeoutBasis::Operator { band: PinBand::AboveCeiling },
         TimeoutBasis::Probed {
-            tok_per_s: 5_000.0,
+            fastest_tok_per_s: 5_000.0,
             slowest_tok_per_s: 5_000.0,
             measured_samples: 3,
             attempted_samples: 3,

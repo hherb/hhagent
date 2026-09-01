@@ -229,7 +229,7 @@ pub fn derive_guard_timeout(summary: &ProbeSummary) -> GuardTimeout {
         ProbeOutcome::Measured { .. } => {
             // **The same function `summarise` used**, not a second copy
             // of the division. `TimeoutBasis::Probed` documents
-            // `slowest_tok_per_s == tok_per_s` when one sample measured,
+            // `slowest_tok_per_s == fastest_tok_per_s` when one sample measured,
             // and until #625's review that held only because two
             // expressions in two files happened to be textually
             // identical; editing either would have separated them by an
@@ -283,7 +283,7 @@ pub fn derive_guard_timeout(summary: &ProbeSummary) -> GuardTimeout {
             GuardTimeout {
                 timeout: Duration::from_millis(timeout_ms),
                 basis: TimeoutBasis::Probed {
-                    tok_per_s: fastest,
+                    fastest_tok_per_s: fastest,
                     slowest_tok_per_s,
                     measured_samples,
                     // A summary cannot have measured more samples than

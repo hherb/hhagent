@@ -33,9 +33,11 @@
 //!   L2-normalised seed vector used by the memory-recall tests.
 //! * [`env`] — `env_lock()` + `EnvVarGuard` for unit tests that mutate
 //!   process-wide environment variables (issue #127).
-//! * [`daemon`] — `MockLlm` + `spawn_inert_mock` + `bring_up_daemon` — the
-//!   real-`kastellan`-daemon-under-the-supervisor bring-up shared by the
-//!   `cli_memory_l3*_run_daemon_e2e` tests.
+//! * [`daemon`] — `MockLlm` + `spawn_inert_mock` + `DaemonSpec` +
+//!   `bring_up_daemon` — the real-`kastellan`-daemon-under-the-supervisor
+//!   bring-up shared by all six daemon e2es (`cli_memory_l3*_run_daemon_e2e`,
+//!   `mail_daemon_e2e`, `cli_ask_e2e`, `observation_capture`,
+//!   `guard_boot_row_e2e`; the last three were hand-rolled copies until #634).
 //! * [`scripted_llm`] — `ScriptedLlm` + `spawn_scripted_llm` + plan/embedding
 //!   envelope builders: the queued multi-shot mock LLM shared by the daemon
 //!   e2e tests that drive a scripted planner (lifted from `cli_ask_e2e.rs`).
@@ -84,8 +86,9 @@ pub use binaries::{
     workspace_target_binary,
 };
 pub use daemon::{
-    assert_cli_failure, assert_cli_success, bring_up_daemon, spawn_inert_mock, stderr_tail,
-    DaemonGuards, DaemonHandle, MockLlm,
+    assert_cli_failure, assert_cli_success, bring_up_daemon, guard_tier_boot_payload,
+    spawn_inert_mock, stderr_tail, DaemonGuards, DaemonHandle, DaemonSpec, LlmEndpoint, MockLlm,
+    COMPAT_SEGMENT,
 };
 pub use embedding::text_to_embedding;
 pub use env::{env_lock, EnvVarGuard};

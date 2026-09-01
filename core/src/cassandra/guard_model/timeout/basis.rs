@@ -169,7 +169,7 @@ pub enum TimeoutBasis {
     /// Derived from a boot probe that produced at least one real
     /// sample.
     ///
-    /// `tok_per_s` is the **fastest** of [`super::PROBE_SAMPLES`]
+    /// `fastest_tok_per_s` is the fastest of [`super::PROBE_SAMPLES`]
     /// samples, and `slowest_tok_per_s` the slowest of the ones that
     /// measured — together the contention spread (issue [#624]). Before
     /// the probe took more than one sample, a single figure here was not
@@ -188,7 +188,7 @@ pub enum TimeoutBasis {
     /// `boot_report::BootRates` together, so the two stay in step.)
     ///
     /// `measured_samples` is at least 1 whenever this variant exists,
-    /// and `slowest_tok_per_s == tok_per_s` when it is exactly 1 — one
+    /// and `slowest_tok_per_s == fastest_tok_per_s` when it is exactly 1 — one
     /// sample observed one rate, which is honest rather than a
     /// fabricated spread. **Both hold of a summary built by
     /// [`super::summarise`]; neither is enforced by this type**, whose
@@ -204,7 +204,28 @@ pub enum TimeoutBasis {
     ///
     /// [#624]: https://github.com/hherb/kastellan/issues/624
     Probed {
-        tok_per_s: f32,
+        /// The **fastest** measuring sample, which is the one that
+        /// measures the *host*: prompt processing has a hardware
+        /// ceiling and no floor, so contention can only ever make an
+        /// observation slower ([#624]'s D11).
+        ///
+        /// ⚠️ **Named for what it is; reported under the older name.**
+        /// The durable `policy / guard_tier.boot` key and `main.rs`'s
+        /// two tracing fields both stay `tok_per_s` — see
+        /// [`super::super::boot_report::boot_payload`] for why the wire
+        /// name is frozen. This field and
+        /// [`super::super::boot_report::BootRates::fastest_tok_per_s`]
+        /// were renamed together in
+        /// [#632](https://github.com/hherb/kastellan/issues/632),
+        /// because renaming one alone leaves
+        /// `fastest_tok_per_s: Some(*tok_per_s)` in `from_basis`, which
+        /// reads like a bug and invites a later session to "restore"
+        /// the old name.
+        fastest_tok_per_s: f32,
+        /// The **slowest** measuring sample. Equal to
+        /// `fastest_tok_per_s` when exactly one sample measured — one
+        /// sample observed one rate, which is honest rather than a
+        /// fabricated spread.
         slowest_tok_per_s: f32,
         measured_samples: u32,
         attempted_samples: u32,
@@ -215,7 +236,7 @@ pub enum TimeoutBasis {
     ///
     /// **A basis of its own, carrying no throughput and no derivation.**
     /// It used to be reported as `Probed`, which forced two fabrications:
-    /// a `tok_per_s` computed from [`MIN_UNCACHED_PROBE_TOKENS`] — a
+    /// a `fastest_tok_per_s` computed from [`MIN_UNCACHED_PROBE_TOKENS`] — a
     /// *sample-rejection floor*, not a count of anything this probe
     /// processed — and a `derived_ms` set to the post-clamp
     /// [`TIMEOUT_CEILING_MS`] while the `Probed` arm's `derived_ms` is

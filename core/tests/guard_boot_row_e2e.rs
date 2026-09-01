@@ -70,20 +70,18 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use kastellan_supervisor::specs::core_service_spec;
-use kastellan_supervisor::{default_supervisor, ServiceStatus};
 use kastellan_tests_common::scripted_llm::{
     props_envelope, spawn_scripted_llm, spawn_scripted_llm_with_props, ScriptedLlm,
 };
 #[cfg(target_os = "macos")]
 use kastellan_tests_common::serial_lock;
 use kastellan_tests_common::{
-    bring_up_pg_cluster, core_binary, current_username, pg_bin_dir_or_skip, skip_if_no_supervisor,
-    stderr_tail, unique_suffix, unique_temp_root, wait_for_log_match, wait_for_status, PathGuard,
-    PgCluster, ServiceGuard,
+    bring_up_daemon, bring_up_pg_cluster, core_binary, current_username,
+    guard_tier_boot_payload, pg_bin_dir_or_skip, skip_if_no_supervisor, stderr_tail,
+    unique_suffix, DaemonHandle, DaemonSpec, LlmEndpoint, PgCluster,
 };
 
 /// The operator's pinned per-request budget for the above-ceiling leg,
@@ -153,111 +151,50 @@ const MOCK_N_CTX: u64 = 131_072;
 /// from the value this test compares against.
 const TAU: f32 = 0.795_526_56;
 
-/// A booted daemon's log files, surfaced so assertion-failure messages
-/// can quote them.
-struct Daemon {
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
-}
-
-/// Install, start, and wait for a daemon wired to the two mock backends
-/// whose base URLs are passed in. The mocks themselves are spawned by
-/// the caller — this only points the daemon's config at them.
+/// The [`DaemonSpec`] for a daemon wired to the two mock backends whose
+/// base URLs are passed in. The mocks themselves are spawned by the
+/// caller — this only points the daemon's config at them.
 ///
-/// Returns the daemon's log paths plus the RAII guards whose drop order
-/// tears the service down before the directories it logs into.
+/// Was the third hand-rolled copy of `bring_up_daemon` until [#634]
+/// folded it onto the shared helper. Everything that made it a copy is
+/// now `extra_env` plus one setter:
 ///
-/// **This is the third hand-rolled copy of a bring-up that already exists
-/// as `kastellan_tests_common::bring_up_daemon`**, whose `extra_env`
-/// parameter would carry the four guard vars below unchanged. It is not
-/// migrated here only because doing so is [#634]'s whole content and
-/// wants its own reviewable diff; the two differences that migration has
-/// to absorb are this copy's 20-second log-match budget (the shared one
-/// hardcodes 10) and its `pinned_timeout_ms` argument.
+/// * the four `KASTELLAN_LLM_GUARD_*` vars, and
+/// * a **20-second** readiness budget against the shared default of 10.
+///   Not cosmetic: `report_guard_tier` runs during bring-up, before
+///   `scheduler spawned` is logged, so a configured tier adds its own
+///   work to the very wait being budgeted.
 ///
 /// [#634]: https://github.com/hherb/kastellan/issues/634
-fn bring_up_daemon(
+fn daemon_spec(
     suffix: &str,
     data_dir: &Path,
     planner_base_url: &str,
     guard_base_url: &str,
     user: &str,
     pinned_timeout_ms: u64,
-) -> (Daemon, (ServiceGuard, PathGuard, PathGuard)) {
-    let core_log_dir = unique_temp_root("gboot-clog");
-    std::fs::create_dir_all(&core_log_dir).expect("create core log dir");
-    let core_log_guard = PathGuard {
-        path: core_log_dir.clone(),
-    };
-
-    let state_dir = unique_temp_root("gboot-state");
-    let state_guard = PathGuard {
-        path: state_dir.clone(),
-    };
-
-    let binary = core_binary();
-    let mut spec = core_service_spec(&binary, &core_log_dir);
-    spec.name = format!("kastellan-supervisor-test-core-gboot-{suffix}");
-    assert!(spec.name.len() <= 200);
-    let stdout_path = core_log_dir.join(format!("{}.out", spec.name));
-    let stderr_path = core_log_dir.join(format!("{}.err", spec.name));
-    spec.stdout_log = Some(stdout_path.clone());
-    spec.stderr_log = Some(stderr_path.clone());
-
-    spec.env.push((
-        "KASTELLAN_DATA_DIR".into(),
-        data_dir.to_string_lossy().into_owned(),
-    ));
-    spec.env.push(("USER".into(), user.to_string()));
-    spec.env.push((
-        "KASTELLAN_STATE_DIR".into(),
-        state_dir.to_string_lossy().into_owned(),
-    ));
-
-    // The prompt loader fails closed if the dir is missing.
-    let workspace_prompts = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root")
-        .join("prompts");
-    spec.env.push((
-        "KASTELLAN_PROMPTS_DIR".into(),
-        workspace_prompts.to_string_lossy().into_owned(),
-    ));
-
-    // The planner backend. Nothing in this test drives a plan, but the
-    // router is constructed at boot and a missing local URL is a config
-    // error, so it has to point somewhere. `/v1` matches the on-wire
-    // OpenAI-compat shape `compose_url` produces.
-    spec.env.push((
-        "KASTELLAN_LLM_LOCAL_URL".into(),
-        format!("{planner_base_url}/v1"),
-    ));
-    spec.env.push((
-        "KASTELLAN_LLM_LOCAL_MODEL".into(),
-        "test-local-model".into(),
-    ));
-    spec.env.push(("KASTELLAN_LLM_TIMEOUT_MS".into(), "5000".into()));
-
+) -> DaemonSpec {
+    DaemonSpec::new(
+        "gboot",
+        suffix,
+        data_dir,
+        user,
+        // The planner backend. Nothing in this test drives a plan, but
+        // the router is constructed at boot and a missing local URL is a
+        // config error, so it has to point somewhere.
+        LlmEndpoint::Base(planner_base_url.to_string()),
+    )
+    .ready_timeout(Duration::from_secs(20))
     // The guard backend — a SEPARATE listener from the planner's, so the
     // two cannot consume each other's queues. `Router::props` strips the
     // `/v1` compat segment before appending `/props`, so the mock sees
     // `GET /props` at its root.
-    spec.env.push((
-        "KASTELLAN_LLM_GUARD_URL".into(),
-        format!("{guard_base_url}/v1"),
-    ));
-    spec.env.push((
-        "KASTELLAN_LLM_GUARD_MODEL".into(),
-        "test-guard-model".into(),
-    ));
-    spec.env.push(("KASTELLAN_LLM_GUARD_TAU".into(), TAU.to_string()));
+    .env("KASTELLAN_LLM_GUARD_URL", format!("{guard_base_url}/v1"))
+    .env("KASTELLAN_LLM_GUARD_MODEL", "test-guard-model")
+    .env("KASTELLAN_LLM_GUARD_TAU", TAU.to_string())
     // The key that makes this test deterministic: with a pin present,
     // `from_router_config` never runs the boot probe.
-    spec.env.push((
-        "KASTELLAN_LLM_GUARD_TIMEOUT_MS".into(),
-        pinned_timeout_ms.to_string(),
-    ));
-
+    .env("KASTELLAN_LLM_GUARD_TIMEOUT_MS", pinned_timeout_ms.to_string())
     // `KASTELLAN_SHELL_EXEC_BIN` is deliberately NOT set. No task is
     // dispatched here, so no worker is ever spawned; discovery falls
     // back to the `current_exe()`-relative sibling and simply does not
@@ -265,62 +202,6 @@ fn bring_up_daemon(
     // That is also why this file skips `skip_if_sandbox_unavailable` —
     // adding a skip the test does not need only makes it silently
     // not-run on more hosts.
-
-    let sup = default_supervisor();
-    let service_guard = ServiceGuard {
-        sup: default_supervisor(),
-        name: spec.name.clone(),
-    };
-    sup.install(&spec).expect("install core");
-    sup.start(&spec.name).expect("start core");
-
-    // Stderr here too, for the same reason as the log wait below: on
-    // launchd this is the first place a daemon that died before `main`
-    // surfaces, and the bare status text names only the last polled
-    // state.
-    if let Err(e) = wait_for_status(
-        sup.as_ref(),
-        &spec.name,
-        |s| s == ServiceStatus::Active,
-        Duration::from_secs(10),
-    ) {
-        panic!("core active: {e}{}", stderr_tail(&stderr_path));
-    }
-
-    // `report_guard_tier` runs during bring-up, well before the
-    // scheduler is spawned, and it `await`s the insert — so once this
-    // line appears the insert has already been ATTEMPTED. Not that it
-    // succeeded: `record` is deliberately non-fatal (an audit sink that
-    // cannot take the row must not stop the tier), so a failure is an
-    // `error!` in this same log plus an empty result below, not a race.
-    //
-    // Stderr goes into the failure message, and that is not decoration.
-    // Tracing writes to STDOUT (`tracing_subscriber::fmt`'s default
-    // writer), so a daemon that dies at the guard-tier step has already
-    // put its boot lines there — stdout is not empty, it just never says
-    // WHY. The reason propagates out of `main() -> Result<()>` and is
-    // printed by `Termination` to stderr, which is the half
-    // `wait_for_log_match`'s own timeout text ("full content was:")
-    // cannot quote. The first Mac run of this test cost a round of
-    // guessing to exactly that split.
-    if let Err(e) = wait_for_log_match(
-        &stdout_path,
-        |s| s.contains("scheduler spawned"),
-        Duration::from_secs(20),
-    ) {
-        panic!(
-            "daemon should log 'scheduler spawned' within 20s: {e}{}",
-            stderr_tail(&stderr_path)
-        );
-    }
-
-    (
-        Daemon {
-            stdout_path,
-            stderr_path,
-        },
-        (service_guard, core_log_guard, state_guard),
-    )
 }
 
 fn cluster_for(suffix: &str) -> PgCluster {
@@ -333,37 +214,6 @@ fn cluster_for(suffix: &str) -> PgCluster {
     )
 }
 
-/// The stored `policy / guard_tier.boot` payload, as Postgres holds it.
-///
-/// Read back from the real table rather than from a sink double:
-/// `db::audit::insert` applies `truncate_payload` on the way in, so a
-/// double asserts the payload that was *passed* rather than the one that
-/// was *stored*. That distinction is live for this arm in a way it is
-/// not for the two-key unconfigured one — the configured payload is the
-/// larger of the two and the only one carrying a prose finding.
-///
-/// `fetch_all` + an explicit length assertion rather than `fetch_one`,
-/// because `fetch_one` returns the FIRST row and errors only on zero: it
-/// does not reject duplicates, so uniqueness has to be asserted here to
-/// be asserted at all.
-async fn guard_tier_boot_payload(pool: &sqlx::PgPool) -> serde_json::Value {
-    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
-        "SELECT payload FROM audit_log \
-         WHERE actor = 'policy' AND action = 'guard_tier.boot' ORDER BY id",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("select guard_tier.boot rows");
-    assert_eq!(
-        rows.len(),
-        1,
-        "expected exactly one guard_tier.boot row (one per daemon start); got {}",
-        rows.len()
-    );
-    rows.into_iter().next().expect("length asserted above").0
-}
-
-
 /// Boot one configured daemon at `pin_ms`, assert everything true of
 /// **any** configured boot, then hand the stored row to `check` for the
 /// band-specific half.
@@ -374,7 +224,7 @@ async fn guard_tier_boot_payload(pool: &sqlx::PgPool) -> serde_json::Value {
 /// hand-rolled copy of them is how one leg quietly stops checking
 /// something the other still does — the same argument #634 makes one
 /// level up about `bring_up_daemon` itself.
-fn with_configured_boot(pin_ms: u64, check: impl FnOnce(&serde_json::Value, &Daemon)) {
+fn with_configured_boot(pin_ms: u64, check: impl FnOnce(&serde_json::Value, &DaemonHandle)) {
     #[cfg(target_os = "macos")]
     let _serial = serial_lock();
 
@@ -445,14 +295,14 @@ fn with_configured_boot(pin_ms: u64, check: impl FnOnce(&serde_json::Value, &Dae
         .expect("probe run");
     });
 
-    let (daemon, _daemon_guards) = bring_up_daemon(
+    let (daemon, _daemon_guards) = bring_up_daemon(&daemon_spec(
         &suffix,
         &cluster.data_dir,
         &planner.base_url,
         &guard.base_url,
         &user,
         pin_ms,
-    );
+    ));
 
     // ---- what the two mocks saw ------------------------------------------
     //

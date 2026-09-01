@@ -38,13 +38,10 @@ use kastellan_core::observation::capture::{
     parse_fixture_prompt, slug_model, write_capture_to_dir, CaptureJson, SCHEMA_VERSION,
 };
 use kastellan_db::{conn::ConnectSpec, pool::connect_runtime_pool};
-use kastellan_supervisor::specs::core_service_spec;
-use kastellan_supervisor::{default_supervisor, ServiceStatus};
 use kastellan_tests_common::{
-    bring_up_pg_cluster, cli_binary, core_binary, current_username, pg_bin_dir_or_skip,
-    seed_tool_allowlist, shell_exec_worker_binary, skip_if_no_supervisor,
-    skip_if_sandbox_unavailable, unique_suffix, unique_temp_root, wait_for_log_match,
-    wait_for_status, PathGuard, PgCluster, ServiceGuard,
+    bring_up_daemon, bring_up_pg_cluster, cli_binary, current_username,
+    pg_bin_dir_or_skip, seed_tool_allowlist, shell_exec_worker_binary, skip_if_no_supervisor,
+    skip_if_sandbox_unavailable, unique_suffix, DaemonSpec, LlmEndpoint, PgCluster,
 };
 #[cfg(target_os = "macos")]
 use kastellan_tests_common::serial_lock;
@@ -224,115 +221,52 @@ fn check_llm_reachable(base_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-struct DaemonHandles {
-    _service: ServiceGuard,
-    _core_log: PathGuard,
-    _state: PathGuard,
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
-}
-
-fn bring_up_daemon(
+/// The [`DaemonSpec`] this capture run boots from.
+///
+/// Was a hand-rolled copy of `bring_up_daemon` until [#634] folded it
+/// onto the shared helper. Three things made it a copy, and each is now
+/// a setter:
+///
+/// * **`LlmEndpoint::from_operator_url`.** `llm_url` comes from the
+///   operator's `KASTELLAN_LLM_LOCAL_URL`, which this file documents as
+///   a *complete* OpenAI-compat endpoint (`http://127.0.0.1:8000/v1`).
+///   The shared helper's other callers own a bare `host:port` and want
+///   `/v1` appended; doing that here would dial `/v1/v1`. Since the
+///   value is the operator's rather than ours, it is classified rather
+///   than asserted — an operator who exports the bare base gets the
+///   endpoint they meant instead of a 404 that names nothing.
+/// * a real model rather than `DEFAULT_LLM_MODEL`, and an
+///   operator-tunable LLM timeout — this run drives a real LLM.
+/// * a **15-second** readiness budget against the shared default of 10.
+///
+/// [#634]: https://github.com/hherb/kastellan/issues/634
+fn daemon_spec(
     suffix: &str,
     data_dir: &Path,
-    llm_base_url: &str,
+    llm_url: &str,
     llm_model: &str,
     user: &str,
-) -> DaemonHandles {
-    let core_log_dir = unique_temp_root("obs-clog");
-    std::fs::create_dir_all(&core_log_dir).expect("create core log dir");
-    let core_log = PathGuard {
-        path: core_log_dir.clone(),
-    };
-
-    let state_dir = unique_temp_root("obs-state");
-    let state_guard = PathGuard {
-        path: state_dir.clone(),
-    };
-
-    let binary = core_binary();
-    let mut spec = core_service_spec(&binary, &core_log_dir);
-    spec.name = format!("kastellan-supervisor-test-core-obs-{suffix}");
-    assert!(spec.name.len() <= 200);
-    let stdout_path = core_log_dir.join(format!("{}.out", spec.name));
-    let stderr_path = core_log_dir.join(format!("{}.err", spec.name));
-    spec.stdout_log = Some(stdout_path.clone());
-    spec.stderr_log = Some(stderr_path.clone());
-
-    spec.env.push((
-        "KASTELLAN_DATA_DIR".into(),
-        data_dir.to_string_lossy().into_owned(),
-    ));
-    spec.env.push(("USER".into(), user.to_string()));
-    spec.env.push((
-        "KASTELLAN_STATE_DIR".into(),
-        state_dir.to_string_lossy().into_owned(),
-    ));
-
-    let workspace_prompts = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root")
-        .join("prompts");
-    spec.env.push((
-        "KASTELLAN_PROMPTS_DIR".into(),
-        workspace_prompts.to_string_lossy().into_owned(),
-    ));
-
-    spec.env.push((
-        "KASTELLAN_LLM_LOCAL_URL".into(),
-        llm_base_url.to_string(),
-    ));
-    spec.env.push((
-        "KASTELLAN_LLM_LOCAL_MODEL".into(),
-        llm_model.to_string(),
-    ));
-    spec.env.push(("KASTELLAN_LLM_TIMEOUT_MS".into(), llm_timeout_ms_string()));
-
-    spec.env.push((
-        "KASTELLAN_SHELL_EXEC_BIN".into(),
+) -> DaemonSpec {
+    DaemonSpec::new(
+        "obs",
+        suffix,
+        data_dir,
+        user,
+        LlmEndpoint::from_operator_url(llm_url),
+    )
+    .llm_model(llm_model)
+    .llm_timeout_ms(llm_timeout_ms_string())
+    .ready_timeout(Duration::from_secs(15))
+    // Allowlist is sourced from the `tool_allowlists` table (migration
+    // 0009). The orchestrator seeds the four argv0 paths (echo/date/ls/
+    // cat — read-only) for its OS via `seed_tool_allowlist` immediately
+    // after pool connect, before the fast-fail assertion.
+    // `KASTELLAN_SHELL_EXEC_ALLOWLIST` is no longer honoured (a
+    // deprecation WARN logs once on bring-up).
+    .env(
+        "KASTELLAN_SHELL_EXEC_BIN",
         shell_exec_worker_binary().to_string_lossy().into_owned(),
-    ));
-    // Allowlist is now sourced from the `tool_allowlists` table (see
-    // migration 0009). The orchestrator seeds the four argv0 paths
-    // (echo/date/ls/cat — read-only) for its OS via
-    // `seed_tool_allowlist` immediately after pool connect, before the
-    // fast-fail assertion (which exists as defence-in-depth in case a
-    // future refactor breaks the seeding path). KASTELLAN_SHELL_EXEC_ALLOWLIST
-    // env is no longer honored (deprecation WARN logs once on bring-up).
-    // Operators do not need to run `kastellan-cli tools allowlist add`
-    // manually — the per-test PG cluster is ephemeral; only the
-    // orchestrator can reach it.
-
-    let sup = default_supervisor();
-    let service = ServiceGuard {
-        sup: default_supervisor(),
-        name: spec.name.clone(),
-    };
-    sup.install(&spec).expect("install core");
-    sup.start(&spec.name).expect("start core");
-
-    wait_for_status(
-        sup.as_ref(),
-        &spec.name,
-        |s| s == ServiceStatus::Active,
-        Duration::from_secs(10),
     )
-    .expect("core active");
-
-    wait_for_log_match(
-        &stdout_path,
-        |s| s.contains("scheduler spawned"),
-        Duration::from_secs(15),
-    )
-    .expect("daemon should log 'scheduler spawned' within 15s");
-
-    DaemonHandles {
-        _service: service,
-        _core_log: core_log,
-        _state: state_guard,
-        stdout_path,
-        stderr_path,
-    }
 }
 
 /// Diagnostic dump of the daemon's stdout/stderr log files to the test's
@@ -530,7 +464,7 @@ async fn capture_all_fixtures_against_live_llm() {
     // starts. `build_tool_registry` reads the allowlist once at startup
     // and caches it; seeding after `bring_up_daemon` would leave the
     // daemon with an empty allowlist and all shell-exec calls would
-    // POLICY_DENIED. Same pattern `cli_ask_e2e.rs::bring_up_daemon` uses:
+    // POLICY_DENIED. Same pattern `cli_ask_e2e.rs`'s daemon tests use:
     // run probe → connect seed_pool → seed → drop seed_pool → start daemon.
     //
     // The probe is required before the seed because the `tool_allowlists`
@@ -557,7 +491,13 @@ async fn capture_all_fixtures_against_live_llm() {
         .expect("seed shell-exec allowlist for observation cluster");
     } // seed_pool dropped here, freeing the connection before daemon start
 
-    let _daemon = bring_up_daemon(&suffix, &cluster.data_dir, &llm_base_url, &llm_model, &user);
+    let (daemon, _daemon_guards) = bring_up_daemon(&daemon_spec(
+        &suffix,
+        &cluster.data_dir,
+        &llm_base_url,
+        &llm_model,
+        &user,
+    ));
 
     let spec = ConnectSpec::default_for(&cluster.data_dir).expect("spec");
     let pool = connect_runtime_pool(&spec).await.expect("pool");
@@ -652,11 +592,11 @@ async fn capture_all_fixtures_against_live_llm() {
     // way it did when the audit-log slice doesn't tell the whole story
     // (e.g. plan_iterations=0 / total_llm_calls=0 — the daemon's tracing
     // output is the only evidence of what failed in formulate_plan).
-    dump_daemon_log("stdout", &_daemon.stdout_path);
-    dump_daemon_log("stderr", &_daemon.stderr_path);
+    dump_daemon_log("stdout", &daemon.stdout_path);
+    dump_daemon_log("stderr", &daemon.stderr_path);
 
     // Teardown is intentionally LEFT to scope-end RAII so the daemon
-    // (_daemon, declared before `pool`) drops AFTER pool but BEFORE
+    // (_daemon_guards, declared before `pool`) drops AFTER pool but BEFORE
     // cluster — the correct order: daemon stops while PG is still alive,
     // then PG tears down. Explicit `drop(pool); drop(cluster);` would
     // tear PG down first and force the daemon to shut down against a

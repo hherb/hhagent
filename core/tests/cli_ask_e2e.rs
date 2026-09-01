@@ -16,17 +16,14 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
 
-use kastellan_supervisor::specs::core_service_spec;
-use kastellan_supervisor::{default_supervisor, ServiceStatus};
 use kastellan_tests_common::{
-    bring_up_pg_cluster, cli_binary, core_binary, current_username, pg_bin_dir_or_skip,
-    seed_tool_allowlist, shell_exec_worker_binary, skip_if_no_supervisor,
-    skip_if_sandbox_unavailable, unique_suffix, unique_temp_root, wait_for_log_match,
-    wait_for_status, PathGuard, PgCluster, ServiceGuard,
+    bring_up_daemon, bring_up_pg_cluster, cli_binary, core_binary, current_username,
+    guard_tier_boot_payload, pg_bin_dir_or_skip, seed_tool_allowlist, shell_exec_worker_binary,
+    skip_if_no_supervisor, skip_if_sandbox_unavailable, unique_suffix, DaemonSpec, LlmEndpoint,
+    PgCluster,
 };
 #[cfg(target_os = "macos")]
 use kastellan_tests_common::serial_lock;
@@ -65,118 +62,37 @@ fn skip_if_any_binary_missing() -> bool {
 // PG cluster + mock LLM + workspace prompts + per-test allowlist.
 // ---------------------------------------------------------------------------
 
-/// Returned by [`bring_up_daemon`]. Surfaces the daemon's stdout/stderr
-/// log files in test-failure messages so a flaky run shows what the
-/// daemon was doing without a re-run.
-struct Daemon {
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
-}
-
-fn bring_up_daemon(
-    suffix: &str,
-    data_dir: &Path,
-    mock_base_url: &str,
-    user: &str,
-) -> (Daemon, (ServiceGuard, PathGuard, PathGuard)) {
-    let core_log_dir = unique_temp_root("cli-clog");
-    std::fs::create_dir_all(&core_log_dir).expect("create core log dir");
-    let core_log_guard = PathGuard {
-        path: core_log_dir.clone(),
-    };
-
-    let state_dir = unique_temp_root("cli-state");
-    let state_guard = PathGuard {
-        path: state_dir.clone(),
-    };
-
-    let binary = core_binary();
-    let mut spec = core_service_spec(&binary, &core_log_dir);
-    spec.name = format!("kastellan-supervisor-test-core-cliask-{suffix}");
-    assert!(spec.name.len() <= 200);
-    let stdout_path = core_log_dir.join(format!("{}.out", spec.name));
-    let stderr_path = core_log_dir.join(format!("{}.err", spec.name));
-    spec.stdout_log = Some(stdout_path.clone());
-    spec.stderr_log = Some(stderr_path.clone());
-
-    // Required env — see the spec doc for why each one is needed.
-    spec.env.push((
-        "KASTELLAN_DATA_DIR".into(),
-        data_dir.to_string_lossy().into_owned(),
-    ));
-    spec.env.push(("USER".into(), user.to_string()));
-    spec.env.push((
-        "KASTELLAN_STATE_DIR".into(),
-        state_dir.to_string_lossy().into_owned(),
-    ));
-
-    // Prompts: the daemon's prompt loader fails closed if the dir is
-    // missing. Point at the in-tree `prompts/` (read-only access).
-    let workspace_prompts = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root")
-        .join("prompts");
-    spec.env.push((
-        "KASTELLAN_PROMPTS_DIR".into(),
-        workspace_prompts.to_string_lossy().into_owned(),
-    ));
-
-    // LLM router → mock. The router's `compose_url` appends
-    // `/chat/completions` to the base. Use `<mock>/v1` so the on-wire
-    // URL matches the production OpenAI-compat shape.
-    spec.env.push((
-        "KASTELLAN_LLM_LOCAL_URL".into(),
-        format!("{mock_base_url}/v1"),
-    ));
-    spec.env.push((
-        "KASTELLAN_LLM_LOCAL_MODEL".into(),
-        "test-local-model".into(),
-    ));
-    // 5 s is loose enough for slow CI runners — the mock responds
-    // synchronously on accept, so on a healthy host this is sub-ms.
-    spec.env.push(("KASTELLAN_LLM_TIMEOUT_MS".into(), "5000".into()));
-
-    // Tool registry: register shell-exec. The argv allowlist is now
-    // loaded from the DB at daemon start — see build_tool_registry.
-    // Tests seed the allowlist via seed_tool_allowlist() before
-    // calling bring_up_daemon so the daemon sees the correct entries.
-    spec.env.push((
-        "KASTELLAN_SHELL_EXEC_BIN".into(),
+/// The [`DaemonSpec`] this file's daemons boot from.
+///
+/// Was a hand-rolled copy of `bring_up_daemon` until [#634] folded it
+/// onto the shared helper — and **nothing** made it a copy. Its one
+/// apparent divergence, the `KASTELLAN_SHELL_EXEC_BIN` registration
+/// below, is exactly what the old `extra_env` parameter already carried
+/// for `cli_memory_l3_run_daemon_e2e`; this was duplication for no
+/// reason, which is what made it the cheapest of the three to fold.
+///
+/// It still cost something. The migration picked up [#635]'s
+/// stderr-on-failure fix, which the shared helper had and this copy did
+/// not — both of its waits used a bare `.expect`, so a daemon that died
+/// before `main` reported only the last polled status.
+///
+/// The argv allowlist is loaded from the DB at daemon start (see
+/// `build_tool_registry`); tests seed it via `seed_tool_allowlist()`
+/// before bringing the daemon up.
+///
+/// [#634]: https://github.com/hherb/kastellan/issues/634
+/// [#635]: https://github.com/hherb/kastellan/pull/635
+fn daemon_spec(suffix: &str, data_dir: &Path, mock_base_url: &str, user: &str) -> DaemonSpec {
+    DaemonSpec::new(
+        "cliask",
+        suffix,
+        data_dir,
+        user,
+        LlmEndpoint::Base(mock_base_url.to_string()),
+    )
+    .env(
+        "KASTELLAN_SHELL_EXEC_BIN",
         shell_exec_worker_binary().to_string_lossy().into_owned(),
-    ));
-
-    let sup = default_supervisor();
-    let service_guard = ServiceGuard {
-        sup: default_supervisor(),
-        name: spec.name.clone(),
-    };
-    sup.install(&spec).expect("install core");
-    sup.start(&spec.name).expect("start core");
-
-    wait_for_status(
-        sup.as_ref(),
-        &spec.name,
-        |s| s == ServiceStatus::Active,
-        Duration::from_secs(10),
-    )
-    .expect("core active");
-
-    // Wait for the database probe to log success — that's our cue
-    // that the daemon has finished bring-up and is ready to claim
-    // tasks.
-    wait_for_log_match(
-        &stdout_path,
-        |s| s.contains("scheduler spawned"),
-        Duration::from_secs(10),
-    )
-    .expect("daemon should log 'scheduler spawned' within 10s");
-
-    (
-        Daemon {
-            stdout_path,
-            stderr_path,
-        },
-        (service_guard, core_log_guard, state_guard),
     )
 }
 
@@ -214,39 +130,6 @@ async fn audit_multiset(pool: &sqlx::PgPool) -> HashMap<(String, String), usize>
         *m.entry(r).or_insert(0_usize) += 1;
     }
     m
-}
-
-/// The stored `policy / guard_tier.boot` payload, as Postgres holds it.
-///
-/// Read back from the real table rather than from a sink double, so this
-/// is the payload the daemon actually persisted — `db::audit::insert`
-/// applies `truncate_payload` on the way in, and a double would assert
-/// the row that was PASSED rather than the row that was STORED. (That
-/// transform is inert for the two-key unconfigured payload this
-/// currently reads; the reasoning is right for the class of assertion,
-/// and reading from the table is what makes it stay right if the payload
-/// ever grows.)
-///
-/// `fetch_all` rather than `fetch_one` because `fetch_one` returns the
-/// FIRST row and errors only on zero — it does not reject duplicates —
-/// so the uniqueness has to be asserted here to be asserted at all.
-/// `ORDER BY id` keeps the failure message deterministic rather than
-/// heap-ordered.
-async fn guard_tier_boot_payload(pool: &sqlx::PgPool) -> serde_json::Value {
-    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
-        "SELECT payload FROM audit_log \
-         WHERE actor = 'policy' AND action = 'guard_tier.boot' ORDER BY id",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("select guard_tier.boot rows");
-    assert_eq!(
-        rows.len(),
-        1,
-        "expected exactly one guard_tier.boot row (one per daemon start); got {}",
-        rows.len()
-    );
-    rows.into_iter().next().expect("length asserted above").0
 }
 
 /// Build the per-test PG cluster + return the handle (with the
@@ -341,7 +224,7 @@ fn ask_subprocess_completes_planned_task_end_to_end() {
     });
 
     let (daemon, _daemon_guards) =
-        bring_up_daemon(&suffix, &cluster.data_dir, &mock.base_url, &user);
+        bring_up_daemon(&daemon_spec(&suffix, &cluster.data_dir, &mock.base_url, &user));
 
     // ---------- Spawn the real CLI subprocess ----------
     let output = Command::new(cli_binary())
@@ -660,7 +543,7 @@ fn ask_subprocess_fails_after_plan_iteration_cap() {
     });
 
     let (daemon, _daemon_guards) =
-        bring_up_daemon(&suffix, &cluster.data_dir, &mock.base_url, &user);
+        bring_up_daemon(&daemon_spec(&suffix, &cluster.data_dir, &mock.base_url, &user));
 
     let output = Command::new(cli_binary())
         .arg("ask")

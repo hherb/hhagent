@@ -35,7 +35,7 @@ use kastellan_tests_common::{
     assert_cli_failure, assert_cli_success, bring_up_daemon, bring_up_pg_cluster, cli_binary,
     cli_command, core_binary, current_username, pg_bin_dir_or_skip, skip_if_no_supervisor,
     skip_if_sandbox_unavailable, spawn_inert_mock, unique_suffix, workspace_target_binary,
-    DaemonGuards, DaemonHandle, MockLlm, PgCluster,
+    DaemonGuards, DaemonHandle, DaemonSpec, LlmEndpoint, MockLlm, PgCluster,
 };
 #[cfg(target_os = "macos")]
 use kastellan_tests_common::serial_lock;
@@ -257,12 +257,14 @@ async fn setup_with_env(
 
     let mock = spawn_inert_mock().await;
     let (daemon, guards) = bring_up_daemon(
-        "l3pyrun",
-        &suffix,
-        &cluster.data_dir,
-        &mock.base_url,
-        &user,
-        env,
+        &DaemonSpec::new(
+            "l3pyrun",
+            &suffix,
+            &cluster.data_dir,
+            &user,
+            LlmEndpoint::Base(mock.base_url.clone()),
+        )
+        .envs(env),
     );
 
     Some(Fixture {

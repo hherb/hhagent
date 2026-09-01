@@ -20,7 +20,9 @@
 
 use std::process::Command;
 
-use kastellan_tests_common::daemon::{bring_up_daemon, DaemonGuards, DaemonHandle};
+use kastellan_tests_common::daemon::{
+    bring_up_daemon, DaemonGuards, DaemonHandle, DaemonSpec, LlmEndpoint,
+};
 use kastellan_tests_common::mock_localmail::{spawn_mock_localmail, MockLocalmail};
 use kastellan_tests_common::scripted_llm::{
     embedding_envelope, envelope_for, plan_json, spawn_scripted_llm,
@@ -73,14 +75,16 @@ struct MailDaemon {
 
 /// Bring up the per-test PG cluster + a plain-HTTP mock localmail + the real
 /// daemon with the mail worker registered (endpoint = mock, 0600 token file,
-/// binary path) and force-routing OFF. `llm_base_url` is the OpenAI-compatible
-/// endpoint the daemon's router dials (`bring_up_daemon` appends `/v1`);
-/// `model_override` replaces the harness default `test-local-model` when `Some`.
+/// binary path) and force-routing OFF. `llm` is the endpoint the daemon's
+/// router dials — `Base` for the mock, which owns a bare `host:port`, and
+/// `from_operator_url` for the live-LLM leg, whose URL comes from an
+/// operator env var that may or may not already carry `/v1`.
+/// `model_override` replaces `DEFAULT_LLM_MODEL` when `Some`.
 fn bring_up_mail_daemon(
     rt: &tokio::runtime::Runtime,
     suffix: &str,
     user: &str,
-    llm_base_url: &str,
+    llm: LlmEndpoint,
     model_override: Option<&str>,
 ) -> MailDaemon {
     let cluster = bring_up_pg_cluster(
@@ -116,25 +120,31 @@ fn bring_up_mail_daemon(
             .expect("chmod token 0600");
     }
 
-    let mut extra_env = vec![
+    let extra_env = vec![
         ("KASTELLAN_MAIL_ENDPOINT".to_string(), mock_mail.base_url.clone()),
         ("KASTELLAN_MAIL_TOKEN_FILE".to_string(), token_file.to_string_lossy().into_owned()),
         (
             "KASTELLAN_MAIL_BIN".to_string(),
             workspace_target_binary("kastellan-worker-mail").to_string_lossy().into_owned(),
         ),
-        ("KASTELLAN_EGRESS_FORCE_ROUTING".to_string(), "0".to_string()),
     ];
-    // Override the harness's hard-coded `test-local-model` for a live LLM.
-    // `bring_up_daemon` pushes the default first, then extends with extra_env, so
-    // this later entry wins when the supervisor materialises the process env.
-    if let Some(model) = model_override {
-        extra_env.push(("KASTELLAN_LLM_LOCAL_MODEL".to_string(), model.to_string()));
-    }
 
-    // bring_up_daemon sets KASTELLAN_DATA_DIR from the cluster's data_dir.
-    let (daemon, guards) =
-        bring_up_daemon("maild", suffix, &cluster.data_dir, llm_base_url, user, extra_env);
+    // `DaemonSpec` sets KASTELLAN_DATA_DIR from the cluster's data_dir.
+    // Force routing OFF through the named setter rather than an `env`
+    // entry: it is a containment control, and `grep force_routing` should
+    // find every test that opts out. The mock localmail origin is plain
+    // HTTP on loopback, which the proxy's webpki-only MITM upstream cannot
+    // reach.
+    let mut spec = DaemonSpec::new("maild", suffix, &cluster.data_dir, user, llm)
+        .force_routing(false)
+        .envs(extra_env);
+    // The live-LLM leg needs a real model in place of `DEFAULT_LLM_MODEL`.
+    // Before #634 this went through `extra_env`'s later-wins ordering; the
+    // setter says the same thing without depending on it.
+    if let Some(model) = model_override {
+        spec = spec.llm_model(model);
+    }
+    let (daemon, guards) = bring_up_daemon(&spec);
 
     MailDaemon {
         cluster,
@@ -214,7 +224,13 @@ fn daemon_planner_dispatches_mail_search_end_to_end() {
         ],
     ));
 
-    let fixture = bring_up_mail_daemon(&rt, &suffix, &user, &scripted.base_url, None);
+    let fixture = bring_up_mail_daemon(
+        &rt,
+        &suffix,
+        &user,
+        LlmEndpoint::Base(scripted.base_url.clone()),
+        None,
+    );
     let output = cli_ask(&fixture, &user, "find my latest invoice email");
     assert_cli_ok(&fixture, &output);
 
@@ -258,14 +274,25 @@ fn daemon_planner_dispatches_mail_search_end_to_end() {
 #[ignore = "needs a real local LLM (KASTELLAN_MAIL_LIVE_LLM_URL); non-deterministic"]
 fn live_llm_selects_mail_unprompted() {
     let Ok(llm_url) = std::env::var("KASTELLAN_MAIL_LIVE_LLM_URL") else {
-        eprintln!("\n[SKIP] set KASTELLAN_MAIL_LIVE_LLM_URL to a local OpenAI-compatible endpoint\n");
+        eprintln!(
+            "\n[SKIP] set KASTELLAN_MAIL_LIVE_LLM_URL to a local OpenAI-compatible \
+             endpoint (with or without a trailing /v1)\n"
+        );
         return;
     };
     if skip_prereqs() {
         return;
     }
-    // bring_up_daemon appends /v1; strip a trailing /v1 the operator may include.
-    let base = llm_url.strip_suffix("/v1").unwrap_or(&llm_url).to_string();
+    // `KASTELLAN_MAIL_LIVE_LLM_URL` has accepted BOTH shapes since this
+    // test was written: pre-#634 it stripped a trailing `/v1` and let the
+    // helper append one, so `http://127.0.0.1:11434` and
+    // `http://127.0.0.1:11434/v1` both reached the daemon as `.../v1`. A
+    // bare `Verbatim` here would have silently dropped the first — and the
+    // bare form is the one this tree's own installer calls canonical
+    // (`OLLAMA_LLM_URL`), so it is what an operator is likeliest to export.
+    // `from_operator_url` keeps that tolerance somewhere a `tests-common`
+    // unit test can reach it, which matters because this test is
+    // `#[ignore]`d and runs on no PR and no DGX sweep.
     let model = std::env::var("KASTELLAN_MAIL_LIVE_LLM_MODEL")
         .unwrap_or_else(|_| "gemma3".to_string());
 
@@ -277,7 +304,13 @@ fn live_llm_selects_mail_unprompted() {
         .build()
         .expect("build multi-threaded tokio runtime");
 
-    let fixture = bring_up_mail_daemon(&rt, &suffix, &user, &base, Some(&model));
+    let fixture = bring_up_mail_daemon(
+        &rt,
+        &suffix,
+        &user,
+        LlmEndpoint::from_operator_url(llm_url),
+        Some(&model),
+    );
     let output = cli_ask(
         &fixture,
         &user,
