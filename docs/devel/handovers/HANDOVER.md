@@ -14,18 +14,33 @@ sample's, so a cold model no longer ends the probe at one measurement), on top o
 ([#636](https://github.com/hherb/kastellan/pull/636), the #635 DGX-gate write-up), `d3f8ed3f`
 ([#635](https://github.com/hherb/kastellan/pull/635), the #633 fix) and `8040ca83`
 ([#631](https://github.com/hherb/kastellan/pull/631), #627). ·
-**OPEN BRANCH: `fix/632-fastest-tok-per-s-rename`** — two commits, two independent issues:
+**OPEN BRANCH: `fix/632-fastest-tok-per-s-rename`** ([PR #640](https://github.com/hherb/kastellan/pull/640))
+— two code commits plus a review-fix wave, two independent issues:
 [#632](https://github.com/hherb/kastellan/issues/632) (the `tok_per_s` → `fastest_tok_per_s` rename,
 reporting vocabulary deliberately frozen) and
 [#634](https://github.com/hherb/kastellan/issues/634) (the three hand-rolled `bring_up_daemon`
-copies migrated onto `tests-common`, +11 CI-visible unit tests). ·
-**Last gate: DGX at `06ea613d` (the branch tip, #632 + #634) — 3921 / 0 / 55, 176 suites,
+copies migrated onto `tests-common`, **+17** CI-visible unit tests). ·
+**Last gate: DGX over the tree now at `553ec6ff` (#632 + #634) — 3921 / 0 / 55, 176 suites,
 `TEST_EXIT=0`; see [Test baseline](#test-baseline-authoritative).** Reconciles exactly: **3910 + 11**,
 the eleven new `tests-common` unit tests, each grepped out of the log as `ok` rather than subtracted.
 8 `[SKIP]`, all gliner-relex — *not* the bwrap-userns skip, so containment really ran. Both hosts on
 rustc **1.98.0** (CI parity, re-checked this session on both). **#632 was gated separately first**
-(`6d61f4e8`, 3910 / 0 / 55 — byte-identical to the `8d92c02b` baseline, which is what a correct pure
-rename looks like), so the two issues' evidence is separable rather than pooled.
+(over the tree now at `6764d272`, 3910 / 0 / 55 — byte-identical to the `8d92c02b` baseline, which is
+what a correct pure rename looks like), so the two issues' evidence is separable rather than pooled.
+
+> ⚠️ **The DGX gate PREDATES the review-fix wave and does not cover the branch tip.** It stands for
+> the tree at `553ec6ff`; the `/fixall` commit after it changes `tests-common` and three `core/tests`
+> files, so **a DGX re-gate is required before merge** — that is the next session's first action.
+> What is verified on the Mac at the tip: `clippy -p kastellan-tests-common -p kastellan-core
+> --all-targets -D warnings` exit 0 (which compiles all six migrated e2es) and
+> `kastellan-tests-common --lib` **116 / 0**.
+
+> ⚠️ **The gates ran on pre-rewrite commits (`06ea613d`, `6d61f4e8`) that history rewriting has since
+> made unreachable — they will not resolve in a fresh clone.** They are cited above by the commits
+> that replaced them, which is honest because `git diff 06ea613d 553ec6ff` and
+> `git diff 6d61f4e8 6764d272` each touch **only** `HANDOVER.md` + `ROADMAP.md`: zero source lines
+> differ, so the gated trees and the pushed ones are source-identical. Cite a hash a later session
+> can actually check, or say which tree it stood for.
 
 > ⚠️ **The Mac cannot currently run ANY daemon e2e, and it is a macOS host condition — not this
 > branch, and not kastellan.** `guard_boot_row_e2e` failed with **both** daemon logs empty; so does
@@ -53,7 +68,7 @@ rename looks like), so the two issues' evidence is separable rather than pooled.
 
 ### #632 + #634 — DONE on `fix/632-fastest-tok-per-s-rename`
 
-Two independent issues, one branch, two commits — the rename is a `core` change and the harness
+Two independent issues, one branch, two code commits — the rename is a `core` change and the harness
 migration is a `tests-common` one, so they share no file.
 
 **#632 — `tok_per_s` → `fastest_tok_per_s`, in `BootRates` *and* `TimeoutBasis::Probed`.** Both
@@ -92,12 +107,32 @@ moved together because renaming one alone leaves `fastest_tok_per_s: Some(*tok_p
     and documented as already carrying `/v1` (`http://127.0.0.1:8000/v1`), so the shared helper's
     unconditional append would have dialled `/v1/v1`. **This is the one migration hazard that
     fails silently** — that test drives a real LLM, so it would have surfaced as an unreachable
-    backend naming nothing. Now unrepresentable: `LlmEndpoint::{Base, Verbatim}` are distinct types
-    at every call site, and `mail_daemon_e2e`'s `strip_suffix("/v1")` workaround was deleted with
-    it.
-- **11 new `tests-common` unit tests, 15 mutants, all killed** — each by the test written for it.
+    backend naming nothing.
+  - ⚠️ **The first fix for that was itself a regression, and the PR review caught it.** Making
+    `LlmEndpoint::{Base, Verbatim}` distinct types let `mail_daemon_e2e` delete a
+    `strip_suffix("/v1")` and pass `Verbatim` — but that `strip_suffix`, paired with the helper's
+    append, had *normalised*: it accepted `http://h:11434` **and** `http://h:11434/v1` and sent
+    both as `.../v1`. A bare `Verbatim` accepts only the second, and the bare form is what this
+    tree's own installer calls canonical (`OLLAMA_LLM_URL`). So the migration narrowed an operator
+    env var's tolerance, silently, in an `#[ignore]`d test that runs on no PR and no DGX sweep —
+    the same failure class the type was introduced to abolish, pointed the other way.
+    **Corrected by a third constructor**, `LlmEndpoint::from_operator_url`, which classifies rather
+    than assumes; both operator-driven callers now use it, so `Verbatim` is reachable only through
+    a hermetically-tested constructor. The lesson is the general one: making a distinction
+    *representable* is not the same as making the wrong side of it *unreachable*, and a type that
+    only names the caller's promise still lets the caller promise wrongly.
+- **17 new `tests-common` unit tests** (11 in the original migration, +6 from the review-fix wave),
+  **21 mutants, all killed** — each by the test written for it. The review wave's six were built by
+  inventorying the new API rather than re-reading the diff, which is what surfaced the three
+  survivors the first round missed: `dedup-keeps-first` (killed by four tests, one of them
+  `force_routing_off_overrides_the_inherited_default` — so the containment control demonstrably
+  depends on the collapse), `operator-url-branches-swapped`, `ends-with-bare-v1`,
+  `program-log-dir-transposed`, `force-routing-off-pushes-1` and `base-assert-removed`.
+  `git diff --stat` was empty afterwards, which is the only proof the index matches the tree
+  [[mutation-testing-contaminates-the-index]].
   They matter out of proportion to their size: `linux-check.yml` runs
-  `cargo test -p kastellan-tests-common` on **every PR and nothing else**, while the six daemon
+  `cargo test -p kastellan-tests-common` on **every PR**, and is the only target there that
+  reaches this code, while the six daemon
   e2es these values configure run on no PR at all. Worth keeping from the mutation round:
   - **A deletion mutant is weaker than a transposition one.** Deleting the `extra_env` extend
     killed two tests; *moving it before the common keys* — the actual defect shape — killed exactly
@@ -105,21 +140,45 @@ moved together because renaming one alone leaves `fastest_tok_per_s: Some(*tok_p
   - **`the_defaults_…` pins LITERALS, not the constants.** Asserting `Some(DEFAULT_LLM_MODEL)` puts
     the constant on both sides and passes at any value; caught in my own first draft, and it is the
     #633 lesson repeating [[audit-sink-doubles-hide-storage-transforms]].
-- **The `extra_env`-later-wins guarantee is now a property, not a comment.** `mail_daemon_e2e`
-  depended on it with nothing testing it. Verified against what the backends actually render —
-  systemd one `Environment=` line per entry, launchd duplicate plist dict keys, both
-  order-preserving and last-wins — rather than carried from the comment
-  [[handover-claims-verify-before-carrying]].
+- **The `extra_env`-later-wins guarantee is now a property, not a comment** — and the review
+  corrected how it is guaranteed. The first version asserted last-wins by reading `spec.env` with
+  `rfind`, i.e. it asserted the **model** and *documented* the render ("systemd one `Environment=`
+  line per entry, launchd duplicate plist dict keys, both order-preserving and last-wins"). Only
+  half of that was checkable: systemd documents last-wins for a repeated assignment, but launchd
+  gets a **plist dict with a duplicate key**, whose resolution the plist format does not define and
+  which nothing in `kastellan-supervisor` tests. So a containment control (`force_routing(false)`,
+  which overrides `core_service_spec`'s baked-in `1`) rested on a belief about `CFPropertyList` on
+  one of the two first-class platforms. **Fixed by removing the dependency rather than testing it**:
+  `service_spec` now collapses duplicates last-wins (`dedup_last_wins`) before returning, so the
+  rendered unit is unambiguous on both backends and the documented semantics are preserved exactly.
+  The general case — any other `ServiceSpec` producer passing a duplicate key — is
+  [#644](https://github.com/hherb/kastellan/issues/644). Lesson:
+  *a property "verified against what the backends render" was verified against what the comment
+  said they render* [[handover-claims-verify-before-carrying]].
 - **Also folded in:** the character-for-character `guard_tier_boot_payload` duplicate (now
   `tests_common::guard_tier_boot_payload`), and **#635's stderr-on-failure fix that `cli_ask_e2e`'s
   private copy had never received** — both its waits used a bare `.expect`, so a daemon dying
   before `main` reported only the last polled status. That is the drift #634 predicted, found
   in the act.
-- **File sizes:** `guard_boot_row_e2e` 687 → **537**, `cli_ask_e2e` 858 → **736**,
-  `observation_capture` 664 → **601**. New files all under cap: `daemon.rs` 292,
-  `daemon/spec.rs` 283, `daemon/spec/tests.rs` 268.
+- **File sizes:** `guard_boot_row_e2e` 687 → **537**, `cli_ask_e2e` 858 → **741**,
+  `observation_capture` 664 → **604**. `tests-common` after the review-fix wave: `daemon.rs` 297,
+  `daemon/spec.rs` **487**, `daemon/spec/tests.rs` **480** — all still under the 500 cap, but
+  `spec.rs` and its tests are now close enough that the next addition to either should split
+  rather than append.
 - **Still open from #634's own text:** nothing. `scripted_llm.rs` (514) and
   `boot_report/tests.rs` (650) remain over cap and are untouched by this branch.
+- **Filed from the PR #640 review, not fixed here** —
+  [#641](https://github.com/hherb/kastellan/issues/641) (`DaemonSpec::new` still has three
+  transposable same-typed parameters; the fix is to *delete* `suffix` and `user`, which are always
+  `unique_suffix()` and `current_username()`, not to newtype them),
+  [#642](https://github.com/hherb/kastellan/issues/642) (the 200-char cap is a third unlinked copy
+  of a private supervisor `MAX_NAME_LEN`, and checks the half that cannot fire while skipping the
+  charset half that can — export one `validate_service_name`),
+  [#643](https://github.com/hherb/kastellan/issues/643) (`main.rs`'s two `tracing` rate mappings are
+  transposable and untested; the payload version of the same mapping *is* guarded, and #632 is what
+  made the two names differ and the gap legible), and
+  [#644](https://github.com/hherb/kastellan/issues/644) (the launchd duplicate-key question above,
+  for every other `ServiceSpec` producer).
 
 ### #626 — a saturating FIRST probe sample ended the probe at one — MERGED `44e0f38d` ([#637](https://github.com/hherb/kastellan/pull/637))
 
@@ -353,8 +412,15 @@ Full prose in [`archive/handover_20260821_pre-prune.md`](archive/handover_202608
 
 > Only *open* work is listed. Shipped items move to [Recently merged](#recently-merged) or the ROADMAP.
 
-**With #626, #632 and #634 done, the guard arc's remaining work is one item and it is the one that
-matters:** [#612](https://github.com/hherb/kastellan/issues/612), a design call rather than a patch
+**FIRST: re-gate PR #640 on the DGX.** The review-fix wave (issue-by-issue fixes from the #640
+review) landed after the `553ec6ff` gate, touching `tests-common/src/daemon{.rs,/spec.rs,/spec/tests.rs}`
+and three `core/tests/` files. The Mac leg is green at the tip (clippy `--all-targets -D warnings`
+exit 0 over `tests-common` + `core`, `tests-common --lib` 116 / 0), but no DGX sweep has run over it
+and **the Mac runs no daemon e2e** (the `_dyld_start` blocker). Expect **3927 / 0 / 55** — 3921 + the
+6 new unit tests — and reconcile by grepping the six out of the log by name rather than subtracting.
+
+**Then, with #626, #632 and #634 done, the guard arc's remaining work is one item and it is the one
+that matters:** [#612](https://github.com/hherb/kastellan/issues/612), a design call rather than a patch
 — **#616 unblocked its favoured option**, so it is now reachable rather than merely filed. Read the
 measurement in the issue before proposing a fix; every cheap one is closed off there. Beside it,
 newly filed and both cheap: [#639](https://github.com/hherb/kastellan/issues/639) (split
@@ -495,9 +561,10 @@ Full prose in the [`archive/`](archive/) snapshots — most recently
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
-| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`06ea613d`** — the tip of `fix/632-fastest-tok-per-s-rename`, #632 + #634 | **3921 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3910 at `6d61f4e8` + 11**, the eleven new `daemon::spec::tests::` unit tests, **all eleven grepped out of the log as `... ok`** rather than subtracted. All six daemon e2es ran against real PG: `cli_ask_e2e` 2/0, `guard_boot_row_e2e` 2/0, `cli_memory_l3_run_daemon_e2e` 2/0, `cli_memory_l3py_run_daemon_e2e` 6/0, `mail_daemon_e2e` 1/0/2. ⚠️ **`observation_capture` is `#[ignore]` (0/0/1) and `mail_daemon_e2e`'s live-LLM leg likewise**, so the two `LlmEndpoint::Verbatim` call sites are **compiled but not executed anywhere** — which is precisely why `a_verbatim_llm_url_gains_nothing` exists as a hermetic unit test. `kastellan-tests-common --lib` **108**, against the Mac's 110: the delta is the two `cfg(target_os = "macos")` `serial::tests`, reconciled rather than assumed [[mac-compiles-zero-systemd-tests]]. Ignored unchanged at 55 | exit 0 from a **cold** private dir (`CARGO_TARGET_DIR=~/clippy-cold-634`, `rm -rf`d first): **345** `Checking`+`Compiling` lines, **zero** `warning` and **zero** `error` lines, **all 27 kastellan crates named** (counted `sort -u`; 330 distinct crates in total). 345 is the same figure the `8d92c02b`, `c0255cd7` and `d3f8ed3f` cold runs produced, which is what says this was a real full-workspace lint rather than a cached pass. rustc **1.98.0** | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — **zero** non-gliner skips, counted from a `--nocapture` run |
-| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | `6d61f4e8` — #632 alone, gated before #634 was written so the rename's evidence stands on its own | **3910 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Byte-identical to the `8d92c02b` baseline, and that is the point**: a pure rename adds and removes no tests, so an unchanged count is what correctness looks like here rather than a weak result. The instrument that *would* have caught the one real hazard — renaming the durable wire key with the field — is the pre-existing `CONFIGURED_KEYS` array, not a new test | folded into the `06ea613d` run below rather than run twice | **8**, all gliner-relex |
-| **Mac** (aarch64 darwin) | **`06ea613d`** — the branch tip | **PARTIAL by design.** `kastellan-tests-common --lib` **110 / 0** (99 + the 11 new, all observed by name), and **15 mutants applied to `daemon/spec.rs`, all 15 killed**, each by the test written for it — the ordering transposition, the `/v1/v1` append, a `data_dir`/`user` swap, the removed 200-char cap, and eleven more. No daemon e2e ran: the `_dyld_start` blocker below still holds on this host | `check -p kastellan-core --all-targets` exit 0 and `clippy -p kastellan-tests-common -p kastellan-core --all-targets -D warnings` exit 0, zero warnings, warm private dir. **Still the load-bearing Mac leg**: the only host that compiles the `cfg(target_os = "macos")` arms of the three migrated e2es | n/a — no integration suite ran |
+| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **the tree now at `553ec6ff`** (gated as the unreachable pre-rewrite `06ea613d`; source-identical) — #632 + #634, **BEFORE the review-fix wave** | **3921 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3910 at `6d61f4e8` + 11**, the eleven new `daemon::spec::tests::` unit tests, **all eleven grepped out of the log as `... ok`** rather than subtracted. All six daemon e2es ran against real PG: `cli_ask_e2e` 2/0, `guard_boot_row_e2e` 2/0, `cli_memory_l3_run_daemon_e2e` 2/0, `cli_memory_l3py_run_daemon_e2e` 6/0, `mail_daemon_e2e` 1/0/2. ⚠️ **`observation_capture` is `#[ignore]` (0/0/1) and `mail_daemon_e2e`'s live-LLM leg likewise**, so both operator-URL call sites are **compiled but not executed anywhere**. At this tree they constructed `LlmEndpoint::Verbatim` directly, which is what let the mail leg's silent narrowing through; they now go via `from_operator_url`, so the arm is reachable only through a hermetically-tested constructor. ⚠️ **This row does NOT cover the review-fix wave — a re-gate is required.** `kastellan-tests-common --lib` **108**, against the Mac's 110: the delta is the two `cfg(target_os = "macos")` `serial::tests`, reconciled rather than assumed [[mac-compiles-zero-systemd-tests]]. Ignored unchanged at 55 | exit 0 from a **cold** private dir (`CARGO_TARGET_DIR=~/clippy-cold-634`, `rm -rf`d first): **345** `Checking`+`Compiling` lines, **zero** `warning` and **zero** `error` lines, **all 27 kastellan crates named** (counted `sort -u`; 330 distinct crates in total). 345 is the same figure the `8d92c02b`, `c0255cd7` and `d3f8ed3f` cold runs produced, which is what says this was a real full-workspace lint rather than a cached pass. rustc **1.98.0** | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — **zero** non-gliner skips, counted from a `--nocapture` run |
+| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | the tree now at `6764d272` (gated as the unreachable pre-rewrite `6d61f4e8`; source-identical) — #632 alone, gated before #634 was written so the rename's evidence stands on its own | **3910 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Byte-identical to the `8d92c02b` baseline, and that is the point**: a pure rename adds and removes no tests, so an unchanged count is what correctness looks like here rather than a weak result. The instrument that *would* have caught the one real hazard — renaming the durable wire key with the field — is the pre-existing `CONFIGURED_KEYS` array, not a new test | folded into the `06ea613d` run below rather than run twice | **8**, all gliner-relex |
+| **Mac** (aarch64 darwin) | **the tree now at `553ec6ff`** — before the review-fix wave | **PARTIAL by design.** `kastellan-tests-common --lib` **110 / 0** (99 + the 11 new, all observed by name), and **15 mutants applied to `daemon/spec.rs`, all 15 killed**, each by the test written for it — the ordering transposition, the `/v1/v1` append, a `data_dir`/`user` swap, the removed 200-char cap, and eleven more. No daemon e2e ran: the `_dyld_start` blocker below still holds on this host | `check -p kastellan-core --all-targets` exit 0 and `clippy -p kastellan-tests-common -p kastellan-core --all-targets -D warnings` exit 0, zero warnings, warm private dir. **Still the load-bearing Mac leg**: the only host that compiles the `cfg(target_os = "macos")` arms of the three migrated e2es | n/a — no integration suite ran |
+| **Mac** (aarch64 darwin) | **the `/fixall` commit** — the branch tip, PR #640's review fixes | **PARTIAL by design.** `kastellan-tests-common --lib` **116 / 0** — 110 + the 6 new review-wave tests (`the_binary_reaches_the_units_program`, `an_operator_url_normalises_to_exactly_one_compat_segment`, `a_base_ending_in_v1_without_the_separator_is_not_complete`, `a_base_that_already_carries_the_compat_segment_is_refused`, `force_routing_off_overrides_the_inherited_default`, `collapsing_duplicates_keeps_the_last_value_in_the_last_position`), each observed by name. No daemon e2e ran: the `_dyld_start` blocker still holds | `clippy -p kastellan-tests-common -p kastellan-core --all-targets -D warnings` **exit 0**, zero warnings — which is what compiles all six migrated e2es and both `cfg(target_os = "macos")` arms | n/a — no integration suite ran |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`8d92c02b`** — the tip of `fix/626-probe-total-budget`, after the SECOND review round | **3910 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--nocapture`. **Reconciles exactly: 3909 at `c0255cd7` + 1**, the one new e2e `a_probe_that_stalls_once_then_measures_drops_the_finding`, grepped out of the log as `... ok`. Its sibling `a_probe_that_overruns_its_budget_derives_the_ceiling` also observed `ok`. `guard_tier_e2e` went 40.02 s / 20 cases → **40.03 s / 21**: the new case's 20 s runs concurrently with the overrun case's 40 s, so the suite absorbs it for 10 ms. Ignored unchanged at 55 | exit 0 from a **cold** private dir (`CARGO_TARGET_DIR=~/626r-clippy-target`, `rm -rf`d first): **345** `Checking`+`Compiling` lines, **zero** `warning` and **zero** `error` lines, **all 27 workspace crates named** (counted `sort -u`). 345 is the same figure the `c0255cd7` and `d3f8ed3f` cold runs produced, which is what says this was a real full-workspace lint rather than a cached pass. rustc **1.98.0** on both hosts, checked rather than assumed | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — **zero** non-gliner skips, counted from a `--nocapture` run so the count is evidence rather than an artifact of captured output |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | `c0255cd7` — superseded by the row above, kept for the reconciliation chain | **3909 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3908 at `d3f8ed3f` + 1**, the single new `#[test]`, grepped out of the log as `... ok` rather than subtracted. **Unchanged from the pre-review gate at `a88691a4`, and that is structural rather than luck** — the review fix turned one assertion into a three-value loop instead of adding a test, so a stable count is what a correct fix looks like here. All four affected names observed running, including `a_probe_that_overruns_its_budget_derives_the_ceiling`, the one test whose *wall clock* moved (20 s → 40 s) and which carries no skip guard. Ignored unchanged at 55 | exit 0 from a **cold** private dir (`CARGO_TARGET_DIR=~/clippy-cold-626b`, `rm -rf`d first): **345** `Checking`+`Compiling` lines, **zero** `warning`/`error` lines, **all 27 workspace crates named** (counted `sort -u`). 345 is the same figure the `d3f8ed3f` cold run produced, which is what says this was a real full-workspace lint rather than a cached pass. rustc **1.98.0** on both hosts — CI parity, checked this session rather than assumed | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — **zero** non-gliner skips, counted; *not* the bwrap-userns skip, so containment really ran |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`d3f8ed3f`** — merged `main`, #635 including its review round | **3908 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3907 at `64587ee9` + 1 net**, and all three deltas are *measured* rather than subtracted — `the_basis_table_covers_every_state_exactly_once` (+1) and `an_in_band_pin_stores_a_configured_row_with_a_null_coverage_finding` (+1) each grepped out of the log as `... ok`, and `classify_endpoint_wins_over_the_chat_fallthrough` (−1, the deleted tautology) grepped for and confirmed **absent**. **This is the first run in which either `guard_boot_row_e2e` leg has ever executed** — both pass. Ignored unchanged at 55 | exit 0 from a cold private dir (`CARGO_TARGET_DIR=~/clippy-cold-635main`): **345** `Checking`+`Compiling` lines (238 + 107), zero `warning`/`error` lines, **all 27 workspace crates named** (counted `sort -u`). rustc **1.96.0**; re-run at CI parity on **1.98.0** after `rustup update` — also exit 0, 0 warnings, 27 crates, 345 lines, so the two-release gap was hiding nothing here | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — *not* the bwrap-userns skip, so containment really ran |

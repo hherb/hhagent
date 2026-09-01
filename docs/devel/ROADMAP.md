@@ -593,7 +593,7 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   detector for cache contamination. Deferred: [#626](https://github.com/hherb/kastellan/issues/626)
   above, and [#627](https://github.com/hherb/kastellan/issues/627).
   **[#627](https://github.com/hherb/kastellan/issues/627) FIXED and MERGED `8040ca83`
-  ([#631](https://github.com/hherb/kastellan/pull/631), 2026-08-27).** `report_guard_tier` was a private `async fn` in
+  ([#631](https://github.com/hherb/kastellan/pull/631), merged 2026-08-30).** `report_guard_tier` was a private `async fn` in
   `core/src/main.rs` — a binary with no `cfg(test)` module — so the durable
   `policy / guard_tier.boot` payload was reachable only from a live daemon, and the two tests
   naming that row asserted its **count**. That left half of #624's fix unguarded: swapping
@@ -822,22 +822,47 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   documented only guard_boot_row's 20 against the shared 10, so the real spread is three values,
   not two); and it passes `KASTELLAN_LLM_LOCAL_URL` **verbatim** -- that variable is
   operator-supplied and documented as already carrying `/v1`, so the shared helper's unconditional
-  append would have dialled `/v1/v1`. That is the one migration hazard that fails **silently**, and
-  it is now unrepresentable: `LlmEndpoint::{Base, Verbatim}` makes the two shapes distinct types at
-  every call site, and `mail_daemon_e2e`'s `strip_suffix("/v1")` workaround was deleted with it.
-  **11 new `tests-common` unit tests, all 15 mutants killed**, each by the test written for it --
+  append would have dialled `/v1/v1`. That is the one migration hazard that fails **silently**:
+  `LlmEndpoint::{Base, Verbatim}` makes the two shapes distinct types at every call site.
+  ⚠️ **The first cut of that fix was itself a regression, caught by the PR review.** Having the
+  types, `mail_daemon_e2e` deleted its `strip_suffix("/v1")` and passed `Verbatim` -- but that
+  `strip_suffix` plus the helper's append had *normalised*, accepting both `http://h:11434` and
+  `http://h:11434/v1`. `Verbatim` accepts only the second, and the bare form is the one the
+  installer calls canonical (`OLLAMA_LLM_URL`), so the migration silently narrowed an operator
+  variable inside an `#[ignore]`d test. Fixed by a third constructor,
+  `LlmEndpoint::from_operator_url`, which classifies rather than assumes; a `Base` that already
+  carries `/v1` now asserts rather than doubling it. **Making a distinction representable is not
+  the same as making the wrong side of it unreachable.**
+  **17 new `tests-common` unit tests** (11 in the migration, +6 from the PR-review wave)
+  **and all 15 mutants killed**, each by the test written for it --
   including the `/v1/v1` mutant, the extra_env ORDERING transposition (a deletion mutant is weaker
   and killed two tests instead of the one), a `data_dir`/`user` swap, and removal of the 200-char
   name cap. They matter out of proportion to their size: `linux-check.yml` runs
-  `cargo test -p kastellan-tests-common` on **every PR** and nothing else, while the six daemon
-  e2es these values configure run on no PR at all. The `extra_env`-later-wins guarantee
-  `mail_daemon_e2e` depends on was a comment at that call site with nothing testing it; it is now a
-  property, verified against both backends' actual rendering (systemd one `Environment=` line per
-  entry, launchd duplicate plist dict keys -- both order-preserving, both last-wins).
+  `cargo test -p kastellan-tests-common` on **every PR** and is the only target there that
+  reaches this code, while the six daemon
+  e2es these values configure run on no PR at all. The `extra_env`-later-wins guarantee was a
+  comment at a call site with nothing testing it; it is now a property. ⚠️ **The PR review corrected
+  how it is guaranteed.** The first version asserted the *model* (`rfind` over `spec.env`) while
+  merely *documenting* the render, and only half of that was checkable: systemd documents last-wins
+  for a repeated assignment, but launchd gets a plist dict with a **duplicate key**, whose
+  resolution the format does not define and which nothing in `kastellan-supervisor` tests -- so a
+  containment control (`force_routing(false)`) rested on a belief about `CFPropertyList`. Fixed by
+  **removing the dependency rather than testing it**: `service_spec` collapses duplicates last-wins
+  before returning. General case filed as
+  [#644](https://github.com/hherb/kastellan/issues/644).
   Also folded in: the character-for-character `guard_tier_boot_payload` duplicate, and #635's
-  stderr-on-failure fix that `cli_ask_e2e`'s private copy had never received. **Three files shrank
-  below or toward the cap**: `guard_boot_row_e2e` 687 -> 537, `cli_ask_e2e` 858 -> 736,
-  `observation_capture` 664 -> 601.
+  stderr-on-failure fix that `cli_ask_e2e`'s private copy had never received -- and note the
+  attribution, which the first draft had inverted: #635 fixed the shared helper **and**
+  `guard_boot_row_e2e`'s copy, writing one fix twice; the copies that never got it were
+  `cli_ask_e2e`'s and `observation_capture`'s. **Three files shrank
+  below or toward the cap**: `guard_boot_row_e2e` 687 -> 537, `cli_ask_e2e` 858 -> 741,
+  `observation_capture` 664 -> 604.
+  **Filed from the review, not fixed:** [#641](https://github.com/hherb/kastellan/issues/641)
+  (`DaemonSpec::new`'s three transposable same-typed parameters -- delete `suffix`/`user` rather
+  than newtype them), [#642](https://github.com/hherb/kastellan/issues/642) (the 200-char cap is a
+  third unlinked copy of a private supervisor constant and checks the half that cannot fire),
+  [#643](https://github.com/hherb/kastellan/issues/643) (`main.rs`'s two `tracing` rate mappings are
+  transposable and untested, where the payload version of the same mapping is guarded).
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one

@@ -88,6 +88,7 @@ pub use binaries::{
 pub use daemon::{
     assert_cli_failure, assert_cli_success, bring_up_daemon, guard_tier_boot_payload,
     spawn_inert_mock, stderr_tail, DaemonGuards, DaemonHandle, DaemonSpec, LlmEndpoint, MockLlm,
+    COMPAT_SEGMENT,
 };
 pub use embedding::text_to_embedding;
 pub use env::{env_lock, EnvVarGuard};

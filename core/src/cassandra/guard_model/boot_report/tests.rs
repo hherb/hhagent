@@ -111,6 +111,42 @@ fn a_configured_row_carries_exactly_the_documented_key_set() {
     assert_eq!(keys_of(&boot_payload(0.795, 66_048, &contended_probed())), CONFIGURED_KEYS);
 }
 
+/// The durable wire key is `tok_per_s` and **must not** become
+/// `fastest_tok_per_s` when the Rust field does.
+///
+/// `CONFIGURED_KEYS` above already fails on a renamed key — but only
+/// *incidentally*, and #632 is what made that worth saying out loud. A
+/// global `s/tok_per_s/fastest_tok_per_s/` sweeps `CONFIGURED_KEYS`
+/// itself, and what then fails is alphabetical ordering (`keys_of`
+/// sorts, and `"fastest_tok_per_s"` no longer sorts where `"tok_per_s"`
+/// did) rather than anything about the key. A renamer who notices the
+/// ordering failure and re-sorts the array passes every other assertion
+/// in this file, because each of them spells the key as a bare literal
+/// the same sweep rewrote.
+///
+/// So this asserts the rename **negatively**, which is the one shape a
+/// global rename cannot satisfy: the field is `fastest_tok_per_s` and
+/// the key is not.
+///
+/// Why it cannot move: `policy / guard_tier.boot` rows carrying this key
+/// are on disk on live hosts, and the documented operator query
+/// `slowest_tok_per_s < tok_per_s / 2` is written against it. Renaming
+/// it is a migration, not a refactor.
+#[test]
+fn the_durable_wire_key_did_not_follow_the_rust_field_rename() {
+    let p = boot_payload(0.795, 66_048, &contended_probed());
+    assert!(
+        p.get("tok_per_s").is_some(),
+        "the durable key is `tok_per_s`; live audit_log rows carry it",
+    );
+    assert!(
+        p.get("fastest_tok_per_s").is_none(),
+        "#632 renamed the FIELD, not the KEY -- the wire vocabulary is \
+         frozen so an operator correlating a boot log line with its \
+         audit row reads one vocabulary rather than two. Got: {p:?}",
+    );
+}
+
 /// The whole of #627: the fastest rate must land in `tok_per_s` and the
 /// slowest in `slowest_tok_per_s`, never the reverse.
 ///

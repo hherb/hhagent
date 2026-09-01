@@ -10,9 +10,12 @@
 //! Three of the six were still hand-rolled copies until issue #634 —
 //! `cli_ask_e2e`, `observation_capture` and `guard_boot_row_e2e`, ~70
 //! identical lines each. The drift that argument predicts had already
-//! happened: #635's stderr-on-failure fix landed in one private copy while
-//! this shared helper, carrying three other e2es, kept the defect. What
-//! made each of them a copy is now a [`DaemonSpec`] setter.
+//! happened: #635 had to write one stderr-on-failure fix **twice**, here
+//! and in `guard_boot_row_e2e`'s copy, and the other two copies never
+//! received it at all — both of `cli_ask_e2e`'s waits used a bare
+//! `.expect`, so a daemon that died before `main` reported only its last
+//! polled status. What made each of them a copy is now a [`DaemonSpec`]
+//! setter.
 //!
 //! What is *not* here: anything that depends on `kastellan-core` types
 //! (skill factories, the per-OS python interpreter cascade). `tests-common`
@@ -32,7 +35,8 @@ use crate::{core_binary, unique_temp_root, wait_for_log_match, wait_for_status};
 mod spec;
 
 pub use spec::{
-    DaemonSpec, LlmEndpoint, DEFAULT_LLM_MODEL, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_READY_TIMEOUT,
+    DaemonSpec, LlmEndpoint, COMPAT_SEGMENT, DEFAULT_LLM_MODEL, DEFAULT_LLM_TIMEOUT_MS,
+    DEFAULT_READY_TIMEOUT,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,8 +50,9 @@ pub use spec::{
 /// A live-but-inert local-LLM endpoint. Holds the listener task; aborts it on
 /// drop so no socket leaks between tests.
 pub struct MockLlm {
-    /// `http://127.0.0.1:<ephemeral-port>` — feed this to the daemon's
-    /// `KASTELLAN_LLM_LOCAL_URL` (the caller appends `/v1`).
+    /// `http://127.0.0.1:<ephemeral-port>` — a **base**, carrying no
+    /// compat segment, so it is an [`LlmEndpoint::Base`] and the `/v1`
+    /// is appended there rather than by the caller.
     pub base_url: String,
     join: Option<tokio::task::JoinHandle<()>>,
 }

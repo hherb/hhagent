@@ -65,11 +65,16 @@ fn skip_if_any_binary_missing() -> bool {
 /// The [`DaemonSpec`] this file's daemons boot from.
 ///
 /// Was a hand-rolled copy of `bring_up_daemon` until [#634] folded it
-/// onto the shared helper; the only thing that made it a copy is the
-/// `KASTELLAN_SHELL_EXEC_BIN` registration below. The migration also
-/// picked up [#635]'s stderr-on-failure fix, which the shared helper had
-/// and this copy did not — both of its waits used a bare `.expect`, so a
-/// daemon that died before `main` reported only the last polled status.
+/// onto the shared helper — and **nothing** made it a copy. Its one
+/// apparent divergence, the `KASTELLAN_SHELL_EXEC_BIN` registration
+/// below, is exactly what the old `extra_env` parameter already carried
+/// for `cli_memory_l3_run_daemon_e2e`; this was duplication for no
+/// reason, which is what made it the cheapest of the three to fold.
+///
+/// It still cost something. The migration picked up [#635]'s
+/// stderr-on-failure fix, which the shared helper had and this copy did
+/// not — both of its waits used a bare `.expect`, so a daemon that died
+/// before `main` reported only the last polled status.
 ///
 /// The argv allowlist is loaded from the DB at daemon start (see
 /// `build_tool_registry`); tests seed it via `seed_tool_allowlist()`

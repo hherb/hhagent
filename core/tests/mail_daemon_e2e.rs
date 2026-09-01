@@ -76,10 +76,10 @@ struct MailDaemon {
 /// Bring up the per-test PG cluster + a plain-HTTP mock localmail + the real
 /// daemon with the mail worker registered (endpoint = mock, 0600 token file,
 /// binary path) and force-routing OFF. `llm` is the endpoint the daemon's
-/// router dials — `Base` for the mock (which owns a bare `host:port`),
-/// `Verbatim` for the live-LLM leg, whose URL comes from an operator env var
-/// that already carries `/v1`. `model_override` replaces
-/// `DEFAULT_LLM_MODEL` when `Some`.
+/// router dials — `Base` for the mock, which owns a bare `host:port`, and
+/// `from_operator_url` for the live-LLM leg, whose URL comes from an
+/// operator env var that may or may not already carry `/v1`.
+/// `model_override` replaces `DEFAULT_LLM_MODEL` when `Some`.
 fn bring_up_mail_daemon(
     rt: &tokio::runtime::Runtime,
     suffix: &str,
@@ -127,11 +127,17 @@ fn bring_up_mail_daemon(
             "KASTELLAN_MAIL_BIN".to_string(),
             workspace_target_binary("kastellan-worker-mail").to_string_lossy().into_owned(),
         ),
-        ("KASTELLAN_EGRESS_FORCE_ROUTING".to_string(), "0".to_string()),
     ];
 
     // `DaemonSpec` sets KASTELLAN_DATA_DIR from the cluster's data_dir.
-    let mut spec = DaemonSpec::new("maild", suffix, &cluster.data_dir, user, llm).envs(extra_env);
+    // Force routing OFF through the named setter rather than an `env`
+    // entry: it is a containment control, and `grep force_routing` should
+    // find every test that opts out. The mock localmail origin is plain
+    // HTTP on loopback, which the proxy's webpki-only MITM upstream cannot
+    // reach.
+    let mut spec = DaemonSpec::new("maild", suffix, &cluster.data_dir, user, llm)
+        .force_routing(false)
+        .envs(extra_env);
     // The live-LLM leg needs a real model in place of `DEFAULT_LLM_MODEL`.
     // Before #634 this went through `extra_env`'s later-wins ordering; the
     // setter says the same thing without depending on it.
@@ -268,16 +274,25 @@ fn daemon_planner_dispatches_mail_search_end_to_end() {
 #[ignore = "needs a real local LLM (KASTELLAN_MAIL_LIVE_LLM_URL); non-deterministic"]
 fn live_llm_selects_mail_unprompted() {
     let Ok(llm_url) = std::env::var("KASTELLAN_MAIL_LIVE_LLM_URL") else {
-        eprintln!("\n[SKIP] set KASTELLAN_MAIL_LIVE_LLM_URL to a local OpenAI-compatible endpoint\n");
+        eprintln!(
+            "\n[SKIP] set KASTELLAN_MAIL_LIVE_LLM_URL to a local OpenAI-compatible \
+             endpoint (with or without a trailing /v1)\n"
+        );
         return;
     };
     if skip_prereqs() {
         return;
     }
-    // Used verbatim: `KASTELLAN_MAIL_LIVE_LLM_URL` is documented as a full
-    // OpenAI-compat endpoint (`http://127.0.0.1:11434/v1`). Before #634 this
-    // had to strip a trailing `/v1` because the helper appended one
-    // unconditionally; `LlmEndpoint` makes the two shapes distinct instead.
+    // `KASTELLAN_MAIL_LIVE_LLM_URL` has accepted BOTH shapes since this
+    // test was written: pre-#634 it stripped a trailing `/v1` and let the
+    // helper append one, so `http://127.0.0.1:11434` and
+    // `http://127.0.0.1:11434/v1` both reached the daemon as `.../v1`. A
+    // bare `Verbatim` here would have silently dropped the first — and the
+    // bare form is the one this tree's own installer calls canonical
+    // (`OLLAMA_LLM_URL`), so it is what an operator is likeliest to export.
+    // `from_operator_url` keeps that tolerance somewhere a `tests-common`
+    // unit test can reach it, which matters because this test is
+    // `#[ignore]`d and runs on no PR and no DGX sweep.
     let model = std::env::var("KASTELLAN_MAIL_LIVE_LLM_MODEL")
         .unwrap_or_else(|_| "gemma3".to_string());
 
@@ -289,8 +304,13 @@ fn live_llm_selects_mail_unprompted() {
         .build()
         .expect("build multi-threaded tokio runtime");
 
-    let fixture =
-        bring_up_mail_daemon(&rt, &suffix, &user, LlmEndpoint::Verbatim(llm_url), Some(&model));
+    let fixture = bring_up_mail_daemon(
+        &rt,
+        &suffix,
+        &user,
+        LlmEndpoint::from_operator_url(llm_url),
+        Some(&model),
+    );
     let output = cli_ask(
         &fixture,
         &user,

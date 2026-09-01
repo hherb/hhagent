@@ -227,11 +227,14 @@ fn check_llm_reachable(base_url: &str) -> Result<(), String> {
 /// onto the shared helper. Three things made it a copy, and each is now
 /// a setter:
 ///
-/// * **`LlmEndpoint::Verbatim`.** `llm_url` comes from the operator's
-///   `KASTELLAN_LLM_LOCAL_URL`, which is documented as a *complete*
-///   OpenAI-compat endpoint (`http://127.0.0.1:8000/v1`). The shared
-///   helper's other callers own a bare `host:port` and want `/v1`
-///   appended; doing that here would dial `/v1/v1`.
+/// * **`LlmEndpoint::from_operator_url`.** `llm_url` comes from the
+///   operator's `KASTELLAN_LLM_LOCAL_URL`, which this file documents as
+///   a *complete* OpenAI-compat endpoint (`http://127.0.0.1:8000/v1`).
+///   The shared helper's other callers own a bare `host:port` and want
+///   `/v1` appended; doing that here would dial `/v1/v1`. Since the
+///   value is the operator's rather than ours, it is classified rather
+///   than asserted — an operator who exports the bare base gets the
+///   endpoint they meant instead of a 404 that names nothing.
 /// * a real model rather than `DEFAULT_LLM_MODEL`, and an
 ///   operator-tunable LLM timeout — this run drives a real LLM.
 /// * a **15-second** readiness budget against the shared default of 10.
@@ -249,7 +252,7 @@ fn daemon_spec(
         suffix,
         data_dir,
         user,
-        LlmEndpoint::Verbatim(llm_url.to_string()),
+        LlmEndpoint::from_operator_url(llm_url),
     )
     .llm_model(llm_model)
     .llm_timeout_ms(llm_timeout_ms_string())
@@ -461,7 +464,7 @@ async fn capture_all_fixtures_against_live_llm() {
     // starts. `build_tool_registry` reads the allowlist once at startup
     // and caches it; seeding after `bring_up_daemon` would leave the
     // daemon with an empty allowlist and all shell-exec calls would
-    // POLICY_DENIED. Same pattern `cli_ask_e2e.rs::bring_up_daemon` uses:
+    // POLICY_DENIED. Same pattern `cli_ask_e2e.rs`'s daemon tests use:
     // run probe → connect seed_pool → seed → drop seed_pool → start daemon.
     //
     // The probe is required before the seed because the `tool_allowlists`
