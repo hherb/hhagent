@@ -8,27 +8,27 @@
 > which holds the verbose pre-prune version of everything summarised here,
 > including the full #619, #615/#616/#618 and live-bring-up write-ups compressed below.
 
-**Last updated:** 2026-09-02 (second session) · **DGX RUNNING `121f22a2` — the whole guard arc is
+**Last updated:** 2026-09-02 (third session) · **DGX RUNNING `121f22a2` — the whole guard arc is
 DEPLOYED** (see [Merged work, compressed](#merged-work-compressed--the-guard-arc-and-the-2026-09-02-deploy)). ·
-**`main` HEAD:** `e5cb6bfc` —
-[#648](https://github.com/hherb/kastellan/pull/648), **docs-only**, on top of
-`121f22a2` ([#645](https://github.com/hherb/kastellan/pull/645): #641, #642, #643, plus a
-movement-only `LlmEndpoint` split) and `466ca7ff`
-([#640](https://github.com/hherb/kastellan/pull/640), #632 + #634). ·
-**OPEN BRANCH: `fix/649-transformers-lock-bump`** — the #649 security bump; see
-[#649](#649--the-transformers-advisory-and-the-two-faults-it-uncovered).
+**`main` HEAD:** `ef8144f8` —
+[#651](https://github.com/hherb/kastellan/pull/651), the #649 transformers advisory fix (see
+[#649](#649--the-transformers-advisory-and-the-two-faults-it-uncovered)), on top of `c5972572`
+([#652](https://github.com/hherb/kastellan/pull/652), the openworker re-survey, docs-only) and
+`e5cb6bfc` ([#648](https://github.com/hherb/kastellan/pull/648), docs-only). ·
+**OPEN BRANCH: `fix/650-interpreter-alias-bind`** — the #650 interpreter-alias bind; see
+[#650](#650--the-fault-the-acceptance-run-exposed-open-next-sessions-first-job).
 
-> ⚠️ **The DGX checkout is left on `fix/649-transformers-lock-bump`, and its gliner-relex `.venv`
-> is rebuilt from that branch's lock** (transformers 5.13.1). Neither affects the running daemon,
-> which executes the *installed* `121f22a2` binaries. `git checkout main` there after #651 merges.
+> The DGX checkout is back on `main` at `ef8144f8`, clean, and its gliner-relex `.venv` is the one
+> rebuilt from the merged lock (transformers 5.13.1). The running daemon is unaffected either way —
+> it executes the *installed* `121f22a2` binaries.
 
 > ⚠️ **THE DGX WORKSPACE IS NO LONGER GREEN, and that is an honest change, not a regression.**
 > Rebuilding the gliner-relex venv (it had been a broken **macOS** copy, so four tests had been
 > skipping-as-passing for months) made those tests actually run — and three of them fail, on a
 > **production** defect now filed as [#650](https://github.com/hherb/kastellan/issues/650).
-> Proved pre-existing by A/B: the same tests fail identically with the pre-bump lock. **The next
-> session's first job is #650**; the operator has already chosen to take it as its own PR right
-> after #649 merges.
+> Proved pre-existing by A/B: the same tests fail identically with the pre-bump lock. **#650 is
+> what this session is fixing** — #649 merged as `ef8144f8`, and the operator had already chosen to
+> take #650 as its own PR straight after.
 
 **Last gate: DGX over the `fix/649-transformers-lock-bump` tip `5445dd68` — 3937 / 3 / 55, 176
 suites, `TEST_EXIT=101`, and 4 `[SKIP]` (was 8).** The total is unchanged at **3940**: the three
@@ -70,7 +70,7 @@ provably ran under transformers 5.13.1. Both hosts on rustc **1.98.0** (CI parit
 
 ### #649 — the transformers advisory, and the two faults it uncovered
 
-Branch `fix/649-transformers-lock-bump`. GHSA-xrqw-3rrv-vx5w (high, `save_pretrained` path
+Merged as `ef8144f8` ([#651](https://github.com/hherb/kastellan/pull/651)). GHSA-xrqw-3rrv-vx5w (high, `save_pretrained` path
 traversal) covered every `transformers < 5.10.0` in `workers/gliner-relex/uv.lock`.
 
 - **The remedy the issue stated does not work, and says nothing while failing.**
@@ -633,9 +633,11 @@ Older rows (3668 back to 3327, covering the guard slice-1 arc, #587, #579 and #5
 Newest first. Older entries live in the [`archive/`](archive/) snapshots and in git history; the
 substance of each is compressed under [Current state](#current-state) rather than repeated here.
 
-- **`fix/649-transformers-lock-bump`** (OPEN) — #649, the transformers advisory, plus the
-  interpreter-bind fixture fix, a repeatable real-model load test, and a `uv lock --check` CI job.
-  Exposed [#650](https://github.com/hherb/kastellan/issues/650).
+- **`ef8144f8`** ([#651](https://github.com/hherb/kastellan/pull/651)) — #649, the transformers
+  advisory, plus the interpreter-bind fixture fix, a repeatable real-model load test, and a
+  `uv lock --check` CI job. Exposed [#650](https://github.com/hherb/kastellan/issues/650).
+- **`c5972572`** ([#652](https://github.com/hherb/kastellan/pull/652)) — docs-only: the openworker
+  re-survey at `fb1bfc62`.
 - **`e5cb6bfc`** ([#648](https://github.com/hherb/kastellan/pull/648)) — docs-only: the DGX redeploy.
 - **`121f22a2`** ([#645](https://github.com/hherb/kastellan/pull/645)) — #641 + #642 + #643 + the
   `LlmEndpoint` split.
