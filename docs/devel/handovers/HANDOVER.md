@@ -105,19 +105,33 @@ bwrap, and `execve` returned **ENOENT for a file that is present and readable**.
   output is canonical, so an alias here would classify the interpreter's *own* libraries as
   out-of-prefix) and `bind_paths` (canonical **plus** every alias). Same shape as #641/#643: make the
   transposition unrepresentable rather than documenting it.
-- **The admission rule is non-widening by construction, and that is the load-bearing design
+- **The admission rule is non-widening, and that is the load-bearing design
   choice.** An alias is bound only when it **canonicalizes to the canonical prefix** — the same tree
   under another name, so the bind grants no byte the canonical bind did not. Homebrew is the
   counter-example the tests pin: `/opt/hb/bin/python3.12` names a prefix of `/opt/hb`, a far larger
   tree, and is **refused** — that venv is no worse off than before. A prefix that does not
   canonicalize is refused too (fail closed). **A containment fix must not widen containment**, and
-  "bind what the shebang names" is only safe with that guard on it.
+  "bind what the shebang names" is only safe with that guard on it. ⚠️ It said "by **construction**"
+  until the review round: the proof is taken at **resolve** time (once, at daemon startup) while
+  `spawn_under_policy` re-resolves every `fs_read` source at **spawn** time, and an alias — unlike
+  the canonical prefix — is by definition a symlink, i.e. mutable state on the bind path. #387's
+  "TOCTOU-safe" note covers the check→bind window *inside* the spawn, not this one. A residual, not
+  a break (repointing it needs the agent's own OS user, already the worst case), filed as
+  [#659](https://github.com/hherb/kastellan/issues/659).
+  [[handover-claims-verify-before-carrying]]
 - **Two new pure modules**, both fully injected:
   [`interpreter_deps::named_path`](../../../core/src/workers/interpreter_deps/named_path.rs)
   (`normalize_lexically` + `symlink_chain` — the deliberate exception to the crate's canonical-paths
-  rule) and `interpreter_deps::root`. `read_link` is injected like `resolve_deps_via_tool` and for the
-  same reason; production passes `read_link_via_fs`. **`ResolveCtx` was deliberately NOT given a
-  `read_link` field** — 29 construction sites for one probe two workers use.
+  rule) and `interpreter_deps::root`. `read_link` is injected and production passes
+  `read_link_via_fs`. **`ResolveCtx` was deliberately NOT given a `read_link` field** — 29
+  construction sites for one probe two workers use. ⚠️ The code said the reason was "it is an
+  impurity"; `ResolveCtx` already carries the `exists`/`canonicalize` impurities, so that never
+  distinguished anything — the honest reason is cost, and the price is that no manifest-level test
+  can reach the alias path and that `canonicalize`/`read_link`, same-typed and adjacent in three
+  signatures, transpose silently ([#658](https://github.com/hherb/kastellan/issues/658)).
+- **`interpreter_lib_dirs` now takes `Option<&InterpreterRoot>`**, not `Option<&Path>`, and picks
+  `dep_walk_prefix()` itself. Three call sites each used to make that choice, two with a comment
+  reminding them which half to pass and the third silent. Now it is not expressible.
 - **`browser_driver_e2e.rs` was a fourth hand-rolled copy** of the resolution cascade and would have
   silently missed the alias; it now calls the production resolver. Count the call sites when a fix
   says "all N of them".
@@ -126,16 +140,30 @@ bwrap, and `execve` returned **ENOENT for a file that is present and readable**.
   **replaying it verbatim** — parse the `{:?}` form with `ast.literal_eval`, because a `join(" ")` +
   `eval` mangles `KASTELLAN_LANDLOCK_RW=["/tmp"]` and hands you a *different*, wrong error. And
   `journalctl -k | grep type=1326` ruled out a seccomp kill in one command.
-- **15 mutants tried, 15 killed — after one survivor earned its keep.** Deleting the
-  `Component::CurDir => {}` arm from `normalize_lexically` passed every test, including a
-  strengthened literal-string assertion. The cause was upstream: **`Path::components()` already
-  normalizes `.` away**, so the arm was unreachable. Deleted, with the property test kept and its
-  mechanism named. Separately, a `starts_with(venv_dir)` guard in `alias_prefixes` was removed for
-  the same reason — the canonicalize rule subsumes it, so no mutation of it could fail a test.
+- **15 mutants tried, 15 killed — and the inventory still stopped one layer short.** The review
+  found the two lines that *are* the fix untested: every root reachable from an entry-level test is
+  built with `canonical_only`, where `bind_paths()` and `dep_walk_prefix()` agree, so
+  `fs_read.push(root.dep_walk_prefix().to_path_buf())` — **the pre-#650 line** — passed the whole
+  suite. Both entry builders are now pinned with the uv fixture.
   [[mutation-proof-counts-only-mutants-you-tried]]
+- ⚠️ **The `CurDir` survivor was misdiagnosed, and the wrong diagnosis shipped as a comment.**
+  Deleting `Component::CurDir => {}` from `normalize_lexically` passed every test, and that was
+  written up as "`Path::components()` already normalizes `.` away, so the arm was unreachable". It
+  does **not**: `components()` drops *interior* `.` but **keeps a leading one on a relative path**
+  (`./a/b` → `[CurDir, a, b]`, and `Path::new("./a") != Path::new("a")`). The arm is unreachable
+  only because every production caller passes an absolute path. Both the doc and the test's claimed
+  "no `.` survives" contract are corrected, a leading-`.` test added, and
+  [[rust-path-components-normalizes-dot]] rewritten — the over-general memory note is what fed the
+  comment. Separately, the `starts_with(venv_dir)` guard removed from `alias_prefixes` is genuinely
+  redundant (the canonicalize rule subsumes it), but the claim that "no test could fail it" was also
+  wrong: `canonicalize` is injected, so a fixture mapping `/v` to the interpreter prefix does
+  distinguish the two. **Say why a line is unreachable, not that it is.**
 - **macOS is unaffected** (Seatbelt is not a filesystem view), as are container mode and
-  system-interpreter venvs — but the modules are `cfg`-free and `kastellan-core --lib` is **2004 on
-  both hosts**.
+  system-interpreter venvs — but the modules are `cfg`-free and both hosts compile and run all of
+  it. Precisely: bwrap emits `--ro-bind-try <canonical-src> <alias-dest>` so the alias becomes a real
+  directory in the jail, while `canonicalize_policy_paths` collapses the alias back into a duplicate
+  rule under Seatbelt — **inert, not merely harmless**. Now said in the `InterpreterRoot` doc, where
+  it was a Linux-only mechanism described as though it were platform-neutral.
 - **Verified on the host it was filed from**: `gliner_relex_e2e` **4/4 with zero `[SKIP]`** and a real
   1.3 GB model load (43 s), `entity_extraction_e2e` **16/16** under `KASTELLAN_GLINER_RELEX_ENABLE=1`
   including both real-worker tests. All five tests the issue named previously failed.
