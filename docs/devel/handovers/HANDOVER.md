@@ -37,20 +37,26 @@ stable is up to date). See [Test baseline](#test-baseline-authoritative).
 > 2026-09-01 21:18Z; the gate above is that owed gate, run a day late against `main`. Nothing was
 > wrong — but the sequence to avoid repeating is "gate required before merge" followed by a merge.
 
-> ⚠️ **The Mac still cannot run cargo at all, and it is a macOS host condition — not this tree.**
-> Freshly-linked executables hang forever in `_dyld_start`; re-confirmed this session by `sample` on
-> a wedged `build-script-build` (one frame, `_dyld_start`), **including one in an unrelated
-> project** (`~/src/secretary`), which is what makes it conclusively a host fault. So the Mac ran no
-> test and no lint this session. Everything below was verified on the DGX.
-> [[mac-fresh-large-binaries-hang-in-dyld]]
+> ⚠️ **A slow Mac cargo build is CONTENTION, not the `_dyld_start` wedge — and I misdiagnosed it
+> this session.** A `cargo test -p kastellan-supervisor --lib` that sat ~25 minutes with no visible
+> progress, plus `sample` on a `build-script-build` showing a single `_dyld_start` frame, looked
+> exactly like the known macOS hazard below. It was not. The operator confirmed the Mac builds fine,
+> and re-running proved it: **115 / 0**, and the timing is the tell —
+> `6.89s user, 31.62s system, 4% cpu, 13:34.55 total`.
 >
-> **What that costs, specifically:** `supervisor/src/launchd_agents/` is `cfg(target_os = "macos")`
-> and the DGX compiles it out, so this branch's launchd edits are compiled on **neither** host. The
-> risk is real and was demonstrated: the DGX flagged an unused `MAX_NAME_LEN` re-export in the
-> systemd backend, and the launchd copy was **character-identical** — fixed in both, but only one
-> was machine-checked. The mirror of [[cfg-linux-e2e-deadcode-dgx-clippy]]. **A Mac reboot usually
-> clears the dyld wedge; the first macOS `cargo clippy -p kastellan-supervisor --all-targets` after
-> one is the outstanding check on this branch.**
+> **The two states are not distinguishable by `sample` alone**, which is the trap: a thread that is
+> never *scheduled* has the same one-frame `_dyld_start` stack as one dyld has genuinely wedged,
+> because `sample` reports where the stack is, not why it is not moving. What separates them is
+> **load, not stacks**:
+>
+> * `uptime` — this box was at **load average 22.68** with a *second* project's `cargo` running 16
+>   `rustc` processes on a different toolchain (1.96.0, while ours is `stable`);
+> * `%cpu` in `time` output — **4%** means starved; a real dyld wedge burns no CPU *and* never
+>   finishes, whereas this finished.
+>
+> **Check `uptime` and the toolchain mix BEFORE concluding a wedge**, and prefer `time` over
+> patience. The hazard below is real and has cost a session; it is just not the first hypothesis for
+> "slow", and I anchored on it because this file named it.
 
 ---
 
@@ -75,8 +81,9 @@ behind each platform `cfg`.
   exercised end to end.
 - **The cap is deliberately NOT re-exported by the backends.** `builder`/`builders` are private
   modules, so a `pub use` of a constant nothing there names is just an unused import — which the
-  DGX caught as an `-D warnings` failure. **The launchd copy was identical and invisible to both
-  hosts**; fixed by reading, not by a compiler.
+  DGX caught as an `-D warnings` failure on the systemd side. The launchd copy was identical, and
+  the **Mac clippy leg confirmed it**: the same fix, machine-checked on the platform that compiles
+  it, rather than argued from symmetry.
 - **Two tests the copies never had**, both from the tree's own lessons: the cap asserted in **both**
   directions (`MAX_NAME_LEN` *and* `+1` — the copies only checked the reject side, so `>` mutated
   to `>=` passed all of them), and the cap pinned to a **literal** rather than to itself
@@ -333,6 +340,8 @@ Full prose in the [`archive/`](archive/) snapshots. What still binds:
 > ⚠️ **Squash-merge caveat:** every PR lands as one squash commit, so its *branch-tip* SHA (where the gate ran) is **not** an ancestor of `main`. Check content, not `merge-base`.
 
 > ⚠️ **Freshly-linked executables can hang forever in `_dyld_start` on macOS**, so every daemon e2e fails with the daemon's stdout **and** stderr **completely empty** — which reads exactly like a code defect. **Newness, not size:** it took the 40 MB daemon first and 13 KB cargo `build-script-build` binaries later, wedging a cold `cargo clippy` indefinitely, while anything already assessed kept running. Not the target dir and not signing — the hanging bin, a working old bin and a working fresh test bin are all identically `adhoc,linker-signed`. Rule it in **before** touching code: run a sibling daemon e2e, then the binary directly, then `sample <pid> 2` — one `_dyld_start` frame with a ~112 KB footprint is conclusive, on a build script as readily as on the daemon. **A warm `CARGO_TARGET_DIR` still works**, so `check` and `clippy --all-targets` remain available; a cold one is what wedges. Distinct from [[custom-cargo-target-dir-breaks-daemon-e2e]], which a `cargo build --workspace` fixes and this does not. [[mac-fresh-large-binaries-hang-in-dyld]]
+>
+> ⚠️ **UPDATED 2026-09-02 — the `sample` signature above is NOT sufficient on its own, and treating it as conclusive cost this session a wrong diagnosis in five documents.** A thread that is merely never *scheduled* shows the same single `_dyld_start` frame, because `sample` reports where a stack is, not why it is not moving. On a box at **load average 22.68** with another project's `cargo` running 16 `rustc` processes, a `kastellan-supervisor --lib` run took **13m34s wall at 4% cpu** and then **passed**. Check `uptime` and `%cpu` first: a wedge burns no CPU *and never finishes*; contention burns little CPU and finishes. Only after ruling out load is the one-frame stack evidence of anything.
 
 > ⚠️ **`kastellan-worker-egress-proxy` leaks on the Mac.** Five orphans were live in one sweep, four of them 1–7 days old, across three target dirs. Test runs are not reaping them. Not investigated — flagged for whoever next touches sidecar lifecycle.
 
@@ -353,11 +362,10 @@ Full prose in the [`archive/`](archive/) snapshots. What still binds:
 
 > Only *open* work is listed. Shipped items move to [Recently merged](#recently-merged) or the ROADMAP.
 
-**FIRST: get [PR #645](https://github.com/hherb/kastellan/pull/645) reviewed and merged.** The
-DGX gate and cold clippy are green over the whole branch (see the header). **The one outstanding
-verification is macOS-side and needs the Mac to be usable again:** `cargo clippy -p
-kastellan-supervisor --all-targets -- -D warnings` on the Mac, because the launchd half of #642 is
-compiled on neither host today. Reboot the Mac first — that usually clears the `_dyld_start` wedge.
+**FIRST: get [PR #645](https://github.com/hherb/kastellan/pull/645) reviewed and merged.** Both
+hosts are green over the whole branch and **nothing is outstanding** — DGX 3940 / 0 / 55 plus cold
+clippy, and the macOS leg (`kastellan-supervisor --lib` 115 / 0, `clippy --all-targets -D warnings`
+exit 0) covering the `cfg(target_os = "macos")` `launchd_agents` code the DGX compiles out.
 
 **THEN: the DGX redeploy, which has now been the "first unblocked action" for two sessions running
 and is the oldest thing on this list.** The whole guard arc —
@@ -531,7 +539,7 @@ Full prose in the [`archive/`](archive/) snapshots — most recently
 | --- | --- | --- | --- | --- |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`466ca7ff`** — merged `main`, #632 + #634 (PR #640) | **3928 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3921 + 1 + 6.** The `+6` are the review wave's `daemon::spec::tests::`; the `+1` is `boot_report::tests::the_durable_wire_key_did_not_follow_the_rust_field_rename`, which the previous handover's predicted 3927 had missed. ⚠️ **Reconciled by diffing PER-SUITE pass counts, not test names** — `--nocapture` interleaves output, so a `test … ok` name grep captured only 3909 of 3928 and invented six "removed" tests that were merely mangled. Pair each `Running <binary>` header with the `test result:` line after it. `kastellan_tests_common` **114** (Mac 116 = +2 `cfg(macos)` `serial::tests`), `kastellan_core` lib **1981** | exit 0 from a **cold** private dir under `$HOME` (`rm -rf`'d first): **345** `Checking`+`Compiling` lines, **330** distinct crates, **all 27** kastellan crates named, **zero** `warning`/`error`. 345 matches the `8d92c02b`/`c0255cd7`/`d3f8ed3f`/`553ec6ff` cold runs — that match is what says it was a real full-workspace lint rather than a cached pass. rustc **1.98.0** | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — **zero** non-gliner, *not* the bwrap-userns skip, so containment really ran |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **branch tip of `fix/641-642-643-daemonspec-and-service-name`** — #641 + #642 + #643 + the `LlmEndpoint` movement | **3940 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3928 + 12**, and all three deltas were *measured* by diffing per-suite counts rather than subtracted — `kastellan_core` 1981 → **1986** (the five `reported::tests`), `kastellan_supervisor` 115 → **117** (eight new `service_name::tests` minus the six duplicated systemd validator tests they replace), `kastellan_tests_common` 114 → **119** (five new `daemon::spec::tests`). All fourteen new tests observed running; the four `#[should_panic]` ones print `- should panic ... ok`, so a bare `… ok` grep reports them missing. **Ten mutants, ten killed**, each by the test written for it — including `validate_service_name(&spec.label)` instead of `&spec.service_name()`, which survives both `#[should_panic]` cap tests and was found by inventorying the new API rather than by reading the diff. `git diff --cached --stat` empty afterwards, the only proof index == tree [[mutation-testing-contaminates-the-index]] | exit 0 from a **cold** private dir under `$HOME`: **345** `Checking`+`Compiling` lines, **330** distinct crates, **all 27** kastellan crates, **zero** `warning`/`error`. rustc **1.98.0** | **8**, all gliner-relex — **zero** non-gliner |
-| **Mac** (aarch64 darwin) | — | **NOTHING RAN.** The host cannot build: freshly-linked executables hang in `_dyld_start`, confirmed by `sample` on a wedged `build-script-build`, **including one in an unrelated project**. Not this tree, and no code change should be attempted for it. The macOS-only launchd code is therefore compiled on neither host [[mac-fresh-large-binaries-hang-in-dyld]] | — | — |
+| **Mac** (aarch64 darwin) | **branch tip** — the macOS half of #642 | `kastellan-supervisor --lib` **115 / 0**, `TEST_EXIT=0`. **All 8 `service_name::tests` observed running here as well as on the DGX**, which is the entire point of #642: the rule set is one set now and both hosts execute it. Platform split confirmed rather than assumed — **38 `launchd_agents` tests, 0 `systemd_user`** (the exact mirror of the DGX) [[mac-compiles-zero-systemd-tests]]. 113 → 115 is the same **+2** the DGX saw (8 new minus the 6 duplicated ones they replace). ⚠️ The first attempt was captured through `tail -12`, so a `service_name` grep over it found nothing and briefly looked like the tests had not run — [[truncated-gate-log-is-not-a-gate]], walked into again | `clippy -p kastellan-supervisor --all-targets -D warnings` **exit 0**, zero warnings — this is the leg that covers `cfg(target_os = "macos")` `launchd_agents`, invisible to the DGX | — |
 Older rows (`553ec6ff` DGX 3921, `6764d272` DGX 3910, `8d92c02b` DGX 3910, `c0255cd7` DGX 3909, `d3f8ed3f` DGX 3908, `12809297` DGX 3901, `33029e32` DGX 3900, `020b0e53` Mac 3778, `b65e44ab` DGX 3890, the `fix/615-616-618-guard-diagnostics` Mac 3748, `8cb8cfb7` DGX 3854, `09c6231f` 3840/3718, `69834357` 3823, `0bae6b2c` 3759, `f46c67cf` 3749, `2ab6612c` 3686, `b58edc77` 3668, and 3047 back to 2950) are in the [`archive/`](archive/) snapshots — most recently [`handover_20260830_633_pre-prune.md`](archive/handover_20260830_633_pre-prune.md) § Test baseline.
 
 **Both hosts are load-bearing, in opposite directions — always check both.** The two supervisor backends compile on one host each: a `launchd_agents.rs` change is invisible to the DGX and a `systemd_user.rs` change is invisible to the Mac, so the two hosts legitimately report different counts. This is sharper than it sounds — `cargo test` on the Mac compiles **zero** `systemd_user` tests, so a Mac-green run can be missing the test that pins a Linux fix entirely (it was, in #530). The mirror direction is just as real: Mac clippy compiles `cfg(target_os = "linux")` items out, so an unused cfg-linux helper fails only the DGX `-D dead-code` gate. [[cfg-linux-e2e-deadcode-dgx-clippy]]

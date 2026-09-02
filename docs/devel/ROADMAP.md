@@ -878,9 +878,11 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   movement-only `LlmEndpoint` split (`spec.rs` 538 -> 438).
   **Gated on the DGX at 3940 / 0 / 55, 176 suites, `TEST_EXIT=0`**, reconciling exactly as 3928 + 12
   by per-suite diff; cold clippy exit 0 over 345 `Checking`+`Compiling` lines, 27 crates, zero
-  warnings; **ten mutants, ten killed**. ⚠️ The **macOS launchd half is compiled on neither host** --
-  the Mac cannot run cargo at all (`_dyld_start` wedge), so a Mac
-  `clippy -p kastellan-supervisor --all-targets` after a reboot is the outstanding check.
+  warnings; **ten mutants, ten killed**. **Both hosts green, nothing outstanding**: the Mac covers
+  the `cfg(target_os = "macos")` `launchd_agents` half the DGX compiles out --
+  `kastellan-supervisor --lib` 115 / 0 with all 8 `service_name::tests` observed running there too
+  (the point of #642: one rule set, both hosts execute it) and 38 launchd / 0 systemd confirming the
+  platform split, plus `clippy -p kastellan-supervisor --all-targets -D warnings` exit 0.
   **Still open from that review:** [#644](https://github.com/hherb/kastellan/issues/644) (the launchd
   duplicate-plist-key question for every *other* `ServiceSpec` producer).
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
