@@ -452,7 +452,8 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   - **Why it is a prerequisite and not a nicety:** without it, a recurring task raises the same approval every run, the operator approves reflexively, and the gate has negative value — it trains the habit it exists to prevent while still costing a round trip.
 - [ ] Policy gate: per-tool, per-task, per-data-classification routing decision
 - [ ] Frontier escalation through egress proxy (Anthropic / OpenAI)
-- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 MERGED 2026-08-23 as `d51c9b20` (PR [#606](https://github.com/hherb/kastellan/pull/606)); the WIRING slice MERGED 2026-08-23 as `8736f559` (PR [#607](https://github.com/hherb/kastellan/pull/607)); the LIVE BRING-UP + audit-cap fix MERGED 2026-08-24 as `45d5f6c2` (PR [#614](https://github.com/hherb/kastellan/pull/614)); **LIVE ON THE DGX since 2026-08-23**.**
+- [~] **Model-based CASSANDRA guard tier — SLICE 1 MERGED 2026-08-21 as `f90631da` (PR [#585](https://github.com/hherb/kastellan/pull/585)); MEASUREMENT 3 MERGED 2026-08-23 as `d51c9b20` (PR [#606](https://github.com/hherb/kastellan/pull/606)); the WIRING slice MERGED 2026-08-23 as `8736f559` (PR [#607](https://github.com/hherb/kastellan/pull/607)); the LIVE BRING-UP + audit-cap fix MERGED 2026-08-24 as `45d5f6c2` (PR [#614](https://github.com/hherb/kastellan/pull/614)); **LIVE ON THE DGX since 2026-08-23**, and the whole diagnostics arc (`4aee83ad`/`8040ca83`/`d3f8ed3f`/`44e0f38d`/`466ca7ff`/`121f22a2`) **DEPLOYED there 2026-09-02**.**
+  **The first post-arc boot row is #624's thesis measured on the host it was filed about:** `measured_samples: 3`, `attempted_samples: 3`, `tok_per_s` (fastest) **4 765.7** against `slowest_tok_per_s` **1 450.4** -- a **3.29x spread inside one boot** -- and `timeout_ms` 94 468 -> **27 718**. The two pre-arc boots reported 1 398 and 1 582, i.e. both sat at this boot's *slowest* sample, so the single-sample probe was not occasionally unlucky: on this host it landed near the floor every time and the derived timeout was 3.4x too generous. #643's shared `ReportedRates` is confirmed live too -- the `info!` line and the durable row carry the same values to the last digit, which is the one property no test in the tree can observe. Not yet exercised: #626's retry on a genuinely stalled `/v1/chat/completions` (this boot measured 3 of 3; it needs a cold backend).
   **FIRST PRODUCTION RUN 2026-08-23.** Deployed to the DGX with the three guard keys in the operator
   overlay. Boot: `tau=0.79552656 timeout_ms=21752 timeout_basis=probed n_ctx=131072`, with
   `tok_per_s: 6072.99` in the `policy / guard_tier.boot` row — and the derivation reproduces D9's
@@ -858,8 +859,8 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   `cli_ask_e2e`'s and `observation_capture`'s. **Three files shrank
   below or toward the cap**: `guard_boot_row_e2e` 687 -> 537, `cli_ask_e2e` 858 -> 741,
   `observation_capture` 664 -> 604.
-  **Filed from the review, and all three now FIXED on branch
-  `fix/641-642-643-daemonspec-and-service-name` (2026-09-02):**
+  **Filed from the review, and all three now FIXED and MERGED `121f22a2`
+  ([#645](https://github.com/hherb/kastellan/pull/645), 2026-09-02):**
   [#642](https://github.com/hherb/kastellan/issues/642) -- one un-`cfg`'d `validate_service_name` +
   `MAX_NAME_LEN` at the supervisor crate root, replacing a character-identical copy in each backend
   that **neither host ever ran the other of**, plus the `tests-common` hand-copy that checked the
