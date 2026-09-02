@@ -654,7 +654,7 @@ const INBOUND_PER_PEER_CAP: usize = 64;
 /// Case-insensitive membership of a Matrix user id in the configured peer set.
 fn peer_allowed(allowed: &[String], user_id: &str) -> bool {
     let u = user_id.to_ascii_lowercase();
-    allowed.iter().any(|p| *p == u)
+    allowed.contains(&u)
 }
 
 /// True iff the room's joined + invited members are exactly the bot and one
