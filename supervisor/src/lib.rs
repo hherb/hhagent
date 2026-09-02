@@ -31,6 +31,15 @@ pub mod launchd_agents;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod atomic_write;
 
+/// The one service-name gate, shared by both backends (#642).
+///
+/// Un-`cfg`'d on purpose: it is the only piece of either backend a
+/// cross-platform caller (`tests-common`) can reach, and having one
+/// copy is what stops the rule set from drifting between the two.
+pub mod service_name;
+
+pub use service_name::{validate_service_name, MAX_NAME_LEN};
+
 pub mod specs;
 
 /// Cross-platform helper to run a child process under a wall-clock

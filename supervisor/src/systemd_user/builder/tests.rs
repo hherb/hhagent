@@ -318,48 +318,6 @@ fn environment_files_absent_when_empty() {
     assert!(!unit.contains("EnvironmentFile="), "{unit}");
 }
 
-// ---------- name validator tests ----------
-
-#[test]
-fn validate_service_name_accepts_typical_names() {
-    for n in &["kastellan", "kastellan-core", "kastellan.core", "a_b", "abc123"] {
-        validate_service_name(n).expect(n);
-    }
-}
-
-#[test]
-fn validate_service_name_rejects_empty() {
-    let err = validate_service_name("").expect_err("empty must reject");
-    assert!(matches!(err, SupervisorError::InvalidName(_)));
-}
-
-#[test]
-fn validate_service_name_rejects_path_traversal() {
-    for n in &["../evil", "a/b", "foo\\bar", ".."] {
-        let err = validate_service_name(n).expect_err(n);
-        assert!(matches!(err, SupervisorError::InvalidName(_)), "{n}: {err}");
-    }
-}
-
-#[test]
-fn validate_service_name_rejects_dot_prefix_and_dash_prefix() {
-    for n in &[".hidden", "-flagish"] {
-        let err = validate_service_name(n).expect_err(n);
-        assert!(matches!(err, SupervisorError::InvalidName(_)), "{n}: {err}");
-    }
-}
-
-#[test]
-fn validate_service_name_rejects_overlong() {
-    let n = "a".repeat(MAX_NAME_LEN + 1);
-    let err = validate_service_name(&n).expect_err("overlong");
-    assert!(matches!(err, SupervisorError::InvalidName(_)));
-}
-
-#[test]
-fn validate_service_name_rejects_whitespace_and_specials() {
-    for n in &["has space", "has\ttab", "has;semi", "has*star", "has\0nul"] {
-        let err = validate_service_name(n).expect_err(n);
-        assert!(matches!(err, SupervisorError::InvalidName(_)), "{n}: {err}");
-    }
-}
+// The name-validator rule set moved to `crate::service_name::tests` in
+// #642: it was character-identical here and in the launchd backend, so
+// neither host ever ran the other's copy. It now runs on both.

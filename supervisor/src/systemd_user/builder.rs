@@ -37,7 +37,7 @@
 //! Each section's directives are emitted in a deterministic order so the
 //! generated file is diffable and unit-testable.
 
-use crate::{ServiceSpec, SupervisorError, TargetSpec};
+use crate::{ServiceSpec, TargetSpec};
 
 /// Default seconds before SIGKILL after SIGTERM on stop.
 ///
@@ -50,11 +50,6 @@ const DEFAULT_TIMEOUT_STOP_SEC: u32 = 10;
 /// Resists tight crash loops without being so long that recovery from
 /// transient errors is annoyingly slow.
 const DEFAULT_RESTART_SEC: u32 = 5;
-
-/// Maximum length of a service name. Generous compared to systemd's
-/// own 255-byte filename ceiling — leaves headroom for the
-/// `.service` suffix and any future namespacing prefix.
-const MAX_NAME_LEN: usize = 200;
 
 /// Build the textual contents of a `<name>.service` unit file.
 ///
@@ -283,48 +278,16 @@ fn quote_if_needed(s: &str) -> String {
     out
 }
 
-/// Validate a service name against `[A-Za-z0-9._-]{1,200}` minus `.`,
-/// `..`, and any name starting with `.` (hidden files) or `-` (would
-/// be parsed as a flag by some tools).
-///
-/// Rejects path-traversal characters (`/`, `\0`) and any byte the
-/// systemd unit-name grammar would refuse. Returning `Ok` is the
-/// gate that lets [`super::SystemdUser::install`] write a file to disk.
-pub fn validate_service_name(name: &str) -> Result<(), SupervisorError> {
-    if name.is_empty() {
-        return Err(SupervisorError::InvalidName(
-            "service name must not be empty".into(),
-        ));
-    }
-    if name.len() > MAX_NAME_LEN {
-        return Err(SupervisorError::InvalidName(format!(
-            "service name longer than {MAX_NAME_LEN} chars"
-        )));
-    }
-    if name == "." || name == ".." {
-        return Err(SupervisorError::InvalidName(
-            ". and .. are not valid service names".into(),
-        ));
-    }
-    if name.starts_with('.') {
-        return Err(SupervisorError::InvalidName(
-            "service name must not start with '.'".into(),
-        ));
-    }
-    if name.starts_with('-') {
-        return Err(SupervisorError::InvalidName(
-            "service name must not start with '-'".into(),
-        ));
-    }
-    for ch in name.chars() {
-        if !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-') {
-            return Err(SupervisorError::InvalidName(format!(
-                "service name contains illegal character: {ch:?}"
-            )));
-        }
-    }
-    Ok(())
-}
+// The name gate lives at the crate root (#642), not here. It used to
+// be a private `MAX_NAME_LEN` plus a character-identical copy of the
+// predicate in each backend, which meant neither host ever ran the
+// other's copy and a cross-platform caller could reach neither.
+//
+// Only the predicate is re-exported, so `systemd_user::validate_service_name`
+// — the path this module's `install` already uses — still resolves. The
+// cap itself is NOT: `builder` is a private module, so a `pub use` of a
+// constant nothing here names is simply an unused import.
+pub use crate::service_name::validate_service_name;
 
 #[cfg(test)]
 mod tests;
