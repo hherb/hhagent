@@ -110,74 +110,150 @@ unblocked action" for three sessions.**
 
 ### #641 + #642 + #643 — MERGED `121f22a2` ([#645](https://github.com/hherb/kastellan/pull/645))
 
-Full prose in [`archive/handover_20260902_deploy_pre-prune.md`](archive/handover_20260902_deploy_pre-prune.md).
-All three are the same failure mode — **a same-typed neighbour that can be transposed in silence** —
-attacked at three layers. What still binds:
+The three follow-ups [#640](https://github.com/hherb/kastellan/pull/640)'s review filed. All three
+are about the same failure mode — **a same-typed neighbour that can be transposed in silence** —
+attacked at three different layers, which is why they belong in one branch.
 
-- **#642 — one un-`cfg`'d `validate_service_name` + `MAX_NAME_LEN` at the supervisor crate root.**
-  The predicate was a character-identical copy behind each platform `cfg`, so **neither host ever
-  ran the other's copy** and "identical" was a belief, not a checked property. The cap is
-  deliberately **not** re-exported by the backends (nothing there names it → unused import →
-  `-D warnings`). Two tests the copies never had: the cap in **both** directions (`>` mutated to
-  `>=` passed every old test) and pinned to a **literal**.
-  ⚠️ **It was the third, fourth AND fifth copy** — [#646](https://github.com/hherb/kastellan/issues/646)
-  records the two still hand-rolled (`tests-common/src/pg.rs:207`,
-  `core/tests/supervisor_e2e.rs:143`). Left out deliberately: the shared predicate is *stricter* and
-  `bring_up_pg_cluster` has ~200 call sites building names from variables, so tightening without an
-  audit turns passing tests into panics. `supervisor_e2e` is a single call site and can go first.
-- **#641 — `DaemonSpec::new(label, data_dir, llm)`, no two parameters sharing a type.** `suffix`
-  and `user` were the same expression at all six call sites, so **deleting beat newtyping**, and no
-  setters were added — an unused setter re-opens what the signature closes. ⚠️ Two consequences,
-  recorded rather than left to be discovered: `new` is now the one function in the module that
-  **reads the environment** (eagerly, once, so `service_spec` stays pure), and the unit's suffix no
-  longer matches its sibling PG cluster's — which [#548](https://github.com/hherb/kastellan/issues/548)'s
-  sweep may one day want back (restore with a `.suffix()` setter, not by reverting the constructor)
+**#642 — one `validate_service_name`, un-`cfg`'d at the supervisor crate root.**
+`MAX_NAME_LEN` was a private `const` in *each* backend and the predicate a character-identical copy
+behind each platform `cfg`.
+
+- **Neither host ever ran the other's copy**, so "identical" was a belief, not a checked property —
+  and the tree's stated contract is that one service name is portable to either OS *without* a
+  rename step. A per-platform gate cannot state that contract; it can only be it, one platform at a
+  time. Both backends now `pub use` the shared predicate, so
+  `systemd_user::validate_service_name` and `launchd_agents::validate_service_name` keep their
+  public paths, and both keep their install-level `InvalidName` tests, so the re-export stays
+  exercised end to end.
+- **The cap is deliberately NOT re-exported by the backends.** `builder`/`builders` are private
+  modules, so a `pub use` of a constant nothing there names is just an unused import — which the
+  DGX caught as an `-D warnings` failure on the systemd side. The launchd copy was identical, and
+  the **Mac clippy leg confirmed it**: the same fix, machine-checked on the platform that compiles
+  it, rather than argued from symmetry.
+- **Two tests the copies never had**, both from the tree's own lessons: the cap asserted in **both**
+  directions (`MAX_NAME_LEN` *and* `+1` — the copies only checked the reject side, so `>` mutated
+  to `>=` passed all of them), and the cap pinned to a **literal** rather than to itself
+  [[audit-sink-doubles-hide-storage-transforms]].
+- **What the hand-copy in `tests-common` actually missed:** it checked the half that essentially
+  cannot fire (a real name is ~60 chars, so tripping 200 needs a 140-char label — hence the
+  `"x".repeat(250)` the test had to use) and skipped the half that can. A label with a space or a
+  `/` sailed past it and died much later inside `install`, naming a *service name* rather than the
+  label that produced it.
+- **⚠️ #642 undercounted: it was the third, fourth AND fifth copy.**
+  [#646](https://github.com/hherb/kastellan/issues/646) records the two still hand-rolled —
+  `tests-common/src/pg.rs:207` and `core/tests/supervisor_e2e.rs:143`, both guarding a name that is
+  installed as a real unit. **Not folded into this branch deliberately:** the shared predicate is
+  *stricter*, and `bring_up_pg_cluster` has ~200 call sites, a good number building the name from a
+  `{label}`/`{tag}`/`{test_label}` variable. Tightening without auditing every one risks turning a
+  passing test into a panic, and folding an unaudited change in would have put it behind an
+  already-green DGX gate. The `supervisor_e2e` one is a single call site and can go first.
+
+**#641 — `DaemonSpec::new(label, data_dir, llm)`: three parameters, no two the same type.**
+It took five, of which `label`, `suffix` and `user` were all `impl Into<String>`.
+
+- **The apparent barrier was accidental.** `data_dir` sitting between them only blocks a swap while
+  callers pass a `Path`-typed value; `impl Into<PathBuf>` accepts a `&str` just as happily.
+- **Deleting beat newtyping** because `suffix` and `user` were the *same expression* at all six call
+  sites (`unique_suffix()` / `current_username()`), so deriving them loses no choice any caller was
+  making. **No `.suffix()`/`.user()` setters were added** — an unused setter is a hatch that
+  re-opens what the signature closes.
+- **The name is now validated at construction** against the supervisor's own predicate, replacing
+  the hand-rolled `len() <= 200` in `service_spec`. That buys the charset half, cannot drift from
+  what `install` applies, names the wrong `label` at the line that supplied it, and covers
+  `service_name()` — which is `pub`, and which a check living only in `service_spec` left unguarded.
+- **⚠️ `new` is now the one function in the module that reads the environment**, eagerly and once,
+  precisely so `service_spec` stays a pure function of stored data. The module doc's blanket "Pure
+  throughout" was corrected rather than left to quietly become false.
+- **⚠️ One property was given up, deliberately:** the unit's suffix is no longer the same string as
+  its sibling Postgres cluster's, because each is now drawn separately. Nothing reads that
+  correspondence today; if [#548](https://github.com/hherb/kastellan/issues/548)'s stale-unit sweep
+  ever wants to correlate a leaked unit with its leaked cluster, a `.suffix()` setter restores it.
+  Recorded here because an issue-as-filed can carry a cost it did not price
   [[issue-as-filed-can-carry-a-regression]].
-- **#643 — one `ReportedRates` mapping** shared by the `info!`, the `warn!` and the durable row.
-  Only the payload copy was guarded; `tracing` fields cannot be read back without a subscriber, so
-  no test in the tree could have caught a swap in the other two. **A swap silences rather than
-  inverts**: since `slowest <= fastest` always holds, a transposed pair reports a *contended* boot
-  as a quiet one. Chose the shared struct over a subscriber test because it leaves **no second site
-  to diverge**. Now verified live — see [The DGX redeploy](#the-dgx-redeploy--done-2026-09-02-the-guard-arc-is-live).
+- **The test changes are consequences, not cosmetics.** `base_spec()` now returns a different name
+  per call, so the one test that pinned a whole literal name split into three properties that are
+  actually true: the name carries prefix-then-label, one spec keeps one name, and **two specs with
+  the same label do not collide** — the whole reason a suffix exists, which no test had ever stated
+  while the caller supplied it.
 - **A mutant found by inventory, not by diff** [[mutation-proof-counts-only-mutants-you-tried]]:
-  `validate_service_name(&spec.label)` survives **both** `#[should_panic]` tests. Killed with a
-  163-char label — legal alone (asserted in the body, or it proves nothing), illegal once the prefix
-  and suffix are added. Plus the **accepting** arm, without which a mutant that panics
-  unconditionally passes both [[unreachable-success-path-proves-nothing]].
-- **Plus a movement-only `LlmEndpoint` split**, `spec.rs` **538 → 438**. **`spec/tests.rs` is 599
-  and stays over cap** — the seam is a judgement (do the endpoint cases belong with the type or with
-  the spec that wires it?), so it went to the file-split backlog rather than being folded in.
-- **Still open:** [#644](https://github.com/hherb/kastellan/issues/644) (the launchd
-  duplicate-plist-key question for every *other* `ServiceSpec` producer — `tests-common` itself is
-  safe, since `service_spec` collapses duplicates last-wins) and #646 above.
+  `validate_service_name(&spec.label)` instead of `&spec.service_name()` survives **both**
+  `#[should_panic]` tests, since a 250-char label and a label with a space are each illegal on their
+  own. Killed by `the_cap_is_applied_to_the_whole_name_not_just_the_label`, which uses a **163-char**
+  label — legal in isolation (asserted in the test body, or it proves nothing), illegal once the
+  31-char prefix and ~28-char suffix are added.
+- Also added: the **accepting** arm (`a_legal_label_constructs`), without which a mutant that panics
+  unconditionally in `new` passes both `#[should_panic]` tests
+  [[unreachable-success-path-proves-nothing]]. And `USER` is cross-checked against `$USER` rather
+  than against `current_username()`, which would put the same helper on both sides.
 
-### #632 + #634, #626, #633, #627 — merged, compressed
+**#643 — one `ReportedRates` mapping, shared by all three guard reporting sites.**
+The same four probe numbers reached an operator through the `info!` line, the `warn!` finding and
+the durable row, and **each renamed them by hand**. Only the payload copy was guarded; `tracing`
+fields cannot be read back without a subscriber, so no test in the tree could have caught a swap in
+the other two.
 
-Full prose in the [`archive/`](archive/) snapshots. What still binds from
-**#632 + #634 (`466ca7ff`, [#640](https://github.com/hherb/kastellan/pull/640))**:
+- **The swap does not produce a visibly wrong row.** Since `slowest <= fastest` always holds, a
+  transposed pair reports a **contended** boot as a quiet one — exactly the diagnostic #624 was
+  filed to make visible, silenced by the line meant to carry it, and `main.rs`'s own comment calls
+  the `warn!` "the line an operator actually reads".
+- **Not introduced by #632, but made legible by it:** the line used to read
+  `tok_per_s = rates.tok_per_s`, where a transposition was visible on its face.
+- **The struct beat the subscriber test**, which is the option #643 listed first: a subscriber test
+  would *detect* a divergence between three sites; moving the mapping leaves no second site to
+  diverge. `tracing` cannot spread a struct, so each macro still names its fields — but the
+  right-hand sides are now name-for-name identity, which restores #632's lost self-evidence
+  **without giving the rename back**.
+- Its **own module** rather than an addition to `boot_report/tests.rs`, which is 686 lines and
+  already over cap. Five tests, every fixture using **four distinct values** because any fixture
+  where two are equal lets the swap through; the numbers are #624's real DGX boots (6 073 / 269.6,
+  a 22.5x spread) so a reader can see what a swapped pair would claim.
+
+**Plus a movement-only split.** `spec.rs` hit 538, and the last handover had already called it
+("the next addition to either should split rather than append") — #641 *was* that addition.
+`LlmEndpoint` lifted to `spec/llm_endpoint.rs`: **538 → 438**, character-for-character except a
+module header and `fn url` → `pub(super) fn url` (its only caller now lives one level up). The
+`pub use` keeps every path resolving, so no caller and no test changed.
+**`spec/tests.rs` is 599 and stays over cap** — splitting it means deciding whether the endpoint
+cases belong with the type or with the spec that wires it, which is a judgement rather than a
+movement, so it went to the file-split backlog instead of being folded in here.
+
+**Still open, and unchanged by this branch:** [#644](https://github.com/hherb/kastellan/issues/644)
+(the launchd duplicate-plist-key question for every *other* `ServiceSpec` producer — `tests-common`
+itself is safe, since `service_spec` collapses duplicates last-wins).
+
+### #632 + #634 — MERGED `466ca7ff` ([#640](https://github.com/hherb/kastellan/pull/640))
+
+Full prose in
+[`archive/handover_20260902_641_642_643_pre-prune.md`](archive/handover_20260902_641_642_643_pre-prune.md).
+Kept here only for what still binds:
 
 - **The REPORTING vocabulary is frozen at `tok_per_s`** — the durable `guard_tier.boot` key cannot
   move (live rows carry it; the operator query `slowest_tok_per_s < tok_per_s / 2` is written
-  against it). #643 is what makes that freeze cost nothing. **A blind `sed` would have broken
-  production**: `\btok_per_s\b` does not match inside `slowest_tok_per_s` but **does** match
-  `"tok_per_s"`, so the naive regex renames the durable key; `CONFIGURED_KEYS` makes that a test
-  failure rather than a silent one.
+  against it), and a log line naming this number differently from the row it accompanies would read
+  as a second measurement. #643 above is what makes that freeze cost nothing.
+- **A blind `sed` would have broken production.** `\btok_per_s\b` does not match inside
+  `slowest_tok_per_s` but **does** match `"tok_per_s"`, so the naive regex renames the durable key.
+  `CONFIGURED_KEYS` is what makes that a test failure rather than a silent one.
 - **#634's two divergences the issue's table missed**, both found by reading the copies rather than
-  the issue: `observation_capture`'s 15 s readiness budget (a **three**-value spread, not two) and
-  its verbatim `KASTELLAN_LLM_LOCAL_URL`, where an unconditional append would have dialled `/v1/v1`.
-  **The first fix for that was itself a regression** — a bare `Verbatim` narrowed an operator
-  variable a `strip_suffix`+append pair had been *normalising*; corrected by
-  `LlmEndpoint::from_operator_url`, which classifies rather than assumes. **Making a distinction
-  representable is not the same as making the wrong side of it unreachable.**
-- **`extra_env` later-wins is a property, not a comment** — `service_spec` now *collapses*
-  duplicates rather than trusting the renderer, because systemd documents last-wins while launchd
-  gets a plist dict with a **duplicate key**, whose resolution the format does not define. A
-  containment control (`force_routing(false)`) rested on a belief about `CFPropertyList`
-  [[handover-claims-verify-before-carrying]]. **A deletion mutant is weaker than a transposition
-  one:** deleting the `extra_env` extend killed two tests; *moving it before the common keys* — the
-  actual defect shape — killed exactly one.
+  the issue: `observation_capture`'s 15 s readiness budget (so the real spread was **three** values,
+  not two), and its verbatim `KASTELLAN_LLM_LOCAL_URL`, where the shared helper's unconditional
+  append would have dialled `/v1/v1`.
+- **The first fix for that was itself a regression** and the review caught it: a bare `Verbatim`
+  narrowed an operator variable that a `strip_suffix`+append pair had been *normalising*. Corrected
+  by `LlmEndpoint::from_operator_url`, which classifies rather than assumes. The general lesson:
+  **making a distinction representable is not the same as making the wrong side of it unreachable**,
+  and a type that only names the caller's promise still lets the caller promise wrongly.
+- **`extra_env` later-wins is a property, not a comment** — and `service_spec` now *collapses*
+  duplicates rather than relying on the renderer, because systemd documents last-wins for a repeated
+  assignment while launchd gets a plist dict with a **duplicate key**, whose resolution the format
+  does not define. A containment control (`force_routing(false)`) rested on a belief about
+  `CFPropertyList` [[handover-claims-verify-before-carrying]].
+- **A deletion mutant is weaker than a transposition one.** Deleting the `extra_env` extend killed
+  two tests; *moving it before the common keys* — the actual defect shape — killed exactly one.
 
-And from **#626, #633 and #627**:
+### #626, #633, #627 — merged, compressed
+
+Full prose in the [`archive/`](archive/) snapshots. What still binds:
 
 - **#626 (`44e0f38d`)** — `PROBE_TOTAL_BUDGET_MS` equalled `PROBE_BUDGET_MS`, so any saturating
   sample ended the probe at one measurement. Fix is one constant, `2 * PROBE_BUDGET_MS`; nothing
@@ -495,9 +571,10 @@ Full prose in the [`archive/`](archive/) snapshots — most recently
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
+| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`466ca7ff`** — merged `main`, #632 + #634 (PR #640) | **3928 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3921 + 1 + 6.** The `+6` are the review wave's `daemon::spec::tests::`; the `+1` is `boot_report::tests::the_durable_wire_key_did_not_follow_the_rust_field_rename`, which the previous handover's predicted 3927 had missed. ⚠️ **Reconciled by diffing PER-SUITE pass counts, not test names** — `--nocapture` interleaves output, so a `test … ok` name grep captured only 3909 of 3928 and invented six "removed" tests that were merely mangled. Pair each `Running <binary>` header with the `test result:` line after it. `kastellan_tests_common` **114** (Mac 116 = +2 `cfg(macos)` `serial::tests`), `kastellan_core` lib **1981** | exit 0 from a **cold** private dir under `$HOME` (`rm -rf`'d first): **345** `Checking`+`Compiling` lines, **330** distinct crates, **all 27** kastellan crates named, **zero** `warning`/`error`. 345 matches the `8d92c02b`/`c0255cd7`/`d3f8ed3f`/`553ec6ff` cold runs — that match is what says it was a real full-workspace lint rather than a cached pass. rustc **1.98.0** | **8**, all gliner-relex (4 venv-shim, 4 `ENABLE != "1"`) — **zero** non-gliner, *not* the bwrap-userns skip, so containment really ran |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`f12ed26d`** — branch tip of `fix/641-642-643-daemonspec-and-service-name`, #641 + #642 + #643 + the `LlmEndpoint` movement. **Tree-identical to merged `main` `121f22a2`**, so this row IS the gate over the current `main` | **3940 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **Reconciles exactly: 3928 + 12**, and all three deltas were *measured* by diffing per-suite counts rather than subtracted — `kastellan_core` 1981 → **1986** (the five `reported::tests`), `kastellan_supervisor` 115 → **117** (eight new `service_name::tests` minus the six duplicated systemd validator tests they replace), `kastellan_tests_common` 114 → **119** (five new `daemon::spec::tests`). All fourteen new tests observed running; the four `#[should_panic]` ones print `- should panic ... ok`, so a bare `… ok` grep reports them missing. **Ten mutants, ten killed**, each by the test written for it — including `validate_service_name(&spec.label)` instead of `&spec.service_name()`, which survives both `#[should_panic]` cap tests and was found by inventorying the new API rather than by reading the diff. `git diff --cached --stat` empty afterwards, the only proof index == tree [[mutation-testing-contaminates-the-index]] | exit 0 from a **cold** private dir under `$HOME`: **345** `Checking`+`Compiling` lines, **330** distinct crates, **all 27** kastellan crates, **zero** `warning`/`error`. rustc **1.98.0** | **8**, all gliner-relex — **zero** non-gliner |
 | **Mac** (aarch64 darwin) | **`f12ed26d`** — the macOS half of #642 | `kastellan-supervisor --lib` **115 / 0**, `TEST_EXIT=0`. **All 8 `service_name::tests` observed running here as well as on the DGX**, which is the entire point of #642: the rule set is one set now and both hosts execute it. Platform split confirmed rather than assumed — **38 `launchd_agents` tests, 0 `systemd_user`** (the exact mirror of the DGX) [[mac-compiles-zero-systemd-tests]]. 113 → 115 is the same **+2** the DGX saw (8 new minus the 6 duplicated ones they replace). ⚠️ The first attempt was captured through `tail -12`, so a `service_name` grep over it found nothing and briefly looked like the tests had not run — [[truncated-gate-log-is-not-a-gate]], walked into again | `clippy -p kastellan-supervisor --all-targets -D warnings` **exit 0**, zero warnings — this is the leg that covers `cfg(target_os = "macos")` `launchd_agents`, invisible to the DGX | — |
-Older rows (`466ca7ff` DGX **3928** — the row this one supersedes, reconciling as 3921 + 1 + 6; `553ec6ff` DGX 3921, `6764d272` DGX 3910, `8d92c02b` DGX 3910, `c0255cd7` DGX 3909, `d3f8ed3f` DGX 3908, `12809297` DGX 3901, `33029e32` DGX 3900, `020b0e53` Mac 3778, `b65e44ab` DGX 3890, the `fix/615-616-618-guard-diagnostics` Mac 3748, `8cb8cfb7` DGX 3854, `09c6231f` 3840/3718, `69834357` 3823, `0bae6b2c` 3759, `f46c67cf` 3749, `2ab6612c` 3686, `b58edc77` 3668, and 3047 back to 2950) are in the [`archive/`](archive/) snapshots — most recently [`handover_20260830_633_pre-prune.md`](archive/handover_20260830_633_pre-prune.md) § Test baseline.
+Older rows (`553ec6ff` DGX 3921, `6764d272` DGX 3910, `8d92c02b` DGX 3910, `c0255cd7` DGX 3909, `d3f8ed3f` DGX 3908, `12809297` DGX 3901, `33029e32` DGX 3900, `020b0e53` Mac 3778, `b65e44ab` DGX 3890, the `fix/615-616-618-guard-diagnostics` Mac 3748, `8cb8cfb7` DGX 3854, `09c6231f` 3840/3718, `69834357` 3823, `0bae6b2c` 3759, `f46c67cf` 3749, `2ab6612c` 3686, `b58edc77` 3668, and 3047 back to 2950) are in the [`archive/`](archive/) snapshots — most recently [`handover_20260830_633_pre-prune.md`](archive/handover_20260830_633_pre-prune.md) § Test baseline.
 
 **Both hosts are load-bearing, in opposite directions — always check both.** The two supervisor backends compile on one host each: a `launchd_agents.rs` change is invisible to the DGX and a `systemd_user.rs` change is invisible to the Mac, so the two hosts legitimately report different counts. This is sharper than it sounds — `cargo test` on the Mac compiles **zero** `systemd_user` tests, so a Mac-green run can be missing the test that pins a Linux fix entirely (it was, in #530). The mirror direction is just as real: Mac clippy compiles `cfg(target_os = "linux")` items out, so an unused cfg-linux helper fails only the DGX `-D dead-code` gate. [[cfg-linux-e2e-deadcode-dgx-clippy]]
 
@@ -624,20 +701,10 @@ Beyond those under [Next TODO](#next-todo). Only currently-open issues; closed-i
 the [`archive/`](archive/) snapshots and git history. **The one-line summaries here are pointers —
 read the issue before acting, since several carry measurements that close off the obvious fix.**
 
-**Dependency security:** [#649](https://github.com/hherb/kastellan/issues/649) — `transformers`
-`5.5.0` in `workers/gliner-relex/uv.lock` is `GHSA-xrqw-3rrv-vx5w` (high, `save_pretrained` path
-traversal), patched in `5.10.0`. `pyproject` already says `>=5.5.0`, so the remedy is a one-command
-lock bump — **but a green `cargo test --workspace` would prove nothing about it**, because the
-gliner-relex tests are the workspace's only standing `[SKIP]`s. Acceptance is a live
-`KASTELLAN_GLINER_RELEX_ENABLE=1 … entity_extraction_e2e` run with the skip count confirmed to have
-dropped. Not exploitable as we use the library (the worker never calls `save_pretrained`, and is
-sandboxed), so it is "free to fix", not "urgent".
-
-**From the #640 review (fixed in #645 as #641/#642/#643):**
+**From the #640 review (this session's branch fixes #641/#642/#643):**
 [#644](https://github.com/hherb/kastellan/issues/644) — a duplicate `ServiceSpec.env` key renders as
 a duplicate launchd plist dict key, whose resolution the format does not define. `tests-common` is
 safe (it collapses last-wins); this is the general case for every *other* producer.
-[#646](https://github.com/hherb/kastellan/issues/646) — the two name-cap copies #642 undercounted.
 
 **Guard model / measurement:** [#605](https://github.com/hherb/kastellan/issues/605) (the
 `PROVISIONAL` banner is unconditional — until it lands no report can say a τ is fitted);
