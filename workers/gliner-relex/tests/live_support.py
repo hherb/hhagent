@@ -6,25 +6,39 @@ a GPU — which is most hosts, most of the time. Every function here takes
 the environment as an argument rather than reading `os.environ`, so a
 test can hand it any environment it likes without monkeypatching.
 
-The resolution rules deliberately mirror the Rust side's
-`core/tests/entity_extraction_e2e.rs::resolve_weights_dir`. If you change
+The resolution rules mirror the Rust side's
+`kastellan_tests_common::gliner_weights::weights_dir_candidate`, which is
+the single copy the three gliner-relex e2e suites now share. If you change
 one, change both — two halves of one gate that disagree about where the
-weights live will produce a skip on one side and a run on the other.
+weights live will produce a skip on one side and a run on the other. The
+Rust module carries the same warning pointing back here.
 """
 from pathlib import Path
 from typing import Mapping, Optional
 
 #: The Hugging Face repo id the on-disk snapshot was downloaded from.
-#: Passed through to `GLiNER.from_pretrained` for provenance only — the
-#: load itself is `local_files_only`, so this never causes a fetch.
+#: `GlinerModel.load` takes it as an argument and does not currently use
+#: it — the load names `weights_dir` directly and is `local_files_only`,
+#: so nothing here can trigger a fetch. Passed anyway to keep the call
+#: shape identical to the worker's, and to record which snapshot the
+#: weights on disk are meant to be.
 MODEL_ID = "knowledgator/gliner-relex-multi-v1.0"
 
 #: Where `scripts/workers/gliner-relex/install.sh` puts the snapshot,
-#: relative to the kastellan data dir.
+#: relative to the kastellan data dir. Must stay equal to the Rust
+#: `gliner_weights::WEIGHTS_SUBPATH`; both are pinned to a literal by a
+#: test, because every other assertion builds its expectation from the
+#: constant and so cannot see a typo in it.
 WEIGHTS_SUBPATH = "workers/gliner-relex/weights/multi-v1.0"
 
-#: Set to exactly "1" to turn a missing-weights skip into a failure.
+#: Set to turn a missing-weights skip into a failure.
 REQUIRE_E2E_VAR = "KASTELLAN_GLINER_RELEX_REQUIRE_E2E"
+
+#: The project-wide flag dialect (#459): `env_flag_enabled` in
+#: `core/src/worker_lifecycle/force_route.rs` accepts exactly these,
+#: trimmed and case-insensitive. Every operator-facing kastellan flag
+#: reads this way, so this one does too.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 def weights_dir_candidate(env: Mapping[str, str]) -> Optional[Path]:
@@ -39,11 +53,13 @@ def weights_dir_candidate(env: Mapping[str, str]) -> Optional[Path]:
        sits at `<data dir>/WEIGHTS_SUBPATH`.
     3. ``HOME`` — the default data root is `$HOME/.local/share/kastellan`.
 
-    Returns `None` when none of the three is set, rather than a relative
-    path: a relative path would silently resolve against whatever the
-    current working directory happens to be, and the resulting skip
-    message would name a location nobody ever installed to.
+    A variable that is set but **empty** counts as unset, at every level.
+    Taking an empty value would build a *relative* path, and a relative
+    path silently resolves against whatever the current working directory
+    happens to be — a skip whose reason names a location nobody ever
+    installed to.
 
+    Returns `None` when none of the three is usable, for the same reason.
     This function does no I/O — the caller decides what a non-existent
     directory means.
     """
@@ -65,9 +81,14 @@ def weights_dir_candidate(env: Mapping[str, str]) -> Optional[Path]:
 def require_live(env: Mapping[str, str]) -> bool:
     """True when a real model run was demanded, so a skip must fail.
 
-    The comparison is against the exact string ``"1"``, matching the
-    Rust side's `Some("1")` check on its own opt-in variables. Accepting
-    ``"true"`` here and not there would let one half of the gate believe
-    a run was demanded while the other half quietly skipped.
+    Accepts the project's one flag dialect — ``1``/``true``/``yes``/``on``,
+    trimmed and case-insensitive — the same set `env_flag_enabled` accepts
+    on the Rust side. An operator who has learned that
+    `KASTELLAN_GLINER_RELEX_ENABLE=true` works would otherwise write
+    `…REQUIRE_E2E=true` here and get it silently ignored: a silent skip
+    from the one knob whose entire job is to abolish silent skips.
+
+    Trimming matters for the same reason it does in Rust: writing a flag
+    with `echo "1" >> kastellan.env` yields ``"1\\n"``.
     """
-    return env.get(REQUIRE_E2E_VAR) == "1"
+    return env.get(REQUIRE_E2E_VAR, "").strip().lower() in _TRUTHY

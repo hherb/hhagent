@@ -13,23 +13,23 @@ dependencies = [
     #
     # The two floors below are COUPLED, and both are load-bearing:
     #
-    #   * `transformers>=5.10.0` is the security floor. Everything below it
-    #     carries GHSA-xrqw-3rrv-vx5w (high) — a `save_pretrained` path
-    #     traversal that lets a crafted chat-template name write to an
-    #     arbitrary path. First patched in 5.10.0. We declare it here rather
-    #     than only bumping `uv.lock`, so the vulnerable range is
-    #     *unsatisfiable* rather than merely unlocked.
+    #   * `transformers>=5.10.0` is the security floor — GHSA-xrqw-3rrv-vx5w
+    #     (high), a `save_pretrained` path traversal, patched in 5.10.0:
+    #     https://github.com/advisories/GHSA-xrqw-3rrv-vx5w
+    #     Declared here rather than only bumped in `uv.lock`, so the
+    #     vulnerable range is *unsatisfiable* rather than merely unlocked.
     #
-    #   * `gliner>=0.2.28` is what makes that floor reachable. `gliner`
-    #     0.2.27 declares `transformers<5.7.0`, so with it in the graph the
-    #     best `uv lock --upgrade-package transformers` can do is 5.6.2 —
-    #     still vulnerable, and it exits 0 while saying so. 0.2.28 raised the
-    #     cap to `<5.14.0`. Bumping `transformers` alone does NOT fix the
-    #     advisory; see issue #649.
+    #   * `gliner>=0.2.28` is what makes that floor reachable. Observed
+    #     2026-09-02: gliner 0.2.27 caps `transformers<5.7.0`, so with it in
+    #     the graph the best `uv lock --upgrade-package transformers` can
+    #     reach is 5.6.2 — still vulnerable, exiting 0 while saying nothing.
+    #     0.2.28 raised the cap to `<5.14.0`. Bumping `transformers` alone
+    #     does NOT fix the advisory; see issue #649.
     #
     # Consequence worth keeping: with both floors declared, a resolution that
-    # tries to hold `gliner` at 0.2.27 is now a hard conflict rather than a
-    # silent downgrade.
+    # tries to hold `gliner` at 0.2.27 is a hard conflict, not a silent
+    # downgrade. The upper bound is still someone else's to move — the next
+    # advisory patched at >=5.14.0 is unsatisfiable until gliner lifts its cap.
     "gliner>=0.2.28",
     "transformers>=5.10.0",
     "sentencepiece>=0.2",
