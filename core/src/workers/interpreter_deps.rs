@@ -8,16 +8,22 @@
 //! worker runs (issue #284). This module finds those out-of-prefix libs and
 //! returns the canonical parent dirs to bind read-only.
 //!
-//! Pure core: the dependency graph and path canonicalization arrive as injected
-//! closures, so the transitive graph walk is unit-testable without `otool`/`ldd`. The
-//! only impurity is [`resolve_deps_via_tool`].
+//! It also answers the prior question — *which* interpreter, and under which
+//! names a jail must be able to reach it ([`root`], [`named_path`]; issue
+//! #650).
+//!
+//! Pure core: the dependency graph and every path probe arrive as injected
+//! closures, so the transitive graph walk is unit-testable without `otool`/`ldd`.
+//! The only impurities are [`resolve_deps_via_tool`] and [`read_link_via_fs`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+mod named_path;
 mod root;
 
-pub use root::resolve_interpreter_root;
+pub use named_path::read_link_via_fs;
+pub use root::{resolve_interpreter_root, InterpreterRoot};
 
 /// True when `p` lies under one of `roots` (path-prefix match).
 fn is_system_lib_path_in(p: &Path, roots: &[&str]) -> bool {

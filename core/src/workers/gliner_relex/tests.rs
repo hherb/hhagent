@@ -14,6 +14,7 @@ use super::*;
 use std::path::{Path, PathBuf};
 
 use crate::worker_lifecycle::Lifecycle;
+use crate::workers::interpreter_deps::InterpreterRoot;
 use kastellan_sandbox::{Net, Profile};
 
 #[test]
@@ -489,6 +490,12 @@ fn entry_container_mode_honours_custom_image_tag() {
 
 // ---- issue #284: host-mode external-interpreter binds ------------
 
+/// No symlinks: `bin/python3` is a plain file in these fixtures, so there is no
+/// alias to bind beside the canonical prefix (issue #650).
+fn no_link(_p: &Path) -> Option<PathBuf> {
+    None
+}
+
 /// A uv venv whose `bin/python3` symlinks to an EXTERNAL interpreter must
 /// surface that interpreter's prefix as `interpreter_root`, plus any
 /// out-of-prefix shared-lib dir the interpreter links (e.g. a Homebrew
@@ -508,8 +515,8 @@ fn host_interpreter_binds_external_venv() {
             vec![]
         }
     };
-    let (root, dirs) = resolve_host_interpreter_binds(venv, exists, canon, deps);
-    assert_eq!(root, Some(PathBuf::from("/opt/py/3.12")));
+    let (root, dirs) = resolve_host_interpreter_binds(venv, exists, canon, no_link, deps);
+    assert_eq!(root, Some(InterpreterRoot::canonical_only("/opt/py/3.12")));
     assert_eq!(dirs, vec![PathBuf::from("/opt/hb/gettext/lib")]);
 }
 
@@ -524,7 +531,7 @@ fn host_interpreter_binds_self_contained() {
             .then(|| PathBuf::from("/v/.venv/bin/python3.12"))
     };
     let no_deps = |_p: &Path| vec![];
-    let (root, dirs) = resolve_host_interpreter_binds(venv, exists, canon, no_deps);
+    let (root, dirs) = resolve_host_interpreter_binds(venv, exists, canon, no_link, no_deps);
     assert_eq!(root, None);
     assert!(dirs.is_empty(), "self-contained venv ⇒ no extra dirs, got {dirs:?}");
 }
@@ -534,7 +541,7 @@ fn host_interpreter_binds_self_contained() {
 #[test]
 fn host_mode_entry_binds_interpreter_root_and_lib_dirs() {
     let env = GlinerRelexEnv {
-        interpreter_root: Some(PathBuf::from("/opt/py/3.12")),
+        interpreter_root: Some(InterpreterRoot::canonical_only("/opt/py/3.12")),
         interpreter_lib_dirs: vec![PathBuf::from("/opt/hb/gettext/lib")],
         ..test_env()
     };

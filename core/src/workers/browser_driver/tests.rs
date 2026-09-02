@@ -1,8 +1,14 @@
 use super::*;
     use crate::worker_manifest::domain_rows;
+    use crate::workers::interpreter_deps::InterpreterRoot;
 
     /// No interpreter canonicalization in most tests — a self-contained venv.
     fn no_canon(_p: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// No symlinks in most tests — `bin/python3` is a plain file.
+    fn no_link(_p: &Path) -> Option<PathBuf> {
         None
     }
 
@@ -17,7 +23,7 @@ use super::*;
         let is_dir = |_p: &Path| true;
         let exists = |_p: &Path| true;
         assert!(matches!(
-            resolve_env(env, is_dir, exists, no_canon, no_deps),
+            resolve_env(env, is_dir, exists, no_canon, no_link, no_deps),
             Err(ResolveSkipReason::Disabled)
         ));
     }
@@ -32,7 +38,7 @@ use super::*;
         let exists = |_p: &Path| true;
         assert!(
             !matches!(
-                resolve_env(env, is_dir, exists, no_canon, no_deps),
+                resolve_env(env, is_dir, exists, no_canon, no_link, no_deps),
                 Err(ResolveSkipReason::Disabled)
             ),
             "ENABLE=true must pass the opt-in gate (not read as off)"
@@ -45,7 +51,7 @@ use super::*;
         let is_dir = |_p: &Path| true;
         let exists = |_p: &Path| true;
         assert!(matches!(
-            resolve_env(env, is_dir, exists, no_canon, no_deps),
+            resolve_env(env, is_dir, exists, no_canon, no_link, no_deps),
             Err(ResolveSkipReason::VenvDirUnresolvable)
         ));
     }
@@ -59,7 +65,7 @@ use super::*;
         };
         let is_dir = |_p: &Path| true;
         let exists = |_p: &Path| false; // shim absent
-        match resolve_env(env, is_dir, exists, no_canon, no_deps) {
+        match resolve_env(env, is_dir, exists, no_canon, no_link, no_deps) {
             Err(ResolveSkipReason::ScriptShimMissing { path }) => {
                 assert!(path.ends_with(SHIM_NAME), "path: {}", path.display());
             }
@@ -76,7 +82,7 @@ use super::*;
         };
         let is_dir = |_p: &Path| true;
         let exists = |_p: &Path| true;
-        let out = resolve_env(env, is_dir, exists, no_canon, no_deps).expect("resolves");
+        let out = resolve_env(env, is_dir, exists, no_canon, no_link, no_deps).expect("resolves");
         assert_eq!(out.venv_dir, PathBuf::from("/v"));
         assert!(out.script_path.ends_with(SHIM_NAME));
         // Self-contained (canonicalize → None) ⇒ no extra interpreter bind.
@@ -104,10 +110,12 @@ use super::*;
                 None
             }
         };
-        let out = resolve_env(env, is_dir, exists, canon, no_deps).expect("resolves");
+        let out = resolve_env(env, is_dir, exists, canon, no_link, no_deps).expect("resolves");
         assert_eq!(
             out.interpreter_root,
-            Some(PathBuf::from("/home/u/.pyenv/versions/3.12.3"))
+            Some(InterpreterRoot::canonical_only(
+                "/home/u/.pyenv/versions/3.12.3"
+            ))
         );
         // And the entry binds that root read-only.
         let entry = browser_driver_entry(&out, &[], None);
@@ -127,7 +135,7 @@ use super::*;
             }
             _ => None,
         };
-        let out = resolve_env(env, |_p| true, |_p| true, no_canon, no_deps).expect("resolves");
+        let out = resolve_env(env, |_p| true, |_p| true, no_canon, no_link, no_deps).expect("resolves");
         // Absolute entry kept; relative one dropped (policy needs absolute paths).
         assert_eq!(out.extra_fs_read, vec![PathBuf::from("/opt/homebrew")]);
         let entry = browser_driver_entry(&out, &[], None);
@@ -142,7 +150,7 @@ use super::*;
             "KASTELLAN_BROWSER_DRIVER_EXTRA_FS_READ" => Some("not json".to_string()),
             _ => None,
         };
-        let out = resolve_env(env, |_p| true, |_p| true, no_canon, no_deps).expect("resolves");
+        let out = resolve_env(env, |_p| true, |_p| true, no_canon, no_link, no_deps).expect("resolves");
         assert!(out.extra_fs_read.is_empty());
     }
 
@@ -157,7 +165,7 @@ use super::*;
         let exists = |_p: &Path| true;
         // Self-contained venv: python3 resolves to within /v.
         let canon = |_p: &Path| Some(PathBuf::from("/v/bin/python3.12"));
-        let out = resolve_env(env, is_dir, exists, canon, no_deps).expect("resolves");
+        let out = resolve_env(env, is_dir, exists, canon, no_link, no_deps).expect("resolves");
         assert_eq!(
             out.interpreter_root, None,
             "interpreter already under venv_dir ⇒ no extra bind"
@@ -362,7 +370,7 @@ use super::*;
         let env = BrowserDriverEnv {
             script_path: PathBuf::from("/v/bin/kastellan-worker-browser-driver"),
             venv_dir: PathBuf::from("/v"),
-            interpreter_root: Some(PathBuf::from("/px")),
+            interpreter_root: Some(InterpreterRoot::canonical_only("/px")),
             interpreter_lib_dirs: vec![PathBuf::from("/opt/hb/gettext/lib")],
             extra_fs_read: vec![],
         };
@@ -441,7 +449,7 @@ use super::*;
                 vec![]
             }
         };
-        let out = resolve_env(env, |_p| true, |_p| true, canon, deps).expect("resolves");
+        let out = resolve_env(env, |_p| true, |_p| true, canon, no_link, deps).expect("resolves");
         assert_eq!(
             out.interpreter_lib_dirs,
             vec![PathBuf::from("/opt/hb/gettext/lib")]
