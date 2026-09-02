@@ -18,6 +18,10 @@ movement-only `LlmEndpoint` split) and `466ca7ff`
 **OPEN BRANCH: `fix/649-transformers-lock-bump`** — the #649 security bump; see
 [#649](#649--the-transformers-advisory-and-the-two-faults-it-uncovered).
 
+> ⚠️ **The DGX checkout is left on `fix/649-transformers-lock-bump`, and its gliner-relex `.venv`
+> is rebuilt from that branch's lock** (transformers 5.13.1). Neither affects the running daemon,
+> which executes the *installed* `121f22a2` binaries. `git checkout main` there after #651 merges.
+
 > ⚠️ **THE DGX WORKSPACE IS NO LONGER GREEN, and that is an honest change, not a regression.**
 > Rebuilding the gliner-relex venv (it had been a broken **macOS** copy, so four tests had been
 > skipping-as-passing for months) made those tests actually run — and three of them fail, on a
