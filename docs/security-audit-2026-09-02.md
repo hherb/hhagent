@@ -137,3 +137,10 @@ egress-proxy 66, llm-router, web-common 89 with `--all-features`, python-exec
 42, microvm-init 24, matrix-wire 8, net-classify 14, browser-driver pytest 46).
 The Firecracker and live-Matrix paths compile (`--features live-matrix`
 checked) but need the DGX for their e2e gates.
+
+CI on PR [#660](https://github.com/hherb/kastellan/pull/660): all checks green on
+`ae3ead6` — workspace check + clippy, the live-matrix check + clippy, `uv lock --check`,
+and CodeQL (rust, python, actions). Two follow-ups landed after the audit commit: a
+`manual_contains` lint that only the live-matrix clippy job compiles, and five CodeQL
+`rust/cleartext-logging` alerts on the guest's privilege drop, which had interpolated the
+numeric uid into stderr and panic messages; the guest now never echoes the value.

@@ -15,7 +15,9 @@ DEPLOYED** (see [Merged work, compressed](#merged-work-compressed--the-guard-arc
 `121f22a2` ([#645](https://github.com/hherb/kastellan/pull/645): #641, #642, #643, plus a
 movement-only `LlmEndpoint` split) and `466ca7ff`
 ([#640](https://github.com/hherb/kastellan/pull/640), #632 + #634). ·
-**OPEN BRANCH: `fix/649-transformers-lock-bump`** — the #649 security bump; see
+**OPEN BRANCHES:** `claude/security-audit-fixes-ov4lej` — the security audit, PR
+[#660](https://github.com/hherb/kastellan/pull/660) (draft, **CI green on `ae3ead6` incl.
+CodeQL**, DGX gate owed; see [Current state](#current-state)) · `fix/649-transformers-lock-bump` — the #649 security bump; see
 [#649](#649--the-transformers-advisory-and-the-two-faults-it-uncovered).
 
 > ⚠️ **The DGX checkout is left on `fix/649-transformers-lock-bump`, and its gliner-relex `.venv`
@@ -73,6 +75,17 @@ provably ran under transformers 5.13.1. Both hosts on rustc **1.98.0** (CI parit
 Full write-up in [`docs/security-audit-2026-09-02.md`](../../security-audit-2026-09-02.md);
 the ROADMAP entry lists every fix in one line. **What the next session must know:**
 
+- **PR [#660](https://github.com/hherb/kastellan/pull/660), draft, CI green on `ae3ead6`** —
+  all nine checks (workspace check + clippy, live-matrix check + clippy, `uv lock --check`,
+  CodeQL rust/python/actions, the two Cloudflare builds). Two follow-up commits after the
+  audit commit, both lessons worth keeping: (1) the **live-matrix clippy job** caught a
+  `manual_contains` lint the default-feature workspace clippy never compiles — run
+  `cargo clippy -p kastellan-worker-matrix --all-targets --features live-matrix --locked -- -D warnings`
+  locally before pushing anything that touches `sdk_live.rs`; (2) **CodeQL flagged five
+  `rust/cleartext-logging` alerts** on the guest's new privilege drop for interpolating the
+  numeric `uid` into stderr/panic lines — the value is now never echoed (the host chose it and
+  knows it). Same convention as the ROADMAP's `hard-coded-cryptographic-value` note: CodeQL
+  reads NAMES, so keep identifier- and credential-like names out of log and panic text.
 - **29 fixes on one branch, 80 files, ~2 200 lines.** Every fix that could be pinned
   hermetically has a test that fails on the old code (the seccomp ones fork a child and
   install the real filter — no bwrap needed). The four load-bearing ones: (H1) the
