@@ -86,6 +86,14 @@ behind each platform `cfg`.
   `"x".repeat(250)` the test had to use) and skipped the half that can. A label with a space or a
   `/` sailed past it and died much later inside `install`, naming a *service name* rather than the
   label that produced it.
+- **⚠️ #642 undercounted: it was the third, fourth AND fifth copy.**
+  [#646](https://github.com/hherb/kastellan/issues/646) records the two still hand-rolled —
+  `tests-common/src/pg.rs:207` and `core/tests/supervisor_e2e.rs:143`, both guarding a name that is
+  installed as a real unit. **Not folded into this branch deliberately:** the shared predicate is
+  *stricter*, and `bring_up_pg_cluster` has ~200 call sites, a good number building the name from a
+  `{label}`/`{tag}`/`{test_label}` variable. Tightening without auditing every one risks turning a
+  passing test into a panic, and folding an unaudited change in would have put it behind an
+  already-green DGX gate. The `supervisor_e2e` one is a single call site and can go first.
 
 **#641 — `DaemonSpec::new(label, data_dir, llm)`: three parameters, no two the same type.**
 It took five, of which `label`, `suffix` and `user` were all `impl Into<String>`.
