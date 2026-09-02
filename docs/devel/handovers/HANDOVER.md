@@ -17,7 +17,7 @@ review filed: [#642](https://github.com/hherb/kastellan/issues/642) (one shared
 `validate_service_name`), [#641](https://github.com/hherb/kastellan/issues/641) (`DaemonSpec::new`
 down to three non-transposable parameters) and
 [#643](https://github.com/hherb/kastellan/issues/643) (one `ReportedRates` mapping for all three
-guard reporting sites), plus a movement-only `LlmEndpoint` split.
+guard reporting sites), plus a movement-only `LlmEndpoint` split. **[PR #645](https://github.com/hherb/kastellan/pull/645), open.**
 
 **Last gate: DGX over `main` at `466ca7ff` — 3928 / 0 / 55, 176 suites, `TEST_EXIT=0`**; cold clippy
 exit 0, **345** `Checking`+`Compiling` lines over 330 distinct crates with all **27** kastellan
@@ -345,7 +345,7 @@ Full prose in the [`archive/`](archive/) snapshots. What still binds:
 
 > Only *open* work is listed. Shipped items move to [Recently merged](#recently-merged) or the ROADMAP.
 
-**FIRST: open the PR for `fix/641-642-643-daemonspec-and-service-name` and get it reviewed.** The
+**FIRST: get [PR #645](https://github.com/hherb/kastellan/pull/645) reviewed and merged.** The
 DGX gate and cold clippy are green over the whole branch (see the header). **The one outstanding
 verification is macOS-side and needs the Mac to be usable again:** `cargo clippy -p
 kastellan-supervisor --all-targets -- -D warnings` on the Mac, because the launchd half of #642 is
