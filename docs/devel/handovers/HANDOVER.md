@@ -8,7 +8,7 @@
 > which holds the verbose pre-prune version of everything summarised here,
 > including the full #619, #615/#616/#618 and live-bring-up write-ups compressed below.
 
-**Last updated:** 2026-09-02 (third session) · **DGX RUNNING `121f22a2` — the whole guard arc is
+**Last updated:** 2026-09-03 (#656 review round) · **DGX RUNNING `121f22a2` — the whole guard arc is
 DEPLOYED** (see [Merged work, compressed](#merged-work-compressed--the-guard-arc-and-the-2026-09-02-deploy)). ·
 **`main` HEAD:** `ef8144f8` —
 [#651](https://github.com/hherb/kastellan/pull/651), the #649 transformers advisory fix, on top of
@@ -23,15 +23,23 @@ DEPLOYED** (see [Merged work, compressed](#merged-work-compressed--the-guard-arc
 > load, as do `entity_extraction_e2e`'s two real-worker tests. The DGX checkout is on the #650
 > branch; its gliner-relex `.venv` is the one rebuilt from the merged lock (transformers 5.13.1).
 
-**Last gate: DGX over `fix/650-interpreter-alias-bind` — 3968 / 0 / 55, 176 suites, `TEST_EXIT=0`,
-4 `[SKIP]`.** The delta reconciles exactly against the 3940 of the last recorded row: **+10** from
-#651's own review round (`kastellan-tests-common::gliner_weights`), which the DGX had never gated —
-this file recorded that debt and it is now paid — and **+18** from #650. `kastellan-core --lib` is
-**2004 on both hosts**, the interpreter modules being `cfg`-free. Plus Mac
-`clippy -p kastellan-core -p kastellan-tests-common --all-targets -D warnings` exit 0, zero
-warnings, and the DGX's own cold-dir `clippy --workspace --all-targets` exit 0 over all **27**
-crates. Both hosts on rustc **1.98.0** (CI parity, re-checked). See
+**Last gate: DGX over `fix/650-interpreter-alias-bind` `757413c1` — 3973 / 0 / 55, 176 suites,
+`TEST_EXIT=0`.** The delta reconciles exactly: **+5** over the 3968 of the pre-review-round gate,
+which is precisely the five tests the #656 review added (two entry-level alias guards, the
+`bin/python` fallback, the leading-`.` carve-out, `symlink_chain`'s fourth termination arm), and
+that 3968 in turn was **+10** `kastellan-tests-common::gliner_weights` from #651's never-gated
+review round plus **+18** from #650. `kastellan-core --lib` is **2009 on both hosts** (2004 + the
+same five), the interpreter modules being `cfg`-free. `gliner_relex_e2e` re-run **4 / 0 with zero
+`[SKIP]` under `--nocapture`** and a real model load (34 s) — the acceptance evidence survives the
+review round's `interpreter_lib_dirs` signature change. Clippy exit 0 on both hosts (Mac
+`-p kastellan-core -p kastellan-tests-common --all-targets -D warnings`, 218 `Checking` lines from
+a cold private dir; DGX `--workspace --all-targets` **incremental**, re-linting the 5 crates this
+diff invalidates — the 27-crate cold sweep is the row below). Both hosts rustc **1.98.0**. See
 [Test baseline](#test-baseline-authoritative).
+
+⚠️ The workspace run was **without** `--nocapture`, so its `[SKIP]` count is unmeasured, not zero —
+`eprintln!` from a passing test is captured. The zero above is from the targeted e2e re-run, which
+did use it. [[custom-cargo-target-dir-breaks-daemon-e2e]]
 
 > ⚠️ **A slow Mac cargo build is CONTENTION, not the `_dyld_start` wedge — and I misdiagnosed it
 > this session.** A `cargo test -p kastellan-supervisor --lib` that sat ~25 minutes with no visible
@@ -471,6 +479,8 @@ Full prose in the [`archive/`](archive/) snapshots — most recently
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`a990e8ec`** — tree-identical to the branch tip `6eec7df4` (the commit was re-cut to move a ROADMAP hunk out of it; `git diff -- core tests-common` empty) | **3968 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **The delta reconciles exactly** against the 3940 below: **+10** `kastellan-tests-common::gliner_weights` from #651's review round, which the DGX had never gated, and **+18** from #650. `kastellan-core --lib` **2004**, identical to the Mac | exit 0 from a **cold** private dir under `$HOME`: **345** `Checking`+`Compiling` lines, all **27** kastellan crates named, **zero** warnings. rustc **1.98.0** | **4**, all `KASTELLAN_GLINER_RELEX_ENABLE != "1"` |
 | **DGX** (targeted, #650 acceptance) | **`a990e8ec`** | `gliner_relex_e2e` **4 / 0** with **zero `[SKIP]`** and a real 1.3 GB model load (43 s); `entity_extraction_e2e` **16 / 0** under `KASTELLAN_GLINER_RELEX_ENABLE=1`, both real-worker tests included. All five tests #650 named previously failed | — | 0 |
 | **Mac** (aarch64 darwin) | **`a990e8ec`** | `cargo test -p kastellan-core --lib` **2004 / 0**; `interpreter_deps` filter **39 / 0** (was 21). **15 mutants tried, 15 killed** | `clippy -p kastellan-core -p kastellan-tests-common --all-targets -D warnings` exit 0, **zero** warnings. rustc **1.98.0** | 0 |
+| **DGX** (post-review-round, #656) | **`757413c1`** | `cargo test --workspace --no-fail-fast` **3973 / 0 / 55**, **176** suites, `TEST_EXIT=0` (+5 = the review round's five new tests). Targeted re-run: `gliner_relex_e2e` **4 / 0**, **zero `[SKIP]` under `--nocapture`**, real model load, 33.7 s | `clippy --workspace --all-targets -D warnings` exit 0 — **incremental, 5 crates** re-linted (`core`, `tests-common`, `sandbox`, `supervisor`, `db`), not a cold 27-crate sweep. rustc **1.98.0** | unmeasured on the workspace run (no `--nocapture`); **0** on the e2e |
+| **Mac** (post-review-round, #656) | **`757413c1`** | `cargo test -p kastellan-core --lib` **2009 / 0 / 1**; `interpreter_deps` filter **42** (was 21 on `main`) | `clippy -p kastellan-core -p kastellan-tests-common --all-targets -D warnings` exit 0, **zero** warnings, **218** `Checking` lines from a cold private target dir. rustc **1.98.0** | 0 |
 | **Mac** (aarch64 darwin) | **#651 review round** | `uv run --frozen pytest` **63 / 0** in `workers/gliner-relex`, including the real 1.3 GB model load under transformers 5.13.1. Seven gate arms verified individually, incl. **deselect-under-knob → exit 1** and **rename-out-of-collection-under-knob → exit 1**, which both exited **0** before | — | 0 |
 
 **The row the delta above is measured against:** DGX `f12ed26d` (tree-identical to `main`
