@@ -624,10 +624,20 @@ Beyond those under [Next TODO](#next-todo). Only currently-open issues; closed-i
 the [`archive/`](archive/) snapshots and git history. **The one-line summaries here are pointers —
 read the issue before acting, since several carry measurements that close off the obvious fix.**
 
-**From the #640 review (this session's branch fixes #641/#642/#643):**
+**Dependency security:** [#649](https://github.com/hherb/kastellan/issues/649) — `transformers`
+`5.5.0` in `workers/gliner-relex/uv.lock` is `GHSA-xrqw-3rrv-vx5w` (high, `save_pretrained` path
+traversal), patched in `5.10.0`. `pyproject` already says `>=5.5.0`, so the remedy is a one-command
+lock bump — **but a green `cargo test --workspace` would prove nothing about it**, because the
+gliner-relex tests are the workspace's only standing `[SKIP]`s. Acceptance is a live
+`KASTELLAN_GLINER_RELEX_ENABLE=1 … entity_extraction_e2e` run with the skip count confirmed to have
+dropped. Not exploitable as we use the library (the worker never calls `save_pretrained`, and is
+sandboxed), so it is "free to fix", not "urgent".
+
+**From the #640 review (fixed in #645 as #641/#642/#643):**
 [#644](https://github.com/hherb/kastellan/issues/644) — a duplicate `ServiceSpec.env` key renders as
 a duplicate launchd plist dict key, whose resolution the format does not define. `tests-common` is
 safe (it collapses last-wins); this is the general case for every *other* producer.
+[#646](https://github.com/hherb/kastellan/issues/646) — the two name-cap copies #642 undercounted.
 
 **Guard model / measurement:** [#605](https://github.com/hherb/kastellan/issues/605) (the
 `PROVISIONAL` banner is unconditional — until it lands no report can say a τ is fitted);
