@@ -298,6 +298,11 @@ pub(crate) fn exec_worker() {
 /// is absent — a rootfs newer than its host — the worker stays root exactly
 /// as before, and says so on stderr, so the two halves can be upgraded in
 /// either order without a silent change.
+///
+/// The numeric uid is deliberately never echoed to stderr or into a panic
+/// message: the host chose it (it is the daemon's own euid) and already knows
+/// it, and identifiers in log lines are what code scanning flags as cleartext
+/// logging. The messages name the env var instead.
 fn drop_privileges_for_worker(cmdline: &str) {
     // SAFETY: prctl with immediate arguments; process-wide flag only.
     unsafe {
@@ -315,7 +320,7 @@ fn drop_privileges_for_worker(cmdline: &str) {
     let uid: u32 = raw
         .to_str()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or_else(|| panic!("microvm-init: {WORKER_UID_ENV} is not a uid: {raw:?}"));
+        .unwrap_or_else(|| panic!("microvm-init: {WORKER_UID_ENV} is not a uid"));
     if uid == 0 {
         eprintln!("microvm-init: {WORKER_UID_ENV}=0 — worker stays root");
         return;
@@ -335,7 +340,7 @@ fn drop_privileges_for_worker(cmdline: &str) {
         let rc = unsafe { libc::chown(c.as_ptr(), uid, uid) };
         if rc != 0 {
             eprintln!(
-                "microvm-init: chown {dir} to {uid} failed: {} (worker may be unable to write there)",
+                "microvm-init: chown {dir} to the worker uid failed: {} (worker may be unable to write there)",
                 std::io::Error::last_os_error()
             );
         }
@@ -346,17 +351,17 @@ fn drop_privileges_for_worker(cmdline: &str) {
             panic!("microvm-init: setgroups failed: {}", std::io::Error::last_os_error());
         }
         if libc::setgid(uid) != 0 {
-            panic!("microvm-init: setgid({uid}) failed: {}", std::io::Error::last_os_error());
+            panic!("microvm-init: setgid to the worker uid failed: {}", std::io::Error::last_os_error());
         }
         if libc::setuid(uid) != 0 {
-            panic!("microvm-init: setuid({uid}) failed: {}", std::io::Error::last_os_error());
+            panic!("microvm-init: setuid to the worker uid failed: {}", std::io::Error::last_os_error());
         }
         // A successful setuid from root must be irreversible; prove it.
         if libc::setuid(0) == 0 || libc::getuid() != uid || libc::geteuid() != uid {
-            panic!("microvm-init: privilege drop to {uid} did not stick");
+            panic!("microvm-init: privilege drop to the worker uid did not stick");
         }
     }
-    eprintln!("microvm-init: worker privileges dropped to uid/gid {uid}");
+    eprintln!("microvm-init: worker privileges dropped to the uid/gid named by {WORKER_UID_ENV}");
 }
 
 /// Mirror of `kastellan_sandbox::linux_firecracker::plan::GUEST_WORKER_UID_ENV`
