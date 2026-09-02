@@ -1,9 +1,14 @@
 """Shared pytest fixtures.
 
 The mocked-model fixture lets us exercise server.py + model.py contract
-without loading 1.3 GB of weights. The real-model load is covered by
-the manual smoke test (operator-runnable, not in CI) and by the Rust
-side's slice-2 integration test (skip-as-pass without weights).
+without loading 1.3 GB of weights.
+
+The real-model load — which no mocked test can prove still works after a
+library upgrade — is covered by `test_model_live.py`, which loads the
+on-disk weights for real and skips-as-pass when they are absent (set
+`KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1` to make that a failure instead).
+The Rust side's `core/tests/entity_extraction_e2e.rs` covers the same
+path through the full sandboxed worker.
 """
 from unittest.mock import MagicMock
 

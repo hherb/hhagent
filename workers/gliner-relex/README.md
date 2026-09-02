@@ -23,6 +23,10 @@ Required tools on PATH: `uv`, `hf` (or `huggingface-cli`), `python3`.
 
 ## Smoke test (operator-runnable; not in cargo test)
 
+This drives the **whole worker** over JSON-RPC. For just the model-load
+half — the part a library upgrade breaks — `pytest` now has a repeatable
+equivalent; see [Testing](#testing).
+
 ```sh
 cd workers/gliner-relex
 echo '{"jsonrpc":"2.0","id":1,"method":"extract","params":{"text":"Dr Smith treats asthma in Mosman.","entity_labels":["person","disease","location"],"relation_labels":["treats","located_in"]}}' \
@@ -82,10 +86,34 @@ Triple-level deduplication is NOT performed by the worker — consumers decide t
 
 ```sh
 cd workers/gliner-relex
-uv run pytest -v
+uv run --frozen pytest -v -rs
 ```
 
-24 tests (6 errors + 12 server + 6 model). All mock the GLiNER load — no weights or GPU needed. The real-model round-trip lives on the Rust side: `cargo test -p kastellan-core --test gliner_relex_e2e` (skip-as-pass without venv + weights; Slice 2 of the implementation plan).
+51 tests: 6 errors + 12 server + 6 model + 12 resolve_device + 15 model_live.
+
+All but one **mock** the GLiNER load, so they need no weights and no GPU.
+The exception is `test_model_live.py::test_real_model_loads_and_extracts`,
+which loads the on-disk `multi-v1.0` snapshot for real and runs one
+extraction through it. That is the only check in this suite that can fail
+when a `transformers` / `gliner` / `torch` upgrade breaks the **load
+path** — the gap that made the #649 security bump risky — so run it after
+any dependency change.
+
+It is **skip-as-pass** when the weights are absent (`-rs` prints the
+reason and the path it looked at). Because a skip and a run are
+indistinguishable in the result column, there is an opt-out:
+
+```sh
+KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1 uv run --frozen pytest -q
+```
+
+turns a missing weights dir into a hard **failure** instead of a skip.
+Use it whenever a green run is supposed to mean something.
+
+The same round-trip through the full sandboxed worker lives on the Rust
+side: `cargo test -p kastellan-core --test gliner_relex_e2e` and
+`--test entity_extraction_e2e` (both skip-as-pass without venv + weights;
+the latter also needs `KASTELLAN_GLINER_RELEX_ENABLE=1`).
 
 ## License
 
