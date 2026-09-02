@@ -336,7 +336,11 @@ async fn pair_revoke(args: &[String]) -> ExitCode {
     use kastellan_db::pool::connect_admin_pool;
 
     let (channel, peer) = match args {
-        [c, p] => (c.clone(), p.clone()),
+        // Normalised exactly like `pair issue-token` stores them (trimmed,
+        // peer lowercased) — otherwise `pair revoke email Me@Example.org`
+        // matched nothing and the pairing silently stayed active (security
+        // audit 2026-09-02, channel F3).
+        [c, p] => (c.trim().to_string(), p.trim().to_ascii_lowercase()),
         _ => {
             eprintln!("usage: kastellan-cli pair revoke <channel> <peer>");
             return ExitCode::from(2);

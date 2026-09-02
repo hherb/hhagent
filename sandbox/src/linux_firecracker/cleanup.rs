@@ -98,11 +98,15 @@ pub fn sweep_orphaned_run_dirs(temp_dir: &std::path::Path, alive: impl Fn(u32) -
             continue;
         }
         let path = entry.path();
-        if !path.is_dir() {
+        // Only a real directory we own is ours to inspect or remove (audit
+        // 2026-09-02, S3): another uid can create `kastellan-microvm-*` under
+        // the shared temp root, and reading its `launcher.pid` used to follow
+        // symlinks and block forever on a planted FIFO.
+        if !is_own_real_dir(&path) {
             continue;
         }
         let marker = path.join(TEARDOWN_MARKER_FILE).exists();
-        let pidfile = std::fs::read_to_string(path.join(LAUNCHER_PID_FILE)).ok();
+        let pidfile = read_pidfile_nofollow(&path.join(LAUNCHER_PID_FILE));
         if orphaned_run_dir_should_remove(marker, pidfile, &alive)
             && std::fs::remove_dir_all(&path).is_ok()
         {
@@ -119,6 +123,33 @@ pub fn sweep_orphaned_run_dirs(temp_dir: &std::path::Path, alive: impl Fn(u32) -
 /// (a dead launcher's pid now held by an unrelated process) reads as alive →
 /// that dir is conservatively kept (a safe missed-cleanup).
 pub use crate::pid::pid_is_alive;
+
+/// True iff `path` is a directory (not a symlink to one) owned by this uid.
+fn is_own_real_dir(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(md) = std::fs::symlink_metadata(path) else { return false };
+    // SAFETY: geteuid has no preconditions.
+    md.is_dir() && !md.file_type().is_symlink() && md.uid() == unsafe { libc::geteuid() }
+}
+
+/// Read a small pid file with `O_NOFOLLOW | O_NONBLOCK` (a symlink or a FIFO
+/// at the path yields `None`/an immediate error instead of a follow or a
+/// hang) and a 64-byte cap.
+fn read_pidfile_nofollow(path: &std::path::Path) -> Option<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut s = String::new();
+    f.take(64).read_to_string(&mut s).ok()?;
+    Some(s)
+}
 
 #[cfg(test)]
 mod tests {

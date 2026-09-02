@@ -91,7 +91,13 @@ impl SystemPromptBuilder for PgSystemPromptBuilder {
         // cap with priority drop" follow-up will plumb a budget
         // through here. See https://github.com/hherb/kastellan/issues/78.
         let l0 = load_l0_active_default(&self.pool).await?;
-        let l1 = load_l1_default(&self.pool).await?;
+        // Every pinned L1 row is screened before it reaches the prompt (audit
+        // 2026-09-02, H2) — the same catalogue gate `<recalled>` rows pass —
+        // so a row that predates promotion-time screening, or an operator
+        // row that happens to carry an override phrase, is withheld too.
+        let l1 = crate::recall_assembly::pg_builder::screen_recall_rows(
+            load_l1_default(&self.pool).await?,
+        );
         let skills = crate::memory::l3_surface::load_l3_skills_default(&self.pool).await?;
         let now_block = self.timezone.as_ref().map(super::now::current_now_block);
         let system_prompt = assemble_system_prompt(

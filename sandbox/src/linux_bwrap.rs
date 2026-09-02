@@ -9,6 +9,8 @@
 //!   - `--new-session` so the worker can't read/write the parent's TTY
 //!   - `--as-pid-1` so signals stay contained
 //!   - `--clearenv` so host env vars don't leak in
+//!   - `--disable-userns` so the worker cannot mint a nested user namespace
+//!     (the parent-side twin of the worker's seccomp `unshare`/`clone` kill)
 //!
 //! Not yet (deferred to Phase 0 hardening, tracked in `docs/threat-model.md`):
 //!   - Per-host network allowlist (handled by the egress proxy, not bwrap)
@@ -52,6 +54,10 @@ impl LinuxBwrap {
         let output = Command::new("bwrap")
             .args([
                 "--unshare-user",
+                // Same flag the real argv carries (see `build_argv_with_resolver`),
+                // so a bwrap too old to know it fails the probe with a clear
+                // message rather than every worker spawn.
+                "--disable-userns",
                 "--ro-bind",
                 "/usr",
                 "/usr",
@@ -86,6 +92,14 @@ impl LinuxBwrap {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("disable-userns") {
+                return Err(SandboxError::Backend(format!(
+                    "bwrap probe failed: {}\n\nThis bwrap does not support --disable-userns \
+                     (bubblewrap < 0.6). kastellan refuses nested user namespaces inside \
+                     worker jails; upgrade bubblewrap.",
+                    stderr.trim()
+                )));
+            }
             let hint = if stderr.contains("setting up uid map")
                 || stderr.contains("Operation not permitted")
                 || stderr.contains("RTM_NEWADDR")
@@ -252,6 +266,15 @@ pub fn build_argv_with_resolver(
         (Net::Deny, _) => { /* no net */ }
     }
 
+    // No nested user namespaces (security audit 2026-09-02). The worker
+    // already sits in the fresh userns `--unshare-all` created; letting it
+    // mint another one is the first step of most unprivileged-userns kernel
+    // LPEs. The worker-side seccomp filter refuses `unshare`/`clone(CLONE_NEW*)`
+    // too — this is the parent-side half of "parent denies + child denies
+    // again". bwrap ≥ 0.6 implements it by capping `user.max_user_namespaces`
+    // inside the new userns; `probe()` carries the same flag so an older
+    // bwrap fails loudly at startup instead of at the first spawn.
+    argv.push("--disable-userns".into());
     argv.push("--die-with-parent".into());
     argv.push("--new-session".into());
     argv.push("--as-pid-1".into());
@@ -337,6 +360,7 @@ mod tests {
         let argv = build_argv(&strict_policy(), "/bin/echo", &["hi"]);
         assert_eq!(argv[0], "bwrap");
         assert!(argv.contains(&"--unshare-all".into()));
+        assert!(argv.contains(&"--disable-userns".into()), "nested userns must be refused");
         assert!(argv.contains(&"--die-with-parent".into()));
         assert!(argv.contains(&"--new-session".into()));
         assert!(argv.contains(&"--clearenv".into()));

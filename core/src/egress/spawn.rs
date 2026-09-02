@@ -323,7 +323,19 @@ pub fn spawn_sidecar(
     }
     let policy = proxy_policy(spec);
     let uds_path = spec.scratch.join(UDS_FILE_NAME);
-    let _ = std::fs::remove_file(&uds_path);
+    // The scratch dir is minted exclusively per spawn (audit 2026-09-02, S1),
+    // so nothing may already be at the socket or CA path. The readiness loop
+    // below waits for both files to EXIST — a planted pair would have made it
+    // return `Ok` while the real proxy died on `bind()`, coupling the worker
+    // to an impostor. Refuse instead of removing.
+    let ca_path_pre = spec.scratch.join(CA_FILE_NAME);
+    if uds_path.symlink_metadata().is_ok() || ca_path_pre.symlink_metadata().is_ok() {
+        anyhow::bail!(
+            "egress sidecar scratch {:?} already holds {UDS_FILE_NAME} or {CA_FILE_NAME} before \
+             the proxy was spawned — refusing to trust a pre-existing socket/CA",
+            spec.scratch
+        );
+    }
 
     // Derive the worker-side lockdown env (KASTELLAN_SECCOMP_PROFILE +
     // KASTELLAN_LANDLOCK_RW/RO) exactly like every other spawn path. Without

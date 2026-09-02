@@ -121,18 +121,9 @@ fn parse_pin(s: &str) -> Result<[u8; 32], PinError> {
         .map_err(|v: Vec<u8>| PinError::Pin(format!("expected 32 bytes, got {}", v.len())))
 }
 
-/// True iff any DER cert in `chain` hashes to a pin in `pins`. A cert that fails
-/// SPKI extraction is treated as "no match" (webpki has already validated the
-/// chain by the time this runs), never fatal.
-pub fn chain_has_pin(pins: &HashSet<[u8; 32]>, chain: &[&[u8]]) -> bool {
-    chain
-        .iter()
-        .filter_map(|der| spki_sha256(der).ok())
-        .any(|h| pins.contains(&h))
-}
-
-/// Test seam: match against already-hashed SPKIs (so unit tests need not forge
-/// real chain certificates). Production uses [`chain_has_pin`].
+/// Test seam: match against already-hashed SPKIs. Production matching runs
+/// against the VALIDATED path in [`verified_path_has_pin`] (the earlier
+/// presented-list `chain_has_pin` was removed by the 2026-09-02 audit, F1).
 #[cfg(test)]
 pub(crate) fn chain_pins_contains(pins: &HashSet<[u8; 32]>, hashes: &[[u8; 32]]) -> bool {
     hashes.iter().any(|h| pins.contains(h))
@@ -167,17 +158,64 @@ fn server_name_host(name: &ServerName) -> String {
 #[derive(Debug)]
 pub struct PinningVerifier {
     inner: Arc<WebPkiServerVerifier>,
+    roots: Arc<RootCertStore>,
     pins: PinSet,
 }
 
 impl PinningVerifier {
     /// Build over `roots`. Returns `Err` only if rustls refuses the roots.
     pub fn new(roots: Arc<RootCertStore>, pins: PinSet) -> Result<Self, PinError> {
-        let inner = WebPkiServerVerifier::builder(roots)
+        let inner = WebPkiServerVerifier::builder(Arc::clone(&roots))
             .build()
             .map_err(|e| PinError::Verifier(e.to_string()))?;
-        Ok(Self { inner, pins })
+        Ok(Self { inner, roots, pins })
     }
+}
+
+/// SHA-256 over the full SPKI `SEQUENCE` of a trust anchor. `TrustAnchor`
+/// stores the *value* of the subjectPublicKeyInfo field (the bytes inside the
+/// outer `SEQUENCE`), so re-wrap it before hashing so an anchor pin is the same
+/// `sha256/<base64(SPKI DER)>` an operator computes from the root's PEM.
+fn anchor_spki_sha256(anchor: &rustls::pki_types::TrustAnchor<'_>) -> [u8; 32] {
+    let inner = anchor.subject_public_key_info.as_ref();
+    let mut der = Vec::with_capacity(inner.len() + 6);
+    der.push(0x30);
+    let len = inner.len();
+    if len < 0x80 {
+        der.push(len as u8);
+    } else {
+        let bytes = len.to_be_bytes();
+        let first = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len() - 1);
+        der.push(0x80 | (bytes.len() - first) as u8);
+        der.extend_from_slice(&bytes[first..]);
+    }
+    der.extend_from_slice(inner);
+    Sha256::digest(&der).into()
+}
+
+/// True iff a pin matches the leaf, an intermediate ON THIS VALIDATED PATH, or
+/// the anchor that terminates it. This is the check `verify_server_cert` runs
+/// through webpki's `verify_path` callback (security audit 2026-09-02, egress
+/// F1): the earlier check hashed every certificate the *server presented*,
+/// and rustls hands the verifier the presented list unfiltered — webpki
+/// path-builds internally and ignores certificates it does not need. So a
+/// mis-issued but webpki-valid leaf shipped with the genuine pinned
+/// intermediate appended (public information) satisfied the pin while the
+/// validated path never touched it. Only certificates on the path count now.
+fn verified_path_has_pin(
+    pins: &HashSet<[u8; 32]>,
+    leaf: &CertificateDer<'_>,
+    path: &webpki::VerifiedPath<'_>,
+) -> bool {
+    if spki_sha256(leaf.as_ref()).is_ok_and(|h| pins.contains(&h)) {
+        return true;
+    }
+    for cert in path.intermediate_certificates() {
+        if spki_sha256(cert.der().as_ref()).is_ok_and(|h| pins.contains(&h)) {
+            return true;
+        }
+    }
+    pins.contains(&anchor_spki_sha256(path.anchor()))
 }
 
 impl ServerCertVerifier for PinningVerifier {
@@ -192,14 +230,37 @@ impl ServerCertVerifier for PinningVerifier {
         // 1. ALWAYS: standard webpki chain validation. Fail-closed if it fails.
         self.inner
             .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
-        // 2. Pin overlay — only for hosts the operator pinned.
+        // 2. Pin overlay — only for hosts the operator pinned. Re-run path
+        //    building with a `verify_path` callback so the pin is matched
+        //    against the path webpki actually validated, not the presented
+        //    list (security audit 2026-09-02, egress F1). webpki keeps
+        //    building alternative paths while the callback rejects, so a pin
+        //    on any valid path through the roots is honoured; if none carries
+        //    a pin, the connection fails with the pin-mismatch marker.
         if let Some(pins) = self.pins.pins_for(&server_name_host(server_name)) {
-            let chain: Vec<&[u8]> = std::iter::once(end_entity.as_ref())
-                .chain(intermediates.iter().map(|c| c.as_ref()))
-                .collect();
-            if !chain_has_pin(pins, &chain) {
-                return Err(RustlsError::General(PIN_MISMATCH_MARKER.to_string()));
-            }
+            let leaf = webpki::EndEntityCert::try_from(end_entity)
+                .map_err(|_| RustlsError::General(PIN_MISMATCH_MARKER.to_string()))?;
+            let provider = rustls::crypto::CryptoProvider::get_default()
+                .cloned()
+                .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+            let algs = provider.signature_verification_algorithms.all;
+            let check = |path: &webpki::VerifiedPath<'_>| -> Result<(), webpki::Error> {
+                if verified_path_has_pin(pins, end_entity, path) {
+                    Ok(())
+                } else {
+                    Err(webpki::Error::UnknownIssuer)
+                }
+            };
+            leaf.verify_for_usage(
+                algs,
+                &self.roots.roots,
+                intermediates,
+                now,
+                webpki::KeyUsage::server_auth(),
+                None,
+                Some(&check),
+            )
+            .map_err(|_| RustlsError::General(PIN_MISMATCH_MARKER.to_string()))?;
         }
         Ok(ServerCertVerified::assertion())
     }

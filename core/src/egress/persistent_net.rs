@@ -187,7 +187,7 @@ pub fn spawn_net_transport(
     //    prevents a full-pipe stall past ~64 KiB regardless of whether the sink
     //    audits). Bundle for 1:1 teardown; the caller hands the scratch dir to
     //    the bundle for RAII.
-    let ingest = spawn_ingest_thread(stdout, on_decision);
+    let ingest = spawn_ingest_thread(stdout, params.worker_name.to_string(), on_decision);
     let egress = EgressSidecar::from_parts(sidecar, ingest, Some(scratch.to_path_buf()));
     Ok(NetClientTransport {
         inner,

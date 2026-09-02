@@ -34,6 +34,12 @@ pub use self::summary::PlanRecord;
 pub(crate) use self::summary::{STEP_ERR_DETAIL_MAX, STEP_OK_SUMMARY_MAX};
 use super::agent::{AgentError, PlanFormulator};
 use super::asks;
+
+/// Hard cap on tool dispatches a single plan iteration may request. Sized far
+/// above any legitimate plan (the planner prompt asks for a handful of steps)
+/// and well below the point where retained outcomes (up to 256 KiB each for a
+/// fetch) become a memory problem for the daemon.
+pub const MAX_STEPS_PER_PLAN: usize = 64;
 use super::inner_loop_audit::{
     write_audit_plan_formulate, write_audit_plan_outcome, write_audit_verdict,
 };
@@ -751,6 +757,23 @@ pub async fn run_to_terminal(
         }
 
         // 4. Execute steps
+        // Per-plan step budget (security audit 2026-09-02, F5): nothing bounded
+        // how many tool dispatches ONE plan could carry — only the number of
+        // plan iterations (`max_plans`) — so a planner steered by injected
+        // content could enqueue hundreds of fetches/sends in a single turn,
+        // each retained in the plan record. A plan over the cap is refused
+        // whole, like an iteration-cap overrun, rather than truncated (a
+        // truncated plan would execute a prefix the planner never reviewed).
+        if plan.steps.len() > MAX_STEPS_PER_PLAN {
+            return finish!(Outcome::Failed(format!(
+                "plan_step_cap_exceeded ({} > {}); refusing to execute a plan with more than \
+                 {} steps in one iteration",
+                plan.steps.len(),
+                MAX_STEPS_PER_PLAN,
+                MAX_STEPS_PER_PLAN
+            )));
+        }
+
         let mut outcomes: Vec<StepOutcome> = Vec::with_capacity(plan.steps.len());
         for step in &plan.steps {
             if tasks::observe_state(pool, ctx.task_id).await? == "cancelled" {

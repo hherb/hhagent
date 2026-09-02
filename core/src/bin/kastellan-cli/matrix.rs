@@ -196,6 +196,9 @@ async fn probe(args: &[String], kp: kastellan_db::secrets::OsKeyringProvider) ->
         device_name: Some("kastellan-probe".to_string()),
         enforce_sandbox: a.enforce_sandbox,
         use_microvm: false,
+        // The probe only logs in and syncs; it never forwards traffic to the
+        // bus, so an empty list (worker forwards nothing) is the safe value.
+        peers: Vec::new(),
     };
 
     eprintln!(

@@ -144,6 +144,12 @@ pub enum LockdownError {
 /// The returned `LockdownReport` carries `rlimit: RlimitReport::Disabled`
 /// from this entry point.
 pub fn lock_down() -> Result<LockdownReport, LockdownError> {
+    // A seccomp kill (SIGSYS) has core-dump semantics, and a worker's memory
+    // holds exactly what must not persist on the host: the egress proxy's CA
+    // private key, a Matrix session's E2E keys, a mail bearer token. Refuse
+    // core dumps and same-uid ptrace/`/proc/<pid>/mem` reads before any
+    // filter can fire (security audit 2026-09-02, F7).
+    forbid_core_dumps()?;
     #[cfg(target_os = "linux")]
     {
         let landlock = landlock_lock::apply_from_env()?;
@@ -177,6 +183,43 @@ pub fn lock_down() -> Result<LockdownReport, LockdownError> {
 /// Both layers fail closed: any error returns `io::Error` and the worker
 /// exits before serving any request.
 pub fn serve_stdio<H: Handler>(handler: &mut H) -> io::Result<()> {
+    apply_lockdown_and_report()?;
+    kastellan_protocol::server::serve_stdio(handler)
+}
+
+/// Like [`serve_stdio`], but the handler is **constructed after** the
+/// lockdown, inside `build`.
+///
+/// Use this for any worker whose handler construction spawns threads — a tokio
+/// runtime for the egress-proxy CONNECT client, a `reqwest::blocking::Client`
+/// (which owns a runtime thread), a connection pool. Landlock restricts only
+/// the *calling* thread and is inherited by threads created afterwards; there
+/// is no TSYNC for it, so a runtime built in `Handler::from_env()` *before*
+/// [`serve_stdio`] ran left every one of its worker threads — the threads that
+/// actually parse the network — with no Landlock at all (security audit
+/// 2026-09-02, F4). Seccomp was already TSYNC'd across threads; this closes
+/// the same gap for the FS layer by construction rather than by ordering
+/// discipline in each worker's `main`.
+///
+/// `build` runs with rlimit + Landlock + seccomp already applied, so it may
+/// only do what the worker's profile permits: reading its fs_read paths (the
+/// egress CA PEM, a token file), building runtimes and TLS configs, binding
+/// sockets in its RW paths. A construction failure is returned before any
+/// request is read.
+pub fn serve_stdio_with<H, F, E>(build: F) -> io::Result<()>
+where
+    H: Handler,
+    F: FnOnce() -> Result<H, E>,
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    apply_lockdown_and_report()?;
+    let mut handler = build().map_err(io::Error::other)?;
+    kastellan_protocol::server::serve_stdio(&mut handler)
+}
+
+/// rlimit → Landlock → seccomp, then the one-line stderr report. Shared by
+/// both serve entry points so the ordering cannot drift between them.
+fn apply_lockdown_and_report() -> io::Result<()> {
     let rlimit = rlimit::apply_from_env().map_err(|e| io::Error::other(e.to_string()))?;
 
     let report = match lock_down() {
@@ -198,6 +241,28 @@ pub fn serve_stdio<H: Handler>(handler: &mut H) -> io::Result<()> {
     // richer logging can call `rlimit::apply_from_env` + `lock_down`
     // themselves and skip this.
     eprintln!("kastellan-worker-prelude: lockdown {report:?}");
+    Ok(())
+}
 
-    kastellan_protocol::server::serve_stdio(handler)
+/// `RLIMIT_CORE = 0` (hard and soft, so it cannot be raised back) plus, on
+/// Linux, `PR_SET_DUMPABLE = 0` — which also closes same-uid `ptrace` and
+/// `/proc/<pid>/mem` against this process. Fails closed: a worker that cannot
+/// refuse to dump does not serve.
+fn forbid_core_dumps() -> Result<(), LockdownError> {
+    let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: setrlimit reads a fully-initialised struct we own; it modifies
+    // only this process's limits.
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) };
+    if rc != 0 {
+        return Err(LockdownError::Io(io::Error::last_os_error()));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl with immediate arguments; process-wide flag only.
+        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        if rc != 0 {
+            return Err(LockdownError::Io(io::Error::last_os_error()));
+        }
+    }
+    Ok(())
 }

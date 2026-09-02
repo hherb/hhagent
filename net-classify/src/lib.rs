@@ -126,9 +126,18 @@ fn is_denied_v4(ip: Ipv4Addr) -> bool {
         || ip.is_link_local()   // 169.254.0.0/16
         || ip.is_multicast()    // 224.0.0.0/4
         || ip.is_unspecified()  // 0.0.0.0
+        || is_this_network_v4(ip) // 0.0.0.0/8 ("this network"; audit 2026-09-02)
         || ip.is_broadcast()    // 255.255.255.255
         || is_cgnat_v4(ip)      // 100.64.0.0/10
         || is_reserved_v4(ip)   // 240.0.0.0/4 (class E)
+}
+
+/// RFC 1122 §3.2.1.3 "this network" 0.0.0.0/8. `is_unspecified` covers only
+/// the all-zeros address; Linux routes the rest of the /8 as local (the
+/// classic `http://0.0.0.0` SSRF alias generalises to `0.x.y.z`), so the whole
+/// block is denied for a resolved hostname (security audit 2026-09-02).
+fn is_this_network_v4(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] == 0
 }
 
 /// RFC6598 carrier-grade NAT space (`is_shared` is unstable in std, so inline).
@@ -150,6 +159,14 @@ fn is_denied_v6(ip: Ipv6Addr) -> bool {
         || ip.is_multicast()    // ff00::/8
         || is_unique_local_v6(ip) // fc00::/7
         || is_link_local_v6(ip)   // fe80::/10
+        || is_site_local_v6(ip)   // fec0::/10 (deprecated site-local; audit 2026-09-02)
+}
+
+/// fec0::/10, the deprecated RFC 3879 site-local block. Not covered by
+/// `fc00::/7` (fc00–fdff) or `fe80::/10` (fe80–febf), and still honoured as
+/// intra-site by routers that predate its deprecation.
+fn is_site_local_v6(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfec0
 }
 
 /// fc00::/7 (unique-local). `Ipv6Addr::is_unique_local` is unstable; inline.
@@ -186,6 +203,23 @@ mod tests {
                   "255.255.255.255"] {
             assert!(is_denied_range(v4(s)), "{s} should be denied");
         }
+    }
+
+    #[test]
+    fn this_network_v4_block_is_denied() {
+        // 0.0.0.0/8 beyond the all-zeros address (audit 2026-09-02).
+        for s in ["0.0.0.1", "0.1.2.3", "0.255.255.255"] {
+            assert!(is_denied_range(v4(s)), "{s} should be denied");
+        }
+        assert!(!is_denied_range(v4("1.0.0.1")));
+    }
+
+    #[test]
+    fn site_local_v6_is_denied() {
+        // fec0::/10 sits between fc00::/7 and fe80::/10 and was uncovered.
+        assert!(is_denied_range(v6("fec0::1")));
+        assert!(is_denied_range(v6("feff::1")));
+        assert!(!is_denied_range(v6("fe00::1")), "fe00::/9 below fe80 stays unicast");
     }
 
     #[test]

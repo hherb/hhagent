@@ -170,7 +170,16 @@ class PlaywrightRenderer:
         try:
             browser = pw.chromium.launch(headless=True, args=self._launch_args)
             try:
-                page = browser.new_page()
+                # A dedicated context with service workers BLOCKED (security
+                # audit 2026-09-02, workers 5): `page.route` intercepts page
+                # requests only — a service worker registered by an
+                # allowlisted page fetches on its own, outside the route
+                # handler, and in direct-net (dev) mode that is a hole in the
+                # only egress control this process has. Under force-routing
+                # the egress sidecar still bounds it; this closes the gap
+                # where there is no sidecar.
+                context = browser.new_context(service_workers="block")
+                page = context.new_page()
                 page.route("**/*", self._route_handler)
                 response = page.goto(url, wait_until=wait_until, timeout=timeout_ms)
                 status = response.status if response is not None else 0

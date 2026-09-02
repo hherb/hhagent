@@ -72,24 +72,32 @@ pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// all yield no (or fewer) pairs rather than an error — the caller falls back to
 /// the baked defaults and still boots a working worker.
 #[allow(dead_code)]
-pub(crate) fn parse_env_cmdline(cmdline: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_env_cmdline(cmdline: &str) -> Result<Vec<(String, String)>, String> {
+    // Fail CLOSED on a present-but-undecodable token (security audit
+    // 2026-09-02, prelude F2). The old decoder returned an EMPTY env for bad
+    // hex / bad UTF-8 "so the worker still boots" — but the env carries the
+    // worker's whole lockdown (`KASTELLAN_SECCOMP_PROFILE`, the Landlock
+    // grants): an empty env meant a guest-root worker with no seccomp and a
+    // Landlock ruleset missing its RW grants, silently. A missing token is
+    // still an empty env (a worker with no env is legitimate); a corrupt one
+    // is an error the init turns into a refused boot.
     let prefix = format!("{ENV_CMDLINE_KEY}=");
     let Some(token) = cmdline.split_whitespace().find_map(|t| t.strip_prefix(&prefix)) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Some(bytes) = hex_decode(token) else {
-        return Vec::new();
+        return Err(format!("{ENV_CMDLINE_KEY}= token is not valid hex ({} chars)", token.len()));
     };
     let Ok(block) = String::from_utf8(bytes) else {
-        return Vec::new();
+        return Err(format!("{ENV_CMDLINE_KEY}= token is not valid UTF-8"));
     };
-    block
+    Ok(block
         .split('\n')
         .filter_map(|line| {
             line.split_once('=')
                 .map(|(k, v)| (k.to_string(), v.to_string()))
         })
-        .collect()
+        .collect())
 }
 
 /// Cmdline token carrying the hex-encoded worker program path to exec (slice 4b).

@@ -343,6 +343,12 @@ pub fn write_capture_to_dir(out_dir: &Path, capture: &CaptureJson)
 
     let fixture_dir = out_dir.join(fid);
     std::fs::create_dir_all(&fixture_dir)?;
+    // Captures hold real planner traffic (prompts, tool output); keep the
+    // tree owner-private (audit 2026-09-02, F6).
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fixture_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let dest = fixture_dir.join(fname);
 
     let bytes = serde_json::to_vec_pretty(capture).map_err(|e| {
@@ -352,10 +358,14 @@ pub fn write_capture_to_dir(out_dir: &Path, capture: &CaptureJson)
     // destination exists, closing the TOCTOU window. Operators MUST
     // recapture under a new (date, model_slug) baseline.
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&dest)?;
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&dest)?
+    };
     f.write_all(&bytes)?;
     f.sync_all()?;
     Ok(dest)

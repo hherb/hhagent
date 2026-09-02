@@ -242,9 +242,17 @@ pub fn apply(rw_paths: &[PathBuf], ro_paths: &[PathBuf]) -> Result<LandlockRepor
         Ok(r) => r,
         Err(RulesetError::CreateRuleset(e)) => {
             // Kernel does not support Landlock at all (ENOSYS) or our requested
-            // ABI. Treat as "kernel too old": bwrap stays in effect, but we
-            // can't add the second layer.
-            return Ok(report_for_create_failure(e));
+            // ABI. Until the 2026-09-02 audit this returned `KernelTooOld` and
+            // the worker served anyway — one containment layer short, with the
+            // only evidence a stderr line the daemon logs at `debug!`. The
+            // second layer is the point of this crate, so its absence is now
+            // an error: a host that cannot enforce Landlock must say so with
+            // `KASTELLAN_LANDLOCK_PROFILE=none`, not discover it in a breach.
+            let _ = report_for_create_failure(&e);
+            return Err(LockdownError::Landlock(format!(
+                "kernel cannot create a Landlock ruleset ({e}); the worker-side FS layer \
+                 would be missing — set KASTELLAN_LANDLOCK_PROFILE=none to run without it"
+            )));
         }
         Err(e) => return Err(LockdownError::Landlock(e.to_string())),
     };
@@ -274,11 +282,17 @@ pub fn apply(rw_paths: &[PathBuf], ro_paths: &[PathBuf]) -> Result<LandlockRepor
         .restrict_self()
         .map_err(|e| LockdownError::Landlock(format!("restrict_self failed: {e}")))?;
 
-    Ok(match status.ruleset {
-        RulesetStatus::FullyEnforced => LandlockReport::FullyEnforced,
-        RulesetStatus::PartiallyEnforced => LandlockReport::PartiallyEnforced,
-        RulesetStatus::NotEnforced => LandlockReport::KernelTooOld,
-    })
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => Ok(LandlockReport::FullyEnforced),
+        RulesetStatus::PartiallyEnforced => Ok(LandlockReport::PartiallyEnforced),
+        // `restrict_self` "succeeded" but enforces nothing — same posture as
+        // the create failure above: refuse rather than serve one layer short.
+        RulesetStatus::NotEnforced => Err(LockdownError::Landlock(
+            "Landlock ruleset is not enforced by this kernel; set \
+             KASTELLAN_LANDLOCK_PROFILE=none to run without the worker-side FS layer"
+                .into(),
+        )),
+    }
 }
 
 /// Best-effort helper: if `path` exists, add it to the ruleset; otherwise
@@ -315,6 +329,8 @@ fn add_path_rule(
 /// the kernel lacks Landlock entirely; everything else we conservatively
 /// also call "too old" so the worker still proceeds (bwrap is the primary
 /// containment layer).
+/// Kept as the classification of a create failure for the report type; the
+/// caller now turns it into an error rather than serving with it.
 fn report_for_create_failure(_e: impl std::fmt::Display) -> LandlockReport {
     LandlockReport::KernelTooOld
 }

@@ -25,6 +25,8 @@ pub mod macos_container;
 #[cfg(target_os = "macos")]
 pub mod macos_seatbelt;
 pub mod pid;
+#[cfg(unix)]
+pub mod private_dir;
 
 use std::path::PathBuf;
 use std::sync::Arc;

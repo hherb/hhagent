@@ -35,6 +35,10 @@ pub const ACTION_L1_REMOVED: &str = "l1.removed";
 /// carried `l1_insight` and the inner loop reached `Outcome::Completed`.
 /// The payload is built by [`build_l1_write_payload`].
 pub const ACTION_L1_PROMOTED: &str = "l1.promoted";
+/// Audit action for an agent-raised insight the injection guard refused to
+/// persist (security audit 2026-09-02, H2). Payload carries the body's SHA-256,
+/// the score and reason codes — never the body.
+pub const ACTION_L1_INJECTION_BLOCKED: &str = "l1.injection_blocked";
 
 /// Action verb for the agent-raised L3 crystallisation row written by
 /// `runner::drain_lane`. Payload built by [`build_l3_write_payload`].
