@@ -197,9 +197,7 @@ async fn run_succeeds_against_daemon_registry_without_operator_env() {
     let (daemon, _daemon_guards) = bring_up_daemon(
         &DaemonSpec::new(
             "l3run",
-            &suffix,
             &cluster.data_dir,
-            &user,
             LlmEndpoint::Base(mock.base_url.clone()),
         )
         .envs(shell_exec_env()),

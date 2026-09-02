@@ -259,9 +259,7 @@ async fn setup_with_env(
     let (daemon, guards) = bring_up_daemon(
         &DaemonSpec::new(
             "l3pyrun",
-            &suffix,
             &cluster.data_dir,
-            &user,
             LlmEndpoint::Base(mock.base_url.clone()),
         )
         .envs(env),

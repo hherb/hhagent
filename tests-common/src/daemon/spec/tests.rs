@@ -11,12 +11,15 @@
 use super::*;
 
 /// A spec with every default left alone.
+///
+/// ⚠️ **Each call returns a spec with a DIFFERENT service name**, since
+/// #641 made `new` draw its own `unique_suffix()`. A test comparing a
+/// name against itself must therefore bind one spec and reuse it —
+/// calling `base_spec()` twice compares two different daemons.
 fn base_spec() -> DaemonSpec {
     DaemonSpec::new(
         "gboot",
-        "1234-5678",
         Path::new("/tmp/pgdata"),
-        "tester",
         LlmEndpoint::Base("http://127.0.0.1:9999".into()),
     )
 }
@@ -83,9 +86,7 @@ fn an_llm_base_url_gains_the_compat_segment() {
 fn a_verbatim_llm_url_gains_nothing() {
     let spec = DaemonSpec::new(
         "obs",
-        "1",
         Path::new("/tmp/pgdata"),
-        "tester",
         LlmEndpoint::Verbatim("http://127.0.0.1:8000/v1".into()),
     );
     assert_eq!(
@@ -249,18 +250,53 @@ fn envs_adds_every_entry_in_order() {
     assert_eq!(effective(&s, "A").as_deref(), Some("3"));
 }
 
-/// The unit name carries both the label and the suffix, in that order.
+/// The unit name carries the label, then a per-spec suffix.
 ///
-/// Both are `&str` and adjacent in `new`, so this is the one place a
-/// transposition would show. It is also what keeps co-running tests from
-/// installing over each other.
+/// Before #641 this pinned a whole literal, because `suffix` was a
+/// caller-supplied `&str` sitting next to `label` and a transposition
+/// between them was the hazard worth catching. `new` now draws the
+/// suffix itself, so there is no transposition left to catch and no
+/// literal to pin — what remains is the *shape*: the fixed prefix, the
+/// caller's label, and a suffix that is not empty.
 #[test]
-fn the_service_name_carries_the_label_then_the_suffix() {
-    assert_eq!(
-        base_spec().service_name(),
-        "kastellan-supervisor-test-core-gboot-1234-5678",
+fn the_service_name_carries_the_label_then_a_suffix() {
+    let spec = base_spec();
+    let name = spec.service_name();
+    let prefix = "kastellan-supervisor-test-core-gboot-";
+    assert!(
+        name.starts_with(prefix),
+        "expected the prefix and label to lead the name, got {name}",
     );
-    assert_eq!(built(&base_spec()).name, base_spec().service_name());
+    assert!(
+        !name[prefix.len()..].is_empty(),
+        "the suffix must not be empty or co-running tests collide: {name}",
+    );
+}
+
+/// One spec keeps ONE name, and the built unit uses that same name.
+///
+/// Split from the test above because the two properties failed together
+/// when they shared a body: with the suffix drawn in `new`, calling
+/// `base_spec()` twice compares two different daemons, and an
+/// assertion written that way fails for a reason that has nothing to do
+/// with what it means to check.
+#[test]
+fn the_built_unit_uses_the_specs_own_name() {
+    let spec = base_spec();
+    assert_eq!(spec.service_name(), spec.service_name());
+    assert_eq!(built(&spec).name, spec.service_name());
+}
+
+/// Two specs with the SAME label get different names.
+///
+/// This is the whole reason a suffix exists, and until #641 no test
+/// stated it — the suffix was a literal the caller passed, so
+/// uniqueness was the caller's problem and silently everyone's. Now
+/// that `new` owns it, this is the property that keeps six co-running
+/// daemon e2es from installing over each other.
+#[test]
+fn two_specs_with_one_label_do_not_collide() {
+    assert_ne!(base_spec().service_name(), base_spec().service_name());
 }
 
 /// The log file names follow the RENAMED unit, not `core_service_spec`'s
@@ -272,8 +308,10 @@ fn the_service_name_carries_the_label_then_the_suffix() {
 /// four co-running daemons appending to one pair of files.
 #[test]
 fn the_log_paths_follow_the_renamed_unit() {
-    let s = built(&base_spec());
-    let name = base_spec().service_name();
+    // ONE spec: `base_spec()` draws a fresh suffix per call (#641).
+    let spec = base_spec();
+    let s = built(&spec);
+    let name = spec.service_name();
     assert_eq!(
         s.stdout_log,
         Some(Path::new("/nonexistent/logs").join(format!("{name}.out"))),
@@ -307,12 +345,31 @@ fn the_common_key_set_is_complete() {
             "a booting daemon needs {key}; the spec did not set it",
         );
     }
-    // The two the caller supplied, read back by value rather than by
-    // presence — `data_dir` and `user` are both `String`-shaped and
-    // adjacent in `new`, so presence alone would survive a swap.
+    // Read back by VALUE, not by presence. `KASTELLAN_DATA_DIR` and
+    // `KASTELLAN_STATE_DIR` are both path-shaped and both pushed in the
+    // same block, so presence alone would survive a swap between them.
     assert_eq!(effective(&s, "KASTELLAN_DATA_DIR").as_deref(), Some("/tmp/pgdata"));
-    assert_eq!(effective(&s, "USER").as_deref(), Some("tester"));
     assert_eq!(effective(&s, "KASTELLAN_STATE_DIR").as_deref(), Some("/nonexistent/state"));
+
+    // `USER` is derived by `new` since #641, so there is no caller
+    // literal left to compare against. Comparing it to
+    // `current_username()` would put the same helper on both sides and
+    // pass at any value — the #633 failure shape. Cross-check it
+    // against the environment itself instead: when `$USER` is set, that
+    // is what the daemon must run as. (`current_username` falls back to
+    // `whoami` and then to `"kastellan"`, so a host without `$USER`
+    // still gets a value — hence the guard rather than an unconditional
+    // assert.)
+    let user = effective(&s, "USER").expect("asserted present above");
+    assert!(!user.is_empty(), "the daemon needs a non-empty USER");
+    if let Ok(env_user) = std::env::var("USER") {
+        if !env_user.is_empty() {
+            assert_eq!(
+                user, env_user,
+                "the spec's USER must be the user this process runs as",
+            );
+        }
+    }
 
     // The prompts dir is DERIVED, so presence is not enough: a dropped
     // `.parent()` yields `tests-common/prompts` and a typo'd `join`
@@ -360,19 +417,85 @@ fn the_inherited_force_routing_default_is_not_dropped() {
     );
 }
 
-/// A label long enough to breach the supervisor's 200-char name cap is
-/// refused loudly rather than installed and rejected by the backend.
+/// A label long enough to breach the supervisor's name cap is refused
+/// loudly, at the line that supplied the bad label.
+///
+/// The panic now comes from `kastellan_supervisor::validate_service_name`
+/// rather than from a hand-rolled `len() <= 200` (#642), so the expected
+/// text is the supervisor's own — which is what makes it impossible for
+/// this test to keep passing against a cap the supervisor has changed.
 #[test]
-#[should_panic(expected = "200-char cap")]
-fn an_overlong_service_name_panics_rather_than_installing() {
-    let spec = DaemonSpec::new(
+#[should_panic(expected = "service name longer than 200 chars")]
+fn an_overlong_service_name_panics_at_construction() {
+    let _ = DaemonSpec::new(
         "x".repeat(250),
-        "1",
         Path::new("/tmp/pgdata"),
-        "tester",
         LlmEndpoint::Base("http://127.0.0.1:1".into()),
     );
-    let _ = built(&spec);
+}
+
+/// **The half the hand-copy could not see.**
+///
+/// A label carrying a character outside `[A-Za-z0-9._-]` passed the old
+/// `len() <= 200` assert untouched and died much later inside
+/// `sup.install(&spec)`, by which point the failure names a service name
+/// rather than the label that produced it. Unlike the length rule, this
+/// one is reachable by an ordinary mistake: a label with a space, a
+/// slash or a colon is exactly what someone types.
+#[test]
+#[should_panic(expected = "illegal character")]
+fn a_label_with_an_illegal_character_panics_at_construction() {
+    let _ = DaemonSpec::new(
+        "has space",
+        Path::new("/tmp/pgdata"),
+        LlmEndpoint::Base("http://127.0.0.1:1".into()),
+    );
+}
+
+/// The gate is applied to the **service name**, not to the label.
+///
+/// Found by mutating the check to `validate_service_name(&spec.label)`,
+/// which survives both `#[should_panic]` tests above: a 250-char label
+/// and a label with a space are each illegal on their own, so checking
+/// the label alone still panics for both. What separates the two is a
+/// label that is *legal in isolation* but whose full name is not —
+/// `kastellan-supervisor-test-core-` (31) plus the label plus a
+/// ~28-char suffix, so a 163-char label is fine and its name is not.
+///
+/// This matters beyond the mutant: the label is a fragment and the name
+/// is what reaches the filesystem, so a check on the fragment is the
+/// wrong check even when it happens to fire.
+#[test]
+#[should_panic(expected = "service name longer than 200 chars")]
+fn the_cap_is_applied_to_the_whole_name_not_just_the_label() {
+    let label = "x".repeat(163);
+    assert!(
+        kastellan_supervisor::validate_service_name(&label).is_ok(),
+        "the label must be legal ON ITS OWN or this test proves nothing",
+    );
+    let _ = DaemonSpec::new(
+        label,
+        Path::new("/tmp/pgdata"),
+        LlmEndpoint::Base("http://127.0.0.1:1".into()),
+    );
+}
+
+/// A label the supervisor accepts must not be refused.
+///
+/// The accepting arm of the same gate — without it, a mutant that
+/// panics unconditionally in `new` passes both `#[should_panic]` tests
+/// above [[unreachable-success-path-proves-nothing]]. `base_spec()`
+/// exercising it everywhere else is coverage by accident; this states
+/// it.
+#[test]
+fn a_legal_label_constructs() {
+    let spec = DaemonSpec::new(
+        "l3pyrun",
+        Path::new("/tmp/pgdata"),
+        LlmEndpoint::Base("http://127.0.0.1:1".into()),
+    );
+    kastellan_supervisor::validate_service_name(&spec.service_name())
+        .expect("a spec that constructed must name an installable unit");
 }
 
 /// `from_operator_url` normalises both shapes to exactly one compat
@@ -398,9 +521,7 @@ fn an_operator_url_normalises_to_exactly_one_compat_segment() {
     ] {
         let spec = DaemonSpec::new(
             "op",
-            "1",
             Path::new("/tmp/pgdata"),
-            "tester",
             LlmEndpoint::from_operator_url(input),
         );
         assert_eq!(
@@ -438,9 +559,7 @@ fn a_base_ending_in_v1_without_the_separator_is_not_complete() {
 fn a_base_that_already_carries_the_compat_segment_is_refused() {
     let spec = DaemonSpec::new(
         "dbl",
-        "1",
         Path::new("/tmp/pgdata"),
-        "tester",
         LlmEndpoint::Base("http://127.0.0.1:8000/v1".into()),
     );
     let _ = built(&spec);

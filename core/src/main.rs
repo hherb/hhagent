@@ -84,7 +84,7 @@ async fn report_guard_tier(
     pool: &sqlx::PgPool,
 ) {
     use kastellan_core::cassandra::guard_model::boot_report::{
-        boot_payload, not_configured_payload, timeout_ms, BootRates,
+        boot_payload, not_configured_payload, timeout_ms, ReportedRates,
     };
 
     // One helper for both arms: the row is non-fatal by design — a guard
@@ -152,7 +152,11 @@ async fn report_guard_tier(
     // checking.
     let budget_ms = timeout_ms(budget);
     let basis = budget.basis.kind();
-    let rates = BootRates::from_basis(&budget.basis);
+    // ONE mapping into the reporting vocabulary, shared with the durable
+    // row below (#643). Both tracing lines used to rename the fields
+    // themselves — two untested copies of a transposition the payload
+    // version was guarded against.
+    let reported = ReportedRates::from_basis(&budget.basis);
 
     info!(
         url = %cfg.guard_url.as_deref().unwrap_or("<unset>"),
@@ -160,20 +164,19 @@ async fn report_guard_tier(
         tau = tier.tau(),
         timeout_ms = budget_ms,
         timeout_basis = basis,
-        // ⚠️ The tracing field stays `tok_per_s` while the struct field
-        // is `fastest_tok_per_s`. #632 renamed the Rust identifiers to
-        // kill a silent transposition between two same-typed
-        // neighbours; it deliberately left the REPORTING vocabulary
-        // alone, because the durable `guard_tier.boot` key cannot move
-        // (live rows carry it, and the operator query
-        // `slowest_tok_per_s < tok_per_s / 2` is written against it) and
-        // a log line naming this number differently from the audit row
-        // it accompanies would read as a second measurement. Same
-        // mapping, same reason, at `boot_report::boot_payload`.
-        tok_per_s = rates.fastest_tok_per_s,
-        slowest_tok_per_s = rates.slowest_tok_per_s,
-        measured_samples = rates.measured_samples,
-        attempted_samples = rates.attempted_samples,
+        // The reporting vocabulary is frozen at `tok_per_s` even though
+        // the struct field is `fastest_tok_per_s`: the durable
+        // `guard_tier.boot` key cannot move (live rows carry it, and the
+        // operator query `slowest_tok_per_s < tok_per_s / 2` is written
+        // against it), and a log line naming this number differently
+        // from the audit row it accompanies would read as a second
+        // measurement. Since #643 the rename happens once, in
+        // `ReportedRates`, so each line below is name-for-name identity
+        // and a swap is visible on its face.
+        tok_per_s = reported.tok_per_s,
+        slowest_tok_per_s = reported.slowest_tok_per_s,
+        measured_samples = reported.measured_samples,
+        attempted_samples = reported.attempted_samples,
         n_ctx = tier.n_ctx(),
         policy_digest = %kastellan_core::cassandra::guard_model::policy::policy_digest(),
         "guard tier configured -- ADVISORY defence-in-depth, not a gate (65% recall at \
@@ -206,10 +209,10 @@ async fn report_guard_tier(
             // diagnostic that separates "slow host" from "busy boot" --
             // which is the whole of #624 -- and this `warn!` is the line
             // an operator actually reads.
-            tok_per_s = rates.fastest_tok_per_s,
-            slowest_tok_per_s = rates.slowest_tok_per_s,
-            measured_samples = rates.measured_samples,
-            attempted_samples = rates.attempted_samples,
+            tok_per_s = reported.tok_per_s,
+            slowest_tok_per_s = reported.slowest_tok_per_s,
+            measured_samples = reported.measured_samples,
+            attempted_samples = reported.attempted_samples,
             "{finding}"
         );
     }

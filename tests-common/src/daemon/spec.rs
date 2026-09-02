@@ -29,10 +29,14 @@
 //! [#632](https://github.com/hherb/kastellan/issues/632) was filed
 //! about one crate over.
 //!
-//! **Pure throughout.** Nothing here creates a directory, installs a
-//! unit or opens a socket; [`DaemonSpec::service_spec`] turns a spec
-//! plus three already-existing paths into a
+//! **The transform is pure.** Nothing here creates a directory,
+//! installs a unit or opens a socket; [`DaemonSpec::service_spec`] turns
+//! a spec plus three already-existing paths into a
 //! [`ServiceSpec`](kastellan_supervisor::ServiceSpec) and nothing else.
+//! The one exception is [`DaemonSpec::new`], which reads the clock and
+//! `$USER` **once** to derive the values #641 removed from its
+//! signature — deliberately eagerly, so that everything downstream is a
+//! pure function of stored data.
 //! That is what lets the assertions below run as `tests-common` unit
 //! tests — the only target in `linux-check.yml` that covers this code,
 //! where the daemon e2es these values feed are DGX-gated and run on no
@@ -45,7 +49,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kastellan_supervisor::specs::core_service_spec;
-use kastellan_supervisor::ServiceSpec;
+use kastellan_supervisor::{validate_service_name, ServiceSpec};
+
+use crate::temp::{current_username, unique_suffix};
 
 /// The planner model every test daemon gets unless it asks for another.
 ///
@@ -93,119 +99,19 @@ pub const DEFAULT_LLM_TIMEOUT_MS: &str = "5000";
 /// configuration.
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The OpenAI-compat path segment appended to an [`LlmEndpoint::Base`].
-///
-/// `pub` so that [`LlmEndpoint::Base`]'s own docs may link to it: a
-/// public item linking to a private one is a `rustdoc` warning and a
-/// dead link in the rendered page.
-pub const COMPAT_SEGMENT: &str = "/v1";
+mod llm_endpoint;
 
-/// Where the daemon's planner router should dial.
-///
-/// Two variants rather than one string **because the tree genuinely
-/// holds both shapes, and they are not interchangeable**. The mock-LLM
-/// callers own a bare `http://127.0.0.1:<port>` and want the on-wire
-/// OpenAI-compat shape appended; the operator-driven callers
-/// (`observation_capture`, `mail_daemon_e2e`'s live leg) read a URL out
-/// of the environment that usually already ends in `/v1`. Appending to
-/// the latter yields `/v1/v1` and a router that dials nothing;
-/// *not* appending to the former yields a base with no compat segment
-/// and a router that 404s. Both failures report a status code and
-/// never the URL.
-///
-/// A single `&str` parameter cannot tell those apart, so the choice
-/// would live in each caller's head. Here it is a type, and a call site
-/// says which it means — or, when the value is the operator's and its
-/// shape genuinely is not knowable, defers to
-/// [`Self::from_operator_url`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LlmEndpoint {
-    /// An OpenAI-compat **base**; [`COMPAT_SEGMENT`] is appended.
-    Base(String),
-    /// A **complete** URL that already carries its compat segment.
-    /// Used verbatim.
-    Verbatim(String),
-}
-
-impl LlmEndpoint {
-    /// Classify an **operator-supplied** URL that may carry its compat
-    /// segment or may not.
-    ///
-    /// The two variants above each demand that the caller already know
-    /// which shape it holds. A caller reading a URL out of the
-    /// *operator's* environment does not: `KASTELLAN_MAIL_LIVE_LLM_URL`
-    /// has accepted both `http://127.0.0.1:11434` and
-    /// `http://127.0.0.1:11434/v1` since that test was written, and the
-    /// bare form is the one this tree's own installer treats as
-    /// canonical (`OLLAMA_LLM_URL` in `core/src/install/plan.rs`).
-    ///
-    /// So this is a **third constructor, not a third variant** — it
-    /// answers the question once, here, where a unit test can reach it,
-    /// rather than in each caller's head. Both shapes normalise to
-    /// exactly one [`COMPAT_SEGMENT`].
-    ///
-    /// Do **not** reach for this when the shape is known: a mock's
-    /// `base_url` is a [`Self::Base`] and saying so is clearer than
-    /// asking a function to work it out.
-    ///
-    /// Trailing slashes are trimmed before classifying *and* kept off
-    /// the result, so `…:11434/` and `…:11434/v1/` reach the daemon as
-    /// `…:11434/v1`. `ends_with` tests the whole `/v1` segment rather
-    /// than a bare `v1`, so a base merely ending in those two characters
-    /// (`…/apiv1`) is correctly read as a base — the same distinction
-    /// `llm-router`'s `props_url` documents having needed.
-    pub fn from_operator_url(url: impl Into<String>) -> Self {
-        let url = url.into();
-        let trimmed = url.trim_end_matches('/');
-        if trimmed.ends_with(COMPAT_SEGMENT) {
-            Self::Verbatim(trimmed.to_string())
-        } else {
-            Self::Base(trimmed.to_string())
-        }
-    }
-
-    /// The value that reaches `KASTELLAN_LLM_LOCAL_URL`.
-    ///
-    /// Asserts rather than silently appending when a [`Self::Base`]
-    /// already carries its compat segment. That combination is never
-    /// anything but a mistake, and it is the *first* half of the failure
-    /// this type exists to prevent — `…/v1/v1`, a router that dials
-    /// nothing, and an error naming a status code but never the URL
-    /// (`RouterError::HttpStatus` carries the status and the body; the
-    /// URL appears only in a `debug!` the daemon does not emit at
-    /// `info`).
-    ///
-    /// The symmetric check on [`Self::Verbatim`] is deliberately absent:
-    /// an OpenAI-compat server need not serve under `/v1`, so "does not
-    /// end in `/v1`" is not evidence of a mistake there. Only the `Base`
-    /// direction has a wrong answer that is knowable from the string.
-    fn url(&self) -> String {
-        match self {
-            Self::Base(base) => {
-                assert!(
-                    !base.trim_end_matches('/').ends_with(COMPAT_SEGMENT),
-                    "LlmEndpoint::Base must not already carry {COMPAT_SEGMENT} \
-                     (appending a second one dials nothing and reports no URL); \
-                     use LlmEndpoint::Verbatim for a complete URL, or \
-                     LlmEndpoint::from_operator_url when the shape is unknown. \
-                     Got: {base}",
-                );
-                format!("{base}{COMPAT_SEGMENT}")
-            }
-            Self::Verbatim(url) => url.clone(),
-        }
-    }
-}
+pub use llm_endpoint::{LlmEndpoint, COMPAT_SEGMENT};
 
 /// Everything [`bring_up_daemon`](super::bring_up_daemon) needs.
 ///
-/// Built with [`DaemonSpec::new`] plus the setters below. The **five**
-/// values in `new` are the ones no caller can omit; everything else has
-/// a default that matches what the shared helper did before this type
-/// existed, so a migrated caller that sets nothing extra behaves
-/// identically.
+/// Built with [`DaemonSpec::new`] plus the setters below. The **three**
+/// values in `new` are the ones no caller can omit and no default can
+/// supply; everything else has a default that matches what the shared
+/// helper did before this type existed, so a migrated caller that sets
+/// nothing extra behaves identically.
 ///
-/// The fifth, `llm`, is worth naming separately: it is the one parameter
+/// The third, `llm`, is worth naming separately: it is the one parameter
 /// carrying a choice that fails *silently* if made wrong. See
 /// [`LlmEndpoint`].
 #[derive(Debug, Clone)]
@@ -225,37 +131,89 @@ pub struct DaemonSpec {
 impl DaemonSpec {
     /// `label` distinguishes co-running tests' temp dirs and service
     /// names (`"l3run"` → `kastellan-supervisor-test-core-l3run-<suffix>`);
-    /// `suffix` is the per-run uniquifier; `data_dir` is the per-test
-    /// Postgres cluster's data directory; `user` is the `USER` the
-    /// daemon runs as; `llm` is where the planner router dials, whose two
-    /// shapes are **not** interchangeable — see [`LlmEndpoint`].
+    /// `data_dir` is the per-test Postgres cluster's data directory;
+    /// `llm` is where the planner router dials, whose two shapes are
+    /// **not** interchangeable — see [`LlmEndpoint`].
     ///
-    /// ⚠️ `label`, `suffix` and `user` are three same-typed parameters, so
-    /// a transposition among them compiles in silence. `data_dir` sitting
-    /// between them is an accidental barrier, not a designed one: it holds
-    /// only while callers pass a `Path`-typed value, since
-    /// `impl Into<PathBuf>` accepts a `&str` just as happily. Narrowing
-    /// this signature is
-    /// [#641](https://github.com/hherb/kastellan/issues/641).
-    pub fn new(
-        label: impl Into<String>,
-        suffix: impl Into<String>,
-        data_dir: impl Into<PathBuf>,
-        user: impl Into<String>,
-        llm: LlmEndpoint,
-    ) -> Self {
-        Self {
+    /// # Why only three parameters (issue [#641])
+    ///
+    /// It took five, of which `label`, `suffix` and `user` were all
+    /// `impl Into<String>`. Any permutation of those three compiled in
+    /// silence — the exact hazard [#632] was filed about one crate over,
+    /// reproduced in the constructor of the thing that removes it. The
+    /// apparent barrier, `data_dir` sitting between them, was
+    /// accidental: `impl Into<PathBuf>` accepts a `&str` just as
+    /// happily, so it would have evaporated the first time someone
+    /// passed a string path.
+    ///
+    /// Both removed values were **always** the same expression at all
+    /// six call sites — `unique_suffix()` and `current_username()` — so
+    /// deriving them here does not lose a choice any caller was making.
+    /// It makes them impossible to get wrong rather than merely hard to,
+    /// and no two remaining parameters share a type.
+    ///
+    /// Should a caller ever genuinely need to name its own, add
+    /// `.suffix(…)` / `.user(…)` setters. None is added speculatively:
+    /// an unused setter is a hatch that re-opens the transposition this
+    /// signature closes.
+    ///
+    /// # Reads the environment; the transform stays pure
+    ///
+    /// This is the one function in the module that is not a pure
+    /// transform: [`unique_suffix`] reads the clock and a counter, and
+    /// [`current_username`] reads `$USER`. Both are read **once, here**,
+    /// precisely so that everything downstream —
+    /// [`service_spec`](Self::service_spec) above all — is a pure
+    /// function of stored data and can be asserted without a filesystem
+    /// or a supervisor.
+    ///
+    /// One consequence worth knowing: the suffix in the unit name is no
+    /// longer the same string as the sibling Postgres cluster's, because
+    /// each is now drawn separately. Nothing reads that correspondence
+    /// today; if [#548]'s stale-unit sweep ever wants to correlate a
+    /// leaked unit with its leaked cluster, a `.suffix(…)` setter
+    /// restores it.
+    ///
+    /// # Panics
+    ///
+    /// If `label` yields a service name the supervisor would refuse —
+    /// too long, or carrying a character outside `[A-Za-z0-9._-]`. The
+    /// check is [`kastellan_supervisor::validate_service_name`], the
+    /// same predicate `install` applies, so this cannot drift from it.
+    /// Failing here rather than at `install` names the wrong `label` at
+    /// the line that supplied it. Since `suffix` is derived and is
+    /// always digits and dashes, `label` is the only input that can
+    /// fail.
+    ///
+    /// [#632]: https://github.com/hherb/kastellan/issues/632
+    /// [#548]: https://github.com/hherb/kastellan/issues/548
+    /// [#641]: https://github.com/hherb/kastellan/issues/641
+    pub fn new(label: impl Into<String>, data_dir: impl Into<PathBuf>, llm: LlmEndpoint) -> Self {
+        let spec = Self {
             label: label.into(),
-            suffix: suffix.into(),
+            suffix: unique_suffix(),
             data_dir: data_dir.into(),
-            user: user.into(),
+            user: current_username(),
             llm,
             llm_model: DEFAULT_LLM_MODEL.to_string(),
             llm_timeout_ms: DEFAULT_LLM_TIMEOUT_MS.to_string(),
             ready_timeout: DEFAULT_READY_TIMEOUT,
             force_routing: true,
             extra_env: Vec::new(),
+        };
+        // Validated at construction, not in `service_spec`: the name is
+        // fully determined by `label` plus the suffix just drawn, so
+        // there is nothing later that could change the answer — and
+        // `service_name()` is `pub`, so a check living only in
+        // `service_spec` left one public path unguarded.
+        if let Err(e) = validate_service_name(&spec.service_name()) {
+            panic!(
+                "DaemonSpec label {:?} yields a service name the supervisor refuses: {e}. \
+                 Labels must be short and match [A-Za-z0-9._-]",
+                spec.label,
+            );
         }
+        spec
     }
 
     /// Override [`DEFAULT_LLM_MODEL`] — for a caller driving a real LLM.
@@ -372,20 +330,13 @@ impl DaemonSpec {
         state_dir: &Path,
     ) -> ServiceSpec {
         let mut spec = core_service_spec(binary, core_log_dir);
+        // Already validated in `new` against the supervisor's own
+        // `validate_service_name` (#642). It used to be a hand-rolled
+        // `len() <= 200` here — a third, unlinked copy of a cap that was
+        // `const` private in both backends, checking the half that
+        // essentially cannot fire (a real name is ~60 chars) and
+        // skipping the charset half that can.
         spec.name = self.service_name();
-        // Length only, and a hand-copy of a `MAX_NAME_LEN` that is
-        // private in both supervisor backends. It therefore misses the
-        // charset half of `validate_service_name` (a label with a `/` or
-        // a space passes here and fails at `install`), and it will stop
-        // being a guard in silence if the supervisor ever lowers its cap.
-        // Exporting one predicate from `kastellan-supervisor` and calling
-        // it here is #642.
-        assert!(
-            spec.name.len() <= 200,
-            "service name must be at most the supervisor's 200-char cap, got {}: {}",
-            spec.name.len(),
-            spec.name
-        );
         spec.stdout_log = Some(core_log_dir.join(format!("{}.out", spec.name)));
         spec.stderr_log = Some(core_log_dir.join(format!("{}.err", spec.name)));
 

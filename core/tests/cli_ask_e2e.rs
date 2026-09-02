@@ -82,12 +82,10 @@ fn skip_if_any_binary_missing() -> bool {
 ///
 /// [#634]: https://github.com/hherb/kastellan/issues/634
 /// [#635]: https://github.com/hherb/kastellan/pull/635
-fn daemon_spec(suffix: &str, data_dir: &Path, mock_base_url: &str, user: &str) -> DaemonSpec {
+fn daemon_spec(data_dir: &Path, mock_base_url: &str) -> DaemonSpec {
     DaemonSpec::new(
         "cliask",
-        suffix,
         data_dir,
-        user,
         LlmEndpoint::Base(mock_base_url.to_string()),
     )
     .env(
@@ -224,7 +222,7 @@ fn ask_subprocess_completes_planned_task_end_to_end() {
     });
 
     let (daemon, _daemon_guards) =
-        bring_up_daemon(&daemon_spec(&suffix, &cluster.data_dir, &mock.base_url, &user));
+        bring_up_daemon(&daemon_spec(&cluster.data_dir, &mock.base_url));
 
     // ---------- Spawn the real CLI subprocess ----------
     let output = Command::new(cli_binary())
@@ -543,7 +541,7 @@ fn ask_subprocess_fails_after_plan_iteration_cap() {
     });
 
     let (daemon, _daemon_guards) =
-        bring_up_daemon(&daemon_spec(&suffix, &cluster.data_dir, &mock.base_url, &user));
+        bring_up_daemon(&daemon_spec(&cluster.data_dir, &mock.base_url));
 
     let output = Command::new(cli_binary())
         .arg("ask")

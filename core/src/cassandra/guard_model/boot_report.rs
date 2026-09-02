@@ -36,6 +36,10 @@
 
 use serde_json::{json, Value};
 
+pub mod reported;
+
+pub use reported::ReportedRates;
+
 use super::policy::policy_digest;
 use super::tier::Unadjudicated;
 use super::timeout::{GuardTimeout, TimeoutBasis};
@@ -215,7 +219,10 @@ pub fn timeout_ms(budget: &GuardTimeout) -> u64 {
 ///   holding `null` — so a reader querying one of them finds the key on
 ///   every row rather than only on the hosts that happened to probe.
 pub fn boot_payload(tau: f32, n_ctx: u64, budget: &GuardTimeout) -> Value {
-    let rates = BootRates::from_basis(&budget.basis);
+    // The ONE mapping from probe fields to reporting names (#643). It
+    // used to be spelled out here and again, twice, in `main.rs`'s two
+    // tracing lines; only this copy was ever guarded.
+    let reported = ReportedRates::from_basis(&budget.basis);
     json!({
         "configured":        true,
         "tau":               tau,
@@ -233,10 +240,10 @@ pub fn boot_payload(tau: f32, n_ctx: u64, budget: &GuardTimeout) -> Value {
         // are frozen at `tok_per_s` for the same reason, so an operator
         // correlating a boot log line with its audit row reads one
         // vocabulary rather than two.
-        "tok_per_s":         rates.fastest_tok_per_s,
-        "slowest_tok_per_s": rates.slowest_tok_per_s,
-        "measured_samples":  rates.measured_samples,
-        "attempted_samples": rates.attempted_samples,
+        "tok_per_s":         reported.tok_per_s,
+        "slowest_tok_per_s": reported.slowest_tok_per_s,
+        "measured_samples":  reported.measured_samples,
+        "attempted_samples": reported.attempted_samples,
         "n_ctx":             n_ctx,
         "policy_digest":     policy_digest(),
         "coverage_finding":  budget.basis.coverage_finding(),

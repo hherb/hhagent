@@ -792,8 +792,8 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   run). Reconciles exactly at 3909 + 1, the one new e2e. Both hosts on rustc 1.98.0 (CI parity,
   checked). The `c0255cd7` gate at 3909 is superseded, not additive.
 
-  **[#632](https://github.com/hherb/kastellan/issues/632) FIXED on branch
-  `fix/632-fastest-tok-per-s-rename` (2026-09-01)** -- `tok_per_s` -> `fastest_tok_per_s` in BOTH
+  **[#632](https://github.com/hherb/kastellan/issues/632) FIXED and MERGED `466ca7ff`
+  ([#640](https://github.com/hherb/kastellan/pull/640), 2026-09-01)** -- `tok_per_s` -> `fastest_tok_per_s` in BOTH
   `BootRates` and `TimeoutBasis::Probed`, moved together because renaming one alone leaves
   `fastest_tok_per_s: Some(*tok_per_s)` in `from_basis`, which reads like a bug and invites a
   later session to "restore" the old name. **The REPORTING vocabulary is deliberately frozen**:
@@ -812,7 +812,8 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   identical to `8d92c02b`'s baseline, which is what a correct pure rename looks like: it adds and
   removes no tests.
 
-  **[#634](https://github.com/hherb/kastellan/issues/634) FIXED on the same branch (2026-09-01)** --
+  **[#634](https://github.com/hherb/kastellan/issues/634) FIXED and MERGED in the same squash
+  `466ca7ff` (2026-09-01)** --
   the three hand-rolled `bring_up_daemon` copies (`cli_ask_e2e`, `observation_capture`,
   `guard_boot_row_e2e`, ~70 identical lines each) now use `tests_common::daemon`. The parameters
   became a `DaemonSpec` builder rather than a seventh, eighth and ninth positional argument --
@@ -857,12 +858,33 @@ Per-item detail and commit hashes: [`archive/roadmap_phase0.md`](archive/roadmap
   `cli_ask_e2e`'s and `observation_capture`'s. **Three files shrank
   below or toward the cap**: `guard_boot_row_e2e` 687 -> 537, `cli_ask_e2e` 858 -> 741,
   `observation_capture` 664 -> 604.
-  **Filed from the review, not fixed:** [#641](https://github.com/hherb/kastellan/issues/641)
-  (`DaemonSpec::new`'s three transposable same-typed parameters -- delete `suffix`/`user` rather
-  than newtype them), [#642](https://github.com/hherb/kastellan/issues/642) (the 200-char cap is a
-  third unlinked copy of a private supervisor constant and checks the half that cannot fire),
-  [#643](https://github.com/hherb/kastellan/issues/643) (`main.rs`'s two `tracing` rate mappings are
-  transposable and untested, where the payload version of the same mapping is guarded).
+  **Filed from the review, and all three now FIXED on branch
+  `fix/641-642-643-daemonspec-and-service-name` (2026-09-02):**
+  [#642](https://github.com/hherb/kastellan/issues/642) -- one un-`cfg`'d `validate_service_name` +
+  `MAX_NAME_LEN` at the supervisor crate root, replacing a character-identical copy in each backend
+  that **neither host ever ran the other of**, plus the `tests-common` hand-copy that checked the
+  half which essentially cannot fire and skipped the charset half that can. Two tests the copies
+  never had: the cap in **both** directions, and the cap pinned to a **literal**.
+  [#641](https://github.com/hherb/kastellan/issues/641) -- `DaemonSpec::new(label, data_dir, llm)`,
+  no two parameters sharing a type; `suffix`/`user` were the same expression at all six call sites,
+  so deleting beat newtyping, and no setters were added speculatively. The name is now validated at
+  construction against the supervisor's own predicate. ⚠️ Two consequences recorded rather than
+  discovered later: `new` reads the environment (eagerly, once, so `service_spec` stays pure), and
+  the unit's suffix no longer matches its sibling PG cluster's -- which #548's sweep may one day
+  want back. [#643](https://github.com/hherb/kastellan/issues/643) -- one `ReportedRates` mapping
+  shared by the `info!`, the `warn!` and the durable row; a transposed pair reports a **contended**
+  boot as a quiet one, silencing exactly what #624 was filed to make visible. Chose the shared
+  struct over the subscriber test because it leaves **no second site to diverge**. Plus a
+  movement-only `LlmEndpoint` split (`spec.rs` 538 -> 438).
+  **Gated on the DGX at 3940 / 0 / 55, 176 suites, `TEST_EXIT=0`**, reconciling exactly as 3928 + 12
+  by per-suite diff; cold clippy exit 0 over 345 `Checking`+`Compiling` lines, 27 crates, zero
+  warnings; **ten mutants, ten killed**. **Both hosts green, nothing outstanding**: the Mac covers
+  the `cfg(target_os = "macos")` `launchd_agents` half the DGX compiles out --
+  `kastellan-supervisor --lib` 115 / 0 with all 8 `service_name::tests` observed running there too
+  (the point of #642: one rule set, both hosts execute it) and 38 launchd / 0 systemd confirming the
+  platform split, plus `clippy -p kastellan-supervisor --all-targets -D warnings` exit 0.
+  **Still open from that review:** [#644](https://github.com/hherb/kastellan/issues/644) (the launchd
+  duplicate-plist-key question for every *other* `ServiceSpec` producer).
   **The FIRST four-agent review of that fix ([#614](https://github.com/hherb/kastellan/pull/614)) found it kept
   half the defect:** an unaffordable preserved key was dropped *silently*, giving a row
   byte-identical to one whose dispatch never ran a tier — the same absence-vs-loss ambiguity one

@@ -18,7 +18,7 @@
 //! 500-LOC cap; the behaviour is identical and the parent's driver still
 //! calls these via the re-export.
 
-use crate::{ServiceSpec, SupervisorError};
+use crate::ServiceSpec;
 
 /// Default seconds to wait for SIGTERM to take effect before launchd
 /// escalates to SIGKILL on `bootout`.
@@ -27,11 +27,6 @@ use crate::{ServiceSpec, SupervisorError};
 /// uniform across OSes; long enough for a graceful exit, short enough
 /// that test teardown does not hang on a misbehaving inner process.
 const DEFAULT_EXIT_TIMEOUT_SEC: u32 = 10;
-
-/// Maximum length of a service name. Generous compared to the file-system
-/// 255-byte basename ceiling — leaves headroom for the `.plist` suffix
-/// and any future namespacing prefix.
-const MAX_NAME_LEN: usize = 200;
 
 /// Build the XML body of a `<name>.plist` LaunchAgent file.
 ///
@@ -181,54 +176,12 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-/// Validate a service name against `[A-Za-z0-9._-]{1,200}` minus `.`,
-/// `..`, and any name starting with `.` (hidden files) or `-` (would
-/// be parsed as a flag by `launchctl`).
-///
-/// Rejects path-traversal characters (`/`, `\0`) and any byte that
-/// would either confuse a shell-style arg parse or break the
-/// `Label`-equals-basename invariant launchd cares about. Returning
-/// `Ok` is the gate that lets [`crate::launchd_agents::LaunchAgents`]
-/// write a file to disk in its `install` step.
-///
-/// The rule set is intentionally identical to the Linux backend's so
-/// a single user-facing service name is portable to either OS without
-/// a "rename for macOS" step.
-pub fn validate_service_name(name: &str) -> Result<(), SupervisorError> {
-    if name.is_empty() {
-        return Err(SupervisorError::InvalidName(
-            "service name must not be empty".into(),
-        ));
-    }
-    if name.len() > MAX_NAME_LEN {
-        return Err(SupervisorError::InvalidName(format!(
-            "service name longer than {MAX_NAME_LEN} chars"
-        )));
-    }
-    if name == "." || name == ".." {
-        return Err(SupervisorError::InvalidName(
-            ". and .. are not valid service names".into(),
-        ));
-    }
-    if name.starts_with('.') {
-        return Err(SupervisorError::InvalidName(
-            "service name must not start with '.'".into(),
-        ));
-    }
-    if name.starts_with('-') {
-        return Err(SupervisorError::InvalidName(
-            "service name must not start with '-'".into(),
-        ));
-    }
-    for ch in name.chars() {
-        if !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-') {
-            return Err(SupervisorError::InvalidName(format!(
-                "service name contains illegal character: {ch:?}"
-            )));
-        }
-    }
-    Ok(())
-}
+// The name gate lives at the crate root (#642) — see the note on the
+// same `pub use` in the systemd backend, including why the cap is not
+// re-exported alongside it. The rule set was always meant to be
+// identical to Linux's so that one service name is portable to either
+// OS; now it is the same code rather than the same intent.
+pub use crate::service_name::validate_service_name;
 
 #[cfg(test)]
 mod tests;

@@ -240,18 +240,10 @@ fn check_llm_reachable(base_url: &str) -> Result<(), String> {
 /// * a **15-second** readiness budget against the shared default of 10.
 ///
 /// [#634]: https://github.com/hherb/kastellan/issues/634
-fn daemon_spec(
-    suffix: &str,
-    data_dir: &Path,
-    llm_url: &str,
-    llm_model: &str,
-    user: &str,
-) -> DaemonSpec {
+fn daemon_spec(data_dir: &Path, llm_url: &str, llm_model: &str) -> DaemonSpec {
     DaemonSpec::new(
         "obs",
-        suffix,
         data_dir,
-        user,
         LlmEndpoint::from_operator_url(llm_url),
     )
     .llm_model(llm_model)
@@ -492,11 +484,9 @@ async fn capture_all_fixtures_against_live_llm() {
     } // seed_pool dropped here, freeing the connection before daemon start
 
     let (daemon, _daemon_guards) = bring_up_daemon(&daemon_spec(
-        &suffix,
         &cluster.data_dir,
         &llm_base_url,
         &llm_model,
-        &user,
     ));
 
     let spec = ConnectSpec::default_for(&cluster.data_dir).expect("spec");
