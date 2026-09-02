@@ -72,6 +72,21 @@ fn interpreter_root_resolved_for_external_venv() {
     );
 }
 
+/// The second name in the candidate cascade. Every other fixture stages
+/// `bin/python3`, so truncating `["python3", "python"]` to `["python3"]` would
+/// otherwise survive — and a venv with only `bin/python` would then bind
+/// nothing and die at `execve` with the same contentless `Protocol(EarlyExit)`
+/// this module exists to prevent.
+#[test]
+fn interpreter_root_falls_back_to_bare_python_when_python3_is_absent() {
+    let exists = exists_of(&["/v/bin/python"]);
+    let canon = canon_of(&[("/v/bin/python", "/u/py/real/bin/python3.13")]);
+    assert_eq!(
+        resolve_interpreter_root(Path::new("/v"), &exists, &canon, &no_links),
+        Some(InterpreterRoot::canonical_only("/u/py/real"))
+    );
+}
+
 #[test]
 fn interpreter_root_none_when_no_python_in_venv() {
     let exists = |_p: &Path| false;

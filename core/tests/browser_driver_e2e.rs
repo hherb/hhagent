@@ -82,7 +82,7 @@ fn resolve_browser_env() -> Option<BrowserDriverEnv> {
     // manifest's seed logic so the two can't drift (review M2).
     let interpreter_lib_dirs = kastellan_core::workers::interpreter_deps::interpreter_lib_dirs(
         &venv_dir,
-        interpreter_root.as_ref().map(|r| r.dep_walk_prefix()),
+        interpreter_root.as_ref(),
         &|p| p.exists(),
         &|p| std::fs::canonicalize(p).ok(),
         &|p| kastellan_core::workers::interpreter_deps::resolve_deps_via_tool(p),

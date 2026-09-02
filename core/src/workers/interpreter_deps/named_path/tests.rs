@@ -8,10 +8,13 @@ use std::collections::HashMap;
 /// Assert on the **literal** path text, not on `PathBuf` equality.
 ///
 /// `Path`'s `PartialEq` compares `components()`, and `Components` normalizes
-/// `.` away — so `PathBuf::from("/a/./b") == PathBuf::from("/a/b")` is *true*,
-/// and a component-wise assertion cannot see a stray `.` at all. The literal is
-/// what matters: these paths are handed to bwrap as `--ro-bind` arguments and
-/// printed in policies an operator reads.
+/// away **interior** `.` — so `PathBuf::from("/a/./b") == PathBuf::from("/a/b")`
+/// is *true* and a component-wise assertion cannot see that stray `.` at all.
+/// A **leading** `.` on a relative path is a different story: it survives
+/// `components()`, so `PathBuf::from("./a") == PathBuf::from("a")` is *false*
+/// and equality does see it. Asserting on the literal makes both cases visible.
+/// The literal is what matters anyway: these paths are handed to bwrap as
+/// `--ro-bind` arguments and printed in policies an operator reads.
 fn assert_normalizes_to(input: &str, expected: &str) {
     let got = normalize_lexically(Path::new(input));
     assert_eq!(
@@ -21,13 +24,27 @@ fn assert_normalizes_to(input: &str, expected: &str) {
     );
 }
 
-/// The output contract: no `.` survives, whatever strips it. Today that is
-/// `Path::components()` upstream of the loop rather than a branch inside it —
-/// which is why there is no `CurDir` arm to mutate. Kept so a future change of
-/// iteration source cannot start emitting `.` into a bind path unnoticed.
+/// The output contract for the paths that actually reach here: no **interior**
+/// `.` survives. Today that is `Path::components()` upstream of the loop rather
+/// than a branch inside it — which is why there is no `CurDir` arm to mutate.
+/// Kept so a future change of iteration source cannot start emitting `.` into a
+/// bind path unnoticed.
 #[test]
-fn normalize_drops_current_dir_components() {
+fn normalize_drops_interior_current_dir_components() {
     assert_normalizes_to("/a/./b/./c", "/a/b/c");
+    // Also stripped straight after the root, where a reader might expect the
+    // `RootDir` arm to have pushed something first.
+    assert_normalizes_to("/./a", "/a");
+}
+
+/// The carve-out, pinned so nobody re-derives "no `.` ever survives" from the
+/// test above. `Path::components()` KEEPS a leading `.` on a relative path, and
+/// the `other` arm preserves it. Unreachable in production — every caller
+/// passes an absolute path — but if that ever changes, this test is what makes
+/// the decision to strip or keep it a deliberate one.
+#[test]
+fn normalize_keeps_a_leading_current_dir_on_a_relative_path() {
+    assert_normalizes_to("./a/b", "./a/b");
 }
 
 #[test]
@@ -123,6 +140,17 @@ fn chain_follows_the_full_uv_venv_shape_to_the_external_interpreter() {
             PathBuf::from("/u/.local/share/uv/python/cpython-3.13-linux-aarch64-gnu/bin/python3.13"),
         ]
     );
+}
+
+/// The fourth termination arm: a relative target on a path with no parent to
+/// resolve it against. Only `/` and `""` reach it (`Path::new("x").parent()` is
+/// `Some("")`, not `None`), so production never does — but the arm is reachable
+/// through the injected `read_link`, so it gets a test rather than a claim that
+/// no test could reach it.
+#[test]
+fn chain_stops_at_a_relative_target_with_no_parent_to_resolve_against() {
+    let rl = links(&[("/", "x")]);
+    assert_eq!(symlink_chain(Path::new("/"), &rl), vec![PathBuf::from("/")]);
 }
 
 #[test]

@@ -150,8 +150,10 @@ fn host_mode_entry(env: &GlinerRelexEnv, lockdown_shim: Option<PathBuf>) -> Tool
     // so it can dyld-load. `bind_paths` is plural because a uv-managed CPython
     // is named through a minor-version symlink alias: bind only the canonical
     // path and `execve` of the shebang gets ENOENT (issue #650). Both
-    // `None`/empty for a self-contained venv (and on Linux the prefix is
-    // `/usr`, already bound by bwrap — a harmless redundancy).
+    // `None`/empty for a self-contained venv. A *distro*-python venv's prefix
+    // is `/usr`, which bwrap already binds — there the bind is a harmless
+    // redundancy; a uv-managed one sits under `~/.local/share/uv/python/` and
+    // the bind is load-bearing, which is exactly what #650 was.
     if let Some(root) = &env.interpreter_root {
         fs_read.extend(root.bind_paths());
     }

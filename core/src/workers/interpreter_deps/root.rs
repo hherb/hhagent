@@ -27,6 +27,15 @@ use super::named_path::symlink_chain;
 /// Holding both in one value is deliberate: the two used to be a single
 /// `Option<PathBuf>` serving both jobs, and the caller that needed the second
 /// silently got the first.
+///
+/// **Backend asymmetry.** The aliases are load-bearing only under bwrap, where
+/// a bind mount is what makes a path resolvable at all: `build_argv` emits
+/// `--ro-bind-try <canonical-src> <alias-dest>`, so the alias becomes a real
+/// directory inside the jail. macOS Seatbelt filters access instead of
+/// remapping a namespace, and `canonicalize_policy_paths` canonicalizes every
+/// `fs_read` entry before emitting rules — so on macOS an alias collapses back
+/// into a duplicate of `canonical` and is inert. #650 was a Linux-only bug;
+/// this is a Linux-only fix that both platforms compile and run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterRoot {
     /// The real prefix, symlinks resolved.
@@ -35,6 +44,16 @@ pub struct InterpreterRoot {
     /// proven to canonicalize to `canonical`, so binding one grants no byte the
     /// canonical bind did not already grant. Empty for the common case where
     /// the venv names the interpreter by its real path.
+    ///
+    /// That proof is taken **at resolve time** (daemon startup, once) while the
+    /// backend re-resolves each `fs_read` entry **at every spawn**. An alias is
+    /// by definition a symlink, so unlike the canonical prefix it is mutable
+    /// state on the bind path: repointing it after startup would bind whatever
+    /// it names then. #387's "TOCTOU-safe" note covers the check→bind window
+    /// *inside* `spawn_under_policy`, not this resolve→spawn one. Writing to
+    /// the interpreter directory already requires the agent's own OS user,
+    /// which is the threat model's worst case, so this is a residual rather
+    /// than a break — tracked in #659.
     aliases: Vec<PathBuf>,
 }
 
@@ -123,8 +142,11 @@ pub fn resolve_interpreter_root(
 /// guard and deliberately does not have one: it can only pass the rule above by
 /// canonicalizing to the *external* interpreter prefix, which would mean the
 /// venv and that prefix are the same tree — in which case binding it grants
-/// nothing new either. An explicit `starts_with(venv_dir)` check here would be
-/// a line no test could ever fail.
+/// nothing new, and `venv_dir` is already in `fs_read` regardless. An explicit
+/// `starts_with(venv_dir)` check here would be redundant, not load-bearing.
+/// (It would not be *untestable*: `canonicalize` is injected, so a fixture
+/// mapping `/v` to the interpreter prefix does distinguish the two. Redundant
+/// is the honest reason to leave it out.)
 fn alias_prefixes(
     candidate: &Path,
     canonical: &Path,

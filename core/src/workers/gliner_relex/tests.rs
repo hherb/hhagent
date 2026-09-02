@@ -520,6 +520,50 @@ fn host_interpreter_binds_external_venv() {
     assert_eq!(dirs, vec![PathBuf::from("/opt/hb/gettext/lib")]);
 }
 
+/// The #650 regression guard, at the layer that actually builds the policy.
+///
+/// `resolve_interpreter_root`'s own tests prove `bind_paths()` carries the
+/// alias; this proves `host_mode_entry` spends it. Without it,
+/// `fs_read.push(root.dep_walk_prefix().to_path_buf())` — literally the
+/// pre-#650 line — passes every other test in this file, because every other
+/// fixture builds its root with `canonical_only` and there the two accessors
+/// agree.
+#[test]
+fn host_mode_entry_binds_every_alias_the_venv_names() {
+    let venv = Path::new("/v/.venv");
+    let exists = |p: &Path| p == Path::new("/v/.venv/bin/python3");
+    // The uv layout from #650: a patch-version directory with a minor-version
+    // symlink alias beside it, and the venv naming the alias.
+    let canon = |p: &Path| match p.to_str() {
+        Some("/v/.venv/bin/python3") => {
+            Some(PathBuf::from("/u/py/cpython-3.13.14-linux/bin/python3.13"))
+        }
+        Some("/u/py/cpython-3.13-linux") => Some(PathBuf::from("/u/py/cpython-3.13.14-linux")),
+        _ => None,
+    };
+    let link = |p: &Path| {
+        (p == Path::new("/v/.venv/bin/python3"))
+            .then(|| PathBuf::from("/u/py/cpython-3.13-linux/bin/python3.13"))
+    };
+    let (root, _dirs) =
+        resolve_host_interpreter_binds(venv, exists, canon, link, |_p: &Path| vec![]);
+    let env = GlinerRelexEnv {
+        interpreter_root: root,
+        interpreter_lib_dirs: vec![],
+        ..test_env()
+    };
+    let fs_read = gliner_relex_entry(&env, None).policy.fs_read;
+    assert!(
+        fs_read.contains(&PathBuf::from("/u/py/cpython-3.13.14-linux")),
+        "canonical prefix must still be bound; got {fs_read:?}"
+    );
+    assert!(
+        fs_read.contains(&PathBuf::from("/u/py/cpython-3.13-linux")),
+        "the alias the shebang NAMES must be bound too, or execve returns \
+         ENOENT for a file that is present and readable (#650); got {fs_read:?}"
+    );
+}
+
 /// A self-contained venv (python canonicalizes UNDER the venv) needs no extra
 /// interpreter binds — the venv `fs_read` already covers it.
 #[test]

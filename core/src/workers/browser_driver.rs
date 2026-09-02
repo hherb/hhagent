@@ -164,8 +164,7 @@ where
     );
     let interpreter_lib_dirs = crate::workers::interpreter_deps::interpreter_lib_dirs(
         &venv_dir,
-        // The DEP-WALK prefix, not the bind set — see #650.
-        interpreter_root.as_ref().map(|r| r.dep_walk_prefix()),
+        interpreter_root.as_ref(),
         &exists,
         &canonicalize,
         &resolve_deps,
@@ -257,8 +256,11 @@ pub fn browser_driver_entry(
         PathBuf::from("/etc/hosts"),
         PathBuf::from("/etc/nsswitch.conf"),
     ];
-    // Bind the real interpreter prefix when the venv's python lives outside
-    // venv_dir (pyenv/uv venvs) so CPython can start inside the jail.
+    // Bind EVERY name the venv reaches its interpreter by (`bind_paths`, not
+    // the canonical path alone) when that interpreter lives outside venv_dir
+    // (pyenv/uv venvs), so CPython can start inside the jail: a uv-managed
+    // CPython is named through a minor-version symlink alias, and binding only
+    // the canonical path leaves the shebang dangling with ENOENT (#650).
     if let Some(root) = &env.interpreter_root {
         fs_read.extend(root.bind_paths());
     }

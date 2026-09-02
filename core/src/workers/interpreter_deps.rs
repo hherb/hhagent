@@ -9,8 +9,11 @@
 //! returns the canonical parent dirs to bind read-only.
 //!
 //! It also answers the prior question — *which* interpreter, and under which
-//! names a jail must be able to reach it ([`root`], [`named_path`]; issue
-//! #650).
+//! names a jail must be able to reach it. That lives in the private `root` and
+//! `named_path` submodules (issue #650), whose public surface is re-exported
+//! here as [`resolve_interpreter_root`], [`InterpreterRoot`] and
+//! [`read_link_via_fs`] — the names to link against, since a `pub` module
+//! cannot usefully link at a private item.
 //!
 //! Pure core: the dependency graph and every path probe arrive as injected
 //! closures, so the transitive graph walk is unit-testable without `otool`/`ldd`.
@@ -96,17 +99,26 @@ pub fn out_of_prefix_lib_dirs(
 ///
 /// Locates `<venv>/bin/{python3,python}`, canonicalizes it to the real
 /// interpreter, then delegates to [`interpreter_lib_dirs_for_binary`].
-/// `interpreter_root` is the external interpreter prefix (when the venv's python
-/// lives outside the venv), else `None`; the dep-walk prefix is that root or,
-/// self-contained, the venv dir (a self-contained interpreter can still link
-/// out-of-prefix libs). Returns empty when the interpreter can't be located.
+/// `interpreter_root` is the external interpreter root (when the venv's python
+/// lives outside the venv), else `None`; the dep-walk prefix is that root's
+/// [`dep_walk_prefix`](InterpreterRoot::dep_walk_prefix) or, self-contained, the
+/// venv dir (a self-contained interpreter can still link out-of-prefix libs).
+/// Returns empty when the interpreter can't be located.
+///
+/// It takes the whole [`InterpreterRoot`] rather than a bare `&Path` on purpose:
+/// `ldd`/`otool` report canonical paths and this walk compares with
+/// `starts_with`, so handing it an *alias* would classify the interpreter's own
+/// libraries as out-of-prefix. Every caller used to make that choice itself,
+/// each with a comment reminding it which half to pass — one of the three had
+/// no comment. Now the choice is made once, here, and passing the wrong half is
+/// not expressible (#650).
 ///
 /// Shared by the browser-driver / gliner-relex manifests and their e2e resolvers
 /// so the seed logic cannot drift across the crate boundary (review M2). Pure:
 /// `exists`, `canonicalize`, and `resolve_deps` are injected.
 pub fn interpreter_lib_dirs(
     venv_dir: &Path,
-    interpreter_root: Option<&Path>,
+    interpreter_root: Option<&InterpreterRoot>,
     exists: &dyn Fn(&Path) -> bool,
     canonicalize: &dyn Fn(&Path) -> Option<PathBuf>,
     resolve_deps: &dyn Fn(&Path) -> Vec<PathBuf>,
@@ -125,8 +137,8 @@ pub fn interpreter_lib_dirs(
         None => return Vec::new(),
     };
     // The prefix to treat as "already bound in-jail": the external interpreter
-    // root, or (self-contained) the venv dir.
-    let prefix = interpreter_root.unwrap_or(venv_dir);
+    // root's CANONICAL path, or (self-contained) the venv dir.
+    let prefix = interpreter_root.map_or(venv_dir, |r| r.dep_walk_prefix());
     interpreter_lib_dirs_for_binary(&real, prefix, exists, canonicalize, resolve_deps)
 }
 

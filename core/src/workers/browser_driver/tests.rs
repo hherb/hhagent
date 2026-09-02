@@ -125,6 +125,50 @@ use super::*;
             .contains(&PathBuf::from("/home/u/.pyenv/versions/3.12.3")));
     }
 
+    /// The #650 regression guard, at the layer that actually builds the policy.
+    ///
+    /// `resolve_interpreter_root`'s own tests prove `bind_paths()` carries the
+    /// alias; this proves the *entry builder* spends it. Without it,
+    /// `fs_read.push(root.dep_walk_prefix().to_path_buf())` — literally the
+    /// pre-#650 line — passes every other test in this file, because every
+    /// other fixture builds its root with `canonical_only` and there the two
+    /// accessors agree.
+    #[test]
+    fn entry_binds_every_alias_the_venv_names_not_only_the_canonical_prefix() {
+        let env = |k: &str| match k {
+            "KASTELLAN_BROWSER_DRIVER_ENABLE" => Some("1".to_string()),
+            "KASTELLAN_BROWSER_DRIVER_VENV_DIR" => Some("/v".to_string()),
+            _ => None,
+        };
+        // The uv layout from #650: a patch-version directory with a
+        // minor-version symlink alias beside it, and the venv naming the alias.
+        let canon = |p: &Path| match p.to_str() {
+            Some("/v/bin/python3") => Some(PathBuf::from(
+                "/u/py/cpython-3.13.14-linux-aarch64-gnu/bin/python3.13",
+            )),
+            Some("/u/py/cpython-3.13-linux-aarch64-gnu") => Some(PathBuf::from(
+                "/u/py/cpython-3.13.14-linux-aarch64-gnu",
+            )),
+            _ => None,
+        };
+        let link = |p: &Path| {
+            (p == Path::new("/v/bin/python3")).then(|| {
+                PathBuf::from("/u/py/cpython-3.13-linux-aarch64-gnu/bin/python3.13")
+            })
+        };
+        let out = resolve_env(env, |_p| true, |_p| true, canon, link, no_deps).expect("resolves");
+        let fs_read = browser_driver_entry(&out, &[], None).policy.fs_read;
+        assert!(
+            fs_read.contains(&PathBuf::from("/u/py/cpython-3.13.14-linux-aarch64-gnu")),
+            "canonical prefix must still be bound; got {fs_read:?}"
+        );
+        assert!(
+            fs_read.contains(&PathBuf::from("/u/py/cpython-3.13-linux-aarch64-gnu")),
+            "the alias the shebang NAMES must be bound too, or execve returns \
+             ENOENT for a file that is present and readable (#650); got {fs_read:?}"
+        );
+    }
+
     #[test]
     fn extra_fs_read_env_is_parsed_and_bound() {
         let env = |k: &str| match k {

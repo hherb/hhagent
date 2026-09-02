@@ -282,9 +282,11 @@ where
 /// * `interpreter_root` — the external interpreter prefix, carrying both the
 ///   canonical path (for the dep walk) and every symlink alias the venv names
 ///   it by (all of which must be bound, #650); `None` for a self-contained
-///   venv. (On Linux the base python lives under `/usr`, which bwrap already
-///   binds — it is still surfaced here; binding it again is a harmless
-///   redundancy, exactly as the browser-driver worker does.)
+///   venv. (A *distro*-python venv's prefix is `/usr`, which bwrap already
+///   binds — it is still surfaced here, and binding it again is a harmless
+///   redundancy, exactly as the browser-driver worker does. A uv-managed
+///   interpreter's prefix is under `~/.local/share/uv/python/` and the bind is
+///   load-bearing, which is what #650 was.)
 /// * `interpreter_lib_dirs` — out-of-prefix shared-lib dirs the interpreter
 ///   links; empty when self-contained / all-system, or the dep tool is
 ///   unavailable (fail-safe — the manual `*_EXTRA_FS_READ` hatch backstops).
@@ -312,10 +314,7 @@ pub fn resolve_host_interpreter_binds(
     );
     let interpreter_lib_dirs = crate::workers::interpreter_deps::interpreter_lib_dirs(
         venv_dir,
-        // The DEP-WALK prefix, not the bind set: `ldd`/`otool` report canonical
-        // paths, so an alias here would classify the interpreter's own
-        // libraries as out-of-prefix (issue #650).
-        interpreter_root.as_ref().map(|r| r.dep_walk_prefix()),
+        interpreter_root.as_ref(),
         &exists,
         &canonicalize,
         &resolve_deps,
