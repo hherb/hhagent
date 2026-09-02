@@ -83,7 +83,6 @@ struct MailDaemon {
 fn bring_up_mail_daemon(
     rt: &tokio::runtime::Runtime,
     suffix: &str,
-    user: &str,
     llm: LlmEndpoint,
     model_override: Option<&str>,
 ) -> MailDaemon {
@@ -135,7 +134,7 @@ fn bring_up_mail_daemon(
     // find every test that opts out. The mock localmail origin is plain
     // HTTP on loopback, which the proxy's webpki-only MITM upstream cannot
     // reach.
-    let mut spec = DaemonSpec::new("maild", suffix, &cluster.data_dir, user, llm)
+    let mut spec = DaemonSpec::new("maild", &cluster.data_dir, llm)
         .force_routing(false)
         .envs(extra_env);
     // The live-LLM leg needs a real model in place of `DEFAULT_LLM_MODEL`.
@@ -227,7 +226,6 @@ fn daemon_planner_dispatches_mail_search_end_to_end() {
     let fixture = bring_up_mail_daemon(
         &rt,
         &suffix,
-        &user,
         LlmEndpoint::Base(scripted.base_url.clone()),
         None,
     );
@@ -307,7 +305,6 @@ fn live_llm_selects_mail_unprompted() {
     let fixture = bring_up_mail_daemon(
         &rt,
         &suffix,
-        &user,
         LlmEndpoint::from_operator_url(llm_url),
         Some(&model),
     );

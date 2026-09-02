@@ -79,9 +79,9 @@ use kastellan_tests_common::scripted_llm::{
 #[cfg(target_os = "macos")]
 use kastellan_tests_common::serial_lock;
 use kastellan_tests_common::{
-    bring_up_daemon, bring_up_pg_cluster, core_binary, current_username,
-    guard_tier_boot_payload, pg_bin_dir_or_skip, skip_if_no_supervisor, stderr_tail,
-    unique_suffix, DaemonHandle, DaemonSpec, LlmEndpoint, PgCluster,
+    bring_up_daemon, bring_up_pg_cluster, core_binary, guard_tier_boot_payload,
+    pg_bin_dir_or_skip, skip_if_no_supervisor, stderr_tail, unique_suffix, DaemonHandle,
+    DaemonSpec, LlmEndpoint, PgCluster,
 };
 
 /// The operator's pinned per-request budget for the above-ceiling leg,
@@ -167,18 +167,14 @@ const TAU: f32 = 0.795_526_56;
 ///
 /// [#634]: https://github.com/hherb/kastellan/issues/634
 fn daemon_spec(
-    suffix: &str,
     data_dir: &Path,
     planner_base_url: &str,
     guard_base_url: &str,
-    user: &str,
     pinned_timeout_ms: u64,
 ) -> DaemonSpec {
     DaemonSpec::new(
         "gboot",
-        suffix,
         data_dir,
-        user,
         // The planner backend. Nothing in this test drives a plan, but
         // the router is constructed at boot and a missing local URL is a
         // config error, so it has to point somewhere.
@@ -254,8 +250,10 @@ fn with_configured_boot(pin_ms: u64, check: impl FnOnce(&serde_json::Value, &Dae
     // already gone is a safe no-op — but the tidy order is the one worth
     // writing down, because the other order's harmlessness is a fact
     // about tokio a reader would have to go and check.
+    // `user` used to be drawn here and threaded into `DaemonSpec::new`.
+    // #641 made the spec derive it, and nothing else in this test needs
+    // it — the daemon's `USER` is the only place it was ever used.
     let suffix = unique_suffix();
-    let user = current_username();
     let cluster = cluster_for(&suffix);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -296,11 +294,9 @@ fn with_configured_boot(pin_ms: u64, check: impl FnOnce(&serde_json::Value, &Dae
     });
 
     let (daemon, _daemon_guards) = bring_up_daemon(&daemon_spec(
-        &suffix,
         &cluster.data_dir,
         &planner.base_url,
         &guard.base_url,
-        &user,
         pin_ms,
     ));
 
