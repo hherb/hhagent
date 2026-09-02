@@ -99,13 +99,64 @@ traversal) covered every `transformers < 5.10.0` in `workers/gliner-relex/uv.loc
   repeatable — a real 1.3 GB load plus one extraction — and
   **`KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1` turns its skip into a failure** (the knob this file has
   wanted for a while). All three arms verified: runs with weights, skips with a reason naming the
-  path, fails under the knob. 51 pytest tests now, **51/51 on both hosts**, and on the DGX with the
-  knob on, so the live load really ran (transformers 5.13.1 / torch 2.13.0+cu130).
+  path, fails under the knob. **63/63 on the Mac** after the review round (51 before), and 51/51 on
+  the DGX with the knob on, so the live load really ran (transformers 5.13.1 / torch 2.13.0+cu130).
+  ⚠️ **The DGX has not re-run since the review round** — it is owed a fresh `pytest` and workspace
+  gate.
 - **`uv.lock` was the one committed lockfile with no drift gate.** Every cargo step passes
   `--locked`; nothing checked that `pyproject.toml` and `uv.lock` agree. New `python-lock-check` CI
   job runs `uv lock --check --offline` — hermetic (validates from the lock's own metadata, no PyPI
-  round-trip), both arms verified. The worker's pytest suite is deliberately **not** in CI: ~2 GB of
-  torch for 50 mocked tests, and its one unmockable test needs 1.3 GB of weights.
+  round-trip), both arms verified. The mocked pytest suite stays out of CI (~2 GB of torch); the
+  torch-free guard tests *are* in, deselecting the live model test explicitly.
+
+#### The #651 review round (2026-09-02, third session)
+
+A six-agent review of #651 found one thing the PR had missed outright and several it had oversold.
+All fixed on the branch; three follow-ups filed. **What is worth carrying:**
+
+- **A "fix all N call sites" commit fixed two of three.** `memory_entity_link_e2e.rs` was the third
+  host-mode fixture with the identical hardcoded `interpreter_root: None`, and the commit message
+  said "the e2e **fixtures**" (plural). Its own in-file comment — *"if a third caller appears, lift
+  them into `kastellan-tests-common`"* — had already tripped its trigger condition and been ignored.
+  **When a comment names the condition under which to refactor, check whether it has fired before
+  adding the caller.**
+- **Now lifted, and the lift found a second drift.** `kastellan-tests-common` gained
+  [`gliner_weights`](../../../tests-common/src/gliner_weights.rs) (pure `weights_dir_candidate` + 10
+  unit tests) and [`venv_interpreter`](../../../tests-common/src/venv_interpreter.rs). The three
+  copied `resolve_weights_dir`s were **not** equivalent: `gliner_relex_e2e`'s ignored
+  `KASTELLAN_GLINER_RELEX_WEIGHTS_DIR` entirely while the other two honoured it, so one override
+  could point two suites at different snapshots in the same `cargo test` run.
+- **`(None, vec![])` from `resolve_host_interpreter_binds` is ambiguous three ways** —
+  self-contained venv (fine), interpreter that does not resolve (dead fixture), dep tool missing
+  (under-bound jail). The fixtures accepted all three alike, so a `.venv` staged on another host
+  produced *exactly* the `interpreter_root: None` the PR had just deleted as broken.
+  `venv_interpreter_binds` now checks the `None`: it panics naming the path and the remedy.
+- **A skip-as-pass knob that only reads itself from inside the test is not a gate.** Proven:
+  `KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1 pytest -k "not real_model"` exited **0**, and a rename off
+  the `test_` prefix exited 0 with *no deselected counter to notice*. `conftest.py` now carries a
+  `pytest_sessionfinish` guard; both holes exit 1. **`trylast=True` on
+  `pytest_collection_modifyitems` is load-bearing** — `-k` deselection is itself such a hook, so
+  without it you see the pre-filter list and misreport a deselected test as present.
+- **Simulate a CI step in a venv-free copy before believing it.** The new torch-free pytest step
+  passed locally for the wrong reason (it silently reused the on-disk `.venv`). In a faithful copy
+  it **failed**: under `--no-project` the worker package is unimportable, so on any host that *does*
+  have weights the live test errors instead of skipping. Now deselected explicitly.
+- **The gate does not cover the advisory class, and the comment now says so.** `uv lock --check`
+  passes on `origin/main`'s vulnerable 5.5.0 state with exit 0 — floor and lock agreed perfectly.
+  Advisories are Dependabot's job (alerts are enabled; that is what filed #649 and opened #647).
+  What the gate *does* catch is a silently **weakened** floor, verified exit 1.
+- **Two review findings were wrong and were dropped**, both asserted by more than one agent: "no
+  advisory scanning anywhere" (inferred from a missing `.github/dependabot.yml` — security updates
+  need no config file) and `gliner_relex_e2e.rs:161` as a fourth unfixed site (it is container mode,
+  where `None` is correct). [[verify-deployment-claims-before-carrying]] applies to agent findings
+  too.
+
+Follow-ups filed, none blocking: **[#653](https://github.com/hherb/kastellan/issues/653)** (the Rust
+e2es still cannot be forced to run — five silent `[SKIP]` gates, and that is how the fixture bug
+survived), **[#654](https://github.com/hherb/kastellan/issues/654)** (three fixtures gate on a strict
+`Some("1")` while production takes the #459 `1|true|yes|on` dialect; `resolve.rs` comments still
+teach the old rule), **[#655](https://github.com/hherb/kastellan/issues/655)** (`main` has **no**
+required status checks — clippy, the matrix build and the new lock gate can all go red and merge).
 
 ### #650 — the fault the acceptance run exposed (OPEN, next session's first job)
 
@@ -136,8 +187,9 @@ file that is present and readable**.
 - **Two faults, the outer masking the inner** — the same shape as the 2026-08-02 four. The DGX venv
   being a macOS copy made the tests skip; the fixtures hardcoding `interpreter_root: None` meant
   even a working venv would not have exercised the production binds. Fixture half fixed in
-  `8dc0a9f6` (both e2e files now call `resolve_host_interpreter_binds`) — **that fix is what let the
-  real fault surface, and it is necessary but not sufficient.**
+  `8dc0a9f6` (two of three e2e files) and completed in the #651 review round (the third, plus a
+  shared `kastellan_tests_common::venv_interpreter_binds` that refuses an unexplained `None`) —
+  **that fix is what let the real fault surface, and it is necessary but not sufficient.**
 
 ### Merged work, compressed — the guard arc and the 2026-09-02 deploy
 
@@ -482,8 +534,9 @@ Full prose in the [`archive/`](archive/) snapshots — most recently
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`5445dd68`** — branch tip of `fix/649-transformers-lock-bump` | **3937 / 3 / 55**, **176** suites, `TEST_EXIT=101`, `--no-fail-fast --nocapture`. **NOT GREEN, and the delta reconciles exactly**: 3937 + 3 = **3940**, the same total as the `f12ed26d` row below. Nothing was added or lost — three tests moved from *skipped-as-passed* to *honestly failing*. All three are `gliner_relex_e2e` (`happy_path_extract_returns_entities_and_triples`, `warm_reuse_two_calls_keep_one_worker_warm`, `invalid_input_returns_rpc_error_and_worker_stays_alive`) and all three are **[#650](https://github.com/hherb/kastellan/issues/650)**, proved pre-existing by A/B against the pre-bump lock. `entity_extraction_e2e`'s two real-model tests hit the same fault but only under `KASTELLAN_GLINER_RELEX_ENABLE=1`, which a plain workspace run does not set | exit 0 from a **cold** private dir under `$HOME`: **345** `Checking`+`Compiling` lines (107 + 238), all **27** kastellan crates named, **zero** warnings. rustc **1.98.0** | **4** (was 8), all `KASTELLAN_GLINER_RELEX_ENABLE != "1"`. **The four venv-shim skips are GONE** — that is #649's acceptance criterion, met literally |
-| **Mac** (aarch64 darwin) | **`5445dd68`** | `uv run --frozen pytest` **51 / 0** in `workers/gliner-relex`, including the real 1.3 GB model load + one extraction under transformers 5.13.1. `cargo check -p kastellan-core --test gliner_relex_e2e --test entity_extraction_e2e` clean | — | 0 |
-| **DGX** (Python leg) | **`5445dd68`** | `KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1 uv run --frozen pytest` **51 / 0** — the knob makes a missing-weights skip a failure, so the live load provably ran (transformers 5.13.1 / torch 2.13.0+cu130) | — | 0 |
+| **Mac** (aarch64 darwin) | **#651 review round** | `uv run --frozen pytest` **63 / 0** in `workers/gliner-relex` (was 51), including the real 1.3 GB model load + one extraction under transformers 5.13.1. Seven gate arms verified individually: plain, knob=`1`, knob=`true`, missing-weights skip, missing-weights+knob→fail (both dialects), and **deselect-under-knob → exit 1** and **rename-out-of-collection-under-knob → exit 1**, which both exited **0** before. `cargo test -p kastellan-tests-common --lib gliner_weights` **10 / 0** | see the row's note | 0 |
+| **Mac** (aarch64 darwin) | **`5445dd68`** | `uv run --frozen pytest` **51 / 0**, real model load under transformers 5.13.1. `cargo check -p kastellan-core --test gliner_relex_e2e --test entity_extraction_e2e` clean. Superseded by the row above | — | 0 |
+| **DGX** (Python leg) | **`5445dd68`** | `KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1 uv run --frozen pytest` **51 / 0** — the knob makes a missing-weights skip a failure, so the live load provably ran (transformers 5.13.1 / torch 2.13.0+cu130). ⚠️ **Predates the review round; owed a re-run at 63** | — | 0 |
 
 **The previous green row, which the three failures above are measured against:** DGX `f12ed26d`
 (tree-identical to `main` `121f22a2`) — **3940 / 0 / 55**, 176 suites, `TEST_EXIT=0`; cold clippy
