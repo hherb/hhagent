@@ -34,8 +34,9 @@ use kastellan_core::workers::gliner_relex::{
 };
 use kastellan_protocol::client::ClientError;
 use kastellan_tests_common::{
-    bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_no_supervisor,
-    skip_if_sandbox_unavailable, unique_suffix, PgCluster,
+    bring_up_pg_cluster, pg_bin_dir_or_skip, resolve_weights_dir_or_skip,
+    skip_if_no_supervisor, skip_if_sandbox_unavailable, unique_suffix,
+    venv_interpreter_binds, PgCluster,
 };
 
 /// Resolve the venv shim path relative to the workspace root.
@@ -62,31 +63,6 @@ fn resolve_worker_script() -> Option<PathBuf> {
         return None;
     }
     Some(script)
-}
-
-/// Resolve the weights snapshot dir for `multi-v1.0`.
-///
-/// Honours `KASTELLAN_DATA_DIR` first, falls back to
-/// `$HOME/.local/share/kastellan` (mirrors `resolve_env`'s resolution).
-/// Skip-as-pass when the dir is missing on disk.
-fn resolve_weights_dir() -> Option<PathBuf> {
-    let data_dir = std::env::var("KASTELLAN_DATA_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local/share/kastellan"))
-        })?;
-    let weights = data_dir.join("workers/gliner-relex/weights/multi-v1.0");
-    if !weights.is_dir() {
-        eprintln!(
-            "\n[SKIP] gliner-relex weights dir missing at {} — run scripts/workers/gliner-relex/install.sh\n",
-            weights.display()
-        );
-        return None;
-    }
-    Some(weights)
 }
 
 /// Slice 2.5: gate container-mode e2e on the operator having built the
@@ -143,7 +119,7 @@ fn build_test_entry_container() -> Option<ToolEntry> {
     if skip_if_image_missing("kastellan/gliner-relex:dev") {
         return None;
     }
-    let weights = resolve_weights_dir()?;
+    let weights = resolve_weights_dir_or_skip()?;
     let env = GlinerRelexEnv {
         // Both paths empty in container mode — the worker shim lives
         // at /usr/local/bin inside the image; the manifest builder
@@ -169,7 +145,7 @@ fn build_test_entry_container() -> Option<ToolEntry> {
 #[test]
 fn skip_helpers_compile_and_return_cleanly_on_unstaged_hosts() {
     let _ = resolve_worker_script();
-    let _ = resolve_weights_dir();
+    let _ = resolve_weights_dir_or_skip();
 }
 
 /// Build the gliner-relex `ToolEntry` against the in-tree venv + the
@@ -184,12 +160,13 @@ fn build_test_entry() -> Option<ToolEntry> {
         return None;
     }
     let script = resolve_worker_script()?;
-    let weights = resolve_weights_dir()?;
+    let weights = resolve_weights_dir_or_skip()?;
     let venv_dir = script
         .parent()
         .and_then(|bin| bin.parent())
         .expect("script_path is .venv/bin/<bin> — both parent levels must exist")
         .to_path_buf();
+    let (interp_root, interp_lib_dirs) = venv_interpreter_binds(&venv_dir);
     let env = GlinerRelexEnv {
         script_path: script,
         venv_dir,
@@ -198,10 +175,29 @@ fn build_test_entry() -> Option<ToolEntry> {
         device: "auto".to_string(),
         use_container_backend: false,
         container_image: None,
-        // Self-contained fixture: the production manifest computes the real
-        // external-interpreter binds (issue #284) via resolve_host_interpreter_binds.
-        interpreter_root: None,
-        interpreter_lib_dirs: vec![],
+        // Bind the venv's real interpreter, exactly as the production manifest
+        // does (`GlinerRelexManifest::resolve` → `resolve_host_interpreter_binds`,
+        // issue #284). This used to hardcode `None` / `vec![]` under the comment
+        // "self-contained fixture", and that assumption is false whenever `uv`
+        // provisions its own CPython: the venv's `bin/python` is then a symlink
+        // into `~/.local/share/uv/python/cpython-*/`, OUTSIDE `venv_dir`. The
+        // shebang path itself IS bound (it lives in the venv); what is missing is
+        // the prefix it resolves *to*, so `execve` returns ENOENT for a file that
+        // is present and readable, and the worker dies before it can answer —
+        // surfacing as the generic `Protocol(EarlyExit)`.
+        //
+        // It went unnoticed because it only bites where the venv is external AND
+        // the sandbox is real, and the one host that is true on (the DGX) had a
+        // venv copied from the Mac, whose `bin/python` pointed at a macOS path —
+        // so these tests skipped rather than ran.
+        //
+        // This makes the fixture faithful, NOT green. `resolve_interpreter_root`
+        // canonicalizes, so only the patch-version directory binds while the
+        // venv names the minor-version symlink alias beside it — that residual
+        // is issue #650, and until it lands a red `gliner_relex_e2e` on Linux is
+        // expected here and is not a regression in this fixture.
+        interpreter_root: interp_root,
+        interpreter_lib_dirs: interp_lib_dirs,
     };
     // Route through the lockdown-exec shim on Linux so the worker actually runs
     // under the `ml_client` seccomp filter — the #281 property this suite must

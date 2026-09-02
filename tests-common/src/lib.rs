@@ -50,6 +50,14 @@
 //!   scaffolding shared by `egress_force_routing_e2e.rs` + `mail_e2e.rs`.
 //! * [`audit`] — `NoopAuditSink`, the no-Postgres `AuditSink` shared by the
 //!   `dispatch_with_sink`-based worker e2e tests.
+//! * [`gliner_weights`] — `weights_dir_candidate` (pure) +
+//!   `resolve_weights_dir_or_skip`: the one `multi-v1.0` snapshot lookup for
+//!   the three gliner-relex e2es, mirrored by the worker's own
+//!   `tests/live_support.py`.
+//! * [`venv_interpreter`] — `venv_interpreter_binds`: the #284 interpreter
+//!   binds for the three gliner-relex host-mode fixtures, with the `None`
+//!   return checked so a `.venv` staged on another host fails loudly instead
+//!   of spawning a jail with no interpreter.
 //!
 //! Nothing here is shipped at runtime. The crate is `publish = false`
 //! and consumed only from `[dev-dependencies]`.
@@ -62,6 +70,7 @@ pub mod embedding;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod egress_forcing;
 pub mod env;
+pub mod gliner_weights;
 pub mod guard_pin;
 pub mod guards;
 pub mod installable;
@@ -76,6 +85,7 @@ pub mod signal_death;
 pub mod skip;
 pub mod temp;
 pub mod tls_origin;
+pub mod venv_interpreter;
 pub mod wait;
 pub mod watchdog;
 
@@ -92,6 +102,7 @@ pub use daemon::{
 };
 pub use embedding::text_to_embedding;
 pub use env::{env_lock, EnvVarGuard};
+pub use gliner_weights::{resolve_weights_dir_or_skip, weights_dir_candidate, WEIGHTS_SUBPATH};
 pub use guards::{PathGuard, ServiceGuard};
 pub use pg::{
     bring_up_pg_cluster, bring_up_pg_cluster_with_timeout, PgCluster, PG_BRING_UP_TIMEOUT_SECS,
@@ -104,5 +115,6 @@ pub use signal_death::{
 };
 pub use skip::{pg_bin_dir_or_skip, skip_if_no_supervisor, skip_if_origin_unreachable};
 pub use temp::{current_username, unique_suffix, unique_temp_root};
+pub use venv_interpreter::venv_interpreter_binds;
 pub use wait::{wait_for_log_match, wait_for_socket, wait_for_status};
 pub use watchdog::{await_within, close_pool, close_pool_bounded, DEFAULT_POOL_CLOSE_TIMEOUT};

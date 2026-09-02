@@ -216,6 +216,85 @@ jobs:
           cargo test -p kastellan-llm-router --lib props_url --locked
           cargo test -p kastellan-llm-router --test props_e2e --locked
 
+  # `uv.lock` is the one committed lockfile in this repo with NO drift gate.
+  # Every cargo step above passes `--locked`, so a `Cargo.toml` edit that was
+  # not followed by a `cargo` run fails the build instead of silently rewriting
+  # the lockfile. `workers/gliner-relex/uv.lock` had no equivalent, and issue
+  # #649 is what made that asymmetry expensive: the advisory fix had to move
+  # BOTH a `pyproject.toml` floor and the lock, and nothing would have noticed
+  # the two disagreeing.
+  #
+  # SCOPE, precisely: `uv lock --check` proves the manifest and the lock AGREE.
+  # It does not judge what they agree ON. The pre-#649 tree — `transformers`
+  # pinned at a version inside GHSA-xrqw-3rrv-vx5w — passes this job with exit
+  # 0, because its floor and its lock were perfectly consistent with each
+  # other. Advisories are covered separately, by Dependabot alerts on the repo
+  # (that is what filed #649 and opened #647); this job is a DRIFT gate and
+  # nothing more. What it does catch, and what makes it worth having here, is a
+  # silently WEAKENED floor: reverting `transformers>=5.10.0` without
+  # regenerating the lock exits 1, because uv compares recorded requirements
+  # for equality rather than satisfaction.
+  #
+  # `--offline` makes it hermetic: a complete lockfile is validated from its own
+  # recorded metadata, no PyPI round-trip, so this job satisfies the header's
+  # bar (no Postgres, no bwrap, no KVM, no network) and takes seconds. Its one
+  # rough edge is the error it produces for a NEW dependency added without
+  # re-locking: uv cannot resolve offline and prints a version-availability wall
+  # rather than "run uv lock", so the step below says so itself.
+  #
+  # It runs on every pull request and every `main` push — cheap enough not to
+  # need a `paths:` filter. It installs no Python PACKAGES: the worker's mocked
+  # pytest suite is deliberately left out, because it needs ~2 GB of torch, and
+  # the one test that could not be mocked (the real model load in
+  # `tests/test_model_live.py`) needs 1.3 GB of weights this runner has no
+  # business staging. That one stays operator-driven, with
+  # `KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1` as the knob that stops it skipping
+  # silently.
+  #
+  # The pure guard tests in that same file ARE run, though — they import only
+  # `pathlib`, `typing` and `pytest`, so they cost a second and no torch. They
+  # are what pins the weights-resolution rules against their Rust counterpart in
+  # `kastellan-tests-common::gliner_weights`; a drift between the two halves
+  # arrives in a diff, which is exactly a pull-request event.
+  python-lock-check:
+    name: uv lock --check (gliner-relex)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned: an unpinned uv is a silent input to a gate whose whole job is
+      # to detect change. `docs.yml` uses the same major.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
+
+      - name: uv lock --check (pyproject and uv.lock agree)
+        working-directory: workers/gliner-relex
+        run: |
+          uv lock --check --offline || {
+            echo "::error file=workers/gliner-relex/pyproject.toml::pyproject.toml and uv.lock disagree - run 'uv lock' in workers/gliner-relex and commit the result"
+            exit 1
+          }
+
+      # No torch, no weights, no model: `test_model_live.py`'s helper tests are
+      # pure functions over an injected environment. `--no-project` keeps uv
+      # from installing the worker (and its ~2 GB of dependencies) just to run
+      # them.
+      #
+      # The live model test is deselected EXPLICITLY rather than left to
+      # skip-as-pass. Under `--no-project` the worker package is not importable,
+      # so on any host that does happen to have the weights staged the test
+      # would reach its `import kastellan_worker_gliner_relex` and ERROR rather
+      # than skip. Relying on "the runner has no weights" would make this step
+      # pass for a reason that is not the reason stated. `REQUIRE_E2E` is
+      # deliberately unset here, so `conftest.py`'s session guard stays quiet.
+      - name: pytest (weights-resolution guards only; no torch)
+        working-directory: workers/gliner-relex
+        run: |
+          uv run --no-project --with pytest pytest tests/test_model_live.py -q -rs \
+            --deselect tests/test_model_live.py::test_real_model_loads_and_extracts
+
   # The Matrix worker's live SDK path (`workers/matrix/src/sdk_live.rs`) is
   # behind the optional `live-matrix` feature (`dep:matrix-sdk`). The `check`
   # job above builds the default `--workspace`, which deliberately excludes that

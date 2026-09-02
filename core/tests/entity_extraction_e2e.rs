@@ -35,12 +35,12 @@ use kastellan_core::entity_extraction::{EntityExtractor, SeedSource};
 use kastellan_core::scheduler::ToolEntry;
 use kastellan_core::worker_lifecycle::{CompositeLifecycle, WorkerLifecycleManager};
 use kastellan_core::workers::gliner_relex::{
-    gliner_relex_entry, Client, Entity, ExtractResponse, GlinerRelexEnv, Triple,
-    TripleEntity,
+    gliner_relex_entry, Client, Entity, ExtractResponse, GlinerRelexEnv, Triple, TripleEntity,
 };
 use kastellan_tests_common::{
-    bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_no_supervisor,
-    skip_if_sandbox_unavailable, unique_suffix, PgCluster,
+    bring_up_pg_cluster, pg_bin_dir_or_skip, resolve_weights_dir_or_skip,
+    skip_if_no_supervisor, skip_if_sandbox_unavailable, unique_suffix,
+    venv_interpreter_binds, PgCluster,
 };
 
 // ---------------------------------------------------------------------
@@ -98,42 +98,6 @@ fn resolve_worker_script() -> Option<PathBuf> {
     Some(script)
 }
 
-/// Resolve the `multi-v1.0` weights dir. Honours
-/// `KASTELLAN_GLINER_RELEX_WEIGHTS_DIR` (when set verbatim — the daemon-
-/// style override the run-command for these tests uses), otherwise
-/// `KASTELLAN_DATA_DIR`, otherwise `$HOME/.local/share/kastellan`. Skip on
-/// missing.
-fn resolve_weights_dir() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("KASTELLAN_GLINER_RELEX_WEIGHTS_DIR") {
-        let p = PathBuf::from(explicit);
-        if p.is_dir() {
-            return Some(p);
-        }
-        eprintln!(
-            "\n[SKIP] KASTELLAN_GLINER_RELEX_WEIGHTS_DIR points at {} which isn't a directory\n",
-            p.display()
-        );
-        return None;
-    }
-    let data_dir = std::env::var("KASTELLAN_DATA_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local/share/kastellan"))
-        })?;
-    let weights = data_dir.join("workers/gliner-relex/weights/multi-v1.0");
-    if !weights.is_dir() {
-        eprintln!(
-            "\n[SKIP] gliner-relex weights dir missing at {} — run scripts/workers/gliner-relex/install.sh\n",
-            weights.display()
-        );
-        return None;
-    }
-    Some(weights)
-}
-
 /// Build the gliner-relex `ToolEntry` for the real-model tier. Returns
 /// `None` (with a `[SKIP]` print) when any of: opt-in env-var off,
 /// sandbox unavailable, supervisor unavailable, venv shim missing,
@@ -150,12 +114,17 @@ fn build_real_model_entry() -> Option<ToolEntry> {
         return None;
     }
     let script = resolve_worker_script()?;
-    let weights = resolve_weights_dir()?;
+    let weights = resolve_weights_dir_or_skip()?;
     let venv_dir = script
         .parent()
         .and_then(|bin| bin.parent())
         .expect("script_path is .venv/bin/<bin> — both parent levels must exist")
         .to_path_buf();
+    // Shared with the other two gliner-relex fixtures, and for the same reason:
+    // a `uv`-provisioned CPython lives outside `venv_dir`, so hardcoding `None`
+    // here left the jail with no bind for the interpreter the shim's shebang
+    // resolves to. See the note in `kastellan_tests_common::venv_interpreter`.
+    let (interp_root, interp_lib_dirs) = venv_interpreter_binds(&venv_dir);
     let env = GlinerRelexEnv {
         script_path: script,
         venv_dir,
@@ -164,8 +133,8 @@ fn build_real_model_entry() -> Option<ToolEntry> {
         device: "auto".to_string(),
         use_container_backend: false,
         container_image: None,
-        interpreter_root: None,
-        interpreter_lib_dirs: vec![],
+        interpreter_root: interp_root,
+        interpreter_lib_dirs: interp_lib_dirs,
     };
     // Route through the lockdown-exec shim on Linux so the real worker runs under
     // the `ml_client` seccomp filter (mirrors the host manifest + gliner_relex_e2e).

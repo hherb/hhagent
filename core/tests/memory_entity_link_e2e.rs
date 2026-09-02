@@ -25,8 +25,9 @@ use kastellan_core::entity_extraction::gliner_relex::GlinerRelexExtractor;
 use kastellan_db::audit::fetch_since;
 use kastellan_db::memories::seed_meta_memory;
 use kastellan_tests_common::{
-    bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_no_supervisor,
-    skip_if_sandbox_unavailable, unique_suffix,
+    bring_up_pg_cluster, pg_bin_dir_or_skip, resolve_weights_dir_or_skip,
+    skip_if_no_supervisor, skip_if_sandbox_unavailable, unique_suffix,
+    venv_interpreter_binds,
 };
 
 /// Build a Tokio runtime for sync-style tests. Mirrors the convention
@@ -395,9 +396,13 @@ fn link_db_failure_still_writes_audit_row_with_seed_info() {
 
 // --- Real-model tier (skip-as-pass without venv + weights) ---
 //
-// The three helpers below (`resolve_worker_script`, `resolve_weights_dir`,
-// `build_real_extractor`) are duplicated from `entity_extraction_e2e.rs`.
-// Marker: if a third caller appears, lift them into `kastellan-tests-common`.
+// `resolve_worker_script` below is still duplicated from
+// `entity_extraction_e2e.rs`. The weights lookup and the #284 interpreter
+// binds that used to be copied alongside it now live in
+// `kastellan-tests-common` (`gliner_weights` / `venv_interpreter`) — the
+// copies had drifted, and one of them silently kept binding no interpreter
+// after the other two were fixed. Lift this one too when it next needs a
+// change.
 
 /// Resolve the in-tree gliner-relex venv shim path. Returns `None` with
 /// a `[SKIP]` print when the path doesn't exist.
@@ -419,40 +424,6 @@ fn resolve_worker_script() -> Option<PathBuf> {
     Some(script)
 }
 
-/// Resolve the `multi-v1.0` weights dir. Honours
-/// `KASTELLAN_GLINER_RELEX_WEIGHTS_DIR`, then `KASTELLAN_DATA_DIR`, then
-/// `$HOME/.local/share/kastellan`. Skip on missing.
-fn resolve_weights_dir() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("KASTELLAN_GLINER_RELEX_WEIGHTS_DIR") {
-        let p = PathBuf::from(explicit);
-        if p.is_dir() {
-            return Some(p);
-        }
-        eprintln!(
-            "\n[SKIP] KASTELLAN_GLINER_RELEX_WEIGHTS_DIR points at {} which isn't a directory\n",
-            p.display()
-        );
-        return None;
-    }
-    let data_dir = std::env::var("KASTELLAN_DATA_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local/share/kastellan"))
-        })?;
-    let weights = data_dir.join("workers/gliner-relex/weights/multi-v1.0");
-    if !weights.is_dir() {
-        eprintln!(
-            "\n[SKIP] gliner-relex weights dir missing at {} — run scripts/workers/gliner-relex/install.sh\n",
-            weights.display()
-        );
-        return None;
-    }
-    Some(weights)
-}
-
 /// Build a live `GlinerRelexExtractor` backed by the real gliner-relex worker.
 /// Returns `None` (with a `[SKIP]` print) when any precondition is absent:
 /// opt-in env-var, sandbox, supervisor, venv shim, or weights dir.
@@ -468,12 +439,13 @@ async fn build_real_extractor(pool: &sqlx::PgPool) -> Option<Arc<dyn EntityExtra
         return None;
     }
     let script = resolve_worker_script()?;
-    let weights = resolve_weights_dir()?;
+    let weights = resolve_weights_dir_or_skip()?;
     let venv_dir = script
         .parent()
         .and_then(|bin| bin.parent())
         .expect("script_path is .venv/bin/<bin> — both parent levels must exist")
         .to_path_buf();
+    let (interp_root, interp_lib_dirs) = venv_interpreter_binds(&venv_dir);
     let env = GlinerRelexEnv {
         script_path: script,
         venv_dir,
@@ -482,8 +454,15 @@ async fn build_real_extractor(pool: &sqlx::PgPool) -> Option<Arc<dyn EntityExtra
         device: "auto".to_string(),
         use_container_backend: false,
         container_image: None,
-        interpreter_root: None,
-        interpreter_lib_dirs: vec![],
+        // Bind the venv's real interpreter, exactly as the production manifest
+        // does. This fixture is the THIRD host-mode copy; it kept the old
+        // hardcoded `None` when the other two were fixed, which on a host with a
+        // `uv`-provisioned CPython means the jail gets no bind for the
+        // interpreter the shim's shebang resolves to and the worker dies as a
+        // contentless `Protocol(EarlyExit)`. See
+        // `kastellan_tests_common::venv_interpreter`.
+        interpreter_root: interp_root,
+        interpreter_lib_dirs: interp_lib_dirs,
     };
     // Route through the lockdown-exec shim on Linux so the real worker runs under
     // the `ml_client` seccomp filter (mirrors the host manifest + gliner_relex_e2e).
