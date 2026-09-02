@@ -30,8 +30,10 @@ use kastellan_core::secrets::Vault;
 use kastellan_core::tool_host::{self, ToolHostError};
 use kastellan_core::worker_lifecycle::{IdleTimeoutLifecycle, WorkerLifecycleManager};
 use kastellan_core::workers::gliner_relex::{
-    gliner_relex_entry, ExtractRequest, ExtractResponse, GlinerRelexEnv,
+    gliner_relex_entry, resolve_host_interpreter_binds, ExtractRequest, ExtractResponse,
+    GlinerRelexEnv,
 };
+use kastellan_core::workers::interpreter_deps::resolve_deps_via_tool;
 use kastellan_protocol::client::ClientError;
 use kastellan_tests_common::{
     bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_no_supervisor,
@@ -190,6 +192,12 @@ fn build_test_entry() -> Option<ToolEntry> {
         .and_then(|bin| bin.parent())
         .expect("script_path is .venv/bin/<bin> — both parent levels must exist")
         .to_path_buf();
+    let (interp_root, interp_lib_dirs) = resolve_host_interpreter_binds(
+        &venv_dir,
+        |p| p.exists(),
+        |p| std::fs::canonicalize(p).ok(),
+        resolve_deps_via_tool,
+    );
     let env = GlinerRelexEnv {
         script_path: script,
         venv_dir,
@@ -198,10 +206,22 @@ fn build_test_entry() -> Option<ToolEntry> {
         device: "auto".to_string(),
         use_container_backend: false,
         container_image: None,
-        // Self-contained fixture: the production manifest computes the real
-        // external-interpreter binds (issue #284) via resolve_host_interpreter_binds.
-        interpreter_root: None,
-        interpreter_lib_dirs: vec![],
+        // Bind the venv's real interpreter, exactly as the production manifest
+        // does (`GlinerRelexManifest::resolve` → `resolve_host_interpreter_binds`,
+        // issue #284). This used to hardcode `None` / `vec![]` under the comment
+        // "self-contained fixture", and that assumption is false whenever `uv`
+        // provisions its own CPython: the venv's `bin/python` then symlinks to
+        // `~/.local/share/uv/python/cpython-*/bin/python3.x`, OUTSIDE `venv_dir`,
+        // so the jail gets no bind for the shim's shebang and the worker dies
+        // before it can answer — surfacing as the generic `Protocol(EarlyExit)`.
+        //
+        // It went unnoticed because it only bites where the venv is external AND
+        // the sandbox is real, and the one host that is true on (the DGX) had a
+        // venv copied from the Mac, whose `bin/python` pointed at a macOS path —
+        // so these tests skipped rather than ran. Calling the production resolver
+        // means the rule lives in one place and the fixture cannot drift from it.
+        interpreter_root: interp_root,
+        interpreter_lib_dirs: interp_lib_dirs,
     };
     // Route through the lockdown-exec shim on Linux so the worker actually runs
     // under the `ml_client` seccomp filter — the #281 property this suite must

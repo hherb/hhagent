@@ -35,9 +35,10 @@ use kastellan_core::entity_extraction::{EntityExtractor, SeedSource};
 use kastellan_core::scheduler::ToolEntry;
 use kastellan_core::worker_lifecycle::{CompositeLifecycle, WorkerLifecycleManager};
 use kastellan_core::workers::gliner_relex::{
-    gliner_relex_entry, Client, Entity, ExtractResponse, GlinerRelexEnv, Triple,
-    TripleEntity,
+    gliner_relex_entry, resolve_host_interpreter_binds, Client, Entity, ExtractResponse,
+    GlinerRelexEnv, Triple, TripleEntity,
 };
+use kastellan_core::workers::interpreter_deps::resolve_deps_via_tool;
 use kastellan_tests_common::{
     bring_up_pg_cluster, pg_bin_dir_or_skip, skip_if_no_supervisor,
     skip_if_sandbox_unavailable, unique_suffix, PgCluster,
@@ -156,6 +157,16 @@ fn build_real_model_entry() -> Option<ToolEntry> {
         .and_then(|bin| bin.parent())
         .expect("script_path is .venv/bin/<bin> — both parent levels must exist")
         .to_path_buf();
+    // Same production resolver `gliner_relex_e2e::build_test_entry` uses, and
+    // for the same reason: a `uv`-provisioned CPython lives outside `venv_dir`,
+    // so hardcoding `None` here left the jail with no bind for the interpreter
+    // the shim's shebang names. See the long note there.
+    let (interp_root, interp_lib_dirs) = resolve_host_interpreter_binds(
+        &venv_dir,
+        |p| p.exists(),
+        |p| std::fs::canonicalize(p).ok(),
+        resolve_deps_via_tool,
+    );
     let env = GlinerRelexEnv {
         script_path: script,
         venv_dir,
@@ -164,8 +175,8 @@ fn build_real_model_entry() -> Option<ToolEntry> {
         device: "auto".to_string(),
         use_container_backend: false,
         container_image: None,
-        interpreter_root: None,
-        interpreter_lib_dirs: vec![],
+        interpreter_root: interp_root,
+        interpreter_lib_dirs: interp_lib_dirs,
     };
     // Route through the lockdown-exec shim on Linux so the real worker runs under
     // the `ml_client` seccomp filter (mirrors the host manifest + gliner_relex_e2e).
