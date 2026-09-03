@@ -121,12 +121,27 @@ fails too. Use it whenever a green run is supposed to mean something.
 
 The same round-trip through the full sandboxed worker lives on the Rust
 side: `cargo test -p kastellan-core --test gliner_relex_e2e`,
-`--test entity_extraction_e2e` and `--test memory_entity_link_e2e` (all
-skip-as-pass without venv + weights; all three also need
-`KASTELLAN_GLINER_RELEX_ENABLE=1`). They share their weights lookup and
-their interpreter binds with each other via `kastellan-tests-common`; the
-Python `tests/live_support.py` mirrors the same rules, and both halves
-pin them.
+`--test entity_extraction_e2e` and `--test memory_entity_link_e2e`. All
+three are skip-as-pass without the venv + weights; the latter two also
+wait for `KASTELLAN_GLINER_RELEX_ENABLE` (`gliner_relex_e2e` has no
+separate opt-in and runs whenever both are staged).
+
+`KASTELLAN_GLINER_RELEX_REQUIRE_E2E` works on the Rust side too, and means
+the same thing: every one of those preconditions — the opt-in flag, the
+sandbox probe, the supervisor probe, the venv shim, the weights snapshot —
+becomes a **panic naming itself** instead of a `[SKIP]`.
+
+```sh
+KASTELLAN_GLINER_RELEX_ENABLE=1 KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1 \
+  cargo test -p kastellan-core --test gliner_relex_e2e --test entity_extraction_e2e \
+  --test memory_entity_link_e2e
+```
+
+All five preconditions, the weights lookup and the interpreter binds live
+in one place, `kastellan-tests-common`'s `gliner_e2e` module; the Python
+`tests/live_support.py` mirrors the same rules, and both halves pin them.
+The de-duplication is not tidiness — the three suites used to carry three
+copies, and the copies drifted (#284, #650).
 
 ## License
 

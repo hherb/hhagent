@@ -1,10 +1,16 @@
 """GLiNER wrapper tests.
 
 We mock `gliner.GLiNER` entirely — the real model load is a 1.3 GB
-operation that doesn't belong in unit tests. The integration test on
-the Rust side (slice-2 `gliner_relex_e2e.rs`) covers the real-model
-round-trip; the manual smoke test in the README is the operator's
-sanity check.
+operation that doesn't belong in unit tests.
+
+The repeatable real-model cover is `test_model_live.py`, which loads the
+staged weights and can be *demanded* with
+`KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1` so a missing snapshot fails the run
+instead of skipping it. On the Rust side the same knob is honoured by
+`gliner_relex_e2e.rs` / `entity_extraction_e2e.rs` /
+`memory_entity_link_e2e.rs` via
+`kastellan_tests_common::gliner_e2e::gliner_host_env`. The README's manual
+smoke test is a convenience, not the gate.
 
 The mock returns batched output (`[[...]]`) because spike correction
 #1 confirmed the upstream method is `model.inference(texts=[text], ...)`

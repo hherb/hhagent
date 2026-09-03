@@ -54,29 +54,35 @@ pub fn weights_dir_candidate(lookup: impl Fn(&str) -> Option<String>) -> Option<
     Some(PathBuf::from(home).join(".local/share/kastellan").join(WEIGHTS_SUBPATH))
 }
 
-/// Resolve the weights dir against the real environment and the real disk,
-/// or print a `[SKIP]` line and return `None`.
+/// Resolve the weights dir against the real environment and the real disk, or
+/// return the *reason* it could not be resolved — no `[SKIP]` prefix, no
+/// newlines, so the caller decides whether that is a clean skip or a hard
+/// failure (see [`crate::gliner_e2e`]).
 ///
-/// The skip reason always names the path that was checked, so an operator can
-/// tell "no weights staged" from "staged somewhere else" without re-deriving
-/// the rules.
+/// The reason always names the path that was checked, so an operator can tell
+/// "no weights staged" from "staged somewhere else" without re-deriving the
+/// rules.
+pub fn weights_dir_or_reason() -> Result<PathBuf, String> {
+    match weights_dir_candidate(|k| std::env::var(k).ok()) {
+        Some(p) if p.is_dir() => Ok(p),
+        Some(p) => Err(format!(
+            "gliner-relex weights dir missing at {} — run scripts/workers/gliner-relex/install.sh",
+            p.display()
+        )),
+        None => Err("gliner-relex weights dir unresolvable: none of \
+             KASTELLAN_GLINER_RELEX_WEIGHTS_DIR, KASTELLAN_DATA_DIR or HOME is set to a \
+             non-empty value — set one of them (install.sh cannot help until you do)"
+            .to_string()),
+    }
+}
+
+/// The skip-as-pass half of [`weights_dir_or_reason`]: print `[SKIP] <reason>`
+/// and return `None` so the calling test returns green.
 pub fn resolve_weights_dir_or_skip() -> Option<PathBuf> {
-    let candidate = weights_dir_candidate(|k| std::env::var(k).ok());
-    match candidate {
-        Some(p) if p.is_dir() => Some(p),
-        Some(p) => {
-            eprintln!(
-                "\n[SKIP] gliner-relex weights dir missing at {} — run scripts/workers/gliner-relex/install.sh\n",
-                p.display()
-            );
-            None
-        }
-        None => {
-            eprintln!(
-                "\n[SKIP] gliner-relex weights dir unresolvable: none of \
-                 KASTELLAN_GLINER_RELEX_WEIGHTS_DIR, KASTELLAN_DATA_DIR or HOME is set to a \
-                 non-empty value — set one of them (install.sh cannot help until you do)\n"
-            );
+    match weights_dir_or_reason() {
+        Ok(p) => Some(p),
+        Err(reason) => {
+            eprintln!("\n[SKIP] {reason}\n");
             None
         }
     }

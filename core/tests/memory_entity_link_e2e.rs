@@ -12,7 +12,6 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use kastellan_core::entity_extraction::{
@@ -20,14 +19,15 @@ use kastellan_core::entity_extraction::{
 };
 use kastellan_core::memory::entity_link::link_memory_entities;
 use kastellan_core::worker_lifecycle::{CompositeLifecycle, WorkerLifecycleManager};
-use kastellan_core::workers::gliner_relex::{gliner_relex_entry, Client, GlinerRelexEnv};
+use kastellan_core::workers::gliner_relex::{gliner_relex_entry, Client};
+use kastellan_tests_common::gliner_e2e::{
+    gliner_host_env, gliner_host_lockdown_shim, report_unmet, require_action, EnableFlag,
+};
 use kastellan_core::entity_extraction::gliner_relex::GlinerRelexExtractor;
 use kastellan_db::audit::fetch_since;
 use kastellan_db::memories::seed_meta_memory;
 use kastellan_tests_common::{
-    bring_up_pg_cluster, pg_bin_dir_or_skip, resolve_weights_dir_or_skip,
-    skip_if_no_supervisor, skip_if_sandbox_unavailable, unique_suffix,
-    venv_interpreter_binds,
+    bring_up_pg_cluster, pg_bin_dir_or_reason, skip_if_no_supervisor, unique_suffix,
 };
 
 /// Build a Tokio runtime for sync-style tests. Mirrors the convention
@@ -57,7 +57,16 @@ async fn bring_up_pg(label: &str) -> Option<(kastellan_tests_common::PgCluster, 
     // Must be called OUTSIDE the async block so skip returns the fn.
     // We return None instead of calling skip helpers (they're sync).
     let cluster = {
-        let bin_dir = pg_bin_dir_or_skip()?;
+        // Routed through the gliner-relex require knob rather than
+    // `pg_bin_dir_or_skip`: without a cluster the test body never runs, which is
+    // the same false green `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` exists to
+    // abolish. The shared helper stays skip-only — ~30 other suites depend on
+    // that — so the decision is made here, at the one call site that must not
+    // silently pass (#653).
+    let bin_dir = match pg_bin_dir_or_reason() {
+        Ok(d) => d,
+        Err(reason) => return report_unmet(require_action(), &reason),
+    };
         let suffix = unique_suffix();
         bring_up_pg_cluster(
             &bin_dir,
@@ -395,90 +404,30 @@ fn link_db_failure_still_writes_audit_row_with_seed_info() {
 }
 
 // --- Real-model tier (skip-as-pass without venv + weights) ---
-//
-// `resolve_worker_script` below is still duplicated from
-// `entity_extraction_e2e.rs`. The weights lookup and the #284 interpreter
-// binds that used to be copied alongside it now live in
-// `kastellan-tests-common` (`gliner_weights` / `venv_interpreter`) — the
-// copies had drifted, and one of them silently kept binding no interpreter
-// after the other two were fixed. Lift this one too when it next needs a
-// change.
-
-/// Resolve the in-tree gliner-relex venv shim path. Returns `None` with
-/// a `[SKIP]` print when the path doesn't exist.
-fn resolve_worker_script() -> Option<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .expect("CARGO_MANIFEST_DIR has no parent")
-        .to_path_buf();
-    let script = workspace_root
-        .join("workers/gliner-relex/.venv/bin/kastellan-worker-gliner-relex");
-    if !script.exists() {
-        eprintln!(
-            "\n[SKIP] gliner-relex venv shim not built at {} — run scripts/workers/gliner-relex/install.sh\n",
-            script.display()
-        );
-        return None;
-    }
-    Some(script)
-}
 
 /// Build a live `GlinerRelexExtractor` backed by the real gliner-relex worker.
-/// Returns `None` (with a `[SKIP]` print) when any precondition is absent:
-/// opt-in env-var, sandbox, supervisor, venv shim, or weights dir.
+///
+/// Every precondition — the `KASTELLAN_GLINER_RELEX_ENABLE` opt-in, sandbox, supervisor, venv
+/// shim, weights — lives in `gliner_host_env`, shared with the other two
+/// gliner-relex e2e suites. This tier passes `EnableFlag::Checked`: it loads
+/// the real 1.3 GB model, so it waits for the operator's flag.
+///
+/// Returns `None` when a precondition is unmet, so the caller `return`s green —
+/// unless `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` is set, in which case the unmet
+/// precondition is a panic naming itself (#653). This file used to carry its
+/// own copy of the cascade, and it is the copy that kept `interpreter_root:
+/// None` after the other two were fixed.
 async fn build_real_extractor(pool: &sqlx::PgPool) -> Option<Arc<dyn EntityExtractor>> {
-    if std::env::var("KASTELLAN_GLINER_RELEX_ENABLE").ok().as_deref() != Some("1") {
-        eprintln!("\n[SKIP] KASTELLAN_GLINER_RELEX_ENABLE != \"1\"\n");
-        return None;
-    }
-    if skip_if_sandbox_unavailable() {
-        return None;
-    }
-    if skip_if_no_supervisor() {
-        return None;
-    }
-    let script = resolve_worker_script()?;
-    let weights = resolve_weights_dir_or_skip()?;
-    let venv_dir = script
-        .parent()
-        .and_then(|bin| bin.parent())
-        .expect("script_path is .venv/bin/<bin> — both parent levels must exist")
-        .to_path_buf();
-    let (interp_root, interp_lib_dirs) = venv_interpreter_binds(&venv_dir);
-    let env = GlinerRelexEnv {
-        script_path: script,
-        venv_dir,
-        weights_dir: weights,
-        model_id: "knowledgator/gliner-relex-multi-v1.0".to_string(),
-        device: "auto".to_string(),
-        use_container_backend: false,
-        container_image: None,
-        // Bind the venv's real interpreter, exactly as the production manifest
-        // does. This fixture is the THIRD host-mode copy; it kept the old
-        // hardcoded `None` when the other two were fixed, which on a host with a
-        // `uv`-provisioned CPython means the jail gets no bind for the
-        // interpreter the shim's shebang resolves to and the worker dies as a
-        // contentless `Protocol(EarlyExit)`. See
-        // `kastellan_tests_common::venv_interpreter`.
-        interpreter_root: interp_root,
-        interpreter_lib_dirs: interp_lib_dirs,
-    };
-    // Route through the lockdown-exec shim on Linux so the real worker runs under
-    // the `ml_client` seccomp filter (mirrors the host manifest + gliner_relex_e2e).
-    // macOS passes None (Seatbelt is applied from the parent).
-    #[cfg(target_os = "linux")]
-    let shim = Some(kastellan_tests_common::workspace_target_binary(
-        "kastellan-worker-lockdown-exec",
-    ));
-    #[cfg(not(target_os = "linux"))]
-    let shim: Option<std::path::PathBuf> = None;
-    let entry = gliner_relex_entry(&env, shim);
+    let env = gliner_host_env(EnableFlag::Checked)?;
+    let entry = gliner_relex_entry(&env, gliner_host_lockdown_shim());
     let sandboxes = Arc::new(kastellan_sandbox::SandboxBackends::default_for_current_os());
-    let lifecycle: Arc<dyn WorkerLifecycleManager> =
-        Arc::new(CompositeLifecycle::new(sandboxes));
+    let lifecycle: Arc<dyn WorkerLifecycleManager> = Arc::new(CompositeLifecycle::new(sandboxes));
     let client = Client::new(lifecycle, pool.clone(), entry);
-    let extractor = GlinerRelexExtractor::new(client, pool.clone(), std::sync::Arc::new(kastellan_core::memory::NoOpEmbedder::new()));
+    let extractor = GlinerRelexExtractor::new(
+        client,
+        pool.clone(),
+        Arc::new(kastellan_core::memory::NoOpEmbedder::new()),
+    );
     Some(Arc::new(extractor))
 }
 

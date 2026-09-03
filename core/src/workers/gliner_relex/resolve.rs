@@ -65,8 +65,9 @@ pub struct GlinerRelexEnv {
     ///   from the worker at startup so the operator sees the
     ///   misconfig immediately.
     pub device: String,
-    /// True when the operator set `KASTELLAN_GLINER_RELEX_USE_CONTAINER=1`
-    /// (strict: only `"1"` after trim counts).
+    /// True when the operator opted into container mode via
+    /// `KASTELLAN_GLINER_RELEX_USE_CONTAINER`. Read through the one project
+    /// flag dialect (#459): `1`/`true`/`yes`/`on`, trimmed, case-insensitive.
     /// [`gliner_relex_entry`](super::entry::gliner_relex_entry) branches
     /// on this field to emit the container-mode `ToolEntry` shape
     /// (in-container binary, weights-only `fs_read`,
@@ -122,10 +123,11 @@ pub struct GlinerRelexEnv {
 /// each branch directly without touching process-wide environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveSkipReason {
-    /// `KASTELLAN_GLINER_RELEX_ENABLE` is unset, empty, or anything other
-    /// than `"1"` (after trim). This is the production default — every
-    /// deployment that hasn't run `scripts/workers/gliner-relex/install.sh`
-    /// and explicitly enabled the worker lands here.
+    /// `KASTELLAN_GLINER_RELEX_ENABLE` is unset, empty, or not one of the
+    /// truthy spellings `1`/`true`/`yes`/`on` (trimmed, case-insensitive —
+    /// the #459 dialect). This is the production default — every deployment
+    /// that hasn't run `scripts/workers/gliner-relex/install.sh` and
+    /// explicitly enabled the worker lands here.
     Disabled,
     /// `KASTELLAN_GLINER_RELEX_ENABLE=1` but
     /// `KASTELLAN_GLINER_RELEX_WEIGHTS_DIR` is unset.
@@ -154,17 +156,19 @@ pub enum ResolveSkipReason {
 ///
 /// Env vars consulted (same names + semantics as the production helper):
 ///
-/// - `KASTELLAN_GLINER_RELEX_ENABLE` — must be `"1"` (whitespace-trimmed)
-///   to register the worker. Anything else (unset / `0` / `true` / `on`)
-///   returns [`ResolveSkipReason::Disabled`].
+/// - `KASTELLAN_GLINER_RELEX_ENABLE` — must be truthy in the #459 dialect
+///   (`1`/`true`/`yes`/`on`, trimmed, case-insensitive) to register the
+///   worker. Anything else (unset / empty / `0` / `off`) returns
+///   [`ResolveSkipReason::Disabled`].
 /// - `KASTELLAN_GLINER_RELEX_WEIGHTS_DIR` — required; absolute path to the
 ///   model snapshot.
 /// - `KASTELLAN_GLINER_RELEX_MODEL` — optional; default
 ///   `knowledgator/gliner-relex-multi-v1.0`.
 /// - `KASTELLAN_GLINER_RELEX_DEVICE` — optional; default `auto`.
-/// - `KASTELLAN_GLINER_RELEX_USE_CONTAINER` — optional; `"1"` (strict,
-///   whitespace-trimmed) opts into container mode. Anything else (unset /
-///   `0` / `true` / `on`) uses host mode (the default). In container mode
+/// - `KASTELLAN_GLINER_RELEX_USE_CONTAINER` — optional; any truthy value in
+///   the #459 dialect (`1`/`true`/`yes`/`on`) opts into container mode.
+///   Anything else (unset / empty / `0` / `off`) uses host mode (the
+///   default). In container mode
 ///   the venv-anchor cascade below is skipped — the worker shim lives
 ///   inside the container image at `/usr/local/bin/...`.
 /// - `KASTELLAN_GLINER_RELEX_IMAGE` — optional container image tag override;
@@ -213,7 +217,8 @@ where
         .unwrap_or_else(|| "auto".to_string());
 
     // New env knobs (Slice 2.5):
-    //   * `KASTELLAN_GLINER_RELEX_USE_CONTAINER=1` → container-mode (strict on "1").
+    //   * `KASTELLAN_GLINER_RELEX_USE_CONTAINER=1` → container-mode (the #459
+    //     dialect: 1|true|yes|on, trimmed, case-insensitive).
     //   * `KASTELLAN_GLINER_RELEX_IMAGE=<tag>` → operator-supplied image override.
     //
     // Container mode is macOS-only — the Apple `container` micro-VM
