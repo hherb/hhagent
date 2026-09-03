@@ -9,6 +9,18 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Render the one `[SKIP] <reason>` line every helper here prints.
+///
+/// Pure, and that is the point: a `[SKIP]` line is **evidence** in this tree —
+/// `cargo test -- --nocapture | grep -c '^\[SKIP\]'` is how a run is audited
+/// for tests that reported green without executing anything. A unit test that
+/// wants to pin the rendering must therefore be able to do so **without
+/// emitting a line**, or it inflates the very count it is checking. Assert on
+/// this; call the `skip_if_*` wrappers only from real fixtures.
+pub fn skip_line(reason: &str) -> String {
+    format!("\n[SKIP] {reason}\n")
+}
+
 use kastellan_db::{find_pg_bin_dir, pg_bin_dir_candidates_with_env_override};
 use kastellan_supervisor::default_probe;
 
@@ -34,7 +46,7 @@ pub fn supervisor_unavailable_reason() -> Option<String> {
 pub fn skip_if_no_supervisor() -> bool {
     match supervisor_unavailable_reason() {
         Some(reason) => {
-            eprintln!("\n[SKIP] {reason}\n");
+            eprint!("{}", skip_line(&reason));
             true
         }
         None => false,
@@ -60,7 +72,7 @@ pub fn pg_bin_dir_or_skip() -> Option<PathBuf> {
     match pg_bin_dir_or_reason() {
         Ok(dir) => Some(dir),
         Err(reason) => {
-            eprintln!("\n[SKIP] {reason}\n");
+            eprint!("{}", skip_line(&reason));
             None
         }
     }

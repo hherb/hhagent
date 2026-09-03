@@ -41,7 +41,7 @@ pub fn sandbox_unavailable_reason() -> Option<String> {
 pub fn skip_if_sandbox_unavailable() -> bool {
     match sandbox_unavailable_reason() {
         Some(reason) => {
-            eprintln!("\n[SKIP] {reason}\n");
+            eprint!("{}", crate::skip::skip_line(&reason));
             true
         }
         None => false,

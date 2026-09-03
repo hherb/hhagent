@@ -82,7 +82,7 @@ pub fn resolve_weights_dir_or_skip() -> Option<PathBuf> {
     match weights_dir_or_reason() {
         Ok(p) => Some(p),
         Err(reason) => {
-            eprintln!("\n[SKIP] {reason}\n");
+            eprint!("{}", crate::skip::skip_line(&reason));
             None
         }
     }

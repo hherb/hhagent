@@ -210,7 +210,7 @@ pub fn report_unmet<T>(action: UnmetAction, reason: &str) -> Option<T> {
              precondition is unmet: {reason}"
         ),
         UnmetAction::Skip => {
-            eprintln!("\n[SKIP] {reason}\n");
+            eprint!("{}", crate::skip::skip_line(reason));
             None
         }
     }
@@ -435,10 +435,25 @@ mod tests {
         }
     }
 
+    /// The default renders a `[SKIP]` line and nothing else.
+    ///
+    /// Asserted against [`crate::skip::skip_line`] rather than by calling
+    /// [`report_unmet`], on purpose: `report_unmet`'s skip arm *prints* that
+    /// line, and `grep -c '^\[SKIP\]'` over a `--nocapture` run is how this
+    /// tree audits for tests that went green without executing anything. A unit
+    /// test that emitted one would inflate the count it exists to protect — it
+    /// did, and showed up as a fifth `[SKIP]` in a DGX gate whose other four
+    /// were real.
+    ///
+    /// The `None` return itself needs no test: `report_unmet` is generic in `T`
+    /// and never constructs one, so the skip arm cannot be mutated to return
+    /// `Some(..)` and still compile.
     #[test]
-    fn an_unmet_precondition_returns_none_by_default() {
-        let got: Option<()> = report_unmet(UnmetAction::Skip, "weights dir missing at /nowhere");
-        assert!(got.is_none(), "the default is a clean skip, not a failure");
+    fn an_unmet_precondition_renders_one_skip_line_by_default() {
+        assert_eq!(
+            crate::skip::skip_line("weights dir missing at /nowhere"),
+            "\n[SKIP] weights dir missing at /nowhere\n"
+        );
     }
 
     /// The panic must name the knob, so an operator who set it knows which
