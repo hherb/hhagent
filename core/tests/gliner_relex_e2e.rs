@@ -22,7 +22,6 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use kastellan_core::scheduler::ToolEntry;
@@ -30,7 +29,7 @@ use kastellan_core::secrets::Vault;
 use kastellan_core::tool_host::{self, ToolHostError};
 use kastellan_core::worker_lifecycle::{IdleTimeoutLifecycle, WorkerLifecycleManager};
 use kastellan_core::workers::gliner_relex::{
-    gliner_relex_entry, ExtractRequest, ExtractResponse, GlinerRelexEnv,
+    gliner_relex_entry, ExtractRequest, ExtractResponse,
 };
 use kastellan_protocol::client::ClientError;
 use kastellan_tests_common::gliner_e2e::{
@@ -38,9 +37,22 @@ use kastellan_tests_common::gliner_e2e::{
     EnableFlag,
 };
 use kastellan_tests_common::{
-    bring_up_pg_cluster, pg_bin_dir_or_reason, resolve_weights_dir_or_skip, skip_if_no_supervisor,
-    skip_if_sandbox_unavailable, unique_suffix, weights_dir_or_reason, PgCluster,
+    bring_up_pg_cluster, pg_bin_dir_or_reason, unique_suffix, weights_dir_or_reason, PgCluster,
 };
+
+// The container tier below is macOS-only, and since the host-mode cascade moved
+// into `kastellan_tests_common::gliner_e2e` it is the ONLY user of these five.
+// Gated rather than imported unconditionally: Linux compiles the tier away, so
+// an ungated `use` is an unused import there — invisible on the Mac, and a
+// `-D warnings` failure on the DGX and in CI's linux clippy job.
+#[cfg(target_os = "macos")]
+use kastellan_core::workers::gliner_relex::GlinerRelexEnv;
+#[cfg(target_os = "macos")]
+use kastellan_tests_common::{
+    resolve_weights_dir_or_skip, skip_if_no_supervisor, skip_if_sandbox_unavailable,
+};
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 
 /// Slice 2.5: gate container-mode e2e on the operator having built the
 /// image. Mirrors the venv-staged skip pattern in
