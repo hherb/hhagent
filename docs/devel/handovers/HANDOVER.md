@@ -8,7 +8,7 @@
 > which holds the verbose pre-prune version of everything summarised here,
 > including the full #619, #615/#616/#618 and live-bring-up write-ups compressed below.
 
-**Last updated:** 2026-09-03 (#656 review round, then `main`'s #660 merged into the branch) · **DGX RUNNING `121f22a2` — the whole guard arc is
+**Last updated:** 2026-09-03 (#656 review round; then `main`'s #660 merged in and its three real-bwrap defects fixed) · **DGX RUNNING `121f22a2` — the whole guard arc is
 DEPLOYED** (see [Merged work, compressed](#merged-work-compressed--the-guard-arc-and-the-2026-09-02-deploy)). ·
 **`main` HEAD:** `62d98a00` —
 [#660](https://github.com/hherb/kastellan/pull/660), the 2026-09-02 security audit (29 fixes, **DGX gate
@@ -36,23 +36,22 @@ owed**; see [#660](#660--the-second-pre-release-security-audit-2026-09-02-merged
 > load, as do `entity_extraction_e2e`'s two real-worker tests. The DGX checkout is on the #650
 > branch; its gliner-relex `.venv` is the one rebuilt from the merged lock (transformers 5.13.1).
 
-**Last gate: DGX over `fix/650-interpreter-alias-bind` `757413c1` — 3973 / 0 / 55, 176 suites,
-`TEST_EXIT=0`.** The delta reconciles exactly: **+5** over the 3968 of the pre-review-round gate,
-which is precisely the five tests the #656 review added (two entry-level alias guards, the
-`bin/python` fallback, the leading-`.` carve-out, `symlink_chain`'s fourth termination arm), and
-that 3968 in turn was **+10** `kastellan-tests-common::gliner_weights` from #651's never-gated
-review round plus **+18** from #650. `kastellan-core --lib` is **2009 on both hosts** (2004 + the
-same five), the interpreter modules being `cfg`-free. `gliner_relex_e2e` re-run **4 / 0 with zero
-`[SKIP]` under `--nocapture`** and a real model load (34 s) — the acceptance evidence survives the
-review round's `interpreter_lib_dirs` signature change. Clippy exit 0 on both hosts (Mac
-`-p kastellan-core -p kastellan-tests-common --all-targets -D warnings`, 218 `Checking` lines from
-a cold private dir; DGX `--workspace --all-targets` **incremental**, re-linting the 5 crates this
-diff invalidates — the 27-crate cold sweep is the row below). Both hosts rustc **1.98.0**. See
-[Test baseline](#test-baseline-authoritative).
-
-⚠️ The workspace run was **without** `--nocapture`, so its `[SKIP]` count is unmeasured, not zero —
-`eprintln!` from a passing test is captured. The zero above is from the targeted e2e re-run, which
-did use it. [[custom-cargo-target-dir-breaks-daemon-e2e]]
+**Last gate: DGX over `fix/650-interpreter-alias-bind` `f97991a6` (= `main` `62d98a00` + #650 + the
+three fixes below) — 4009 / 1 / 55, 176 suites, `TEST_EXIT=101`, 4 `[SKIP]` under `--nocapture`.**
+Total **4010** reconciles exactly: 3940 + 34 (#660) + 10 (#651) + 18 (#650) + 5 (#656 review) + 2
+(S6 alias-arm guard tests) + 1 (bwrap probe/spawn parity test). The 1 failure is
+`scheduler_ask_expiry_e2e::an_unanswered_ask_expires_and_fails_its_task_without_a_restart` — a
+60-second polling wait for a `task.failed` row that missed under full-workspace load; it passed the
+previous full run and **2 / 2 in isolation** afterwards (62 s each), and neither this branch nor #660
+touches it (last: #579). Flaky under load, not a regression. It took **three** full gates to get
+here: `5659bc8a` (the bare merge) **3943 / 66** — every sandbox spawn refused
+([#661](https://github.com/hherb/kastellan/issues/661)); `4269ff7e` **3997 / 13** — python-exec
+SIGSYS ([#662](https://github.com/hherb/kastellan/issues/662)) plus three pre-H1 `secret_vault_e2e`
+assertions; `f97991a6` as above. Clippy `--workspace --all-targets -D warnings` exit 0 on the DGX at
+every step, zero warnings; rustc **1.98.0**. **No Mac run this session** — the Mac was build-locked
+by rust-analyzer's `cargo check --workspace` at load average 26 throughout
+[[mac-cargo-buildlock-prefer-dgx]]; the surfaces this branch touches are `cfg`-free, and CI's linux
+clippy + CodeQL are green at `f97991a6`. See [Test baseline](#test-baseline-authoritative).
 
 > ⚠️ **A slow Mac cargo build is CONTENTION, not the `_dyld_start` wedge — and I misdiagnosed it
 > this session.** A `cargo test -p kastellan-supervisor --lib` that sat ~25 minutes with no visible
@@ -134,13 +133,44 @@ the ROADMAP entry lists every fix in one line. **What the next session must know
   returns `Option<InterpreterRoot>`, lives in `interpreter_deps::root` and is re-exported under the
   same name; the sensitive set and the refusal contract are #660's, unchanged, applied to every
   `bind_paths()` entry rather than the canonical prefix alone.
+- ⚠️ **#660 as merged spawns NO worker under real bwrap —
+  [#661](https://github.com/hherb/kastellan/issues/661).** `--disable-userns` was added beside
+  `--unshare-all`, and bubblewrap validates that pair at option-parse time against the *hard*
+  `--unshare-user` flag (`--unshare-all` sets only the try-flag, promoted after parsing), so every
+  spawn died with `bwrap: --disable-userns requires --unshare-user` (bubblewrap 0.9.0). `probe()`
+  always spelled `--unshare-user` out, so the probe passed, nothing `[SKIP]`ped, and the first
+  real-bwrap gate over the merged tree failed **66 tests across the 23 sandbox-spawning suites**
+  (3943 / 66 / 55, `TEST_EXIT=101`, at `5659bc8a`). Fixed on this branch as `4269ff7e`: one
+  `USERNS_LOCKDOWN_FLAGS` const shared by `probe()` and `build_argv_with_resolver`, plus a parity
+  test; `linux_smoke` 8 / 8 again with zero `[SKIP]`. **Do not deploy `main` to the DGX until that
+  commit is on `main`** (`scripts/upgrade_from_git.sh` is hardcoded to `main`); if #656 stalls,
+  cherry-pick it. A probe that passes a different argv than the spawn proves nothing about the
+  spawn — and a parse-time bwrap failure never reaches a skip guard, so the container gate's
+  "0 `[SKIP]`" was not evidence either.
+- ⚠️ **Two more #660 defects surfaced the moment spawns worked, both invisible to a gate without
+  bwrap.** (1) **python-exec died of SIGSYS on every call** —
+  [#662](https://github.com/hherb/kastellan/issues/662). F5's `pre_exec(|| setsid())` forces Rust std
+  off `posix_spawn` onto its fork path, which opens an `AF_UNIX SOCK_SEQPACKET` socketpair as the
+  exec-result channel (`std/src/sys/process/unix/unix.rs:78`), and `socketpair` is pinned *out* of
+  `strict` by `socket_is_only_in_net_client_profile`. Fixed as `f97991a6`: `cmd.process_group(0)`
+  (`POSIX_SPAWN_SETPGROUP`; `setpgid` is in `BASE_ALLOW`) — the same group-leader property, the same
+  reaper, the pre-#660 syscall footprint, the profile's bright line untouched. **Any `pre_exec`
+  closure means `socketpair` under `strict`** — reach for `process_group`/std attrs instead. The
+  diagnosis that worked: run the worker binary by hand with `KASTELLAN_SECCOMP_PROFILE=strict` (exit
+  159), `journalctl -k | grep type=1326` (syscall 199 = `socketpair` on aarch64), then `strace -f`
+  under `=none` to see who calls it. (2) **Three `secret_vault_e2e` tests asserted the pre-H1
+  plaintext echo**; they now assert the `[redacted:<hash8>]` placeholder is present with marker and
+  ref absent, plus the `policy/secret.output_scrubbed` row (`407918e8`, test-only — H1 is correct).
+  ⚠️ **A core e2e does not rebuild a worker package:** `cargo test -p kastellan-core --test
+  python_exec_e2e` ran the *stale* `kastellan-worker-python-exec` after the fix and failed
+  identically; `cargo build -p kastellan-worker-python-exec` (or `--workspace`) first.
 - **DGX gates owed (this container has no bwrap, no Landlock, no KVM, no unprivileged
   Postgres — see the baseline row):** the Firecracker e2e (guest init now drops to the
   daemon's euid, chowns the RW mounts, `nosuid,nodev`; run dirs 0700; images 0600), the
   live-Matrix path (`--features live-matrix` compiles incl. tests; invites from outside
   `KASTELLAN_MATRIX_PEERS` are declined and only two-party rooms are forwarded — verify a
   DM still round-trips), and real bwrap (`--disable-userns` needs bubblewrap ≥ 0.6;
-  `LinuxBwrap::probe()` names it if the host's is older).
+  `LinuxBwrap::probe()` names it if the host's is older). **The real-bwrap leg ran 2026-09-03 (three full sweeps) and found #661 + #662; the Firecracker e2e and live-Matrix legs remain owed.**
 - **Deferred with a reason** (all in the audit doc): brokers are not force-routed; the
   guard tier never sees bytes past 64 KiB / `fetch_handoff` slices; `secret://` refs are
   not tool-bound; `Host:` ≠ CONNECT authority (fronting); `net_client` grants
@@ -395,15 +425,19 @@ and the snapshots before it. What still binds:
 green again and the debt this file recorded (main's `gliner_weights` tests never gated on Linux) is
 paid with it.
 
-**FIRST: #660's DGX gate is still owed, and this branch now carries all 29 of its fixes.** The audit
-ran in a container with no bwrap, Landlock, KVM or unprivileged Postgres, and merged on that
-evidence. The post-merge gate in the header is the first real-bwrap sweep over #660's content; still
-owed after it are the three DGX-only paths named under [#660](#660--the-second-pre-release-security-audit-2026-09-02-merged): the Firecracker e2e
-(guest uid drop, 0700 run dirs, 0600 images), the live-Matrix path (`--features live-matrix`;
+**FIRST: merge #656 — it is what makes `main` deployable again.** `main` `62d98a00` is broken under
+real bwrap three ways ([#661](https://github.com/hherb/kastellan/issues/661),
+[#662](https://github.com/hherb/kastellan/issues/662), plus the three pre-H1 `secret_vault_e2e`
+assertions), all fixed on this branch (`4269ff7e`, `f97991a6`, `407918e8`) and gated **4009 / 1 / 55**
+on the DGX. If #656 stalls, cherry-pick `4269ff7e` + `f97991a6` to `main` on their own; until one of
+those lands, **do not run `scripts/upgrade_from_git.sh`** (hardcoded to `main`) — every Linux worker
+spawn would fail. Still owed from #660 after that, both DGX-only and untouched here: the Firecracker
+e2e (guest uid drop, 0700 run dirs, 0600 images) and the live-Matrix path (`--features live-matrix`;
 invites from outside `KASTELLAN_MATRIX_PEERS` declined, two-party rooms only — verify a DM still
-round-trips), and bwrap `--disable-userns` on the *deployed* host (bubblewrap ≥ 0.6;
-`LinuxBwrap::probe()` names it if older). Deploying `main` to the DGX (`scripts/upgrade_from_git.sh`)
-is what makes the last one real.
+round-trips). The real-bwrap item on that list is what this session ran, three times, and it is why
+#661 and #662 exist. **Also:** `scheduler_ask_expiry_e2e` flaked once under the full sweep (0 / 1,
+then 2 / 2 alone); if it recurs, widen the poll deadline at
+`core/tests/scheduler_ask_expiry_e2e.rs:193` rather than re-running until green.
 
 **FIRST: the two cheap follow-ups #650 left standing, and they belong together.**
 [#653](https://github.com/hherb/kastellan/issues/653) — the Rust gliner e2es still cannot be *forced*
@@ -568,6 +602,9 @@ Full prose in the [`archive/`](archive/) snapshots — most recently
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
+| **DGX** (#656 at the three fixes — the gate that stands) | **`f97991a6`** | `cargo test --workspace --no-fail-fast -- --nocapture` **4009 / 1 / 55**, **176** suites, `TEST_EXIT=101`; total **4010** reconciles (see header). The 1: `scheduler_ask_expiry_e2e` — flaky under load, **2 / 2 in isolation** afterwards, untouched by this branch or #660. `python_exec_e2e` **5 / 5**, `cli_memory_l3py_run_daemon_e2e` **6 / 6**, `secret_vault_e2e` **11 / 11**, `linux_smoke` **8 / 8** | `--workspace --all-targets -D warnings` exit 0, zero warnings. rustc **1.98.0** | **4**, all `KASTELLAN_GLINER_RELEX_ENABLE != "1"` |
+| **DGX** (#656 + `main`'s #660 merge — the FIRST real-bwrap gate over #660) | **`5659bc8a`** | `cargo test --workspace --no-fail-fast -- --nocapture` **3943 / 66 / 55**, **176** suites, `TEST_EXIT=101`. All 66 in the 23 sandbox-spawning suites incl. `kastellan-sandbox`'s own `linux_smoke` 4 / 8 — every spawn `bwrap: --disable-userns requires --unshare-user` ([#661](https://github.com/hherb/kastellan/issues/661)). Total **4009** reconciles exactly: 3940 + 34 (#660) + 10 (#651) + 18 (#650) + 5 (review round) + 2 (guard alias tests). `kastellan-core --lib` **2020 / 0 / 1** | `--workspace --all-targets -D warnings` exit 0, incremental (23 crates re-linted), zero warnings. rustc **1.98.0** | **4**, all `KASTELLAN_GLINER_RELEX_ENABLE != "1"` |
+| **DGX** (after `4269ff7e`, the #661 fix) | **`4269ff7e`** | **3997 / 13 / 55**, 176 suites, `TEST_EXIT=101`; total **4010** (+1, the probe/spawn parity test). The 13: python-exec SIGSYS on `socketpair` ×10 ([#662](https://github.com/hherb/kastellan/issues/662)) and the 3 `secret_vault_e2e` pre-H1 assertions. `cargo test -p kastellan-sandbox -- --nocapture` **173 / 0** incl. `linux_smoke` **8 / 8**, zero `[SKIP]` | exit 0, incremental (4 crates), zero warnings | **4** (gliner) |
 | **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`a990e8ec`** — tree-identical to the branch tip `6eec7df4` (the commit was re-cut to move a ROADMAP hunk out of it; `git diff -- core tests-common` empty) | **3968 / 0 / 55**, **176** suites, `TEST_EXIT=0`, `--no-fail-fast --nocapture`. **The delta reconciles exactly** against the 3940 below: **+10** `kastellan-tests-common::gliner_weights` from #651's review round, which the DGX had never gated, and **+18** from #650. `kastellan-core --lib` **2004**, identical to the Mac | exit 0 from a **cold** private dir under `$HOME`: **345** `Checking`+`Compiling` lines, all **27** kastellan crates named, **zero** warnings. rustc **1.98.0** | **4**, all `KASTELLAN_GLINER_RELEX_ENABLE != "1"` |
 | **DGX** (targeted, #650 acceptance) | **`a990e8ec`** | `gliner_relex_e2e` **4 / 0** with **zero `[SKIP]`** and a real 1.3 GB model load (43 s); `entity_extraction_e2e` **16 / 0** under `KASTELLAN_GLINER_RELEX_ENABLE=1`, both real-worker tests included. All five tests #650 named previously failed | — | 0 |
 | **Mac** (aarch64 darwin) | **`a990e8ec`** | `cargo test -p kastellan-core --lib` **2004 / 0**; `interpreter_deps` filter **39 / 0** (was 21). **15 mutants tried, 15 killed** | `clippy -p kastellan-core -p kastellan-tests-common --all-targets -D warnings` exit 0, **zero** warnings. rustc **1.98.0** | 0 |
