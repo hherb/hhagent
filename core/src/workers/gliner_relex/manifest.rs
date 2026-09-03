@@ -82,6 +82,7 @@ impl crate::worker_manifest::WorkerManifest for GlinerRelexManifest {
                         &env.venv_dir,
                         |p| (ctx.exists)(p),
                         |p| (ctx.canonicalize)(p),
+                        crate::workers::interpreter_deps::read_link_via_fs,
                         crate::workers::interpreter_deps::resolve_deps_via_tool,
                     );
                     env.interpreter_root = root;

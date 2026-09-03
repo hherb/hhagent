@@ -382,18 +382,19 @@ pub fn run_code(
     // `fork(); setsid(); exec(...)` grandchild used to outlive its call — with
     // that call's redeemed secret in its argv, readable via `/proc` by the
     // next dispatch of any task, past the per-dispatch output scrub.
+    //
+    // `process_group(0)` — `setpgid(0, 0)`, applied through `posix_spawn`'s
+    // `POSIX_SPAWN_SETPGROUP` — rather than a `pre_exec(|| setsid())`: any
+    // `pre_exec` closure forces Rust std off `posix_spawn` onto its fork path,
+    // which opens an `AF_UNIX` `SOCK_SEQPACKET` socketpair as the exec-result
+    // channel (`std::sys::process::unix`), and `socketpair` is deliberately
+    // outside the `strict` seccomp profile — so the worker died of SIGSYS on
+    // its first spawn under real bwrap (2026-09-03, the first gate after
+    // #661). A process group is all the reaper below needs; a new *session*
+    // bought nothing in a jail with no controlling terminal to detach from.
     {
         use std::os::unix::process::CommandExt as _;
-        // SAFETY: `setsid` is async-signal-safe and touches only the child's
-        // own session/pgid state; no allocation, no locks.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        cmd.process_group(0);
     }
     let mut child = cmd.spawn()?;
     let child_pgid = child.id() as libc::pid_t;
@@ -424,7 +425,8 @@ pub fn run_code(
     // behind (a daemonised grandchild, a background thread's helper process)
     // dies with the call. `ESRCH` when nothing remains is the normal case.
     // SAFETY: kill(2) with a negative pid targets the group; the pgid is the
-    // child's own pid (it called setsid), so this cannot address our group.
+    // child's own pid (it leads the group `process_group(0)` created), so
+    // this cannot address our group.
     unsafe {
         libc::kill(-child_pgid, libc::SIGKILL);
     }

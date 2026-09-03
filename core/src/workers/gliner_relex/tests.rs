@@ -14,6 +14,7 @@ use super::*;
 use std::path::{Path, PathBuf};
 
 use crate::worker_lifecycle::Lifecycle;
+use crate::workers::interpreter_deps::InterpreterRoot;
 use kastellan_sandbox::{Net, Profile};
 
 #[test]
@@ -489,6 +490,12 @@ fn entry_container_mode_honours_custom_image_tag() {
 
 // ---- issue #284: host-mode external-interpreter binds ------------
 
+/// No symlinks: `bin/python3` is a plain file in these fixtures, so there is no
+/// alias to bind beside the canonical prefix (issue #650).
+fn no_link(_p: &Path) -> Option<PathBuf> {
+    None
+}
+
 /// A uv venv whose `bin/python3` symlinks to an EXTERNAL interpreter must
 /// surface that interpreter's prefix as `interpreter_root`, plus any
 /// out-of-prefix shared-lib dir the interpreter links (e.g. a Homebrew
@@ -508,9 +515,53 @@ fn host_interpreter_binds_external_venv() {
             vec![]
         }
     };
-    let (root, dirs) = resolve_host_interpreter_binds(venv, exists, canon, deps);
-    assert_eq!(root, Some(PathBuf::from("/opt/py/3.12")));
+    let (root, dirs) = resolve_host_interpreter_binds(venv, exists, canon, no_link, deps);
+    assert_eq!(root, Some(InterpreterRoot::canonical_only("/opt/py/3.12")));
     assert_eq!(dirs, vec![PathBuf::from("/opt/hb/gettext/lib")]);
+}
+
+/// The #650 regression guard, at the layer that actually builds the policy.
+///
+/// `resolve_interpreter_root`'s own tests prove `bind_paths()` carries the
+/// alias; this proves `host_mode_entry` spends it. Without it,
+/// `fs_read.push(root.dep_walk_prefix().to_path_buf())` — literally the
+/// pre-#650 line — passes every other test in this file, because every other
+/// fixture builds its root with `canonical_only` and there the two accessors
+/// agree.
+#[test]
+fn host_mode_entry_binds_every_alias_the_venv_names() {
+    let venv = Path::new("/v/.venv");
+    let exists = |p: &Path| p == Path::new("/v/.venv/bin/python3");
+    // The uv layout from #650: a patch-version directory with a minor-version
+    // symlink alias beside it, and the venv naming the alias.
+    let canon = |p: &Path| match p.to_str() {
+        Some("/v/.venv/bin/python3") => {
+            Some(PathBuf::from("/u/py/cpython-3.13.14-linux/bin/python3.13"))
+        }
+        Some("/u/py/cpython-3.13-linux") => Some(PathBuf::from("/u/py/cpython-3.13.14-linux")),
+        _ => None,
+    };
+    let link = |p: &Path| {
+        (p == Path::new("/v/.venv/bin/python3"))
+            .then(|| PathBuf::from("/u/py/cpython-3.13-linux/bin/python3.13"))
+    };
+    let (root, _dirs) =
+        resolve_host_interpreter_binds(venv, exists, canon, link, |_p: &Path| vec![]);
+    let env = GlinerRelexEnv {
+        interpreter_root: root,
+        interpreter_lib_dirs: vec![],
+        ..test_env()
+    };
+    let fs_read = gliner_relex_entry(&env, None).policy.fs_read;
+    assert!(
+        fs_read.contains(&PathBuf::from("/u/py/cpython-3.13.14-linux")),
+        "canonical prefix must still be bound; got {fs_read:?}"
+    );
+    assert!(
+        fs_read.contains(&PathBuf::from("/u/py/cpython-3.13-linux")),
+        "the alias the shebang NAMES must be bound too, or execve returns \
+         ENOENT for a file that is present and readable (#650); got {fs_read:?}"
+    );
 }
 
 /// A self-contained venv (python canonicalizes UNDER the venv) needs no extra
@@ -524,7 +575,7 @@ fn host_interpreter_binds_self_contained() {
             .then(|| PathBuf::from("/v/.venv/bin/python3.12"))
     };
     let no_deps = |_p: &Path| vec![];
-    let (root, dirs) = resolve_host_interpreter_binds(venv, exists, canon, no_deps);
+    let (root, dirs) = resolve_host_interpreter_binds(venv, exists, canon, no_link, no_deps);
     assert_eq!(root, None);
     assert!(dirs.is_empty(), "self-contained venv ⇒ no extra dirs, got {dirs:?}");
 }
@@ -534,7 +585,7 @@ fn host_interpreter_binds_self_contained() {
 #[test]
 fn host_mode_entry_binds_interpreter_root_and_lib_dirs() {
     let env = GlinerRelexEnv {
-        interpreter_root: Some(PathBuf::from("/opt/py/3.12")),
+        interpreter_root: Some(InterpreterRoot::canonical_only("/opt/py/3.12")),
         interpreter_lib_dirs: vec![PathBuf::from("/opt/hb/gettext/lib")],
         ..test_env()
     };

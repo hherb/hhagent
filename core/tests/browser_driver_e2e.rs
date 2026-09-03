@@ -57,14 +57,22 @@ fn resolve_browser_env() -> Option<BrowserDriverEnv> {
         return None;
     }
     // Bind the real interpreter prefix when the venv's python lives outside the
-    // venv (pyenv/uv), mirroring the manifest's resolve_interpreter_root.
-    let interpreter_root = ["python3", "python"]
-        .iter()
-        .map(|n| venv_dir.join("bin").join(n))
-        .find(|p| p.exists())
-        .and_then(|p| std::fs::canonicalize(&p).ok())
-        .and_then(|real| real.parent().and_then(|b| b.parent()).map(PathBuf::from))
-        .filter(|prefix| !prefix.starts_with(&venv_dir));
+    // venv (pyenv/uv). This used to hand-roll the cascade; it now calls the
+    // production resolver, because a copy is a copy: it silently missed the
+    // symlink alias `uv` names its managed interpreters by, which is issue #650.
+    let interpreter_root = kastellan_core::workers::interpreter_deps::resolve_interpreter_root(
+        &venv_dir,
+        &|p| p.exists(),
+        &|p| std::fs::canonicalize(p).ok(),
+        &kastellan_core::workers::interpreter_deps::read_link_via_fs,
+    );
+    // Same S6 step the manifest takes (security audit 2026-09-02): never bind a
+    // prefix that contains the daemon's own state. Mirrored here for the same
+    // reason the resolver is — a copy that skips a step is a copy that drifts.
+    let interpreter_root = kastellan_core::workers::interpreter_deps::guard_interpreter_root(
+        interpreter_root,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    );
     // Operator escape hatch for host-specific deps (e.g. a pyenv interpreter's
     // /opt/homebrew libs) — same env the manifest reads.
     let extra_fs_read = std::env::var("KASTELLAN_BROWSER_DRIVER_EXTRA_FS_READ")
@@ -81,7 +89,7 @@ fn resolve_browser_env() -> Option<BrowserDriverEnv> {
     // manifest's seed logic so the two can't drift (review M2).
     let interpreter_lib_dirs = kastellan_core::workers::interpreter_deps::interpreter_lib_dirs(
         &venv_dir,
-        interpreter_root.as_deref(),
+        interpreter_root.as_ref(),
         &|p| p.exists(),
         &|p| std::fs::canonicalize(p).ok(),
         &|p| kastellan_core::workers::interpreter_deps::resolve_deps_via_tool(p),

@@ -191,11 +191,9 @@ fn build_test_entry() -> Option<ToolEntry> {
         // venv copied from the Mac, whose `bin/python` pointed at a macOS path —
         // so these tests skipped rather than ran.
         //
-        // This makes the fixture faithful, NOT green. `resolve_interpreter_root`
-        // canonicalizes, so only the patch-version directory binds while the
-        // venv names the minor-version symlink alias beside it — that residual
-        // is issue #650, and until it lands a red `gliner_relex_e2e` on Linux is
-        // expected here and is not a regression in this fixture.
+        // The residual — only the patch-version directory binding while the venv
+        // names the minor-version symlink alias beside it — was issue #650, and
+        // is fixed: `InterpreterRoot::bind_paths` now carries both names.
         interpreter_root: interp_root,
         interpreter_lib_dirs: interp_lib_dirs,
     };

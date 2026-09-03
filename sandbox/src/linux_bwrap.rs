@@ -9,8 +9,10 @@
 //!   - `--new-session` so the worker can't read/write the parent's TTY
 //!   - `--as-pid-1` so signals stay contained
 //!   - `--clearenv` so host env vars don't leak in
-//!   - `--disable-userns` so the worker cannot mint a nested user namespace
-//!     (the parent-side twin of the worker's seccomp `unshare`/`clone` kill)
+//!   - `--unshare-user --disable-userns` so the worker cannot mint a nested
+//!     user namespace (the parent-side twin of the worker's seccomp
+//!     `unshare`/`clone` kill); bwrap requires the explicit `--unshare-user`
+//!     beside `--disable-userns` — see [`USERNS_LOCKDOWN_FLAGS`]
 //!
 //! Not yet (deferred to Phase 0 hardening, tracked in `docs/threat-model.md`):
 //!   - Per-host network allowlist (handled by the egress proxy, not bwrap)
@@ -27,6 +29,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use crate::{Net, SandboxBackend, SandboxError, SandboxPolicy};
+
+/// The user-namespace lockdown pair every jail passes, shared by
+/// [`LinuxBwrap::probe`] and [`build_argv_with_resolver`] so the probe cannot
+/// drift from the spawn: `--unshare-user` (a *hard* unshare — `--unshare-all`
+/// sets only bwrap's try-flag) and `--disable-userns` (no nested user
+/// namespaces; security audit 2026-09-02). bwrap validates the pair at option
+/// parse time, before the try-flag is promoted, so `--unshare-all
+/// --disable-userns` without the explicit `--unshare-user` is not a weaker
+/// jail but a refused spawn: `bwrap: --disable-userns requires --unshare-user`.
+pub const USERNS_LOCKDOWN_FLAGS: [&str; 2] = ["--unshare-user", "--disable-userns"];
 
 /// Shell out to `bwrap` for sandboxing. Assumes `bwrap` is on `$PATH`.
 #[derive(Default)]
@@ -52,12 +64,12 @@ impl LinuxBwrap {
         // Ubuntu 24.04+ before this fix and which masked broken probes as
         // "kernel restricts userns" false positives.
         let output = Command::new("bwrap")
+            // The same userns pair the real argv carries — one const, so the
+            // probe exercises exactly what every spawn will pass, and a bwrap
+            // too old to know `--disable-userns` fails here with a clear
+            // message rather than at the first worker spawn.
+            .args(USERNS_LOCKDOWN_FLAGS)
             .args([
-                "--unshare-user",
-                // Same flag the real argv carries (see `build_argv_with_resolver`),
-                // so a bwrap too old to know it fails the probe with a clear
-                // message rather than every worker spawn.
-                "--disable-userns",
                 "--ro-bind",
                 "/usr",
                 "/usr",
@@ -272,9 +284,17 @@ pub fn build_argv_with_resolver(
     // LPEs. The worker-side seccomp filter refuses `unshare`/`clone(CLONE_NEW*)`
     // too — this is the parent-side half of "parent denies + child denies
     // again". bwrap ≥ 0.6 implements it by capping `user.max_user_namespaces`
-    // inside the new userns; `probe()` carries the same flag so an older
+    // inside the new userns; `probe()` carries the same pair so an older
     // bwrap fails loudly at startup instead of at the first spawn.
-    argv.push("--disable-userns".into());
+    //
+    // `--unshare-user` is spelled out even though `--unshare-all` implies it:
+    // `--unshare-all` sets only bwrap's *try* flag, promoted to a hard unshare
+    // after option parsing, while `--disable-userns` is validated at parse
+    // time against the hard flag — so `--unshare-all --disable-userns` alone
+    // dies with `--disable-userns requires --unshare-user` (bubblewrap 0.9.0).
+    // The probe always spelled it out, which is how #660's first gate under
+    // real bwrap saw the probe pass and every spawn fail (2026-09-03).
+    argv.extend(USERNS_LOCKDOWN_FLAGS.iter().map(|f| f.to_string()));
     argv.push("--die-with-parent".into());
     argv.push("--new-session".into());
     argv.push("--as-pid-1".into());
@@ -361,9 +381,25 @@ mod tests {
         assert_eq!(argv[0], "bwrap");
         assert!(argv.contains(&"--unshare-all".into()));
         assert!(argv.contains(&"--disable-userns".into()), "nested userns must be refused");
+        assert!(
+            argv.contains(&"--unshare-user".into()),
+            "bwrap rejects --disable-userns at parse time unless --unshare-user is explicit; \
+             --unshare-all only sets the try-flag, and every spawn failed on the DGX without this"
+        );
         assert!(argv.contains(&"--die-with-parent".into()));
         assert!(argv.contains(&"--new-session".into()));
         assert!(argv.contains(&"--clearenv".into()));
+    }
+
+    /// The probe and the spawn must pass the same userns pair, or the probe
+    /// passes while every spawn fails — which is exactly what the first
+    /// real-bwrap gate of the 2026-09-02 audit did (66 failures, 23 suites).
+    #[test]
+    fn spawn_argv_carries_every_flag_the_probe_passes() {
+        let argv = build_argv(&strict_policy(), "/bin/true", &[]);
+        for f in USERNS_LOCKDOWN_FLAGS {
+            assert!(argv.contains(&f.to_string()), "{f} missing from the spawn argv");
+        }
     }
 
     #[test]

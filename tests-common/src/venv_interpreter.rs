@@ -16,7 +16,9 @@
 use std::path::{Path, PathBuf};
 
 use kastellan_core::workers::gliner_relex::resolve_host_interpreter_binds;
-use kastellan_core::workers::interpreter_deps::resolve_deps_via_tool;
+use kastellan_core::workers::interpreter_deps::{
+    read_link_via_fs, resolve_deps_via_tool, InterpreterRoot,
+};
 
 /// Resolve `(interpreter_root, interpreter_lib_dirs)` for a host-mode venv
 /// worker, exactly as `GlinerRelexManifest::resolve` does.
@@ -48,11 +50,12 @@ use kastellan_core::workers::interpreter_deps::resolve_deps_via_tool;
 /// Panics only on a broken fixture — never on a legitimately self-contained
 /// venv, and never on a venv whose interpreter is external (that path returns
 /// `Some` and is not checked here).
-pub fn venv_interpreter_binds(venv_dir: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
+pub fn venv_interpreter_binds(venv_dir: &Path) -> (Option<InterpreterRoot>, Vec<PathBuf>) {
     let (interpreter_root, interpreter_lib_dirs) = resolve_host_interpreter_binds(
         venv_dir,
         |p| p.exists(),
         |p| std::fs::canonicalize(p).ok(),
+        read_link_via_fs,
         resolve_deps_via_tool,
     );
     if interpreter_root.is_none() {

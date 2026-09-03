@@ -8,12 +8,27 @@
 //! worker runs (issue #284). This module finds those out-of-prefix libs and
 //! returns the canonical parent dirs to bind read-only.
 //!
-//! Pure core: the dependency graph and path canonicalization arrive as injected
-//! closures, so the transitive graph walk is unit-testable without `otool`/`ldd`. The
-//! only impurity is [`resolve_deps_via_tool`].
+//! It also answers the prior question — *which* interpreter, under which
+//! names a jail must be able to reach it, and whether it may be bound at all
+//! (an interpreter prefix that contains the daemon's own state is refused —
+//! security audit 2026-09-02, S6). That lives in the private `root` and
+//! `named_path` submodules (issue #650), whose public surface is re-exported
+//! here as [`resolve_interpreter_root`], [`guard_interpreter_root`],
+//! [`InterpreterRoot`] and [`read_link_via_fs`] — the names to link against,
+//! since a `pub` module cannot usefully link at a private item.
+//!
+//! Pure core: the dependency graph and every path probe arrive as injected
+//! closures, so the transitive graph walk is unit-testable without `otool`/`ldd`.
+//! The only impurities are [`resolve_deps_via_tool`] and [`read_link_via_fs`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+mod named_path;
+mod root;
+
+pub use named_path::read_link_via_fs;
+pub use root::{guard_interpreter_root, resolve_interpreter_root, InterpreterRoot};
 
 /// True when `p` lies under one of `roots` (path-prefix match).
 fn is_system_lib_path_in(p: &Path, roots: &[&str]) -> bool {
@@ -82,88 +97,30 @@ pub fn out_of_prefix_lib_dirs(
     dirs.into_iter().collect()
 }
 
-/// Refuse an interpreter prefix that would expose the daemon's own private
-/// state to a worker (security audit 2026-09-02, sandbox S6).
-///
-/// `resolve_interpreter_root` derives `<prefix>` from
-/// `<prefix>/bin/python`; the whole prefix then rides `fs_read` into the jail
-/// (bwrap `--ro-bind`, Seatbelt `file-read*`). A uv-managed interpreter gives
-/// a leaf like `~/.local/share/uv/python/cpython-3.12-…` — fine. But an
-/// interpreter installed with `--prefix=$HOME` (`~/bin/python3`), or living
-/// in `~/.local/bin`, derives `$HOME` or `~/.local` — which contains
-/// `~/.config/kastellan` (env files, tokens), `~/.local/share/kastellan`
-/// (the Matrix store), `~/.local/state/kastellan` (the audit mirror) and the
-/// vault's keyring material. Returns `None` (the worker then fails to start
-/// with an ENOENT it can explain) rather than binding any of that.
-pub fn guard_interpreter_root(root: Option<PathBuf>, home: Option<&Path>) -> Option<PathBuf> {
-    let prefix = root?;
-    let Some(home) = home else { return Some(prefix) };
-    let sensitive: [PathBuf; 6] = [
-        home.to_path_buf(),
-        home.join(".config").join("kastellan"),
-        home.join(".local").join("share").join("kastellan"),
-        home.join(".local").join("state").join("kastellan"),
-        home.join(".local").join("lib").join("kastellan"),
-        home.join(".kastellan"),
-    ];
-    if sensitive.iter().any(|s| s.starts_with(&prefix)) {
-        tracing::warn!(
-            prefix = %prefix.display(),
-            "refusing interpreter prefix: it contains the daemon's own config/state; \
-             install the worker's interpreter under a leaf prefix (a uv-managed or \
-             venv-local CPython)"
-        );
-        return None;
-    }
-    Some(prefix)
-}
-
-/// Resolve the real interpreter prefix a venv's `python3` symlinks to.
-///
-/// Locates `<venv>/bin/{python3,python}`, canonicalizes it to the real CPython,
-/// and returns its **prefix** (`<bin>/..`) — the tree holding the interpreter
-/// binary + `libpython` + the stdlib. Returns `None` when the interpreter can't
-/// be found/canonicalized, or when it already lives **under** `venv_dir`
-/// (self-contained — the venv `fs_read` already covers it, nothing extra to
-/// bind). Pure: `exists` and `canonicalize` are injected.
-///
-/// Shared by every venv-backed worker (browser-driver, gliner-relex) so the
-/// "where's the real interpreter" rule lives in exactly one place.
-pub fn resolve_interpreter_root(
-    venv_dir: &Path,
-    exists: &dyn Fn(&Path) -> bool,
-    canonicalize: &dyn Fn(&Path) -> Option<PathBuf>,
-) -> Option<PathBuf> {
-    let bin = venv_dir.join("bin");
-    let candidate = ["python3", "python"]
-        .iter()
-        .map(|n| bin.join(n))
-        .find(|p| exists(p))?;
-    let real = canonicalize(&candidate)?;
-    let prefix = real.parent()?.parent()?; // <prefix>/bin/python → <prefix>
-    // Self-contained: the real interpreter is already under venv_dir, so the
-    // venv fs_read covers it — nothing extra to bind.
-    if prefix.starts_with(venv_dir) {
-        return None;
-    }
-    Some(prefix.to_path_buf())
-}
-
 /// Compute the out-of-prefix shared-lib dirs to bind for a venv's interpreter.
 ///
 /// Locates `<venv>/bin/{python3,python}`, canonicalizes it to the real
 /// interpreter, then delegates to [`interpreter_lib_dirs_for_binary`].
-/// `interpreter_root` is the external interpreter prefix (when the venv's python
-/// lives outside the venv), else `None`; the dep-walk prefix is that root or,
-/// self-contained, the venv dir (a self-contained interpreter can still link
-/// out-of-prefix libs). Returns empty when the interpreter can't be located.
+/// `interpreter_root` is the external interpreter root (when the venv's python
+/// lives outside the venv), else `None`; the dep-walk prefix is that root's
+/// [`dep_walk_prefix`](InterpreterRoot::dep_walk_prefix) or, self-contained, the
+/// venv dir (a self-contained interpreter can still link out-of-prefix libs).
+/// Returns empty when the interpreter can't be located.
+///
+/// It takes the whole [`InterpreterRoot`] rather than a bare `&Path` on purpose:
+/// `ldd`/`otool` report canonical paths and this walk compares with
+/// `starts_with`, so handing it an *alias* would classify the interpreter's own
+/// libraries as out-of-prefix. Every caller used to make that choice itself,
+/// each with a comment reminding it which half to pass — one of the three had
+/// no comment. Now the choice is made once, here, and passing the wrong half is
+/// not expressible (#650).
 ///
 /// Shared by the browser-driver / gliner-relex manifests and their e2e resolvers
 /// so the seed logic cannot drift across the crate boundary (review M2). Pure:
 /// `exists`, `canonicalize`, and `resolve_deps` are injected.
 pub fn interpreter_lib_dirs(
     venv_dir: &Path,
-    interpreter_root: Option<&Path>,
+    interpreter_root: Option<&InterpreterRoot>,
     exists: &dyn Fn(&Path) -> bool,
     canonicalize: &dyn Fn(&Path) -> Option<PathBuf>,
     resolve_deps: &dyn Fn(&Path) -> Vec<PathBuf>,
@@ -182,8 +139,8 @@ pub fn interpreter_lib_dirs(
         None => return Vec::new(),
     };
     // The prefix to treat as "already bound in-jail": the external interpreter
-    // root, or (self-contained) the venv dir.
-    let prefix = interpreter_root.unwrap_or(venv_dir);
+    // root's CANONICAL path, or (self-contained) the venv dir.
+    let prefix = interpreter_root.map_or(venv_dir, |r| r.dep_walk_prefix());
     interpreter_lib_dirs_for_binary(&real, prefix, exists, canonicalize, resolve_deps)
 }
 
@@ -288,44 +245,3 @@ pub fn resolve_deps_via_tool(obj: &Path) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod guard_tests {
-    use super::*;
-
-    fn home() -> PathBuf {
-        PathBuf::from("/home/agent")
-    }
-
-    #[test]
-    fn leaf_prefixes_pass() {
-        for p in [
-            "/home/agent/.local/share/uv/python/cpython-3.12.6-linux-x86_64-gnu",
-            "/usr",
-            "/opt/python3.12",
-            "/home/agent/venvs/tool/.venv",
-        ] {
-            assert_eq!(
-                guard_interpreter_root(Some(PathBuf::from(p)), Some(&home())),
-                Some(PathBuf::from(p)),
-                "{p} must pass"
-            );
-        }
-    }
-
-    #[test]
-    fn ancestors_of_the_daemon_state_are_refused() {
-        for p in ["/", "/home", "/home/agent", "/home/agent/.local", "/home/agent/.local/share", "/home/agent/.config"] {
-            assert_eq!(guard_interpreter_root(Some(PathBuf::from(p)), Some(&home())), None, "{p} must be refused");
-        }
-    }
-
-    #[test]
-    fn none_and_no_home_pass_through() {
-        assert_eq!(guard_interpreter_root(None, Some(&home())), None);
-        assert_eq!(
-            guard_interpreter_root(Some(PathBuf::from("/home/agent")), None),
-            Some(PathBuf::from("/home/agent"))
-        );
-    }
-}

@@ -92,15 +92,18 @@ pub struct GlinerRelexEnv {
     /// Setting `IMAGE=` alone (without `USE_CONTAINER=1`) does NOT
     /// switch the worker to container mode.
     pub container_image: Option<String>,
-    /// Host-mode only: the real interpreter prefix the venv's `bin/python3`
-    /// symlinks to, when it lives **outside** `venv_dir` (a uv venv symlinks
-    /// to a base CPython whose `libpython` + stdlib are external). Mounted
-    /// read-only so the interpreter starts inside the jail. `None` for a
-    /// self-contained venv (or container mode). Populated by the manifest via
+    /// Host-mode only: the interpreter prefix the venv's `bin/python3` points
+    /// at, when it lives **outside** `venv_dir` (a uv venv symlinks to a base
+    /// CPython whose `libpython` + stdlib are external). Every path in its
+    /// [`bind_paths`](crate::workers::interpreter_deps::InterpreterRoot::bind_paths)
+    /// is mounted read-only so the interpreter starts inside the jail — that is
+    /// plural because the venv may name the prefix through a symlink alias, and
+    /// binding only the canonical name leaves the shebang dangling (#650).
+    /// `None` for a self-contained venv (or container mode). Populated by the manifest via
     /// [`resolve_host_interpreter_binds`] (NOT by [`resolve_env`], which has no
     /// other `canonicalize` need) — same external-interpreter binding the
     /// browser-driver worker does.
-    pub interpreter_root: Option<PathBuf>,
+    pub interpreter_root: Option<crate::workers::interpreter_deps::InterpreterRoot>,
     /// Host-mode only: read-only directories of the interpreter's out-of-prefix
     /// shared-library dependencies (e.g. a Homebrew `libintl` a pyenv/Homebrew
     /// CPython links). Bound so the interpreter can dyld-load inside the jail —
@@ -276,29 +279,38 @@ where
 /// Returns `(interpreter_root, interpreter_lib_dirs)` for
 /// [`GlinerRelexEnv`]:
 ///
-/// * `interpreter_root` — the external interpreter prefix to bind read-only;
-///   `None` for a self-contained venv. (On Linux the base python lives under
-///   `/usr`, which bwrap already binds — it is still surfaced here; binding it
-///   again is a harmless redundancy, exactly as the browser-driver worker does.)
+/// * `interpreter_root` — the external interpreter prefix, carrying both the
+///   canonical path (for the dep walk) and every symlink alias the venv names
+///   it by (all of which must be bound, #650); `None` for a self-contained
+///   venv. (A *distro*-python venv's prefix is `/usr`, which bwrap already
+///   binds — it is still surfaced here, and binding it again is a harmless
+///   redundancy, exactly as the browser-driver worker does. A uv-managed
+///   interpreter's prefix is under `~/.local/share/uv/python/` and the bind is
+///   load-bearing, which is what #650 was.)
 /// * `interpreter_lib_dirs` — out-of-prefix shared-lib dirs the interpreter
 ///   links; empty when self-contained / all-system, or the dep tool is
 ///   unavailable (fail-safe — the manual `*_EXTRA_FS_READ` hatch backstops).
 ///
 /// Delegates to the shared [`crate::workers::interpreter_deps`] helpers so the
 /// "where's the real interpreter + what does it link" logic is byte-identical
-/// to the browser-driver worker. Pure: `exists`, `canonicalize`, and
-/// `resolve_deps` are injected. Call for host mode only — container-mode workers
+/// to the browser-driver worker. Pure: `exists`, `canonicalize`, `read_link`
+/// and `resolve_deps` are injected. Call for host mode only — container-mode workers
 /// bake the interpreter into the image.
 pub fn resolve_host_interpreter_binds(
     venv_dir: &Path,
     exists: impl Fn(&Path) -> bool,
     canonicalize: impl Fn(&Path) -> Option<PathBuf>,
+    read_link: impl Fn(&Path) -> Option<PathBuf>,
     resolve_deps: impl Fn(&Path) -> Vec<PathBuf>,
-) -> (Option<PathBuf>, Vec<PathBuf>) {
+) -> (
+    Option<crate::workers::interpreter_deps::InterpreterRoot>,
+    Vec<PathBuf>,
+) {
     let interpreter_root = crate::workers::interpreter_deps::resolve_interpreter_root(
         venv_dir,
         &exists,
         &canonicalize,
+        &read_link,
     );
     // Never bind a prefix that contains the daemon's own state (audit
     // 2026-09-02, S6).
@@ -308,7 +320,7 @@ pub fn resolve_host_interpreter_binds(
     );
     let interpreter_lib_dirs = crate::workers::interpreter_deps::interpreter_lib_dirs(
         venv_dir,
-        interpreter_root.as_deref(),
+        interpreter_root.as_ref(),
         &exists,
         &canonicalize,
         &resolve_deps,

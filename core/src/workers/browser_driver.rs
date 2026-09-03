@@ -72,13 +72,16 @@ pub struct BrowserDriverEnv {
     pub script_path: PathBuf,
     /// Worker venv root, mounted read-only into the jail.
     pub venv_dir: PathBuf,
-    /// Real interpreter prefix root (e.g. `~/.pyenv/versions/3.12.3` or
-    /// `/usr`), when the venv's `python3` symlinks to a CPython whose
-    /// `libpython`/stdlib live **outside** `venv_dir`. Mounted read-only so the
-    /// interpreter starts inside the jail (the spike's `py_root` finding §3.1;
-    /// mirrors `python-exec`'s interpreter binding). `None` for a fully
-    /// self-contained venv (nothing extra to bind).
-    pub interpreter_root: Option<PathBuf>,
+    /// Interpreter prefix root (e.g. `~/.pyenv/versions/3.12.3` or `/usr`),
+    /// when the venv's `python3` symlinks to a CPython whose `libpython`/stdlib
+    /// live **outside** `venv_dir`. Every path in its
+    /// [`bind_paths`](crate::workers::interpreter_deps::InterpreterRoot::bind_paths)
+    /// is mounted read-only so the interpreter starts inside the jail (the
+    /// spike's `py_root` finding §3.1; mirrors `python-exec`'s interpreter
+    /// binding) — plural because a uv-managed CPython is named through a
+    /// symlink alias the canonical path alone does not cover (#650). `None` for
+    /// a fully self-contained venv (nothing extra to bind).
+    pub interpreter_root: Option<crate::workers::interpreter_deps::InterpreterRoot>,
     /// Read-only directories of the interpreter's out-of-prefix shared-library
     /// dependencies (e.g. a Homebrew `libintl` dir a pyenv CPython links). Bound
     /// so the interpreter can dyld-load inside the jail — without them it
@@ -112,13 +115,16 @@ pub enum ResolveSkipReason {
 /// `is_dir` is unused today (browser-driver has no weights dir like GLiNER) but
 /// kept in the signature so the manifest can thread the same `ResolveCtx`
 /// probes uniformly. `canonicalize` resolves the venv's `python3` symlink to
-/// the real interpreter so its prefix can be bound into the jail (see
-/// [`BrowserDriverEnv::interpreter_root`]).
-pub fn resolve_env<E, D, X, C, R>(
+/// the real interpreter so its prefix can be bound into the jail, and
+/// `read_link` walks that same symlink chain *without* resolving it, so the
+/// alias the shebang actually names is bound too (see
+/// [`BrowserDriverEnv::interpreter_root`] and issue #650).
+pub fn resolve_env<E, D, X, C, L, R>(
     env_lookup: E,
     _is_dir: D,
     exists: X,
     canonicalize: C,
+    read_link: L,
     resolve_deps: R,
 ) -> Result<BrowserDriverEnv, ResolveSkipReason>
 where
@@ -126,6 +132,7 @@ where
     D: Fn(&Path) -> bool,
     X: Fn(&Path) -> bool,
     C: Fn(&Path) -> Option<PathBuf>,
+    L: Fn(&Path) -> Option<PathBuf>,
     R: Fn(&Path) -> Vec<PathBuf>,
 {
     // Opt-in gate under the one unified flag dialect (`1|true|yes|on`, trimmed,
@@ -153,6 +160,7 @@ where
         &venv_dir,
         &exists,
         &canonicalize,
+        &read_link,
     );
     // Never bind a prefix that contains the daemon's own state (audit
     // 2026-09-02, S6).
@@ -162,7 +170,7 @@ where
     );
     let interpreter_lib_dirs = crate::workers::interpreter_deps::interpreter_lib_dirs(
         &venv_dir,
-        interpreter_root.as_deref(),
+        interpreter_root.as_ref(),
         &exists,
         &canonicalize,
         &resolve_deps,
@@ -254,10 +262,13 @@ pub fn browser_driver_entry(
         PathBuf::from("/etc/hosts"),
         PathBuf::from("/etc/nsswitch.conf"),
     ];
-    // Bind the real interpreter prefix when the venv's python lives outside
-    // venv_dir (pyenv/uv venvs) so CPython can start inside the jail.
+    // Bind EVERY name the venv reaches its interpreter by (`bind_paths`, not
+    // the canonical path alone) when that interpreter lives outside venv_dir
+    // (pyenv/uv venvs), so CPython can start inside the jail: a uv-managed
+    // CPython is named through a minor-version symlink alias, and binding only
+    // the canonical path leaves the shebang dangling with ENOENT (#650).
     if let Some(root) = &env.interpreter_root {
-        fs_read.push(root.clone());
+        fs_read.extend(root.bind_paths());
     }
     // Bind the interpreter's out-of-prefix shared-lib dirs (issue #284) so a
     // pyenv/Homebrew-linked interpreter can dyld-load in the jail.
@@ -535,6 +546,7 @@ impl WorkerManifest for BrowserDriverManifest {
             |p| (ctx.is_dir)(p),
             |p| (ctx.exists)(p),
             |p| (ctx.canonicalize)(p),
+            crate::workers::interpreter_deps::read_link_via_fs,
             crate::workers::interpreter_deps::resolve_deps_via_tool,
         ) {
             Ok(env) => {
