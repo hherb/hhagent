@@ -182,6 +182,15 @@ fn send_sigkill(pid: u32) {
     // which we ignore.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        // macOS (security audit 2026-09-02, tool_host F4): `sandbox-exec`
+        // execs the worker after `setsid()`, so `pid` is a session/group
+        // leader but nothing tears its children down when it dies — a
+        // python-exec interpreter or a shell-exec command kept running,
+        // Seatbelt-confined, after its scratch dir was removed from under it.
+        // Kill the whole group. Linux needs no equivalent: bwrap's
+        // `--as-pid-1 --die-with-parent` takes the pid namespace down.
+        #[cfg(target_os = "macos")]
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
     }
 }
 

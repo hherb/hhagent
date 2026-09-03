@@ -199,6 +199,10 @@ pub(super) async fn finalize(
     // Prompt-injection screen on successful results. Errors are not
     // text-channel content (the planner sees them as failure codes,
     // not as text), so they can't carry injection — skip.
+    // Fingerprints of every secret materialized into THIS dispatch's params
+    // (`req_for_audit` is the pre-substitution snapshot, so its `secret://`
+    // refs are still present). Shared by both arms below.
+    let fps = secret_scrub::fingerprints_for_dispatch(req_for_audit, vault);
     let (final_result, screened) = match call_result {
         Ok(mut v) => {
             // ── python-exec output secret-scrub (design 2026-06-17). ──
@@ -209,18 +213,38 @@ pub(super) async fn finalize(
             // worker and for any call with no scannable secrets. `req_for_audit`
             // is the pre-substitution snapshot, so its `secret://` refs are still
             // present for fingerprinting.
-            if secret_scrub::worker_redacts_output(tool) {
-                let fps = secret_scrub::fingerprints_for_dispatch(req_for_audit, vault);
-                if !fps.is_empty() {
-                    let hits = secret_scrub::scrub_result_value(&mut v, &fps);
-                    secret_scrub::emit_scrub_audit(sink, tool, &hits).await;
-                }
+            //
+            // Security audit 2026-09-02 (finding H1): the scrub now runs for
+            // EVERY tool, and on the error arm below too. The old gate
+            // (`python-exec` only) reasoned about which worker to trust with a
+            // secret, not about where the worker's bytes end up — and they
+            // end up in the planner prompt (`StepOutcome::detail`, the
+            // plan-so-far summary) and in `audit_log` (`payload.result` /
+            // `payload.err`) plus its JSONL mirror. shell-exec's honest
+            // `argv[0] "…" not in allowlist` denial therefore handed a
+            // substituted `secret://` ref's plaintext straight to the LLM.
+            // `fps` is empty when the call redeemed nothing, so the common
+            // case costs one JSON walk. Verbatim-contiguous only (an encoded
+            // or split secret evades it — `leak-scan` documents that); this is
+            // the floor, not the per-tool secret policy.
+            if !fps.is_empty() {
+                let hits = secret_scrub::scrub_result_value(&mut v, &fps);
+                secret_scrub::emit_scrub_audit(sink, tool, &hits).await;
             }
 
             let outcome = screen_result(tool, guard, v).await;
             (Ok(outcome.value), Some((outcome.blocked, outcome.guard)))
         }
-        Err(e) => (Err(e), None),
+        Err(mut e) => {
+            // Same scrub on the error: an `RpcError` message/data (or a
+            // mismatched-id echo) is rendered into the audit `err` string and
+            // the planner-bound step detail exactly like a result would be.
+            if !fps.is_empty() {
+                let hits = secret_scrub::scrub_client_error(&mut e, &fps);
+                secret_scrub::emit_scrub_audit(sink, tool, &hits).await;
+            }
+            (Err(e), None)
+        }
     };
     let (blocked_meta, guard_report) = screened.unwrap_or((None, None));
 

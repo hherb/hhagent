@@ -48,9 +48,9 @@ use matrix_sdk::ruma::events::room::message::{
 };
 use matrix_sdk::ruma::RoomId;
 use matrix_sdk::store::StateStoreDataKey;
-use matrix_sdk::{Client, Room, RoomState};
+use matrix_sdk::{Client, Room, RoomMemberships, RoomState};
 
-use kastellan_matrix_wire::{push_bounded, Event, InitResult};
+use kastellan_matrix_wire::{push_bounded_fair, Event, FairPush, InitResult};
 
 use crate::bridge::ProxyBridge;
 use crate::sdk::MatrixSdk;
@@ -103,6 +103,13 @@ pub struct LiveSdkConfig {
     pub device_name: String,
     /// Egress sidecar UDS; when set, traffic is routed through a `ProxyBridge`.
     pub proxy_uds: Option<PathBuf>,
+    /// `KASTELLAN_MATRIX_PEERS` (comma-separated user ids), the same set the
+    /// core authorises against. Enforced here at the room edge as well
+    /// (security audit 2026-09-02, channel F1): invites from anyone else are
+    /// declined and their events are never buffered. Empty ⇒ no per-sender
+    /// filter (the core remains the gate), but the two-party room rule below
+    /// still applies.
+    pub allowed_peers: Vec<String>,
 }
 
 impl LiveSdkConfig {
@@ -145,6 +152,12 @@ fn parse_config(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<LiveSdkC
         device_name: get("KASTELLAN_MATRIX_DEVICE_NAME")
             .unwrap_or_else(|| DEVICE_NAME_DEFAULT.to_string()),
         proxy_uds: get("KASTELLAN_EGRESS_PROXY_UDS").map(PathBuf::from),
+        allowed_peers: get("KASTELLAN_MATRIX_PEERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|p| p.trim().to_ascii_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect(),
     })
 }
 
@@ -186,6 +199,21 @@ impl LiveSdk {
     pub fn connect(config: LiveSdkConfig) -> anyhow::Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            // Landlock is per-thread and this runtime is built BEFORE the
+            // worker's `lock_down` (login + first sync need the network
+            // first), so without this hook every runtime thread — the ones
+            // that parse homeserver data — would carry no Landlock at all
+            // (security audit 2026-09-02, F4/F5). Restrict each worker thread
+            // as it starts, from the same env the main thread will use; a
+            // failure aborts, since serving one layer short is the thing this
+            // exists to prevent.
+            .on_thread_start(|| {
+                #[cfg(target_os = "linux")]
+                if let Err(e) = kastellan_worker_prelude::landlock_lock::apply_from_env() {
+                    eprintln!("kastellan-worker-matrix: per-thread landlock failed: {e}");
+                    std::process::abort();
+                }
+            })
             .build()
             .context("build tokio runtime")?;
         let buffer: Arc<Mutex<VecDeque<Event>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -405,8 +433,9 @@ async fn connect_client(
     // registered so the decision covers the entire initial sync.
     let prior_sync_token = read_prior_sync_token(&client).await;
     let live = Arc::new(AtomicBool::new(initial_live_state(prior_sync_token.as_deref())));
-    register_message_handler(&client, buffer, user_id, live.clone());
-    register_autojoin_handler(&client);
+    let allowed_peers: Arc<Vec<String>> = Arc::new(config.allowed_peers.clone());
+    register_message_handler(&client, buffer, user_id, live.clone(), allowed_peers.clone());
+    register_autojoin_handler(&client, allowed_peers);
 
     // One initial sync so room state + member device keys are present before we
     // start serving `send`; the continuous sync task takes over afterwards.
@@ -545,11 +574,13 @@ fn register_message_handler(
     buffer: Arc<Mutex<VecDeque<Event>>>,
     own_user_id: matrix_sdk::ruma::OwnedUserId,
     live: Arc<AtomicBool>,
+    allowed_peers: Arc<Vec<String>>,
 ) {
     client.add_event_handler(move |ev: OriginalSyncRoomMessageEvent, room: Room| {
         let buffer = buffer.clone();
         let own = own_user_id.clone();
         let live = live.clone();
+        let allowed = allowed_peers.clone();
         async move {
             // Skip the initial catch-up sync (room history + offline backlog):
             // only surface events once continuous sync is live.
@@ -563,23 +594,97 @@ fn register_message_handler(
             if ev.sender == own {
                 return;
             }
+            // Room-edge gate (security audit 2026-09-02, channel F1). The
+            // core authorises the *peer*; nothing scoped the *room*, so a
+            // third party could invite the bot and the paired operator into
+            // a room they control, have the operator's messages executed as
+            // instructions and read every reply. Two rules: (1) when a peer
+            // set is configured, only those senders are ever buffered;
+            // (2) the room must be two-party — its joined+invited members
+            // are exactly the bot and one peer — so a shared room is never a
+            // command channel, whoever created it. Bodies are never logged.
+            if !allowed.is_empty() && !peer_allowed(&allowed, ev.sender.as_str()) {
+                eprintln!(
+                    "kastellan-worker-matrix: dropping event in {} from a sender outside \
+                     KASTELLAN_MATRIX_PEERS",
+                    room.room_id()
+                );
+                return;
+            }
+            if !room_is_two_party(&room, &own, &allowed).await {
+                eprintln!(
+                    "kastellan-worker-matrix: dropping event in {}: not a two-party room \
+                     (bot + one peer)",
+                    room.room_id()
+                );
+                return;
+            }
             if let MessageType::Text(text) = ev.content.msgtype {
                 let event = Event {
                     conversation: room.room_id().to_string(),
                     peer: ev.sender.to_string(),
                     body: text.body,
                 };
-                let dropped = push_bounded(
+                match push_bounded_fair(
                     &mut buffer.lock().expect("buffer not poisoned"),
                     event,
                     INBOUND_CAP,
-                );
-                if dropped {
-                    eprintln!("kastellan-worker-matrix: inbound buffer full; dropped oldest event");
+                    INBOUND_PER_PEER_CAP,
+                ) {
+                    FairPush::Pushed => {}
+                    FairPush::PushedEvictedOldest => {
+                        eprintln!("kastellan-worker-matrix: inbound buffer full; dropped oldest event");
+                    }
+                    FairPush::DroppedSenderFlood => {
+                        eprintln!(
+                            "kastellan-worker-matrix: sender {} at its per-peer buffer cap; \
+                             dropped its newest event",
+                            ev.sender
+                        );
+                    }
                 }
             }
         }
     });
+}
+
+/// Per-sender share of the inbound buffer (see `push_bounded_fair`).
+const INBOUND_PER_PEER_CAP: usize = 64;
+
+/// Case-insensitive membership of a Matrix user id in the configured peer set.
+fn peer_allowed(allowed: &[String], user_id: &str) -> bool {
+    let u = user_id.to_ascii_lowercase();
+    allowed.contains(&u)
+}
+
+/// True iff the room's joined + invited members are exactly the bot and one
+/// other account (which, when a peer set is configured, must be in it).
+/// Invited-but-not-joined members count: a pending third-party invite would
+/// otherwise let them join later and read the exchange.
+async fn room_is_two_party(
+    room: &Room,
+    own: &matrix_sdk::ruma::UserId,
+    allowed: &[String],
+) -> bool {
+    let members = match room
+        .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("kastellan-worker-matrix: could not list members of {}: {e}", room.room_id());
+            return false; // fail closed
+        }
+    };
+    let others: Vec<&matrix_sdk::ruma::UserId> = members
+        .iter()
+        .map(|m| m.user_id())
+        .filter(|u| *u != own)
+        .collect();
+    match others.as_slice() {
+        [one] => allowed.is_empty() || peer_allowed(allowed, one.as_str()),
+        _ => false,
+    }
 }
 
 /// Auto-accept room invites addressed to the bot so a user can simply start a
@@ -588,8 +693,10 @@ fn register_message_handler(
 /// which drops messages from unpaired senders. Joining is retried a few times
 /// to ride out transient server lag (federation is off here, so a couple of
 /// short retries suffice).
-fn register_autojoin_handler(client: &Client) {
-    client.add_event_handler(|ev: StrippedRoomMemberEvent, client: Client, room: Room| async move {
+fn register_autojoin_handler(client: &Client, allowed_peers: Arc<Vec<String>>) {
+    client.add_event_handler(move |ev: StrippedRoomMemberEvent, client: Client, room: Room| {
+        let allowed = allowed_peers.clone();
+        async move {
         // Only react to the invite *for us*; ignore membership churn for others.
         let Some(me) = client.user_id() else { return };
         if ev.state_key != me {
@@ -599,6 +706,21 @@ fn register_autojoin_handler(client: &Client) {
             return;
         }
         let room_id = room.room_id().to_string();
+        // Decline invites from outside the configured peer set (security
+        // audit 2026-09-02, channel F1): joining is not trust, but every
+        // joined room is synced, stored and a flood surface, and the old
+        // handler joined *any* room from *anyone*. `ev.sender` is the
+        // inviter. Leaving rejects the invite so it does not linger.
+        if !allowed.is_empty() && !peer_allowed(&allowed, ev.sender.as_str()) {
+            eprintln!(
+                "kastellan-worker-matrix: declining invite to {room_id} from a sender outside \
+                 KASTELLAN_MATRIX_PEERS"
+            );
+            if let Err(e) = room.leave().await {
+                eprintln!("kastellan-worker-matrix: could not decline invite to {room_id}: {e}");
+            }
+            return;
+        }
         for attempt in 0..3u32 {
             match room.join().await {
                 Ok(()) => {
@@ -616,6 +738,7 @@ fn register_autojoin_handler(client: &Client) {
             }
         }
         eprintln!("kastellan-worker-matrix: gave up auto-joining {room_id}");
+        }
     });
 }
 

@@ -39,10 +39,18 @@ echo ">>> installing the worker into the venv (non-editable)"
 # NON-editable on purpose: the jailed worker only fs_reads the venv, so the
 # package must be copied INTO venv site-packages. An editable (`-e`) install
 # leaves the source in the repo via a `.pth`, which the sandbox can't read.
-"$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
 # Two steps so a re-run always stages the CURRENT worker source:
-#   1. Plain install pulls in the runtime deps (readability/lxml/playwright);
-#      pip skips any already-satisfied versioned dep, so re-runs are fast.
+#   1. Install the runtime deps (readability/lxml/playwright + transitives)
+#      from the HASH-PINNED lock, never from pyproject.toml's `>=` floors
+#      (security audit 2026-09-02): `--require-hashes` makes pip refuse any
+#      distribution whose sha256 is not in the lock, and `--only-binary=:all:`
+#      refuses sdists outright, so no setup.py from PyPI ever executes here and
+#      two operators installing a month apart get byte-identical dependency
+#      sets — the same set the micro-VM rootfs bakes in. Regenerate the lock
+#      with the command in its header; never edit it by hand. pip skips any
+#      already-satisfied pinned dep, so re-runs stay fast. (The venv's bundled
+#      pip is used as-is: an unpinned `pip install --upgrade pip` would itself be
+#      the kind of floating install this step exists to remove.)
 #   2. Force-reinstall the local package WITHOUT deps. The package version is
 #      static (0.0.1), so a plain `pip install <path>` on a re-run reports
 #      "already satisfied" and SILENTLY KEEPS STALE worker code after the source
@@ -52,10 +60,15 @@ echo ">>> installing the worker into the venv (non-editable)"
 #      but was just an out-of-date install. --force-reinstall always recopies.
 #      (Recent pip rebuilds a local path install every run anyway; the explicit
 #      --force-reinstall keeps this robust on older pip that skips "already
-#      satisfied". Caveat: a NEW runtime dep added WITHOUT a version bump can
-#      still be skipped by step 1 on such pip — bump the version when deps
-#      change. The shim.py tripwire below catches any source staleness.)
-"$VENV_DIR/bin/pip" install "$WORKER_DIR"
+#      satisfied". A NEW runtime dep must be added to pyproject.toml AND the lock
+#      regenerated, or step 1 will not know about it. The shim.py tripwire below
+#      catches any source staleness.)
+LOCK="$WORKER_DIR/requirements.lock"
+if [ ! -f "$LOCK" ]; then
+  echo "error: $LOCK not found — the hash-pinned dependency lock is required" >&2
+  exit 1
+fi
+"$VENV_DIR/bin/pip" install --require-hashes --only-binary=:all: -r "$LOCK"
 "$VENV_DIR/bin/pip" install --force-reinstall --no-deps "$WORKER_DIR"
 
 echo ">>> installing the chromium headless shell into $BROWSERS_DIR"

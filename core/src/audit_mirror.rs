@@ -42,6 +42,7 @@
 //! local time, so log files stay contiguous across DST transitions
 //! and timezone changes.
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use kastellan_db::audit::{self, AuditRow};
@@ -193,9 +194,22 @@ pub async fn spawn_mirror(
     pool: PgPool,
     state_dir: PathBuf,
 ) -> Result<MirrorHandle, MirrorError> {
-    tokio::fs::create_dir_all(&state_dir)
-        .await
-        .map_err(|e| MirrorError::Mkdir(state_dir.clone(), e))?;
+    // Owner-private (audit 2026-09-02, F6/A-1): the mirror carries every
+    // ≤4 KiB tool req/result head, serialised plans and ask text, with none
+    // of the `audit_log` table's role gating — under umask 022 it was
+    // world-readable. `DirBuilder::mode` covers a fresh dir; an existing one
+    // is tightened explicitly below.
+    {
+        tokio::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&state_dir)
+            .await
+            .map_err(|e| MirrorError::Mkdir(state_dir.clone(), e))?;
+        tokio::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| MirrorError::Mkdir(state_dir.clone(), e))?;
+    }
 
     // Open the listener BEFORE returning so a misconfigured cluster
     // surfaces synchronously (bad role, no NOTIFY trigger). Pool
@@ -359,6 +373,8 @@ async fn write_row(
         let file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            // 0600 on creation (audit 2026-09-02): see the dir comment above.
+            .mode(0o600)
             .open(&path)
             .await
             .map_err(|e| CatchUpError::OpenFile(path.clone(), e))?;

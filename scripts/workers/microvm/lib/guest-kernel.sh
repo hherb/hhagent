@@ -261,7 +261,20 @@ fetch_guest_kernel() {
     expected="$(guest_kernel_sha256 "$arch")" || return 1
     url="$(guest_kernel_url "$arch")"
     dest="$out_dir/vmlinux"
-    tmp="$dest.partial.$$"
+    # Download into a private directory of OUR OWN, never into $out_dir
+    # (security audit 2026-09-02, installer F4): the privileged installer
+    # makes $out_dir root:<agent-group> 1775, so the agent user can create
+    # names there — and `$dest.partial.$$` was predictable (pids are in
+    # /proc). A planted symlink at that name would have had root's `curl -o`
+    # truncate and overwrite an arbitrary file with kernel bytes. mktemp -d
+    # gives a 0700 directory with an unguessable name under a root-only
+    # parent, so nothing can be pre-planted along the download path.
+    local tmp_dir
+    tmp_dir="$(mktemp -d "${TMPDIR:-/var/tmp}/kastellan-guest-kernel.XXXXXX")" || {
+        echo "Could not create a private download directory." >&2
+        return 1
+    }
+    tmp="$tmp_dir/vmlinux.partial"
 
     if [ -f "$dest" ]; then
         if verify_sha256 "$dest" "$expected"; then
@@ -276,12 +289,13 @@ fetch_guest_kernel() {
 
     echo "Fetching pinned guest kernel (${arch}, ${KASTELLAN_GUEST_KERNEL_VERSION})..."
     if ! curl -fL --retry 3 -o "$tmp" "$url"; then
-        rm -f "$tmp"
+        rm -rf "$tmp_dir"
         echo "Guest-kernel download failed: $url" >&2
         return 1
     fi
     if ! verify_sha256 "$tmp" "$expected"; then
-        quarantined="$(_kastellan_quarantine "$tmp" "$dest")" || return 1
+        quarantined="$(_kastellan_quarantine "$tmp" "$dest")" || { rm -rf "$tmp_dir"; return 1; }
+        rm -rf "$tmp_dir"
         echo "Downloaded guest kernel does not match the recorded sha256." >&2
         echo "  source:      $url" >&2
         echo "  quarantined: $quarantined" >&2
@@ -290,9 +304,17 @@ fetch_guest_kernel() {
     # Verified. Only now does it get the name a build will trust — and if
     # even this fails, say so rather than returning a bare non-zero: the
     # bytes were good, so "download failed" would be the wrong story.
-    if ! mv -f "$tmp" "$dest"; then
-        echo "Verified guest kernel, but could not move it into place: $dest" >&2
+    # `install` (not `mv`/`cp`) so the destination is created fresh with an
+    # explicit mode: a pre-existing symlink at $dest is replaced, never
+    # followed. Ownership stays with the caller (root under the privileged
+    # installer, the operator under fetch-guest-kernel.sh).
+    if [ -L "$dest" ]; then
+        rm -f "$dest"
+    fi
+    if ! install -m 0644 "$tmp" "$dest"; then
+        echo "Verified guest kernel, but could not install it into place: $dest" >&2
         echo "  it is still at: $tmp" >&2
         return 1
     fi
+    rm -rf "$tmp_dir"
 }

@@ -25,6 +25,9 @@ tokio        = { version = "1",    features = ["rt", "net", "io-util", "time", "
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls       = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
 rustls-pki-types = { version = "1", features = ["std"] }
+# Direct use of the path builder so a pin can be checked against the VALIDATED
+# path (security audit 2026-09-02, egress F1); same version rustls itself uses.
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 rcgen        = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 webpki-roots = "1"
 # POSIX recv(MSG_PEEK) for the non-consuming first-tunnel-byte peek (std's

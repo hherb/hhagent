@@ -124,6 +124,10 @@ fn main() -> ExitCode {
         #[cfg(target_os = "linux")]
         "seccomp-unshare" => probe_unshare(),
         #[cfg(target_os = "linux")]
+        "seccomp-clone-newuser" => probe_clone_newuser(),
+        #[cfg(target_os = "linux")]
+        "seccomp-clone3" => probe_clone3(),
+        #[cfg(target_os = "linux")]
         "seccomp-mount" => probe_mount(),
         #[cfg(target_os = "linux")]
         "seccomp-socket" => probe_socket(),
@@ -197,6 +201,46 @@ fn probe_unshare() -> ExitCode {
     let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
     eprintln!("UNEXPECTED: unshare returned rc={rc} errno={}", errno());
     ExitCode::from(0) // intentionally 0 — test interprets "any exit at all" as failure
+}
+
+/// `clone(CLONE_NEWUSER)` — the same fresh user namespace `unshare` would
+/// mint, spelled as the syscall that *is* in the allow-list. The flags
+/// condition must kill it exactly like `probe_unshare` (security audit
+/// 2026-09-02).
+#[cfg(target_os = "linux")]
+fn probe_clone_newuser() -> ExitCode {
+    // SAFETY: raw clone(2) with a NULL child stack is the fork idiom; the
+    // flag set asks for a new user namespace. Under the filter this never
+    // returns — reaching the eprintln means the guard is missing.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_clone,
+            (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    eprintln!("UNEXPECTED: clone(CLONE_NEWUSER) returned rc={rc} errno={}", errno());
+    ExitCode::from(0) // intentionally 0 — test interprets "any exit at all" as failure
+}
+
+/// `clone3` must answer ENOSYS (so libc falls back to `clone`, where the
+/// flags condition applies) — not SIGSYS, and not run. Exit 0 iff ENOSYS.
+#[cfg(target_os = "linux")]
+fn probe_clone3() -> ExitCode {
+    // SAFETY: a NULL args pointer with size 0 earns EINVAL from a kernel that
+    // actually runs the syscall; the overlay must answer ENOSYS first.
+    let rc = unsafe { libc::syscall(libc::SYS_clone3, 0 as libc::c_long, 0 as libc::c_long) };
+    let e = errno();
+    if rc == -1 && e == libc::ENOSYS {
+        eprintln!("clone3 -> ENOSYS (overlay active)");
+        ExitCode::from(0)
+    } else {
+        eprintln!("UNEXPECTED: clone3 returned rc={rc} errno={e}");
+        ExitCode::from(2)
+    }
 }
 
 #[cfg(target_os = "linux")]

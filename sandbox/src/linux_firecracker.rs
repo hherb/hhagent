@@ -129,7 +129,10 @@ fn make_spawn_dir() -> Result<std::path::PathBuf, SandboxError> {
         std::process::id(),
         seq
     ));
-    std::fs::create_dir_all(&dir)
+    // Exclusive + 0700 (audit 2026-09-02, S2): this dir receives fc.json (the
+    // worker env, kernel + rootfs paths), the vsock UDS and the drive images;
+    // `create_dir_all` would have adopted a pre-created directory of any owner.
+    crate::private_dir::create_private_dir(&dir)
         .map_err(|e| SandboxError::Backend(format!("create per-spawn dir {dir:?}: {e}")))?;
     Ok(dir)
 }
@@ -218,7 +221,7 @@ impl SandboxBackend for LinuxFirecracker {
         build_persistent_image(&mut plan)?;
         let config_path = run_dir.join("fc.json");
         let log_path = run_dir.join("fc.log");
-        std::fs::write(&config_path, render_firecracker_config(&plan).to_string())
+        write_private_new(&config_path, render_firecracker_config(&plan).to_string().as_bytes())
             .map_err(|e| SandboxError::Backend(format!("write fc config: {e}")))?;
         let confine = confinement_from_env(
             std::env::var("KASTELLAN_MICROVM_CONFINE_VMM").ok().as_deref(),
@@ -261,12 +264,22 @@ impl SandboxBackend for LinuxFirecracker {
         // VM's run-dir from a dead one (#362). Best-effort: a write failure only
         // means this one dir won't be swept if its launcher is later SIGKILLed;
         // the launcher's own teardown still cleans the dir on a graceful exit.
-        let _ = std::fs::write(
-            run_dir.join(cleanup::LAUNCHER_PID_FILE),
-            child.id().to_string(),
+        let _ = write_private_new(
+            &run_dir.join(cleanup::LAUNCHER_PID_FILE),
+            child.id().to_string().as_bytes(),
         );
         Ok(child)
     }
+}
+
+/// `O_CREAT|O_EXCL` + 0600 write of a file inside the per-spawn run dir — the
+/// dir is exclusively ours, and this refuses to follow anything at the path
+/// anyway (audit 2026-09-02, S2).
+fn write_private_new(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = crate::private_dir::create_private_file(path)?;
+    f.write_all(bytes)?;
+    f.flush()
 }
 
 #[cfg(all(test, target_os = "linux"))]

@@ -37,6 +37,10 @@ pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
         .create(true)
         .truncate(true)
         .mode(0o600)
+        // Never write a secret through a symlink (audit 2026-09-02, F5): the
+        // parent dir is verified owner-private before this runs, and this is
+        // the second lock on the same door.
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     f.write_all(bytes)
 }

@@ -90,6 +90,26 @@ use error::{truncate_for_error, ERROR_BODY_CAP};
 /// Every other read failure keeps a placeholder. The old wording blamed
 /// UTF-8, which is essentially never the cause — `Response::text`
 /// decodes lossily and fails on transport, not on encoding.
+/// Hard cap on a model/embedding/`/props` response body. A backend (or an
+/// on-path party, when the base URL is plain HTTP) answering `200` with an
+/// unbounded body would otherwise be buffered whole by `Response::text` inside
+/// the one process that holds the vault and the DB role (security audit
+/// 2026-09-02, router F1). 64 MiB is far above any legitimate completion or
+/// embedding batch and matches the protocol crate's record cap.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read the body as (lossy) UTF-8 text, refusing to buffer past `cap` bytes.
+async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Result<String, RouterError> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(RouterError::BodyTooLarge { cap });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 async fn error_body(resp: reqwest::Response) -> Result<String, RouterError> {
     match resp.text().await {
         Ok(body) => Ok(body),
@@ -149,6 +169,14 @@ impl Router {
     ) -> Result<Self, RouterError> {
         let http = reqwest::Client::builder()
             .timeout(config.timeout)
+            // The router is the core's sole model egress and speaks to the
+            // operator-configured URL directly. Never let an ambient
+            // `HTTP(S)_PROXY`/`ALL_PROXY` in the daemon environment silently
+            // re-route every prompt (the whole system prompt — recalled
+            // memories included) through an unlisted host (security audit
+            // 2026-09-02, router F2). A proxy, if ever wanted, is a config
+            // decision, not an environment accident.
+            .no_proxy()
             // Connect timeout shorter than the overall timeout so a
             // dead local-backend port surfaces fast — connection
             // refused on the OpenAI-compat URL is the most common
@@ -274,7 +302,7 @@ impl Router {
             });
         }
 
-        let body = resp.text().await?;
+        let body = read_body_capped(resp, MAX_RESPONSE_BODY_BYTES).await?;
         let decoded: EmbeddingResponse = serde_json::from_str(&body).map_err(|source| {
             RouterError::DecodeResponse {
                 source,
@@ -332,7 +360,7 @@ impl Router {
             });
         }
 
-        let body = resp.text().await?;
+        let body = read_body_capped(resp, MAX_RESPONSE_BODY_BYTES).await?;
         serde_json::from_str(&body).map_err(|source| RouterError::DecodeProps {
             source,
             body: truncate_for_error(&body, ERROR_BODY_CAP),
@@ -379,7 +407,7 @@ impl Router {
             });
         }
 
-        let body = resp.text().await?;
+        let body = read_body_capped(resp, MAX_RESPONSE_BODY_BYTES).await?;
         let decoded: ChatResponse = serde_json::from_str(&body).map_err(|source| {
             RouterError::DecodeResponse {
                 source,

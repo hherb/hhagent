@@ -120,6 +120,7 @@ fn short_fetch_reason(e: &FetchError) -> String {
     match e {
         // HostDenied/NonHttps can fire on the initial hit URL (hop 0) as well as
         // on a redirect target, so the reason says "target", not "redirect".
+        FetchError::PortDenied(p) => format!("fetch-failed: port {p} refused (https on 443 only)"),
         FetchError::HostDenied(h) => format!("fetch-failed: target host {h} off-allowlist"),
         FetchError::NonHttps(s) => format!("fetch-failed: target scheme {s} not https"),
         FetchError::TooManyRedirects => "fetch-failed: too many redirects".to_string(),

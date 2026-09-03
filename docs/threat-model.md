@@ -85,8 +85,8 @@ the best containment available without entitlements.
 | Layer | Purpose |
 | ----- | ------- |
 | Policy gate (core) | Static allow/deny per `(tool, args, data class)` before any tool spawn |
-| Parent-side sandbox (bwrap / Seatbelt) | Namespace isolation, FS bind-mount, network unshare. Applied by `core::tool_host`. |
-| Worker-side sandbox (Landlock + seccomp-bpf) | Second, finer kernel filter installed by the worker on itself via [`kastellan-worker-prelude`](../workers/prelude/). One-way: cannot be relaxed once `restrict_self`/`apply_filter` returns. |
+| Parent-side sandbox (bwrap / Seatbelt) | Namespace isolation, FS bind-mount, network unshare; `--disable-userns` refuses nested user namespaces (2026-09-02). Applied by `core::tool_host`. |
+| Worker-side sandbox (Landlock + seccomp-bpf) | Second, finer kernel filter installed by the worker on itself via [`kastellan-worker-prelude`](../workers/prelude/). One-way: cannot be relaxed once `restrict_self`/`apply_filter` returns. `clone` is admitted only without namespace flags and `clone3` answers `ENOSYS`, so every spelling of "new namespace" is refused, not just `unshare`; Landlock is per-thread, so networked workers construct their transports *after* lockdown (`serve_stdio_with`) and a missing profile or an unenforceable ruleset is an error, never a silent skip (all 2026-09-02). |
 | **Optional separate-kernel micro-VM** (opt-in, Linux: Firecracker `FirecrackerVm`; macOS: Apple `container`) | A throwaway **guest kernel** under KVM. **What it replaces vs. what it keeps (slice 1):** the micro-VM is a worker's *parent-side* sandbox backend — it is selected *instead of* the bwrap/Seatbelt row for that one worker (a worker carries exactly one backend), so for a VM-mode worker bwrap is **not** also applied. It does **not** replace the *worker-side* row: the unchanged worker still installs its own Landlock + seccomp-bpf on itself inside the guest. Net effect is strictly stronger than bwrap: VM-grade isolation **+** the worker self-filter, with `mem_mb` enforced by the hypervisor (closing the macOS-Seatbelt memory gap and adding a blast wall on Linux). A kernel-level escape in the worker-side seccomp/Landlock layer still has to cross the guest-kernel/VM boundary. (Stacking the VM *on top of* host bwrap — VM-in-bwrap — is a later slice; today it is VM-instead-of-bwrap.) **Opt-in per worker, not the default** — `python-exec`, `web-fetch`, `web-search`, `web-research` and `browser-driver` each opt in via `KASTELLAN_{PYTHON_EXEC,WEB_FETCH,WEB_SEARCH,WEB_RESEARCH,BROWSER_DRIVER}_USE_MICROVM=1` (Linux). Net egress works inside the VM: a networked VM worker reaches its force-routed egress sidecar over a vsock transport, so VM mode is no longer `Net::Deny`-only. The guest kernel is sha256-pinned and re-verified at **every VM boot** ([`sandbox::guest_kernel_pin`](../sandbox/src/guest_kernel_pin.rs), fail-closed). Applied by [`sandbox::linux_firecracker`](../sandbox/src/linux_firecracker.rs) / `sandbox::macos_container`. Scope is unchanged for non-opted workers (still bwrap/Seatbelt). |
 | Resource caps (Linux: cgroup v2 via `systemd-run --user --scope`) | Hard `MemoryMax` + `MemorySwapMax=0` from `policy.mem_mb`; defense-in-depth `CPUQuota=200%` and `TasksMax=64` defaults. Wraps `bwrap` so the cgroup is in place before the worker namespace is created. Applied by [`sandbox::linux_cgroup`](../sandbox/src/linux_cgroup.rs). |
 | Egress proxy       | Per-worker host:port allowlist, SSRF/IP-pinning, TLS-intercept leak scan, SPKI pinning, audit-log every request. **All four slices built** (`workers/egress-proxy`) and **force-routed by default** in the supervised deployment (`KASTELLAN_EGRESS_FORCE_ROUTING=1`) — see "Network egress" below. |
@@ -97,7 +97,7 @@ The two sandbox rows together implement the "parent denies + child denies again"
 
 ### Secrets in the audit log
 
-Redeemed secret plaintext never appears in the request snapshot (`payload.req` of any `tool:<name>` row, snapshotted *before* `secret://<8-hex>` substitution — issue #147) nor in any `actor='policy'` row (issue #146 / Item 31). It does **not** follow that the audit log is free of secrets: a worker that is legitimately handed a secret may echo it into its own output, which lands in `payload.result`. That field is the worker's response, not the request, and is out of scope of the redaction invariant — the worker is the authorized consumer, so an operator with `audit_log` read access can recover any secret a worker chose to emit. Containing worker-emitted plaintext is the egress proxy's and the injection guard's job, not the audit redactor's.
+Redeemed secret plaintext never appears in the request snapshot (`payload.req` of any `tool:<name>` row, snapshotted *before* `secret://<8-hex>` substitution — issue #147) nor in any `actor='policy'` row (issue #146 / Item 31). Since the [2026-09-02 audit](security-audit-2026-09-02.md) (finding H1) the dispatch chokepoint also scrubs every secret redeemed for a call out of the worker's **response** — the `Ok` value *and* an `RpcError`'s message/data — before either reaches `payload.result` / `payload.err`, the JSONL mirror, or the planner's step detail. The scrub matches verbatim, contiguous bytes only (`leak-scan`), so an encoded or split secret still evades it; it is the floor under a per-tool secret policy, not a substitute for one, and worker-emitted plaintext remains the egress proxy's and the injection guard's problem on the network side.
 
 ### User data in the daemon log
 
@@ -297,7 +297,43 @@ Already shipped:
 - `sandbox/tests/linux_smoke.rs::worker_with_low_mem_max_is_oom_killed` — a worker that allocates 256 MiB under `MemoryMax=32M` is OOM-killed by the kernel. Closes the cgroup-resource layer.
 - `web-fetch` attempts a non-allowlisted host → blocked at the egress proxy boundary (`workers/egress-proxy` `decide_blocks_off_allowlist` / `handle_conn_reports_block_for_off_allowlist`), with the worker's own layer-2 refusal pinned by `core/tests/web_fetch_e2e.rs::host_outside_allowlist_is_denied`.
 
+### Memory-write injection: the agent-raised L1 path
+
+Adversary #6's "less-trusted code path" exists today: the planner's own
+`l1_insight` is persisted to `memories` at layer 1 and rendered into every later
+task's `<l1_insights>` block. Since the 2026-09-02 audit (H2) an agent-raised
+body is screened by the strict injection catalogue at promotion (refused and
+audited as `l1.injection_blocked`) and every L1 row is screened again at
+prompt-assembly time, alongside the framing escape the July audit added; the
+planner prompt states that these blocks are data, not instructions. Operator
+rows (`memory l1 add`) are trusted at write time but still pass the load-time
+screen.
+
+### Shared-host adjacency: per-spawn directories
+
+Every per-spawn directory the daemon mints under the temp root (egress
+sidecar scratch, broker scratch, the Matrix channel's, a Firecracker run dir)
+is created **exclusively** with mode `0700` and verified owner-private
+(`kastellan_sandbox::private_dir`), and the secret-bearing files inside them
+(`secret_hashes.json`, `fc.json`, VM images) are created `O_EXCL` `0600`. A
+pre-planted name from another local uid fails the spawn closed instead of
+being adopted — the name predictability itself is kept for the orphan sweeps
+and costs an attacker at most one failed spawn of ours.
+
+### Trusted sidecars (brokers) — an open trust assumption
+
+`embed-broker` and `search-broker` run under `Net::Allowlist` with no OS-level
+enforcement (bwrap `--share-net`) and are not force-routed through an egress
+sidecar. A broker compromised through a malicious embedding or search response
+reaches the whole host network. This is a documented gap pending its own
+egress-sidecar slice; until then the brokers' backends are trusted inputs.
+
 ## Open items
 
 - Whether `python-exec` should default to micro-VM rather than seccomp/Seatbelt-only.
-- Concrete `setrlimit` budgets per worker class.
+- Concrete `setrlimit` budgets per worker class (macOS has only `RLIMIT_CPU`
+  worker-side; Seatbelt enforces no memory/pids cap).
+- Force-routing (`KASTELLAN_EGRESS_FORCE_ROUTING`) is opt-in; making it the
+  default with an explicit opt-out is recommended before release.
+- Route the brokers through egress sidecars (above).
+- Bind `secret://` refs to an allowed-tool set at `materialize`.

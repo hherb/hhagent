@@ -1,13 +1,17 @@
-//! python-exec result secret-scrub (design 2026-06-17).
+//! Worker-output secret-scrub (design 2026-06-17; widened 2026-09-02).
 //!
-//! `python-exec` runs agent-authored code, so — unlike the curated Rust workers
-//! whose result-plaintext is trusted by design (#147) — we do NOT trust its
-//! output to handle a materialized secret responsibly. It is `Net::Deny`, so its
-//! returned stdout/stderr is its only output channel (the direct analog of
-//! egress). We scan that output for the fingerprints of the secrets materialized
-//! into THIS dispatch's params and redact them before the result is screened,
-//! audited, or shown to the operator. Symmetric with egress slice #3b, which
-//! scans force-routed net workers' egress.
+//! Originally `python-exec`-only: it runs agent-authored code, so — unlike the
+//! curated Rust workers, whose result-plaintext #147 trusted by design — its
+//! output could not be trusted to handle a materialized secret responsibly.
+//! The 2026-09-02 security audit (finding H1) showed the trust argument was
+//! about the *worker*, not about where its bytes go: a curated worker's `Ok`
+//! value and, above all, its `RpcError` message are rendered into the planner
+//! prompt and `audit_log`, so shell-exec's honest `argv[0] "…" not in
+//! allowlist` denial handed a substituted `secret://` ref's plaintext straight
+//! to the LLM. The scrub therefore now runs for **every** tool, on both the
+//! success value and the error, keyed on the fingerprints of the secrets
+//! materialized into THIS dispatch's params. Symmetric with egress slice #3b,
+//! which scans force-routed net workers' egress.
 //!
 //! Pulled into a sibling (like `egress_provision.rs`) so `tool_host.rs` stays
 //! near the 500-LOC cap and the pure pieces are unit-testable with a fake sink.
@@ -17,16 +21,6 @@ use serde_json::Value;
 
 use super::audit_sink::AuditSink;
 use crate::secrets::{collect_refs_in_params, Vault};
-
-/// True iff `tool`'s result must be scrubbed of materialized-secret plaintext.
-/// Only `python-exec` opts in (it runs agent-authored code). The dispatch
-/// chokepoint only carries the tool name, and there is exactly one such worker
-/// today, so the gate keys on the name rather than threading a manifest flag
-/// through the dispatch signature (YAGNI; revisit if a second untrusted-code
-/// worker appears).
-pub(crate) fn worker_redacts_output(tool: &str) -> bool {
-    tool == crate::workers::python_exec::TOOL_NAME
-}
 
 /// Fingerprints of every scannable secret materialized into this dispatch.
 /// `req_for_audit` is the PRE-substitution snapshot, so its `secret://` refs are
@@ -52,19 +46,48 @@ pub(crate) fn scrub_result_value(result: &mut Value, fps: &[SecretFingerprint]) 
     hits
 }
 
-fn scrub_value(v: &mut Value, fps: &[SecretFingerprint], hits: &mut Vec<RedactHit>) {
-    match v {
-        Value::String(s) => {
-            let outcome = redact(s.as_bytes(), fps);
-            if !outcome.hits.is_empty() {
-                // The input was valid UTF-8 and the marker is ASCII, so the
-                // redacted bytes are valid UTF-8; the lossy fallback is purely
-                // defensive and never expected to fire.
-                *s = String::from_utf8(outcome.bytes)
-                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-                hits.extend(outcome.hits);
+/// Scrub redeemed-secret plaintext out of a failed call's error before it is
+/// rendered anywhere (audit `payload.err`, the planner-bound step `detail`).
+/// Only the variants that carry worker-authored bytes are touched: an
+/// `RpcError`'s `message` + `data`, and the `got` id of an id mismatch. The
+/// `Io`/`Decode`/`EarlyExit`/`ResponseTooLarge` variants carry OS/serde text
+/// and the cap, never worker payload.
+pub(crate) fn scrub_client_error(
+    err: &mut kastellan_protocol::client::ClientError,
+    fps: &[SecretFingerprint],
+) -> Vec<RedactHit> {
+    use kastellan_protocol::client::ClientError;
+    let mut hits = Vec::new();
+    match err {
+        ClientError::Rpc(rpc) => {
+            scrub_string(&mut rpc.message, fps, &mut hits);
+            if let Some(data) = rpc.data.as_mut() {
+                scrub_value(data, fps, &mut hits);
             }
         }
+        ClientError::IdMismatch { got, .. } => scrub_value(got, fps, &mut hits),
+        ClientError::Io(_)
+        | ClientError::Decode(_)
+        | ClientError::EarlyExit
+        | ClientError::ResponseTooLarge { .. } => {}
+    }
+    hits
+}
+
+fn scrub_string(s: &mut String, fps: &[SecretFingerprint], hits: &mut Vec<RedactHit>) {
+    let outcome = redact(s.as_bytes(), fps);
+    if !outcome.hits.is_empty() {
+        // The input was valid UTF-8 and the marker is ASCII, so the redacted
+        // bytes are valid UTF-8; the lossy fallback is purely defensive.
+        *s = String::from_utf8(outcome.bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+        hits.extend(outcome.hits);
+    }
+}
+
+fn scrub_value(v: &mut Value, fps: &[SecretFingerprint], hits: &mut Vec<RedactHit>) {
+    match v {
+        Value::String(s) => scrub_string(s, fps, hits),
         Value::Array(a) => a.iter_mut().for_each(|e| scrub_value(e, fps, hits)),
         Value::Object(o) => o.values_mut().for_each(|e| scrub_value(e, fps, hits)),
         _ => {}
@@ -128,10 +151,45 @@ mod tests {
     }
 
     #[test]
-    fn gate_is_on_only_for_python_exec() {
-        assert!(worker_redacts_output("python-exec"));
-        assert!(!worker_redacts_output("web-fetch"));
-        assert!(!worker_redacts_output("shell-exec"));
+    fn scrubs_secret_out_of_an_rpc_error_message_and_data() {
+        // The H1 shape: shell-exec's POLICY_DENIED echoed the (substituted)
+        // argv[0] back — i.e. the plaintext — in `message`.
+        use kastellan_protocol::client::ClientError;
+        use kastellan_protocol::{codes, RpcError};
+        let secret = b"super-secret-token-123";
+        let mut err = ClientError::Rpc(
+            RpcError::new(codes::POLICY_DENIED, "argv[0] \"super-secret-token-123\" not in allowlist")
+                .with_data(serde_json::json!({"argv": ["super-secret-token-123", "-la"]})),
+        );
+        let hits = scrub_client_error(&mut err, &[fp(secret)]);
+        assert_eq!(hits.len(), 2, "message and data each carried the secret once");
+        let rendered = err.to_string();
+        assert!(!rendered.contains("super-secret-token-123"), "rendered: {rendered}");
+        assert!(rendered.contains("[redacted:"), "rendered: {rendered}");
+        let ClientError::Rpc(rpc) = &err else { panic!("variant must be preserved") };
+        assert!(!serde_json::to_string(rpc.data.as_ref().unwrap()).unwrap().contains("super-secret"));
+        assert_eq!(rpc.code, codes::POLICY_DENIED, "code must survive the scrub");
+    }
+
+    #[test]
+    fn scrubs_secret_out_of_a_mismatched_id_echo() {
+        use kastellan_protocol::client::ClientError;
+        let secret = b"super-secret-token-123";
+        let mut err = ClientError::IdMismatch {
+            expected: serde_json::json!(1),
+            got: serde_json::json!("super-secret-token-123"),
+        };
+        let hits = scrub_client_error(&mut err, &[fp(secret)]);
+        assert_eq!(hits.len(), 1);
+        assert!(!err.to_string().contains("super-secret-token-123"));
+    }
+
+    #[test]
+    fn non_payload_error_variants_are_left_alone() {
+        use kastellan_protocol::client::ClientError;
+        let mut err = ClientError::EarlyExit;
+        assert!(scrub_client_error(&mut err, &[fp(b"super-secret-token-123")]).is_empty());
+        assert!(matches!(err, ClientError::EarlyExit));
     }
 
     #[test]

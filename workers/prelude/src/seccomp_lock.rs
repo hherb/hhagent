@@ -55,6 +55,15 @@
 //! user namespace. Same for `mount`: bwrap removed the capability, but
 //! seccomp removes the syscall entry point too.
 //!
+//! That guarantee has to cover every spelling of "new namespace", not just
+//! `unshare`: `clone(CLONE_NEWUSER | …)` mints the same namespace, so the
+//! main filter admits `clone` only when its flags carry no
+//! [`NAMESPACE_CLONE_FLAGS`] bit, and `clone3` — whose flags sit in a struct
+//! seccomp cannot read — is answered `ENOSYS` by an overlay filter
+//! ([`build_clone3_enosys_bpf`]) so libc falls back to the filtered `clone`.
+//! Until the 2026-09-02 audit both were unconditional allows, which made the
+//! `unshare` kill decorative.
+//!
 //! ## Layout
 //!
 //! Split 2026-07-06 to stay under the 500-LOC file cap; item bodies are
@@ -73,7 +82,8 @@
 use std::collections::BTreeMap;
 
 use seccompiler::{
-    apply_filter_all_threads, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
+    apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
+    SeccompCondition, SeccompFilter, SeccompRule, TargetArch,
 };
 
 use crate::{LockdownError, SeccompReport};
@@ -81,7 +91,7 @@ use crate::{LockdownError, SeccompReport};
 mod allow_lists;
 pub use allow_lists::{
     BASE_ALLOW, BASE_ALLOW_X86_64_LEGACY, BROWSER_CLIENT_ADDITIONS, BROWSER_IO_URING,
-    MATRIX_CLIENT_ADDITIONS, ML_CLIENT_ADDITIONS, NET_CLIENT_ADDITIONS,
+    MATRIX_CLIENT_ADDITIONS, ML_CLIENT_ADDITIONS, NAMESPACE_CLONE_FLAGS, NET_CLIENT_ADDITIONS,
 };
 
 #[cfg(test)]
@@ -162,7 +172,23 @@ impl Profile {
 
 /// Read `KASTELLAN_SECCOMP_PROFILE` and apply the corresponding filter.
 pub fn apply_from_env() -> Result<SeccompReport, LockdownError> {
-    let raw = std::env::var("KASTELLAN_SECCOMP_PROFILE").unwrap_or_else(|_| "none".to_string());
+    // Fail CLOSED on an absent variable (security audit 2026-09-02, F2): the
+    // core always derives `KASTELLAN_SECCOMP_PROFILE` for every spawn
+    // (`tool_host::lockdown_env`), so "not set" means a spawn path that
+    // forgot the lockdown env — or a micro-VM cmdline the guest could not
+    // decode — not an operator choice. Opting out is still one explicit
+    // token away (`none`), which is what the hermetic worker tests set.
+    let raw = match std::env::var("KASTELLAN_SECCOMP_PROFILE") {
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => {
+            return Err(LockdownError::Env(
+                "KASTELLAN_SECCOMP_PROFILE is not set; the spawn path must derive it \
+                 (tool_host::derive_lockdown_env), or set it to 'none' to opt out explicitly"
+                    .into(),
+            ))
+        }
+        Err(e) => return Err(LockdownError::Env(format!("KASTELLAN_SECCOMP_PROFILE: {e}"))),
+    };
     match Profile::parse(&raw)? {
         None => Ok(SeccompReport::Disabled),
         Some(p) => apply(p).map(|()| SeccompReport::Installed),
@@ -206,7 +232,15 @@ pub fn apply_from_env() -> Result<SeccompReport, LockdownError> {
 /// EPERM/KILL semantics are identical either way.
 pub fn apply(profile: Profile) -> Result<(), LockdownError> {
     set_no_new_privs()?;
-    // For BrowserClient, install the permissive io_uring->EPERM filter FIRST so
+    // Every profile: install the clone3->ENOSYS overlay FIRST (its Allow
+    // default permits the SYS_seccomp of the later installs). This is what
+    // makes the main filter's `clone` flags condition airtight — see
+    // `build_clone3_enosys_bpf` (security audit 2026-09-02).
+    let clone3 = build_clone3_enosys_bpf()?;
+    apply_filter_all_threads(&clone3).map_err(|e| {
+        LockdownError::Seccomp(format!("apply_filter_all_threads (clone3 ENOSYS): {e}"))
+    })?;
+    // For BrowserClient, install the permissive io_uring->EPERM filter next so
     // its Allow-default permits the SYS_seccomp of the main filter's install.
     if matches!(profile, Profile::BrowserClient) {
         let io_uring = build_io_uring_eperm_bpf()?;
@@ -228,6 +262,13 @@ pub fn build_bpf(profile: Profile) -> Result<BpfProgram, LockdownError> {
     let allow_syscalls = allow_list_for(profile);
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     for nr in allow_syscalls {
+        if nr == libc::SYS_clone {
+            // `clone` is admitted only without namespace flags; a `clone`
+            // carrying any bit of `NAMESPACE_CLONE_FLAGS` falls through to
+            // the mismatch action (KillProcess) exactly like `unshare` does.
+            rules.insert(nr, vec![clone_without_namespace_flags_rule()?]);
+            continue;
+        }
         // Empty rule vec = unconditional match for that syscall number.
         // The match action is the filter's `match_action` (Allow, below).
         rules.insert(nr, Vec::new());
@@ -241,6 +282,54 @@ pub fn build_bpf(profile: Profile) -> Result<BpfProgram, LockdownError> {
     .map_err(|e| LockdownError::Seccomp(format!("SeccompFilter::new: {e}")))?;
     BpfProgram::try_from(filter)
         .map_err(|e| LockdownError::Seccomp(format!("BpfProgram::try_from: {e}")))
+}
+
+/// The `clone(2)` rule: match (and therefore Allow) only when the flags
+/// argument carries **no** namespace bit. `MaskedEq(mask)` compares
+/// `arg & mask` against the value, so `(flags & NAMESPACE_CLONE_FLAGS) == 0`
+/// is the match; any `CLONE_NEW*` bit makes the rule miss and the syscall
+/// takes the filter's mismatch action (KillProcess). The flags are argument 0
+/// of the raw syscall on both x86_64 and aarch64.
+fn clone_without_namespace_flags_rule() -> Result<SeccompRule, LockdownError> {
+    let no_namespace_bits = SeccompCondition::new(
+        0,
+        SeccompCmpArgLen::Qword,
+        SeccompCmpOp::MaskedEq(NAMESPACE_CLONE_FLAGS),
+        0,
+    )
+    .map_err(|e| LockdownError::Seccomp(format!("SeccompCondition::new (clone flags): {e}")))?;
+    SeccompRule::new(vec![no_namespace_bits])
+        .map_err(|e| LockdownError::Seccomp(format!("SeccompRule::new (clone flags): {e}")))
+}
+
+/// Pure builder: the overlay filter every profile installs before the main
+/// one — `clone3` → `Errno(ENOSYS)`, everything else `Allow` (deferring to the
+/// main filter).
+///
+/// Why: `clone3(2)` takes its flags inside a `struct clone_args` in user
+/// memory, which a BPF seccomp filter cannot read, so the namespace-flag
+/// condition on `clone` (see [`build_bpf`]) would be trivially bypassed by
+/// spelling the same call as `clone3`. Answering `ENOSYS` — rather than
+/// killing — is the standard treatment (runc, systemd and Docker's default
+/// profile do the same): glibc ≥ 2.34 and musl detect `ENOSYS` from `clone3`
+/// and fall back to `clone`, where the condition applies, so `fork`,
+/// `pthread_create` and `posix_spawn` keep working unchanged. `clone3` stays
+/// in every allow-list so the main filter answers `Allow`; the kernel keeps
+/// the highest-precedence verdict across filters (`ERRNO` outranks `ALLOW`),
+/// so the net result is `ENOSYS`, never `SIGSYS`.
+pub fn build_clone3_enosys_bpf() -> Result<BpfProgram, LockdownError> {
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    rules.insert(libc::SYS_clone3, Vec::new());
+    const ENOSYS: u32 = libc::ENOSYS as u32;
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow, // default: defer to the main filter
+        SeccompAction::Errno(ENOSYS),
+        target_arch()?,
+    )
+    .map_err(|e| LockdownError::Seccomp(format!("SeccompFilter::new (clone3): {e}")))?;
+    BpfProgram::try_from(filter)
+        .map_err(|e| LockdownError::Seccomp(format!("BpfProgram::try_from (clone3): {e}")))
 }
 
 /// Pure builder: the **second** [`Profile::BrowserClient`] filter — a tiny

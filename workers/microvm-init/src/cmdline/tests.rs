@@ -65,22 +65,25 @@ fn parse_env_cmdline_decodes_host_fixture() {
     // fixture identical in both crates' tests.
     let cmdline = "console=ttyS0 panic=1 kastellan.env=413d310a423d32";
     assert_eq!(
-        parse_env_cmdline(cmdline),
+        parse_env_cmdline(cmdline).unwrap(),
         vec![("A".to_string(), "1".to_string()), ("B".to_string(), "2".to_string())]
     );
 }
 
 #[test]
 fn parse_env_cmdline_missing_token_is_empty() {
-    assert!(parse_env_cmdline("console=ttyS0 panic=1").is_empty());
+    assert!(parse_env_cmdline("console=ttyS0 panic=1").unwrap().is_empty());
 }
 
 #[test]
-fn parse_env_cmdline_malformed_hex_is_empty() {
-    // Odd length and non-hex both fail closed to no env (fail-safe → caller
-    // keeps the baked defaults).
-    assert!(parse_env_cmdline("kastellan.env=abc").is_empty());
-    assert!(parse_env_cmdline("kastellan.env=zz").is_empty());
+fn parse_env_cmdline_malformed_hex_is_an_error() {
+    // Odd length and non-hex are ERRORS (audit 2026-09-02, F2): an empty env
+    // would boot a worker with its lockdown missing, which is the one thing
+    // "fail-safe" must not mean here.
+    assert!(parse_env_cmdline("kastellan.env=abc").is_err());
+    assert!(parse_env_cmdline("kastellan.env=zz").is_err());
+    // Valid hex that is not UTF-8 is an error too.
+    assert!(parse_env_cmdline("kastellan.env=ff").is_err());
 }
 
 #[test]
@@ -89,7 +92,7 @@ fn parse_env_cmdline_value_may_contain_equals() {
     // = bytes 4b 3d 5b 22 61 3d 62 22 5d → one whitespace-free token.
     let cmdline = "console=ttyS0 kastellan.env=4b3d5b22613d62225d";
     assert_eq!(
-        parse_env_cmdline(cmdline),
+        parse_env_cmdline(cmdline).unwrap(),
         vec![("K".to_string(), "[\"a=b\"]".to_string())]
     );
 }

@@ -11,7 +11,6 @@
 //! validator (the proxy's) avoids drift.
 
 use std::collections::BTreeMap;
-use std::collections::HashSet;
 
 /// Prefix every pin string must carry (RFC-7469 `sha256/<base64-SPKI>`).
 const PIN_PREFIX: &str = "sha256/";
@@ -89,6 +88,18 @@ pub fn host_of_endpoint(endpoint: &str) -> &str {
     }
 }
 
+/// Mirror of `kastellan_worker_web_common::allowlist::HostMatch::matches`, the
+/// proxy's own rule: an entry is exact, or — with a leading dot — a suffix
+/// that admits the bare domain and every subdomain at a label boundary. Kept
+/// as a local mirror (web-common is a dev-only dependency of the core) and
+/// pinned to the proxy's semantics by the tests below.
+fn allowlist_entry_admits(entry_host: &str, pinned_host: &str) -> bool {
+    match entry_host.strip_prefix('.') {
+        Some(d) if !d.is_empty() => pinned_host == d || pinned_host.ends_with(&format!(".{d}")),
+        _ => entry_host == pinned_host,
+    }
+}
+
 /// Select the subset of `map` whose hosts appear in this worker's `allowlist`,
 /// serialized back to the proxy's `{host:[...]}` JSON. Returns `None` when no
 /// pinned host is in the allowlist, so the sidecar gets no pin env and the
@@ -97,12 +108,23 @@ pub fn host_of_endpoint(endpoint: &str) -> &str {
 /// Least-privilege: a worker's sidecar only learns pins for hosts that worker
 /// may actually dial.
 pub fn select_pins_for_allowlist(map: &CertPinMap, allowlist: &[String]) -> Option<String> {
-    let hosts: HashSet<String> = allowlist
+    // Select with the SAME matcher the proxy enforces the allowlist with
+    // (security audit 2026-09-02, egress F3): an exact-string intersection
+    // silently dropped every pin for a host reached through a suffix entry
+    // (`.example.com` admits `api.example.com` at the proxy, but
+    // `"api.example.com" == ".example.com"` is false), so the sidecar started
+    // with no `KASTELLAN_EGRESS_PROXY_PINS` at all and the operator's pin was
+    // bypassed without a warning. A pinned host is now selected iff the proxy
+    // would let this worker CONNECT to it.
+    let entries: Vec<String> = allowlist
         .iter()
         .map(|ep| host_of_endpoint(ep).to_ascii_lowercase())
         .collect();
-    let selected: BTreeMap<&String, &Vec<String>> =
-        map.0.iter().filter(|(host, _)| hosts.contains(*host)).collect();
+    let selected: BTreeMap<&String, &Vec<String>> = map
+        .0
+        .iter()
+        .filter(|(host, _)| entries.iter().any(|e| allowlist_entry_admits(e, host)))
+        .collect();
     if selected.is_empty() {
         return None;
     }
@@ -114,6 +136,18 @@ pub fn select_pins_for_allowlist(map: &CertPinMap, allowlist: &[String]) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffix_allowlist_entry_selects_the_pinned_subdomain() {
+        // Egress F3 (audit 2026-09-02): `.example.com:443` admits
+        // `api.example.com` at the proxy, so its pin must ride along.
+        let m = parse_cert_pins(r#"{"api.example.com":["sha256/AAAA"],"other.test":["sha256/BBBB"]}"#)
+            .unwrap();
+        let sel = select_pins_for_allowlist(&m, &[".example.com:443".to_string()]).unwrap();
+        assert!(sel.contains("api.example.com"), "{sel}");
+        assert!(!sel.contains("other.test"), "{sel}");
+        assert!(select_pins_for_allowlist(&m, &["nope.test:443".to_string()]).is_none());
+    }
 
     #[test]
     fn parses_valid_map_and_lowercases_hosts() {

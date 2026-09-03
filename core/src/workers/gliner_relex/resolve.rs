@@ -300,6 +300,12 @@ pub fn resolve_host_interpreter_binds(
         &exists,
         &canonicalize,
     );
+    // Never bind a prefix that contains the daemon's own state (audit
+    // 2026-09-02, S6).
+    let interpreter_root = crate::workers::interpreter_deps::guard_interpreter_root(
+        interpreter_root,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    );
     let interpreter_lib_dirs = crate::workers::interpreter_deps::interpreter_lib_dirs(
         venv_dir,
         interpreter_root.as_deref(),

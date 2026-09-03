@@ -109,6 +109,11 @@ const BASE_BOOT_ARGS: &str =
 /// not depend on the sandbox crate — same pattern as [`WORKER_VSOCK_PORT`]).
 const ENV_CMDLINE_KEY: &str = "kastellan.env";
 
+/// Env key carrying the uid the guest init switches to before `execv`.
+/// Read by `kastellan-microvm-init`; a guest built before it existed simply
+/// ignores the variable and keeps today's root worker.
+pub const GUEST_WORKER_UID_ENV: &str = "KASTELLAN_MICROVM_WORKER_UID";
+
 /// Cmdline token carrying the hex-encoded worker program path the guest init
 /// execs (generalizes slice-1's baked python-exec path). Kept in sync with
 /// `kastellan-microvm-init`'s WORKER_CMDLINE_KEY.
@@ -401,6 +406,16 @@ pub fn build_launch_plan(
     // receives the resolved `image`), never by the worker. Don't forward into the
     // guest: it's noise there and costs scarce cmdline budget.
     env.retain(|(k, _)| k != "KASTELLAN_MICROVM_DIR" && k != "KASTELLAN_MICROVM_ROOTFS");
+    // The guest init drops from root to this uid before exec'ing the worker
+    // (security audit 2026-09-02, workers 2 / prelude F3). The daemon's own
+    // euid is the right identity: the ro-share image is staged by this uid, so
+    // 0600 files in it (a token file) stay readable by the worker without
+    // guest-side chown of a read-only drive. `unsafe`-free: geteuid cannot fail.
+    if !env.iter().any(|(k, _)| k == GUEST_WORKER_UID_ENV) {
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        env.push((GUEST_WORKER_UID_ENV.to_string(), euid.to_string()));
+    }
     let mut boot_args = BASE_BOOT_ARGS.to_string();
     if let Some(suffix) = encode_env_cmdline(&env)? {
         boot_args.push_str(&suffix);
@@ -705,9 +720,15 @@ mod tests {
             "base kernel args must be preserved: {}",
             plan.boot_args
         );
+        // Since the 2026-09-02 audit the env token is ALWAYS present: it
+        // carries the uid the guest init drops to. With an empty policy env
+        // that is the only line in the block.
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let expected = hex_encode(format!("{GUEST_WORKER_UID_ENV}={euid}").as_bytes());
         assert!(
-            !plan.boot_args.contains("kastellan.env"),
-            "no env token when env is empty: {}",
+            plan.boot_args.contains(&format!(" {ENV_CMDLINE_KEY}={expected}")),
+            "env token must carry exactly the worker uid when env is empty: {}",
             plan.boot_args
         );
         assert!(

@@ -236,3 +236,44 @@ fn unshare_is_killed_under_browser_client() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `clone(CLONE_NEWUSER)` is the same escape as `unshare(CLONE_NEWUSER)`
+/// spelled through the allow-listed syscall; the flags condition must kill it
+/// (security audit 2026-09-02).
+#[test]
+fn clone_with_newuser_is_killed_by_sigsys() {
+    if !seccomp_enforced() {
+        return;
+    }
+    let out = run_probe(
+        &[("KASTELLAN_SECCOMP_PROFILE", "strict")],
+        &["seccomp-clone-newuser"],
+    );
+    assert_eq!(
+        out.status.signal(),
+        Some(SIGSYS),
+        "expected SIGSYS from clone(CLONE_NEWUSER); status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `clone3` must be ENOSYS (libc falls back to `clone`), never SIGSYS and
+/// never executed.
+#[test]
+fn clone3_returns_enosys_not_sigsys() {
+    if !seccomp_enforced() {
+        return;
+    }
+    let out = run_probe(
+        &[("KASTELLAN_SECCOMP_PROFILE", "strict")],
+        &["seccomp-clone3"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "expected clean exit after ENOSYS; status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

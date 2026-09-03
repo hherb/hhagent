@@ -82,6 +82,42 @@ pub fn out_of_prefix_lib_dirs(
     dirs.into_iter().collect()
 }
 
+/// Refuse an interpreter prefix that would expose the daemon's own private
+/// state to a worker (security audit 2026-09-02, sandbox S6).
+///
+/// `resolve_interpreter_root` derives `<prefix>` from
+/// `<prefix>/bin/python`; the whole prefix then rides `fs_read` into the jail
+/// (bwrap `--ro-bind`, Seatbelt `file-read*`). A uv-managed interpreter gives
+/// a leaf like `~/.local/share/uv/python/cpython-3.12-…` — fine. But an
+/// interpreter installed with `--prefix=$HOME` (`~/bin/python3`), or living
+/// in `~/.local/bin`, derives `$HOME` or `~/.local` — which contains
+/// `~/.config/kastellan` (env files, tokens), `~/.local/share/kastellan`
+/// (the Matrix store), `~/.local/state/kastellan` (the audit mirror) and the
+/// vault's keyring material. Returns `None` (the worker then fails to start
+/// with an ENOENT it can explain) rather than binding any of that.
+pub fn guard_interpreter_root(root: Option<PathBuf>, home: Option<&Path>) -> Option<PathBuf> {
+    let prefix = root?;
+    let Some(home) = home else { return Some(prefix) };
+    let sensitive: [PathBuf; 6] = [
+        home.to_path_buf(),
+        home.join(".config").join("kastellan"),
+        home.join(".local").join("share").join("kastellan"),
+        home.join(".local").join("state").join("kastellan"),
+        home.join(".local").join("lib").join("kastellan"),
+        home.join(".kastellan"),
+    ];
+    if sensitive.iter().any(|s| s.starts_with(&prefix)) {
+        tracing::warn!(
+            prefix = %prefix.display(),
+            "refusing interpreter prefix: it contains the daemon's own config/state; \
+             install the worker's interpreter under a leaf prefix (a uv-managed or \
+             venv-local CPython)"
+        );
+        return None;
+    }
+    Some(prefix)
+}
+
 /// Resolve the real interpreter prefix a venv's `python3` symlinks to.
 ///
 /// Locates `<venv>/bin/{python3,python}`, canonicalizes it to the real CPython,
@@ -252,3 +288,44 @@ pub fn resolve_deps_via_tool(obj: &Path) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    fn home() -> PathBuf {
+        PathBuf::from("/home/agent")
+    }
+
+    #[test]
+    fn leaf_prefixes_pass() {
+        for p in [
+            "/home/agent/.local/share/uv/python/cpython-3.12.6-linux-x86_64-gnu",
+            "/usr",
+            "/opt/python3.12",
+            "/home/agent/venvs/tool/.venv",
+        ] {
+            assert_eq!(
+                guard_interpreter_root(Some(PathBuf::from(p)), Some(&home())),
+                Some(PathBuf::from(p)),
+                "{p} must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn ancestors_of_the_daemon_state_are_refused() {
+        for p in ["/", "/home", "/home/agent", "/home/agent/.local", "/home/agent/.local/share", "/home/agent/.config"] {
+            assert_eq!(guard_interpreter_root(Some(PathBuf::from(p)), Some(&home())), None, "{p} must be refused");
+        }
+    }
+
+    #[test]
+    fn none_and_no_home_pass_through() {
+        assert_eq!(guard_interpreter_root(None, Some(&home())), None);
+        assert_eq!(
+            guard_interpreter_root(Some(PathBuf::from("/home/agent")), None),
+            Some(PathBuf::from("/home/agent"))
+        );
+    }
+}

@@ -109,6 +109,11 @@ pub enum RouterError {
     /// input texts; treat this as a backend protocol violation.
     #[error("embedding count mismatch: requested {requested}, got {returned}")]
     EmbeddingCountMismatch { requested: usize, returned: usize },
+
+    /// The backend's response body exceeded [`crate::MAX_RESPONSE_BODY_BYTES`]
+    /// and was abandoned rather than buffered (security audit 2026-09-02).
+    #[error("backend response body exceeded the {cap}-byte cap")]
+    BodyTooLarge { cap: usize },
 }
 
 #[cfg(test)]

@@ -23,6 +23,12 @@ pub struct FetchOutcome {
 
 /// Errors from the drive loop. The handler maps these to JSON-RPC codes.
 pub enum FetchError {
+    /// The URL (initial or a redirect hop) names a port other than 443. The
+    /// worker-side allowlist is host-only, and the egress proxy admits these
+    /// hosts on `:443` alone — so in legacy (`--share-net`) mode a redirect to
+    /// `https://allowed.host:8443/` reached a port no policy ever granted
+    /// (security audit 2026-09-02, workers 4).
+    PortDenied(u16),
     /// A redirect targeted a host not on the allowlist.
     HostDenied(String),
     /// A redirect targeted a non-https scheme.
@@ -32,6 +38,10 @@ pub enum FetchError {
     BadUrl(String),
     Transport(String),
 }
+
+/// The only port the worker-side layer admits; mirrors the `:443` scope the
+/// core gives every web allowlist entry at the egress proxy.
+pub const HTTPS_PORT: u16 = 443;
 
 /// Follow redirects from `start`, re-validating https + allowlist on every hop,
 /// up to [`MAX_REDIRECTS`]. Returns the terminal (non-3xx) response.
@@ -50,6 +60,9 @@ pub fn drive<T: HttpGet>(
             .ok_or_else(|| FetchError::BadUrl("url has no host".to_string()))?;
         if !allowlist.is_allowed(host) {
             return Err(FetchError::HostDenied(host.to_string()));
+        }
+        if let Some(port) = url.port_or_known_default().filter(|p| *p != HTTPS_PORT) {
+            return Err(FetchError::PortDenied(port));
         }
 
         let resp = transport.get(&url).map_err(FetchError::Transport)?;
@@ -109,6 +122,22 @@ mod tests {
             .err()
             .expect("must refuse");
         assert!(matches!(err, FetchError::HostDenied(h) if h == "evil.test"));
+    }
+
+    #[test]
+    fn redirect_to_allowlisted_host_on_another_port_is_refused() {
+        // Workers 4 (audit 2026-09-02): the host matches, the port does not —
+        // no policy ever granted `allowed.host:8443`.
+        let t = FakeGet::new(vec![redirect_to("https://a.example.com:8443/admin")]);
+        let err = drive(&t, &al(&[".example.com"]), Url::parse("https://example.com/").unwrap())
+            .err()
+            .expect("must refuse");
+        assert!(matches!(err, FetchError::PortDenied(8443)));
+        // An explicit :443 is the default port and stays allowed.
+        let t = FakeGet::new(vec![redirect_to("https://a.example.com:443/ok"), ok_resp("fine")]);
+        let out = drive(&t, &al(&[".example.com"]), Url::parse("https://example.com/").unwrap())
+            .unwrap_or_else(|_| panic!("expected ok"));
+        assert_eq!(out.body, b"fine");
     }
 
     #[test]

@@ -70,3 +70,6 @@ name = "uds_probe"
 path = "tests/fixtures/uds_probe.rs"
 test = false
 doc = false
+
+[dev-dependencies]
+tempfile = "3"

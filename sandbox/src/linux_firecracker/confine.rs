@@ -76,6 +76,7 @@ pub fn build_vmm_jail_argv(
     let mut a: Vec<String> = Vec::with_capacity(48);
     a.push("bwrap".into());
     a.push("--unshare-all".into()); // user/ipc/pid/uts/cgroup/net ns; egress rides vsock, no host net
+    a.push("--disable-userns".into()); // no nested userns for the VMM either (audit 2026-09-02)
     a.push("--die-with-parent".into());
     a.push("--new-session".into());
     a.push("--as-pid-1".into());

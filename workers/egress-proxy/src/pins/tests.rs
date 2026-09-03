@@ -263,3 +263,97 @@ fn build_upstream_config_with_certless_extra_ca_file_fails_closed() {
         "a zero-certificate PEM must fail closed"
     );
 }
+
+/// Egress F1 (security audit 2026-09-02): the pin must be matched against the
+/// VALIDATED path, not every certificate the server presented.
+mod validated_path_pinning {
+    use super::*;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::RootCertStore;
+    use std::sync::Arc;
+
+    struct Issued {
+        der: CertificateDer<'static>,
+        spki_pin: [u8; 32],
+    }
+
+    fn ca(name: &str) -> (rcgen::Certificate, rcgen::KeyPair, Issued) {
+        use sha2::{Digest, Sha256};
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        let der = CertificateDer::from(cert.der().to_vec());
+        let spki_pin: [u8; 32] = Sha256::digest(key.public_key_der()).into();
+        (cert, key, Issued { der, spki_pin })
+    }
+
+    fn leaf(host: &str, issuer: &rcgen::Certificate, issuer_key: &rcgen::KeyPair) -> Issued {
+        use sha2::{Digest, Sha256};
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec![host.to_string()]).unwrap();
+        let cert = params.signed_by(&key, issuer, issuer_key).unwrap();
+        Issued {
+            der: CertificateDer::from(cert.der().to_vec()),
+            spki_pin: Sha256::digest(key.public_key_der()).into(),
+        }
+    }
+
+    fn verifier(root: &Issued, host: &str, pin: &[u8; 32]) -> PinningVerifier {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = RootCertStore::empty();
+        roots.add(root.der.clone()).unwrap();
+        let pins = PinSet::parse(&format!(r#"{{"{host}":["{}"]}}"#, pin_str(pin))).unwrap();
+        PinningVerifier::new(Arc::new(roots), pins).unwrap()
+    }
+
+    fn verify(v: &PinningVerifier, leaf: &Issued, extra: &[&Issued], host: &str) -> Result<(), String> {
+        let name = ServerName::try_from(host.to_string()).unwrap();
+        let inter: Vec<CertificateDer<'static>> = extra.iter().map(|i| i.der.clone()).collect();
+        v.verify_server_cert(&leaf.der, &inter, &name, &[], UnixTime::now())
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn leaf_pin_on_the_validated_path_passes() {
+        let (root_cert, root_key, root) = ca("Root A");
+        let l = leaf("pin.test", &root_cert, &root_key);
+        let v = verifier(&root, "pin.test", &l.spki_pin);
+        verify(&v, &l, &[], "pin.test").expect("leaf pin on the real path must pass");
+    }
+
+    #[test]
+    fn anchor_pin_on_the_validated_path_passes() {
+        let (root_cert, root_key, root) = ca("Root A");
+        let l = leaf("pin.test", &root_cert, &root_key);
+        let v = verifier(&root, "pin.test", &root.spki_pin);
+        verify(&v, &l, &[], "pin.test").expect("anchor pin must pass (SPKI re-wrapped)");
+    }
+
+    #[test]
+    fn appended_unrelated_pinned_cert_does_not_satisfy_the_pin() {
+        // Root A is trusted and issued the leaf. Root B is NOT trusted; its
+        // SPKI is what the operator pinned. The server appends B's cert to
+        // the presented list: webpki validates leaf → A and ignores B, so the
+        // pin must FAIL — the old presented-list check passed here.
+        let (root_a_cert, root_a_key, root_a) = ca("Root A");
+        let (_root_b_cert, _root_b_key, root_b) = ca("Root B");
+        let l = leaf("pin.test", &root_a_cert, &root_a_key);
+        let v = verifier(&root_a, "pin.test", &root_b.spki_pin);
+        let err = verify(&v, &l, &[&root_b], "pin.test").expect_err("pin on an off-path cert must fail");
+        assert!(err.contains(PIN_MISMATCH_MARKER), "{err}");
+        // Control: the same presented list with the LEAF pinned passes, so the
+        // failure above is the pin logic, not the appended cert breaking webpki.
+        let v2 = verifier(&root_a, "pin.test", &l.spki_pin);
+        verify(&v2, &l, &[&root_b], "pin.test").expect("leaf pin still passes with junk appended");
+    }
+
+    #[test]
+    fn unpinned_host_is_left_to_webpki_alone() {
+        let (root_cert, root_key, root) = ca("Root A");
+        let l = leaf("other.test", &root_cert, &root_key);
+        let v = verifier(&root, "pin.test", &[0x42u8; 32]);
+        verify(&v, &l, &[], "other.test").expect("no pin for this host → plain webpki");
+    }
+}

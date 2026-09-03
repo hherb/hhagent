@@ -244,6 +244,12 @@ pub fn spawn_matrix_worker(
         .env
         .push(("KASTELLAN_MATRIX_HOMESERVER_URL".into(), cfg.homeserver_url.clone()));
     policy.env.push(("KASTELLAN_MATRIX_USER".into(), cfg.user.clone()));
+    // The worker enforces the same peer set at the room edge (invites +
+    // forwarding) — see `MatrixSpawnConfig::peers`.
+    policy.env.push((
+        "KASTELLAN_MATRIX_PEERS".into(),
+        cfg.peers.iter().map(|p| p.0.as_str()).collect::<Vec<_>>().join(","),
+    ));
     if let Some(dev) = &cfg.device_name {
         policy.env.push(("KASTELLAN_MATRIX_DEVICE_NAME".into(), dev.clone()));
     }
@@ -266,12 +272,13 @@ pub fn spawn_matrix_worker(
             if let Some(parent) = pw_path.parent() {
                 // Owner-only (0700) — the transient plaintext password lives under
                 // the shared /tmp anchor, so restrict the pid-scoped dir to the
-                // daemon user (matches the private posture of the old store_dir).
-                use std::os::unix::fs::DirBuilderExt as _;
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(parent)
+                // daemon user. Create-or-VERIFY (audit 2026-09-02, F5): the
+                // recursive `DirBuilder` before this adopted a pre-existing dir
+                // of any owner at the predictable `/tmp/kastellan-matrix-<pid>`,
+                // and `write_private` then followed a planted symlink with the
+                // bot password. `ensure_private_dir` refuses anything that is
+                // not a real 0700 directory owned by this uid.
+                kastellan_sandbox::private_dir::ensure_private_dir(parent)
                     .map_err(|e| anyhow::anyhow!("create matrix pw dir {parent:?}: {e}"))?;
             }
             write_private(pw_path, secret.as_bytes())
@@ -291,8 +298,10 @@ pub fn spawn_matrix_worker(
                     crate::egress::scratch_sweep::MATRIX_SCRATCH_DIR_PREFIX,
                     std::process::id()
                 ));
-                let _ = std::fs::remove_dir_all(&scratch);
-                std::fs::create_dir_all(&scratch)
+                // Exclusive + 0700 (audit 2026-09-02, S1): the seq makes each
+                // respawn's name fresh, so a pre-existing one is a plant, not a
+                // leftover of ours — refuse it rather than adopt it.
+                kastellan_sandbox::private_dir::create_private_dir(&scratch)
                     .map_err(|e| anyhow::anyhow!("create matrix egress scratch {scratch:?}: {e}"))?;
                 let params = NetTransportSpawn {
                     backend: &*backend,

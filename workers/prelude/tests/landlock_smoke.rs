@@ -40,7 +40,15 @@ fn landlock_enforced() -> bool {
     // care about the LOCKDOWN_REPORT line on stderr.
     let out = run_probe(&[("KASTELLAN_SECCOMP_PROFILE", "none")], &["seccomp-getpid"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    if stderr.contains("KernelTooOld") {
+    // Since the 2026-09-02 audit a kernel that cannot enforce Landlock is a
+    // lockdown ERROR (the probe exits non-zero with `LOCKDOWN_ERROR: landlock:
+    // …`), not a `KernelTooOld` report — the worker refuses to serve one layer
+    // short. For this suite that is still "this host cannot exercise
+    // Landlock": skip, loudly.
+    if stderr.contains("KernelTooOld")
+        || stderr.contains("not enforced by this kernel")
+        || stderr.contains("cannot create a Landlock ruleset")
+    {
         eprintln!("\n[SKIP] Landlock not enforced on this kernel: {stderr}");
         return false;
     }
@@ -124,6 +132,11 @@ fn write_to_allowlisted_scratch_succeeds() {
 /// full enforcement.
 #[test]
 fn v6_abi_yields_fully_enforced_on_modern_kernel() {
+    // Same skip guard as every other test here: a host without Landlock (a
+    // minimal VM kernel) cannot make this assertion meaningful either way.
+    if !landlock_enforced() {
+        return;
+    }
     let out = run_probe(
         &[
             ("KASTELLAN_LANDLOCK_RW", "[]"),
