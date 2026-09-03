@@ -376,7 +376,27 @@ pub fn run_code(
     if Path::new(&scratch).is_dir() {
         cmd.current_dir(&scratch);
     }
+    // The interpreter leads its own process group so that everything it
+    // forks can be reaped as a unit after it exits (security audit
+    // 2026-09-02, F5): a warm micro-VM worker serves many dispatches, and a
+    // `fork(); setsid(); exec(...)` grandchild used to outlive its call — with
+    // that call's redeemed secret in its argv, readable via `/proc` by the
+    // next dispatch of any task, past the per-dispatch output scrub.
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: `setsid` is async-signal-safe and touches only the child's
+        // own session/pgid state; no allocation, no locks.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = cmd.spawn()?;
+    let child_pgid = child.id() as libc::pid_t;
 
     // CPython with `-` reads the whole program to EOF before executing,
     // so a single-threaded write-then-wait cannot deadlock — but feed
@@ -400,6 +420,14 @@ pub fn run_code(
     let err_reader = std::thread::spawn(move || read_capped(err_pipe, MAX_CAPTURE_BYTES));
 
     let status = child.wait()?;
+    // Reap the whole process group the interpreter led: anything it left
+    // behind (a daemonised grandchild, a background thread's helper process)
+    // dies with the call. `ESRCH` when nothing remains is the normal case.
+    // SAFETY: kill(2) with a negative pid targets the group; the pgid is the
+    // child's own pid (it called setsid), so this cannot address our group.
+    unsafe {
+        libc::kill(-child_pgid, libc::SIGKILL);
+    }
     let _ = feeder.join();
     let (out_bytes, out_raw_truncated) =
         out_reader.join().expect("stdout reader thread panicked")?;

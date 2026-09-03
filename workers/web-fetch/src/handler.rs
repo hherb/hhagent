@@ -27,6 +27,7 @@ enum CheckError {
     NotHttps(String),
     HostMissing,
     HostDenied(String),
+    PortDenied(u16),
 }
 
 /// Validate the initial URL: parse, require https, require allowlisted host.
@@ -38,6 +39,12 @@ fn check_url(raw: &str, allowlist: &HostAllowlist) -> Result<Url, CheckError> {
     let host = url.host_str().ok_or(CheckError::HostMissing)?;
     if !allowlist.is_allowed(host) {
         return Err(CheckError::HostDenied(host.to_string()));
+    }
+    if let Some(port) = url
+        .port_or_known_default()
+        .filter(|p| *p != kastellan_worker_web_common::fetch::HTTPS_PORT)
+    {
+        return Err(CheckError::PortDenied(port));
     }
     Ok(url)
 }
@@ -55,11 +62,19 @@ fn check_err_to_rpc(e: CheckError) -> RpcError {
         CheckError::HostDenied(h) => {
             RpcError::new(codes::POLICY_DENIED, format!("host {h:?} not on allowlist"))
         }
+        CheckError::PortDenied(p) => RpcError::new(
+            codes::POLICY_DENIED,
+            format!("port {p} not allowed; https on 443 only"),
+        ),
     }
 }
 
 fn fetch_err_to_rpc(e: FetchError) -> RpcError {
     match e {
+        FetchError::PortDenied(p) => RpcError::new(
+            codes::POLICY_DENIED,
+            format!("redirect to port {p} refused; https on 443 only"),
+        ),
         FetchError::HostDenied(h) => RpcError::new(
             codes::POLICY_DENIED,
             format!("redirect host {h:?} not on allowlist"),

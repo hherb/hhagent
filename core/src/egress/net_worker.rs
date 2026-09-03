@@ -258,7 +258,7 @@ where
     let mut worker = spawn_worker(params.backend, &forced_spec)?;
     // 4. Decision-ingest thread on the proxy stdout; attach the bundle so
     //    teardown is 1:1 with the worker.
-    let ingest = spawn_ingest_thread(stdout, on_decision);
+    let ingest = spawn_ingest_thread(stdout, params.worker_name.to_string(), on_decision);
     worker.egress = Some(EgressSidecar {
         sidecar,
         _ingest: ingest,
@@ -352,7 +352,12 @@ fn make_worker_scratch_dir(scratch_root: &Path) -> Result<PathBuf, ToolHostError
             ),
         )));
     }
-    std::fs::create_dir_all(&dir).map_err(ToolHostError::Io)?;
+    // Exclusive + 0700 (security audit 2026-09-02, S1/F4): `create_dir_all`
+    // adopted a pre-existing directory whoever owned it, so another local uid
+    // could pre-create this predictable name under /tmp and then swap the
+    // sidecar's UDS + MITM CA under the worker. Now a planted name fails the
+    // spawn closed instead.
+    kastellan_sandbox::private_dir::create_private_dir(&dir).map_err(ToolHostError::Io)?;
     Ok(dir)
 }
 
@@ -361,6 +366,7 @@ fn make_worker_scratch_dir(scratch_root: &Path) -> Result<PathBuf, ToolHostError
 /// (already taken) the thread exits immediately.
 pub(crate) fn spawn_ingest_thread<F>(
     stdout: Option<std::process::ChildStdout>,
+    worker: String,
     on_decision: F,
 ) -> JoinHandle<()>
 where
@@ -368,7 +374,7 @@ where
 {
     std::thread::spawn(move || {
         let Some(stdout) = stdout else { return };
-        ingest_decisions_into(BufReader::new(stdout), on_decision);
+        ingest_decisions_into(BufReader::new(stdout), &worker, on_decision);
     })
 }
 

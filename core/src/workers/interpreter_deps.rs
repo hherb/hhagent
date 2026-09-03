@@ -8,12 +8,14 @@
 //! worker runs (issue #284). This module finds those out-of-prefix libs and
 //! returns the canonical parent dirs to bind read-only.
 //!
-//! It also answers the prior question — *which* interpreter, and under which
-//! names a jail must be able to reach it. That lives in the private `root` and
+//! It also answers the prior question — *which* interpreter, under which
+//! names a jail must be able to reach it, and whether it may be bound at all
+//! (an interpreter prefix that contains the daemon's own state is refused —
+//! security audit 2026-09-02, S6). That lives in the private `root` and
 //! `named_path` submodules (issue #650), whose public surface is re-exported
-//! here as [`resolve_interpreter_root`], [`InterpreterRoot`] and
-//! [`read_link_via_fs`] — the names to link against, since a `pub` module
-//! cannot usefully link at a private item.
+//! here as [`resolve_interpreter_root`], [`guard_interpreter_root`],
+//! [`InterpreterRoot`] and [`read_link_via_fs`] — the names to link against,
+//! since a `pub` module cannot usefully link at a private item.
 //!
 //! Pure core: the dependency graph and every path probe arrive as injected
 //! closures, so the transitive graph walk is unit-testable without `otool`/`ldd`.
@@ -26,7 +28,7 @@ mod named_path;
 mod root;
 
 pub use named_path::read_link_via_fs;
-pub use root::{resolve_interpreter_root, InterpreterRoot};
+pub use root::{guard_interpreter_root, resolve_interpreter_root, InterpreterRoot};
 
 /// True when `p` lies under one of `roots` (path-prefix match).
 fn is_system_lib_path_in(p: &Path, roots: &[&str]) -> bool {

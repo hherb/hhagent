@@ -28,6 +28,11 @@ fn cpu_burner_under_short_budget_is_killed_promptly() {
     let status = Command::new(PROBE)
         .arg("cpu-burner")
         .env_clear()
+        // These tests exercise rlimit ONLY. Since the 2026-09-02 audit a
+        // missing seccomp profile and an unenforceable Landlock ruleset are
+        // lockdown errors, so opt out of both explicitly.
+        .env("KASTELLAN_SECCOMP_PROFILE", "none")
+        .env("KASTELLAN_LANDLOCK_PROFILE", "none")
         .env("KASTELLAN_CPU_MS", "200")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -71,6 +76,11 @@ fn cpu_burner_with_no_env_runs_past_one_second() {
     let mut child = Command::new(PROBE)
         .arg("cpu-burner")
         .env_clear()
+        // These tests exercise rlimit ONLY. Since the 2026-09-02 audit a
+        // missing seccomp profile and an unenforceable Landlock ruleset are
+        // lockdown errors, so opt out of both explicitly.
+        .env("KASTELLAN_SECCOMP_PROFILE", "none")
+        .env("KASTELLAN_LANDLOCK_PROFILE", "none")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

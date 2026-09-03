@@ -34,7 +34,6 @@ fn main() -> anyhow::Result<()> {
     if endpoint.scheme() == "https" {
         kastellan_worker_web_common::http::ensure_crypto_provider();
     }
-    let transport = kastellan_worker_web_common::http::make_get("kastellan-search-broker/0")?;
 
     // Bind BEFORE lock-down (Landlock forbids fs mutation after) — the embed-broker
     // / egress-proxy ordering.
@@ -44,6 +43,11 @@ fn main() -> anyhow::Result<()> {
     // Worker-side defense-in-depth (Linux Landlock+seccomp; no-op on macOS, where
     // the parent Seatbelt profile contains us).
     let _report = kastellan_worker_prelude::lock_down()?;
+    // The transport's tokio runtime (or reqwest's blocking runtime thread) is
+    // built only now, AFTER Landlock — it restricts the calling thread and is
+    // inherited by threads created afterwards, never applied retroactively
+    // (security audit 2026-09-02, F4).
+    let transport = kastellan_worker_web_common::http::make_get("kastellan-search-broker/0")?;
 
     let mut handler = SearchHandler::new(endpoint, allowlist, transport);
     for conn in listener.incoming() {

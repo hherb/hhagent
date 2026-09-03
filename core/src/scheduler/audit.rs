@@ -556,7 +556,7 @@ pub use memory_rows::{
     build_l3_invoke_outcome_payload, build_l3_invoke_rejected_agent_payload,
     build_l3_invoke_rejected_payload, build_l3_invoked_payload, build_l3_pin_rejected_payload,
     build_l3_pinned_payload, build_l3_revoked_payload, build_l3_write_payload, ACTION_L1_ADDED,
-    ACTION_L1_PROMOTED, ACTION_L1_REMOVED, ACTION_L3_APPROVED, ACTION_L3_APPROVE_REJECTED,
+    ACTION_L1_INJECTION_BLOCKED, ACTION_L1_PROMOTED, ACTION_L1_REMOVED, ACTION_L3_APPROVED, ACTION_L3_APPROVE_REJECTED,
     ACTION_L3_CRYSTALLISED, ACTION_L3_INVOKED, ACTION_L3_INVOKE_OUTCOME,
     ACTION_L3_INVOKE_REJECTED, ACTION_L3_PINNED, ACTION_L3_PIN_REJECTED, ACTION_L3_REMOVED,
     ACTION_L3_REVOKED,

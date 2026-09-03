@@ -255,3 +255,88 @@ fn bind_paths_of_a_canonical_only_root_is_the_canonical_root() {
     assert_eq!(root.bind_paths(), vec![PathBuf::from("/u/py/real")]);
     assert_eq!(root.dep_walk_prefix(), Path::new("/u/py/real"));
 }
+
+// ---- guard_interpreter_root (security audit 2026-09-02, sandbox S6) ----
+
+fn home() -> PathBuf {
+    PathBuf::from("/home/agent")
+}
+
+#[test]
+fn guard_passes_leaf_prefixes() {
+    for p in [
+        "/home/agent/.local/share/uv/python/cpython-3.12.6-linux-x86_64-gnu",
+        "/usr",
+        "/opt/python3.12",
+        "/home/agent/venvs/tool/.venv",
+    ] {
+        assert_eq!(
+            guard_interpreter_root(Some(InterpreterRoot::canonical_only(p)), Some(&home())),
+            Some(InterpreterRoot::canonical_only(p)),
+            "{p} must pass"
+        );
+    }
+}
+
+/// One prefix per entry of the sensitive set, so dropping any single entry
+/// from the guard fails a named case here rather than surviving.
+#[test]
+fn guard_refuses_ancestors_of_the_daemon_state() {
+    for p in [
+        "/",
+        "/home",
+        "/home/agent",
+        "/home/agent/.local",
+        "/home/agent/.local/share",
+        "/home/agent/.local/state",
+        "/home/agent/.local/lib",
+        "/home/agent/.config",
+        "/home/agent/.kastellan",
+    ] {
+        assert_eq!(
+            guard_interpreter_root(Some(InterpreterRoot::canonical_only(p)), Some(&home())),
+            None,
+            "{p} must be refused"
+        );
+    }
+}
+
+#[test]
+fn guard_passes_none_and_no_home_through() {
+    assert_eq!(guard_interpreter_root(None, Some(&home())), None);
+    assert_eq!(
+        guard_interpreter_root(Some(InterpreterRoot::canonical_only("/home/agent")), None),
+        Some(InterpreterRoot::canonical_only("/home/agent"))
+    );
+}
+
+/// The guard reads `bind_paths`, not the canonical prefix alone: an alias is
+/// bound too (#650), so an alias over the daemon's state refuses the whole
+/// root even when the canonical prefix is a clean leaf. Checking only
+/// `dep_walk_prefix()` would pass this root.
+#[test]
+fn guard_refuses_an_alias_over_the_daemon_state_even_when_canonical_is_a_leaf() {
+    let root = InterpreterRoot {
+        canonical: PathBuf::from("/opt/uv/python/cpython-3.13.14-linux-aarch64-gnu"),
+        aliases: vec![PathBuf::from("/home/agent/.local")],
+    };
+    assert_eq!(guard_interpreter_root(Some(root), Some(&home())), None);
+}
+
+/// And the uv shape #650 exists for — a leaf canonical prefix with a leaf alias
+/// beside it — passes intact, alias included; the guard must not strip it.
+#[test]
+fn guard_keeps_the_aliases_of_a_passing_root() {
+    let root = InterpreterRoot {
+        canonical: PathBuf::from(
+            "/home/agent/.local/share/uv/python/cpython-3.13.14-linux-aarch64-gnu",
+        ),
+        aliases: vec![PathBuf::from(
+            "/home/agent/.local/share/uv/python/cpython-3.13-linux-aarch64-gnu",
+        )],
+    };
+    assert_eq!(
+        guard_interpreter_root(Some(root.clone()), Some(&home())),
+        Some(root)
+    );
+}

@@ -114,6 +114,11 @@ pub fn build_share_images(
             copy_tree(src, &dest, &root)?;
         }
         let out = run_dir.join("ro-share.ext4");
+        // Pre-create 0600 so `mkfs.ext4 -F` fills a file only this uid can read
+        // (audit 2026-09-02, S4: mke2fs creates a missing image 0644, and this
+        // one carries the fs_read snapshot — including the Matrix bot password
+        // file — for the VM's lifetime).
+        precreate_private_image(&out)?;
         let mib = ro_image_mib(&stage_root);
         run(mkfs_populate_argv(
             &stage_root.to_string_lossy(),
@@ -125,6 +130,7 @@ pub fn build_share_images(
 
     if plan.rw_scratch.is_some() {
         let out = run_dir.join("rw-scratch.ext4");
+        precreate_private_image(&out)?;
         run(mkfs_blank_argv(&out.to_string_lossy(), rw_scratch_mib(env)))?;
         plan.rw_image_path = Some(out);
     }
@@ -181,6 +187,13 @@ pub fn build_persistent_image(plan: &mut FirecrackerLaunchPlan) -> Result<(), Sa
             .map_err(|e| SandboxError::Backend(format!("persistent store mkdir {parent:?}: {e}")))?;
     }
     let usable = persistent_image_is_usable(&ps.host_backing);
+    if !usable && !ps.host_backing.exists() {
+        // A fresh persistent image is created 0600 before mkfs fills it; an
+        // existing one is hardened below. Its directory
+        // (`/var/lib/kastellan/microvm`, 1775) is world-traversable, so the
+        // file mode is the only thing keeping the Matrix E2E store private.
+        precreate_private_image(&ps.host_backing)?;
+    }
     if let Some(argv) = persistent_mkfs_decision(
         usable,
         &ps.host_backing.to_string_lossy(),
@@ -194,8 +207,24 @@ pub fn build_persistent_image(plan: &mut FirecrackerLaunchPlan) -> Result<(), Sa
             return Err(SandboxError::Backend(format!("{} failed: {status}", argv[0])));
         }
     }
+    // Existing images predate the 0600 rule (audit 2026-09-02, S4): chmod
+    // them now if we own them; refuse a foreign-owned or symlinked one.
+    crate::private_dir::harden_owned_file_mode(&ps.host_backing).map_err(|e| {
+        SandboxError::Backend(format!(
+            "persistent store {:?} must be an owner-private regular file: {e}",
+            ps.host_backing
+        ))
+    })?;
     plan.persistent_image_path = Some(ps.host_backing.clone());
     Ok(())
+}
+
+/// Create an empty image file `O_EXCL` + 0600 for `mkfs.ext4 -F` to fill;
+/// mke2fs keeps the mode of an existing file. Refuses a pre-existing path.
+fn precreate_private_image(path: &Path) -> Result<(), SandboxError> {
+    crate::private_dir::create_private_file(path)
+        .map(drop)
+        .map_err(|e| SandboxError::Backend(format!("pre-create image {path:?}: {e}")))
 }
 
 /// Recursively copy a host tree (dirs, files, symlinks-as-targets) into `dest`.

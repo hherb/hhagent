@@ -8,14 +8,27 @@
 > which holds the verbose pre-prune version of everything summarised here,
 > including the full #619, #615/#616/#618 and live-bring-up write-ups compressed below.
 
-**Last updated:** 2026-09-03 (#656 review round) · **DGX RUNNING `121f22a2` — the whole guard arc is
+**Last updated:** 2026-09-03 (#656 review round, then `main`'s #660 merged into the branch) · **DGX RUNNING `121f22a2` — the whole guard arc is
 DEPLOYED** (see [Merged work, compressed](#merged-work-compressed--the-guard-arc-and-the-2026-09-02-deploy)). ·
-**`main` HEAD:** `ef8144f8` —
-[#651](https://github.com/hherb/kastellan/pull/651), the #649 transformers advisory fix, on top of
+**`main` HEAD:** `62d98a00` —
+[#660](https://github.com/hherb/kastellan/pull/660), the 2026-09-02 security audit (29 fixes, **DGX gate
+owed**; see [#660](#660--the-second-pre-release-security-audit-2026-09-02-merged)), on top of `ef8144f8`
+([#651](https://github.com/hherb/kastellan/pull/651), the #649 transformers advisory fix),
 `c5972572` ([#652](https://github.com/hherb/kastellan/pull/652), the openworker re-survey) and
 `e5cb6bfc` ([#648](https://github.com/hherb/kastellan/pull/648)), both docs-only. ·
-**OPEN BRANCH: `fix/650-interpreter-alias-bind`** — #650, fixed and gated; see
+**OPEN BRANCH: `fix/650-interpreter-alias-bind`** — #650, fixed and gated, PR
+[#656](https://github.com/hherb/kastellan/pull/656), now carrying `main`'s #660 as a merge commit; see
 [#650](#650--the-interpreter-alias-bind-fixed).
+
+> **#660 and #650 crossed in one place, and the auto-merge compiled neither side.** S6's
+> `guard_interpreter_root` was written against the `Option<PathBuf>` the resolver used to return,
+> while #650 had made it return `InterpreterRoot`; git merged both call sites cleanly and left a
+> type error. Resolved by re-homing the guard in `interpreter_deps::root` beside the resolver it
+> guards, over `InterpreterRoot`, checking **every `bind_paths()` entry** (canonical **plus**
+> aliases — an alias is a lexical name the canonical comparison cannot see) and refusing the whole
+> root on one offending name. Re-exported under the same public name, so #660's two call sites are
+> untouched; its three tests moved with it, plus two alias-arm cases. The e2e resolver in
+> `browser_driver_e2e.rs` takes the same step, since it exists to mirror the manifest.
 
 > **THE DGX WORKSPACE IS GREEN AGAIN, and honestly so.** The three `gliner_relex_e2e` failures the
 > last session left behind were [#650](https://github.com/hherb/kastellan/issues/650), a production
@@ -65,6 +78,75 @@ did use it. [[custom-cargo-target-dir-breaks-daemon-e2e]]
 ---
 
 ## Current state
+
+### #660 — the second pre-release security audit (2026-09-02), MERGED
+
+Full write-up in [`docs/security-audit-2026-09-02.md`](../../security-audit-2026-09-02.md);
+the ROADMAP entry lists every fix in one line. **What the next session must know:**
+
+- **PR [#660](https://github.com/hherb/kastellan/pull/660) MERGED as `62d98a00` (2026-09-03), CI green on `ae3ead6`** —
+  all nine checks (workspace check + clippy, live-matrix check + clippy, `uv lock --check`,
+  CodeQL rust/python/actions, the two Cloudflare builds). Two follow-up commits after the
+  audit commit, both lessons worth keeping: (1) the **live-matrix clippy job** caught a
+  `manual_contains` lint the default-feature workspace clippy never compiles — run
+  `cargo clippy -p kastellan-worker-matrix --all-targets --features live-matrix --locked -- -D warnings`
+  locally before pushing anything that touches `sdk_live.rs`; (2) **CodeQL flagged five
+  `rust/cleartext-logging` alerts** on the guest's new privilege drop for interpolating the
+  numeric `uid` into stderr/panic lines — the value is now never echoed (the host chose it and
+  knows it). Same convention as the ROADMAP's `hard-coded-cryptographic-value` note: CodeQL
+  reads NAMES, so keep identifier- and credential-like names out of log and panic text.
+- **29 fixes on one branch, 80 files, ~2 200 lines.** Every fix that could be pinned
+  hermetically has a test that fails on the old code (the seccomp ones fork a child and
+  install the real filter — no bwrap needed). The four load-bearing ones: (H1) the
+  dispatch chokepoint now scrubs every secret redeemed for a call out of the worker's
+  `Ok` value AND its `RpcError` — shell-exec's `argv[0] "…" not in allowlist` denial was
+  handing a substituted `secret://` ref's plaintext straight to the planner and
+  `audit_log`; (H2) agent-raised `l1_insight`s are screened by the strict catalogue at
+  promotion (audited `l1.injection_blocked`) and at prompt assembly; (H3) every per-spawn
+  dir under `/tmp` is now minted with `kastellan_sandbox::private_dir::create_private_dir`
+  (exclusive `mkdir` 0700, owner-verified) and secret files with `O_EXCL` 0600 — a
+  pre-planted name from another uid FAILS THE SPAWN CLOSED (that is the new contract; do
+  not "fix" it back to `create_dir_all`); (H4) seccomp admits `clone` only without
+  `CLONE_NEW*` flags and answers `ENOSYS` to `clone3` (glibc falls back), and bwrap +
+  the VMM jail pass `--disable-userns`.
+- **Three lockdown behaviours are now FAIL-CLOSED and will bite a careless fixture:** a
+  missing `KASTELLAN_SECCOMP_PROFILE` is an error (`none` is the explicit opt-out), a
+  Landlock ruleset the kernel cannot enforce is an error (`KASTELLAN_LANDLOCK_PROFILE=none`
+  to opt out), and a corrupt `kastellan.env=` guest token refuses the VM boot. The rlimit
+  smoke fixtures and `landlock_smoke`'s skip guard were updated accordingly — a new probe
+  invocation must set both `none`s if it means to exercise only rlimit.
+- **Every networked stdio worker now builds its handler INSIDE
+  `kastellan_worker_prelude::serve_stdio_with`** (Landlock is per-thread; a tokio/reqwest
+  runtime built in `from_env()` before lockdown ran with no Landlock on the threads that
+  parse the network). Brokers build their transport after `lock_down`; the Matrix worker
+  restricts each runtime thread in `on_thread_start`. Keep that order for any new worker.
+- **Cargo.lock moved:** `h2` 0.4.15→0.4.16 (RUSTSEC-2026-0258), `spin` un-yanked,
+  `rustls-webpki` now a direct dep of the proxy, `tempfile` a sandbox dev-dep, python-exec's
+  `libc` moved to a runtime dep. The windows-sys re-pins in the same diff are what
+  `cargo update -p h2` on cargo 1.98 produces for range deps — Windows-only, inert.
+- **`workers/browser-driver/requirements.lock` is tracked and hash-pinned**; both
+  `install.sh` and the rootfs Dockerfile install from it with
+  `--require-hashes --only-binary=:all:`. The next rootfs rebuild picks up playwright
+  1.62.0 (was hand-pinned 1.60.0) — a bump to gate on the DGX, not a surprise.
+- **Migration 0025** narrows the runtime role's UPDATE on `pairing_codes` to
+  `(consumed_at, consumed_by)`. `kastellan-db-init` applies it on the next install/upgrade.
+- **S6 (`guard_interpreter_root`) crossed #650 at merge — see the header note.** It now takes and
+  returns `Option<InterpreterRoot>`, lives in `interpreter_deps::root` and is re-exported under the
+  same name; the sensitive set and the refusal contract are #660's, unchanged, applied to every
+  `bind_paths()` entry rather than the canonical prefix alone.
+- **DGX gates owed (this container has no bwrap, no Landlock, no KVM, no unprivileged
+  Postgres — see the baseline row):** the Firecracker e2e (guest init now drops to the
+  daemon's euid, chowns the RW mounts, `nosuid,nodev`; run dirs 0700; images 0600), the
+  live-Matrix path (`--features live-matrix` compiles incl. tests; invites from outside
+  `KASTELLAN_MATRIX_PEERS` are declined and only two-party rooms are forwarded — verify a
+  DM still round-trips), and real bwrap (`--disable-userns` needs bubblewrap ≥ 0.6;
+  `LinuxBwrap::probe()` names it if the host's is older).
+- **Deferred with a reason** (all in the audit doc): brokers are not force-routed; the
+  guard tier never sees bytes past 64 KiB / `fetch_handoff` slices; `secret://` refs are
+  not tool-bound; `Host:` ≠ CONNECT authority (fronting); `net_client` grants
+  `bind`/`listen`; email replay has no freshness window; gliner weights have no revision
+  pin (HF API unreachable from the audit box); macOS worker-side caps; force-routing is
+  opt-in. **Recommendation before release:** flip force-routing to default-on.
 
 ### #649 / #651 — the transformers advisory, compressed
 
@@ -313,6 +395,16 @@ and the snapshots before it. What still binds:
 green again and the debt this file recorded (main's `gliner_weights` tests never gated on Linux) is
 paid with it.
 
+**FIRST: #660's DGX gate is still owed, and this branch now carries all 29 of its fixes.** The audit
+ran in a container with no bwrap, Landlock, KVM or unprivileged Postgres, and merged on that
+evidence. The post-merge gate in the header is the first real-bwrap sweep over #660's content; still
+owed after it are the three DGX-only paths named under [#660](#660--the-second-pre-release-security-audit-2026-09-02-merged): the Firecracker e2e
+(guest uid drop, 0700 run dirs, 0600 images), the live-Matrix path (`--features live-matrix`;
+invites from outside `KASTELLAN_MATRIX_PEERS` declined, two-party rooms only — verify a DM still
+round-trips), and bwrap `--disable-userns` on the *deployed* host (bubblewrap ≥ 0.6;
+`LinuxBwrap::probe()` names it if older). Deploying `main` to the DGX (`scripts/upgrade_from_git.sh`)
+is what makes the last one real.
+
 **FIRST: the two cheap follow-ups #650 left standing, and they belong together.**
 [#653](https://github.com/hherb/kastellan/issues/653) — the Rust gliner e2es still cannot be *forced*
 to run: five independent `[SKIP]` gates and no `REQUIRE_*` knob, which is exactly how the fixture bug
@@ -482,6 +574,10 @@ Full prose in the [`archive/`](archive/) snapshots — most recently
 | **DGX** (post-review-round, #656) | **`757413c1`** | `cargo test --workspace --no-fail-fast` **3973 / 0 / 55**, **176** suites, `TEST_EXIT=0` (+5 = the review round's five new tests). Targeted re-run: `gliner_relex_e2e` **4 / 0**, **zero `[SKIP]` under `--nocapture`**, real model load, 33.7 s | `clippy --workspace --all-targets -D warnings` exit 0 — **incremental, 5 crates** re-linted (`core`, `tests-common`, `sandbox`, `supervisor`, `db`), not a cold 27-crate sweep. rustc **1.98.0** | unmeasured on the workspace run (no `--nocapture`); **0** on the e2e |
 | **Mac** (post-review-round, #656) | **`757413c1`** | `cargo test -p kastellan-core --lib` **2009 / 0 / 1**; `interpreter_deps` filter **42** (was 21 on `main`) | `clippy -p kastellan-core -p kastellan-tests-common --all-targets -D warnings` exit 0, **zero** warnings, **218** `Checking` lines from a cold private target dir. rustc **1.98.0** | 0 |
 | **Mac** (aarch64 darwin) | **#651 review round** | `uv run --frozen pytest` **63 / 0** in `workers/gliner-relex`, including the real 1.3 GB model load under transformers 5.13.1. Seven gate arms verified individually, incl. **deselect-under-knob → exit 1** and **rename-out-of-collection-under-knob → exit 1**, which both exited **0** before | — | 0 |
+| **Audit container** (x86_64, root, NO bwrap / Landlock / KVM / unprivileged PG) | `claude/security-audit-fixes-ov4lej` tip | **3980 / 4 / 55**, **176** suites, `TEST_EXIT=101`, `--no-fail-fast`. The 4 are environment-only and reconcile exactly: three `initdb: cannot be run as root` (`pg_decision_sink_persists_decisions_to_audit_log`, `decision_row_persists_to_audit_log`, `migration_0021_check_accepts_both_kinds_and_rejects_malformed`) and `remove_run_dir_drops_marker_when_dir_cannot_be_removed` (a chmod-0555 parent root ignores). 3980 + 4 = **3984** = the 3940 DGX baseline + 44 new tests | exit 0, `--locked`, zero warnings, rustc **1.98.0** | 0 (the Linux sandbox e2e skip-as-pass silently here; the Landlock smokes skip via `landlock_enforced()`) |
+| **DGX** (native aarch64, real bwrap + KVM + live PG 18) | **`5445dd68`** — branch tip of `fix/649-transformers-lock-bump` | **3937 / 3 / 55**, **176** suites, `TEST_EXIT=101`, `--no-fail-fast --nocapture`. **NOT GREEN, and the delta reconciles exactly**: 3937 + 3 = **3940**, the same total as the `f12ed26d` row below. Nothing was added or lost — three tests moved from *skipped-as-passed* to *honestly failing*. All three are `gliner_relex_e2e` (`happy_path_extract_returns_entities_and_triples`, `warm_reuse_two_calls_keep_one_worker_warm`, `invalid_input_returns_rpc_error_and_worker_stays_alive`) and all three are **[#650](https://github.com/hherb/kastellan/issues/650)**, proved pre-existing by A/B against the pre-bump lock. `entity_extraction_e2e`'s two real-model tests hit the same fault but only under `KASTELLAN_GLINER_RELEX_ENABLE=1`, which a plain workspace run does not set | exit 0 from a **cold** private dir under `$HOME`: **345** `Checking`+`Compiling` lines (107 + 238), all **27** kastellan crates named, **zero** warnings. rustc **1.98.0** | **4** (was 8), all `KASTELLAN_GLINER_RELEX_ENABLE != "1"`. **The four venv-shim skips are GONE** — that is #649's acceptance criterion, met literally |
+| **Mac** (aarch64 darwin) | **`5445dd68`** | `uv run --frozen pytest` **51 / 0**, real model load under transformers 5.13.1. `cargo check -p kastellan-core --test gliner_relex_e2e --test entity_extraction_e2e` clean. Superseded by the row above | — | 0 |
+| **DGX** (Python leg) | **`5445dd68`** | `KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1 uv run --frozen pytest` **51 / 0** — the knob makes a missing-weights skip a failure, so the live load provably ran (transformers 5.13.1 / torch 2.13.0+cu130). ⚠️ **Predates the review round; owed a re-run at 63** | — | 0 |
 
 **The row the delta above is measured against:** DGX `f12ed26d` (tree-identical to `main`
 `121f22a2`) — **3940 / 0 / 55**, 176 suites, `TEST_EXIT=0`; cold clippy exit 0 with **345**

@@ -66,6 +66,13 @@ fn resolve_browser_env() -> Option<BrowserDriverEnv> {
         &|p| std::fs::canonicalize(p).ok(),
         &kastellan_core::workers::interpreter_deps::read_link_via_fs,
     );
+    // Same S6 step the manifest takes (security audit 2026-09-02): never bind a
+    // prefix that contains the daemon's own state. Mirrored here for the same
+    // reason the resolver is — a copy that skips a step is a copy that drifts.
+    let interpreter_root = kastellan_core::workers::interpreter_deps::guard_interpreter_root(
+        interpreter_root,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    );
     // Operator escape hatch for host-specific deps (e.g. a pyenv interpreter's
     // /opt/homebrew libs) — same env the manifest reads.
     let extra_fs_read = std::env::var("KASTELLAN_BROWSER_DRIVER_EXTRA_FS_READ")

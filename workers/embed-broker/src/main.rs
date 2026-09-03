@@ -29,7 +29,6 @@ fn main() -> anyhow::Result<()> {
     // The backend transport: direct (loopback Ollama/vLLM) in v1. `make_get`
     // returns a proxy-connect transport only if KASTELLAN_EGRESS_PROXY_UDS is set
     // (a remote backend force-routed through the egress proxy — out of scope here).
-    let transport = kastellan_worker_web_common::http::make_get("kastellan-embed-broker/0")?;
 
     // Bind the UDS BEFORE lock-down (Landlock forbids fs mutation after) — the
     // same ordering the egress proxy uses.
@@ -40,6 +39,11 @@ fn main() -> anyhow::Result<()> {
     // the parent Seatbelt profile contains us). The net_client profile must permit
     // AF_UNIX accept + AF_INET connect (serve + dial) — verified on the DGX in Slice B.
     let _report = kastellan_worker_prelude::lock_down()?;
+    // The transport's tokio runtime (or reqwest's blocking runtime thread) is
+    // built only now, AFTER Landlock — it restricts the calling thread and is
+    // inherited by threads created afterwards, never applied retroactively
+    // (security audit 2026-09-02, F4).
+    let transport = kastellan_worker_web_common::http::make_get("kastellan-embed-broker/0")?;
 
     let mut handler = EmbedHandler::new(transport, endpoint);
     // Connections are handled serially: one web-research worker per broker, and

@@ -16,7 +16,8 @@ mod egress;
 pub(crate) use egress::{egress_selftest, mount_run_tmpfs, setup_relay};
 
 use crate::cmdline::{
-    anchor_of, bind_prep, parse_env_cmdline, parse_worker_args_cmdline, parse_worker_cmdline,
+    anchor_of, bind_prep, parse_env_cmdline, parse_mount_manifest, parse_worker_args_cmdline,
+    parse_worker_cmdline,
     vsock_listen_cid_port, BindPrep, MountManifest, VMADDR_CID_ANY,
 };
 use std::os::unix::io::RawFd;
@@ -169,7 +170,8 @@ pub(crate) fn apply_host_mounts(m: &MountManifest) {
     // persistent drive; every entry is mounted.
     for rw in &m.rw {
         let _ = std::fs::create_dir_all(&rw.mountpoint);
-        mount(&rw.dev, &rw.mountpoint, Some("ext4"), 0);
+        // nosuid + nodev (audit 2026-09-02): agent-authored code writes here.
+        mount(&rw.dev, &rw.mountpoint, Some("ext4"), libc::MS_NOSUID | libc::MS_NODEV);
     }
 }
 
@@ -256,12 +258,20 @@ pub(crate) fn exec_worker() {
         // Baked python interpreter default (harmless for non-python workers,
         // which ignore it); host-forwarded policy.env overrides it.
         std::env::set_var("KASTELLAN_PYTHON_EXEC_PYTHON", "/usr/bin/python3");
-        for (k, v) in parse_env_cmdline(&cmdline) {
+        // A corrupt env token is a refused boot, never an un-locked worker
+        // (audit 2026-09-02, F2). PID 1 panicking halts the VM; the launcher
+        // reports the death and the spawn fails closed on the host.
+        let env = match parse_env_cmdline(&cmdline) {
+            Ok(env) => env,
+            Err(e) => panic!("microvm-init: refusing to exec the worker: {e}"),
+        };
+        for (k, v) in env {
             std::env::set_var(k, v);
         }
     }
     // execv argv = [program, args…, NULL]. argv[0] is the program itself by
     // convention; for a shimmed worker that's the shim path, args[0] the target.
+    drop_privileges_for_worker(&cmdline);
     let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(arg_cstrings.len() + 2);
     argv.push(prog.as_ptr());
     for c in &arg_cstrings {
@@ -273,3 +283,87 @@ pub(crate) fn exec_worker() {
     }
     panic!("execv of worker failed");
 }
+
+/// Leave root before the worker runs (security audit 2026-09-02, workers 2 /
+/// prelude F3). `exec_worker` used to `execv` straight from PID 1, so
+/// agent-authored Python ran as guest root with every capability: DAC was a
+/// no-op inside the VM and Landlock + seccomp were the only in-guest gates.
+///
+/// The host passes the daemon's euid as `KASTELLAN_MICROVM_WORKER_UID`. When
+/// present: the writable mountpoints (rw scratch, persistent store, the
+/// share anchors' tmpfs, `/tmp`) are chowned to it, supplementary groups are
+/// cleared, gid then uid are switched, and `PR_SET_NO_NEW_PRIVS` is set so no
+/// setuid binary in the rootfs can hand privilege back. Any failure is fatal
+/// (PID 1 panics → the VM halts → the spawn fails closed). When the variable
+/// is absent — a rootfs newer than its host — the worker stays root exactly
+/// as before, and says so on stderr, so the two halves can be upgraded in
+/// either order without a silent change.
+///
+/// The numeric uid is deliberately never echoed to stderr or into a panic
+/// message: the host chose it (it is the daemon's own euid) and already knows
+/// it, and identifiers in log lines are what code scanning flags as cleartext
+/// logging. The messages name the env var instead.
+fn drop_privileges_for_worker(cmdline: &str) {
+    // SAFETY: prctl with immediate arguments; process-wide flag only.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            panic!("microvm-init: PR_SET_NO_NEW_PRIVS failed: {}", std::io::Error::last_os_error());
+        }
+    }
+    let Some(raw) = std::env::var_os(WORKER_UID_ENV) else {
+        eprintln!(
+            "microvm-init: {WORKER_UID_ENV} not set by the host; worker runs as guest root \
+             (upgrade the daemon to drop privileges)"
+        );
+        return;
+    };
+    let uid: u32 = raw
+        .to_str()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| panic!("microvm-init: {WORKER_UID_ENV} is not a uid"));
+    if uid == 0 {
+        eprintln!("microvm-init: {WORKER_UID_ENV}=0 — worker stays root");
+        return;
+    }
+    // Everything the worker may write is owned by the uid it will run as.
+    let m = parse_mount_manifest(cmdline);
+    let mut writable: Vec<String> = m.rw.iter().map(|rw| rw.mountpoint.clone()).collect();
+    writable.push("/tmp".to_string());
+    for t in m.rw.iter().map(|rw| rw.mountpoint.as_str()) {
+        if let Some(a) = anchor_of(t) {
+            writable.push(a);
+        }
+    }
+    for dir in writable {
+        let c = std::ffi::CString::new(dir.clone()).expect("mountpoint has no NUL");
+        // SAFETY: chown on a path we own as root; the cstring outlives the call.
+        let rc = unsafe { libc::chown(c.as_ptr(), uid, uid) };
+        if rc != 0 {
+            eprintln!(
+                "microvm-init: chown {dir} to the worker uid failed: {} (worker may be unable to write there)",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    // SAFETY: plain setgroups/setgid/setuid; each return code is checked.
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            panic!("microvm-init: setgroups failed: {}", std::io::Error::last_os_error());
+        }
+        if libc::setgid(uid) != 0 {
+            panic!("microvm-init: setgid to the worker uid failed: {}", std::io::Error::last_os_error());
+        }
+        if libc::setuid(uid) != 0 {
+            panic!("microvm-init: setuid to the worker uid failed: {}", std::io::Error::last_os_error());
+        }
+        // A successful setuid from root must be irreversible; prove it.
+        if libc::setuid(0) == 0 || libc::getuid() != uid || libc::geteuid() != uid {
+            panic!("microvm-init: privilege drop to the worker uid did not stick");
+        }
+    }
+    eprintln!("microvm-init: worker privileges dropped to the uid/gid named by {WORKER_UID_ENV}");
+}
+
+/// Mirror of `kastellan_sandbox::linux_firecracker::plan::GUEST_WORKER_UID_ENV`
+/// (the two crates share no code by design; keep them identical).
+const WORKER_UID_ENV: &str = "KASTELLAN_MICROVM_WORKER_UID";

@@ -51,18 +51,45 @@ pub struct EgressAuditRow {
 /// Pure over its I/O source + sink, so the loop is unit-testable without
 /// Postgres or a live proxy; the live wrapper ([`super::net_worker`]) supplies
 /// an `on_row` that inserts into `audit_log`.
-pub fn ingest_decisions_into<R, F>(reader: R, mut on_row: F)
+pub fn ingest_decisions_into<R, F>(mut reader: R, worker: &str, mut on_row: F)
 where
     R: std::io::BufRead,
     F: FnMut(EgressAuditRow),
 {
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        if let Some(row) = decision_to_audit(&line) {
-            on_row(row);
+    use kastellan_protocol::{read_capped_record, Record};
+    loop {
+        // Bounded read (security audit 2026-09-02, egress F2): `lines()` grew
+        // one String until `\n` with no cap, so a compromised sidecar — the
+        // network-facing process that parses every origin's TLS — could stream
+        // newline-free bytes and OOM the core. An over-cap record is a
+        // protocol fault: stop ingesting (the sidecar dies with its worker).
+        match read_capped_record(&mut reader, MAX_DECISION_LINE_BYTES) {
+            Ok(Record::Line(buf)) => {
+                let line = String::from_utf8_lossy(&buf);
+                if let Some(mut row) = decision_to_audit(&line) {
+                    // Attribution is the core's to assert, not the sidecar's
+                    // to claim (audit 2026-09-02, egress F2): a compromised
+                    // proxy could otherwise file its rows under another tool.
+                    row.payload["worker"] = serde_json::Value::String(worker.to_string());
+                    on_row(row);
+                }
+            }
+            Ok(Record::TooLarge) => {
+                tracing::error!(
+                    cap = MAX_DECISION_LINE_BYTES,
+                    "egress sidecar emitted an over-cap decision line; stopping decision ingest"
+                );
+                break;
+            }
+            Ok(Record::Eof) | Err(_) => break,
         }
     }
 }
+
+/// Cap on one decision line from the sidecar. A real record is a few hundred
+/// bytes (host, port, ip, reason, a hash); 64 KiB leaves room for a long
+/// reason string and nothing else.
+pub const MAX_DECISION_LINE_BYTES: usize = 64 * 1024;
 
 /// Parse one decision line into an audit row. Returns `None` for a line that
 /// isn't valid decision JSON (logged-and-skipped by the caller — never trusted
@@ -141,7 +168,7 @@ mod tests {
         let input: &[u8] = b"{\"worker\":\"web-fetch\",\"host\":\"a.com\",\"port\":443,\"resolved_ip\":\"1.2.3.4\",\"verdict\":\"allowed\",\"reason\":\"ok\"}\n\
                              {\"worker\":\"web-fetch\",\"host\":\"b.com\",\"port\":443,\"resolved_ip\":null,\"verdict\":\"blocked_allowlist\",\"reason\":\"x\"}\n";
         let mut rows = Vec::new();
-        ingest_decisions_into(input, |row| rows.push(row));
+        ingest_decisions_into(input, "test-worker", |row| rows.push(row));
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].action, "egress.allowed");
         assert_eq!(rows[1].action, "egress.blocked.allowlist");
@@ -155,7 +182,7 @@ mod tests {
                              {\"verdict\":\"wat\"}\n\
                              {\"worker\":\"w\",\"host\":\"h\",\"port\":443,\"resolved_ip\":null,\"verdict\":\"blocked_ssrf\",\"reason\":\"r\"}\n";
         let mut rows = Vec::new();
-        ingest_decisions_into(input, |row| rows.push(row));
+        ingest_decisions_into(input, "test-worker", |row| rows.push(row));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].action, "egress.blocked.ssrf");
     }

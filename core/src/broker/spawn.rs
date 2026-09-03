@@ -164,7 +164,9 @@ fn make_broker_scratch_dir(scratch_root: &Path, kind: BrokerKind) -> Result<Path
             ),
         )));
     }
-    std::fs::create_dir_all(&dir).map_err(ToolHostError::Io)?;
+    // Exclusive + 0700 — same reasoning as `egress::net_worker` (audit
+    // 2026-09-02, S1): never adopt a pre-existing per-spawn directory.
+    kastellan_sandbox::private_dir::create_private_dir(&dir).map_err(ToolHostError::Io)?;
     Ok(dir)
 }
 

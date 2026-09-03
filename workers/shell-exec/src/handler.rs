@@ -22,6 +22,21 @@ pub struct ShellExecHandler {
     allowed_argv0: HashSet<String>,
 }
 
+/// How many chars of the joined allowlist a denial carries. Sized to fit the
+/// planner's step-detail clamp (`kastellan_protocol::STEP_ERR_DETAIL_MAX`,
+/// 200 chars) after the fixed prefix, so the advice survives the render.
+const ALLOWLIST_ECHO_MAX: usize = 150;
+
+/// Truncate `s` to at most `max` chars with a trailing `…` marker.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 impl ShellExecHandler {
     pub fn from_env() -> anyhow::Result<Self> {
         let raw = std::env::var("KASTELLAN_SHELL_ALLOWLIST").unwrap_or_else(|_| "[]".to_string());
@@ -48,9 +63,22 @@ impl Handler for ShellExecHandler {
             RpcError::new(codes::INVALID_PARAMS, "argv must be non-empty")
         })?;
         if !self.allowed_argv0.contains(program) {
+            // Do NOT echo argv[0] back (security audit 2026-09-02, finding
+            // H1): the core substitutes `secret://` refs anywhere in params
+            // before the call, so an injected planner could pass a ref as
+            // argv[0] and read the plaintext out of this very message. The
+            // core now scrubs error text too, but the worker should not hand
+            // out what it was given in the first place. What the planner can
+            // use instead is the operator's allowlist, which is not secret —
+            // that is the repair advice this error exists to carry.
+            let mut allowed: Vec<&str> = self.allowed_argv0.iter().map(String::as_str).collect();
+            allowed.sort_unstable();
             return Err(RpcError::new(
                 codes::POLICY_DENIED,
-                format!("argv[0] {program:?} not in allowlist"),
+                format!(
+                    "argv[0] not in allowlist; allowed argv[0] values: {}",
+                    clip(&allowed.join(", "), ALLOWLIST_ECHO_MAX)
+                ),
             ));
         }
 
@@ -132,5 +160,26 @@ mod tests {
         let params = serde_json::json!({"argv": ["/usr/bin/whoami"]});
         let err = h.call("shell.exec", params).expect_err("off-allowlist must be denied");
         assert_eq!(err.code, codes::POLICY_DENIED);
+    }
+
+    #[test]
+    fn a_denial_never_echoes_argv0_but_names_the_allowlist() {
+        // argv[0] may be a substituted `secret://` ref's plaintext (audit
+        // 2026-09-02, H1): the denial must not carry it, and must instead
+        // carry the (non-secret) allowlist as repair advice.
+        let mut h = handler(&["/bin/sh", "/usr/bin/env"]);
+        let params = serde_json::json!({"argv": ["hunter2-the-secret-value"]});
+        let err = h.call("shell.exec", params).expect_err("off-allowlist must be denied");
+        assert!(!err.message.contains("hunter2"), "message echoed argv[0]: {}", err.message);
+        assert!(err.message.contains("/bin/sh, /usr/bin/env"), "message: {}", err.message);
+    }
+
+    #[test]
+    fn clip_bounds_the_allowlist_echo() {
+        assert_eq!(clip("short", 10), "short");
+        let long = "x".repeat(200);
+        let clipped = clip(&long, 150);
+        assert_eq!(clipped.chars().count(), 151);
+        assert!(clipped.ends_with('…'));
     }
 }

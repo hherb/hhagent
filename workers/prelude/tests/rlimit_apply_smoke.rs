@@ -35,6 +35,11 @@ fn apply_from_env_with_generous_budget_reports_applied() {
     let output = Command::new(PROBE)
         .arg("rlimit-report")
         .env_clear()
+        // These tests exercise rlimit ONLY. Since the 2026-09-02 audit a
+        // missing seccomp profile and an unenforceable Landlock ruleset are
+        // lockdown errors, so opt out of both explicitly.
+        .env("KASTELLAN_SECCOMP_PROFILE", "none")
+        .env("KASTELLAN_LANDLOCK_PROFILE", "none")
         .env("KASTELLAN_CPU_MS", "30000")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -72,6 +77,11 @@ fn apply_from_env_with_no_budget_env_reports_disabled() {
     let output = Command::new(PROBE)
         .arg("rlimit-report")
         .env_clear()
+        // These tests exercise rlimit ONLY. Since the 2026-09-02 audit a
+        // missing seccomp profile and an unenforceable Landlock ruleset are
+        // lockdown errors, so opt out of both explicitly.
+        .env("KASTELLAN_SECCOMP_PROFILE", "none")
+        .env("KASTELLAN_LANDLOCK_PROFILE", "none")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

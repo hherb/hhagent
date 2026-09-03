@@ -210,9 +210,12 @@ pub fn classify(e: &RouterError) -> GuardErrorKind {
             GuardErrorKind::Decode
         }
         RouterError::Config(_) => GuardErrorKind::Config,
-        RouterError::PolicyDeniedFrontier(_) | RouterError::EmbeddingCountMismatch { .. } => {
-            GuardErrorKind::Other
-        }
+        // `BodyTooLarge` (audit 2026-09-02): the guard backend answered with a
+        // body over the router's cap — a misbehaving backend, not a timeout,
+        // status or decode failure; `Other` is the honest bucket.
+        RouterError::PolicyDeniedFrontier(_)
+        | RouterError::EmbeddingCountMismatch { .. }
+        | RouterError::BodyTooLarge { .. } => GuardErrorKind::Other,
     }
 }
 

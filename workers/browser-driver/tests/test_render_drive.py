@@ -91,14 +91,31 @@ class FakePage:
         return self._html
 
 
+class FakeContext:
+    def __init__(self, page, options):
+        self._page = page
+        self.options = options
+        self.closed = False
+
+    def new_page(self):
+        return self._page
+
+    def close(self):
+        self.closed = True
+
+
 class FakeBrowser:
     def __init__(self, page):
         self._page = page
         self.closed = False
         self.launch_args = None
+        self.context_options = None
 
-    def new_page(self):
-        return self._page
+    def new_context(self, **options):
+        # Mirrors Playwright's `Browser.new_context(...)`; the renderer must
+        # create its page inside a context with service workers blocked.
+        self.context_options = options
+        return FakeContext(self._page, options)
 
     def close(self):
         self.closed = True
@@ -239,3 +256,16 @@ def test_headless_true_is_pinned_for_the_microvm_rootfs():
         "headless=False would need the full chromium bundle, which the micro-VM "
         "rootfs deliberately does not ship"
     )
+
+
+def test_render_blocks_service_workers_in_its_context():
+    """Audit 2026-09-02 (workers 5): `page.route` does not see service-worker
+    fetches, so the context must refuse to register them."""
+    page = FakePage(html="<html><body>ok</body></html>", title="", final_url="https://x.test/", status=200)
+    browser = FakeBrowser(page)
+    r = PlaywrightRenderer(
+        allowlist=HostAllowlist.from_endpoints(["x.test"]),
+        playwright_factory=make_factory(browser),
+    )
+    r.render(url="https://x.test/", timeout_ms=1000, wait_until="load")
+    assert browser.context_options == {"service_workers": "block"}

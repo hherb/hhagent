@@ -119,6 +119,63 @@ pub fn resolve_interpreter_root(
     })
 }
 
+/// Refuse an interpreter root that would expose the daemon's own private
+/// state to a worker (security audit 2026-09-02, sandbox S6).
+///
+/// [`resolve_interpreter_root`] derives `<prefix>` from `<prefix>/bin/python`;
+/// every path in [`bind_paths`](InterpreterRoot::bind_paths) then rides
+/// `fs_read` into the jail (bwrap `--ro-bind`, Seatbelt `file-read*`). A
+/// uv-managed interpreter gives a leaf like
+/// `~/.local/share/uv/python/cpython-3.12-…` — fine. But an interpreter
+/// installed with `--prefix=$HOME` (`~/bin/python3`), or living in
+/// `~/.local/bin`, derives `$HOME` or `~/.local` — which contains
+/// `~/.config/kastellan` (env files, tokens), `~/.local/share/kastellan` (the
+/// Matrix store), `~/.local/state/kastellan` (the audit mirror) and the vault's
+/// keyring material. Returns `None` (the worker then fails to start with an
+/// ENOENT it can explain) rather than binding any of that.
+///
+/// The check runs over **every** bind path, not the canonical prefix alone:
+/// since #650 a root also carries the aliases the venv names it by, and each
+/// one becomes a real directory inside the jail. An alias is a *lexical* name
+/// the canonical comparison cannot see — a `$HOME` that is itself a symlink
+/// into the prefix would pass `alias_prefixes` and the canonical check both,
+/// and only the alias check catches it. One offending name refuses the whole
+/// root: dropping just that alias would leave the shebang dangling with the
+/// very ENOENT #650 fixed, only quieter.
+///
+/// A separate step rather than part of [`resolve_interpreter_root`] so the
+/// resolver stays a pure function of its injected probes; `home` is the one
+/// environmental input, and the callers pass `$HOME`.
+pub fn guard_interpreter_root(
+    root: Option<InterpreterRoot>,
+    home: Option<&Path>,
+) -> Option<InterpreterRoot> {
+    let root = root?;
+    let Some(home) = home else { return Some(root) };
+    let sensitive: [PathBuf; 6] = [
+        home.to_path_buf(),
+        home.join(".config").join("kastellan"),
+        home.join(".local").join("share").join("kastellan"),
+        home.join(".local").join("state").join("kastellan"),
+        home.join(".local").join("lib").join("kastellan"),
+        home.join(".kastellan"),
+    ];
+    let offending = root
+        .bind_paths()
+        .into_iter()
+        .find(|prefix| sensitive.iter().any(|s| s.starts_with(prefix)));
+    if let Some(prefix) = offending {
+        tracing::warn!(
+            prefix = %prefix.display(),
+            "refusing interpreter prefix: it contains the daemon's own config/state; \
+             install the worker's interpreter under a leaf prefix (a uv-managed or \
+             venv-local CPython)"
+        );
+        return None;
+    }
+    Some(root)
+}
+
 /// Every prefix the venv *names* that is the canonical prefix under a different
 /// name, in the order the symlink chain names them.
 ///

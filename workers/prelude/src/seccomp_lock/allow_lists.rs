@@ -64,6 +64,19 @@ pub const BASE_ALLOW: &[i64] = &[
     // ---- Fork / exec / wait ----
     // clone3 is the modern fork primitive used by glibc/musl; clone is
     // kept for compat. execve+execveat for shell-exec child spawn.
+    //
+    // Neither is an *unconditional* allow, even though both sit in this
+    // table (security audit 2026-09-02): `unshare(2)`/`setns(2)` are killed
+    // below, but `clone(CLONE_NEWUSER | …)` mints exactly the same fresh
+    // user namespace — so [`super::build_bpf`] attaches a flags condition
+    // to `clone` (allowed only when `flags & NAMESPACE_CLONE_FLAGS == 0`,
+    // see [`NAMESPACE_CLONE_FLAGS`]), and `clone3` — whose flags live in a
+    // userspace struct seccomp cannot inspect — is downgraded to
+    // `Errno(ENOSYS)` by a second filter ([`super::build_clone3_enosys_bpf`])
+    // so glibc/musl fall back to `clone`, where the condition applies. It
+    // must stay listed here so the main filter answers `Allow` rather than
+    // `KillProcess` (the kernel keeps the highest-precedence verdict across
+    // filters, and `ERRNO` outranks `ALLOW` but not `KILL`).
     libc::SYS_clone,
     libc::SYS_clone3,
     libc::SYS_execve,
@@ -279,6 +292,34 @@ pub const BASE_ALLOW: &[i64] = &[
 /// number (the modern variants are the only entry point). Listing them
 /// behind `cfg(target_arch = "x86_64")` keeps the same crate building on
 /// both arches without `unused_imports` warnings.
+/// The `clone(2)` flag bits that request a **new namespace** — the escape
+/// primitive the worker-side layer exists to remove (`docs/threat-model.md`:
+/// "a kernel bug … does not get the worker `unshare(CLONE_NEWUSER)`
+/// privileges it could use to escape into a fresh user namespace").
+///
+/// `unshare` and `setns` are simply absent from every allow-list, but a
+/// `clone` carrying any of these flags creates the same namespace, so the
+/// main filter (see [`super::build_bpf`]) admits `clone` only when
+/// `flags & NAMESPACE_CLONE_FLAGS == 0`. Ordinary `fork`/`pthread_create`
+/// carry none of them (`CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+/// CLONE_THREAD | …` plus the exit signal in the low byte), so worker code is
+/// unaffected; Chromium under `browser_client` runs `--no-sandbox` and never
+/// asks for namespaces either. Every unprivileged-userns kernel LPE of recent
+/// years (netfilter/nf_tables, overlayfs, …) starts with this one call.
+///
+/// `CLONE_NEWTIME` (`0x80`) is deliberately **not** in the mask: it is valid
+/// only for `clone3`/`unshare`, and on `clone(2)` bit 7 belongs to the exit
+/// signal number, which would make `clone(SIGRTMAX…)`-style calls a false
+/// positive. Time namespaces are unreachable anyway — `unshare` is killed and
+/// `clone3` is `ENOSYS` (see the fork/exec block in [`BASE_ALLOW`]).
+pub const NAMESPACE_CLONE_FLAGS: u64 = (libc::CLONE_NEWNS
+    | libc::CLONE_NEWCGROUP
+    | libc::CLONE_NEWUTS
+    | libc::CLONE_NEWIPC
+    | libc::CLONE_NEWUSER
+    | libc::CLONE_NEWPID
+    | libc::CLONE_NEWNET) as u64;
+
 #[cfg(target_arch = "x86_64")]
 pub const BASE_ALLOW_X86_64_LEGACY: &[i64] = &[
     libc::SYS_open,

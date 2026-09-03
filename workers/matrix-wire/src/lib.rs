@@ -68,9 +68,71 @@ pub fn push_bounded(buf: &mut VecDeque<Event>, event: Event, cap: usize) -> bool
     dropped
 }
 
+/// What [`push_bounded_fair`] did with the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FairPush {
+    /// Buffered.
+    Pushed,
+    /// Buffered, evicting the oldest event overall (the buffer was at `cap`).
+    PushedEvictedOldest,
+    /// Refused: this sender already holds `per_peer_cap` events. The NEW event
+    /// is dropped, nobody else's is.
+    DroppedSenderFlood,
+}
+
+/// [`push_bounded`] with per-sender fairness (security audit 2026-09-02,
+/// channel F1 / workers 1): drop-oldest alone let any one sender flood the
+/// buffer and evict the operator's queued commands between two core polls. A
+/// sender at `per_peer_cap` has its *own* newest event refused instead; the
+/// global `cap` still applies afterwards.
+pub fn push_bounded_fair(
+    buf: &mut VecDeque<Event>,
+    event: Event,
+    cap: usize,
+    per_peer_cap: usize,
+) -> FairPush {
+    if per_peer_cap > 0 && buf.iter().filter(|e| e.peer == event.peer).count() >= per_peer_cap {
+        return FairPush::DroppedSenderFlood;
+    }
+    if push_bounded(buf, event, cap) {
+        FairPush::PushedEvictedOldest
+    } else {
+        FairPush::Pushed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ev_from(peer: &str, body: &str) -> Event {
+        Event { conversation: "!room:srv".into(), peer: peer.into(), body: body.into() }
+    }
+
+    #[test]
+    fn fair_push_refuses_a_flooding_sender_and_keeps_others() {
+        let mut buf = VecDeque::new();
+        for i in 0..4 {
+            assert_eq!(push_bounded_fair(&mut buf, ev_from("@evil:srv", &i.to_string()), 256, 4), FairPush::Pushed);
+        }
+        // The 5th from the same sender is refused; the buffer is unchanged.
+        assert_eq!(push_bounded_fair(&mut buf, ev_from("@evil:srv", "5"), 256, 4), FairPush::DroppedSenderFlood);
+        assert_eq!(buf.len(), 4);
+        // The operator's event still gets in.
+        assert_eq!(push_bounded_fair(&mut buf, ev_from("@op:srv", "hi"), 256, 4), FairPush::Pushed);
+        assert_eq!(buf.len(), 5);
+        assert!(buf.iter().any(|e| e.peer == "@op:srv"));
+    }
+
+    #[test]
+    fn fair_push_still_honours_the_global_cap() {
+        let mut buf = VecDeque::new();
+        push_bounded_fair(&mut buf, ev_from("@a:srv", "1"), 2, 8);
+        push_bounded_fair(&mut buf, ev_from("@b:srv", "2"), 2, 8);
+        assert_eq!(push_bounded_fair(&mut buf, ev_from("@c:srv", "3"), 2, 8), FairPush::PushedEvictedOldest);
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf.front().unwrap().peer, "@b:srv");
+    }
 
     fn ev(body: &str) -> Event {
         Event {

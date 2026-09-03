@@ -102,6 +102,7 @@ pub(crate) fn parse_daemon_spawn_config(
         device_name: Some("kastellan-daemon".to_string()),
         enforce_sandbox,
         use_microvm,
+        peers: parse_peers_csv(&get("KASTELLAN_MATRIX_PEERS").unwrap_or_default()),
     })
 }
 
@@ -191,4 +192,12 @@ pub struct MatrixSpawnConfig {
     /// `spawn_matrix_worker` builds the VM policy (persistent_store at /data + baked
     /// rootfs). Ignored on macOS. Default `false` ⇒ the 5b-4a bwrap/Seatbelt path.
     pub use_microvm: bool,
+    /// `KASTELLAN_MATRIX_PEERS`, handed to the worker as well (security audit
+    /// 2026-09-02, channel F1): the worker auto-joined any invite from any
+    /// account and forwarded every room's traffic, leaving the core-side
+    /// peer check as the only gate — with no room scoping at all, so a
+    /// third party could host the paired operator in a room they control.
+    /// When non-empty the worker declines invites from, and drops events
+    /// by, anyone else; two-party room scoping applies regardless.
+    pub peers: Vec<crate::channel::PeerId>,
 }

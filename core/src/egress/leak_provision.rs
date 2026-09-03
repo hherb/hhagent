@@ -26,7 +26,18 @@ pub const SECRET_HASHES_FILE_NAME: &str = "secret_hashes.json";
 pub fn write_secret_hashes(scratch: &Path, fps: &[SecretFingerprint]) -> io::Result<()> {
     let final_path = scratch.join(SECRET_HASHES_FILE_NAME);
     let tmp_path = scratch.join(format!("{SECRET_HASHES_FILE_NAME}.tmp"));
-    std::fs::write(&tmp_path, serialize_hashes(fps))?;
+    // 0600 + O_EXCL (audit 2026-09-02, F4): this file holds an unsalted
+    // SHA-256 and the exact length of every provisioned secret — an offline
+    // dictionary target — and `fs::write` created it 0644 while following
+    // any symlink planted at the tmp name. A stale tmp from an interrupted
+    // write is ours (the scratch dir is exclusively owned), so clear it first.
+    let _ = std::fs::remove_file(&tmp_path);
+    {
+        use std::io::Write as _;
+        let mut f = kastellan_sandbox::private_dir::create_private_file(&tmp_path)?;
+        f.write_all(serialize_hashes(fps).as_bytes())?;
+        f.flush()?;
+    }
     std::fs::rename(&tmp_path, &final_path)
 }
 

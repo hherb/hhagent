@@ -45,19 +45,24 @@ RUN apt-get update \
 
 RUN python3 -m venv "$KASTELLAN_BD_ROOT/venv"
 
-# 2. Third-party deps FIRST, exactly pinned, so the expensive layers cache and
-#    the rootfs is reproducible. These are the three declared in
-#    workers/browser-driver/pyproject.toml (which floats them as >= ranges for
-#    the host install path).
+# 2. Third-party deps FIRST, from the HASH-PINNED lock, so the expensive layers
+#    cache and the rootfs is reproducible — and identical to what the host
+#    install path (scripts/workers/browser-driver/install.sh) stages.
 #
-#    Pinned here rather than deferred to a lock file on purpose:
-#    workers/browser-driver/uv.lock is git-IGNORED (.gitignore:43), so it is a
-#    local developer artifact and cannot be this image's source of truth. These
-#    versions were taken from a resolved uv.lock and must be bumped by hand.
-#    Pinning only playwright while letting lxml/readability float would make the
-#    image's contents depend on when it happened to be built.
+#    `workers/browser-driver/requirements.lock` (tracked; security audit
+#    2026-09-02) pins every runtime dep AND transitive by version + sha256.
+#    Before it existed this line hand-pinned the three direct deps and let the
+#    transitives (greenlet, pyee, cssselect, chardet, lxml-html-clean, …) float
+#    to whatever PyPI served at build time, and the host path floated all of
+#    them. `--require-hashes` refuses any distribution whose sha256 is not in
+#    the lock; `--only-binary=:all:` refuses sdists, so no setup.py from PyPI
+#    executes inside this image. Bump by regenerating the lock (command in its
+#    header) and reviewing the diff — never by editing versions here.
+#    (`uv.lock` in that directory is a git-ignored local artifact; it is not
+#    the source of truth and is excluded by .dockerignore.)
+COPY requirements.lock /src/requirements.lock
 RUN "$KASTELLAN_BD_ROOT/venv/bin/pip" install --no-cache-dir \
-      "playwright==1.60.0" "readability-lxml==0.8.4.1" "lxml==6.1.1"
+      --require-hashes --only-binary=:all: -r /src/requirements.lock
 
 # 3. Chromium + its apt dependency closure. The expensive layer; kept above the
 #    source COPY on purpose.

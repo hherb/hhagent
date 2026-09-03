@@ -24,7 +24,8 @@ use crate::entity_extraction::EntityExtractor;
 use crate::memory::embedder::Embedder;
 use crate::scheduler::audit::{
     build_finalize_payload, build_l1_write_payload, build_l3_write_payload,
-    build_lifecycle_payload, compute_duration_ms, TaskFinalizeStats, ACTION_L1_PROMOTED,
+    build_lifecycle_payload, compute_duration_ms, TaskFinalizeStats, ACTION_L1_INJECTION_BLOCKED,
+    ACTION_L1_PROMOTED,
     ACTION_L3_CRYSTALLISED, ACTION_TASK_FINALIZE, SCHEDULER_AUDIT_ACTOR,
 };
 use crate::scheduler::inner_loop::InnerLoopResult;
@@ -109,6 +110,32 @@ pub(super) async fn write_l1_promoted_row(
                 task_id, error = %msg,
                 "agent-raised L1 promotion rejected on validation (skipping audit row)"
             );
+            return;
+        }
+        Err(L1Error::InjectionBlocked { score, reason_codes, body_sha256 }) => {
+            // A security event, not a validation nit: the planner tried to
+            // persist an instruction-shaped insight. Record the hash + codes
+            // (never the body) so the attempt is visible in `audit_log`.
+            tracing::warn!(
+                task_id, score, ?reason_codes, body_sha256 = %body_sha256,
+                "agent-raised L1 promotion BLOCKED by injection guard"
+            );
+            let payload = serde_json::json!({
+                "task_id": task_id,
+                "source": "agent_raised",
+                "decision": "block",
+                "score": score,
+                "reason_codes": reason_codes,
+                "body_sha256": body_sha256,
+            });
+            if let Err(e) = kastellan_db::audit::insert(
+                pool, SCHEDULER_AUDIT_ACTOR, ACTION_L1_INJECTION_BLOCKED, payload,
+            ).await {
+                tracing::warn!(
+                    task_id, error = %e,
+                    "audit insert for scheduler l1.injection_blocked row failed (best-effort)"
+                );
+            }
             return;
         }
         Err(L1Error::Db(e)) => {
