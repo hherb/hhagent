@@ -268,14 +268,27 @@ async fn dispatch_substitutes_and_writes_redeemed_row() {
         .await
         .expect("dispatch");
 
+    // The worker received the substituted plaintext and echoed it — and the
+    // dispatch chokepoint scrubbed it back out of the result before it could
+    // reach the planner or `audit_log` (security audit 2026-09-02, H1). The
+    // placeholder is the evidence of both: an unsubstituted ref would echo as
+    // the literal `secret://…` and produce no scrub hit at all.
     let stdout = result["stdout"].as_str().expect("stdout");
     assert!(
-        stdout.contains(marker),
-        "worker stdout should contain substituted plaintext: got {stdout:?}"
+        stdout.contains("[redacted:"),
+        "worker stdout should carry the scrub placeholder where the plaintext was echoed: got {stdout:?}"
+    );
+    assert!(
+        !stdout.contains(marker),
+        "H1: redeemed plaintext must not survive in the dispatch result: got {stdout:?}"
+    );
+    assert!(
+        !stdout.contains(secret_ref.as_str()),
+        "the worker must have received the plaintext, not the opaque ref: got {stdout:?}"
     );
 
-    // Audit log: 1 materialize + 1 redeemed + 1 tool row (3 in addition
-    // to the bring-up rows that probe::run writes).
+    // Audit log: 1 materialize + 1 redeemed + 1 tool row + 1 output_scrubbed
+    // (4 in addition to the bring-up rows that probe::run writes).
     let materialize_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM audit_log WHERE actor='policy' AND action='secret.materialized'",
     ).fetch_one(&pool).await.unwrap();
@@ -294,6 +307,11 @@ async fn dispatch_substitutes_and_writes_redeemed_row() {
         "SELECT COUNT(*) FROM audit_log WHERE actor='tool:shell-exec'",
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(tool_count, 1, "exactly one tool:shell-exec row");
+
+    let scrubbed_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE actor='policy' AND action='secret.output_scrubbed'",
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(scrubbed_count, 1, "exactly one H1 scrub row for the echoed secret");
 
     let _ = worker.close();
     pool.close().await;
@@ -588,9 +606,19 @@ async fn tool_row_req_shows_opaque_ref_not_plaintext() {
         .await
         .expect("dispatch");
 
-    // The worker received the real plaintext (substitution happened).
+    // The worker received the real plaintext (substitution happened): it
+    // echoed it, and the H1 chokepoint scrub replaced the echo with its
+    // placeholder. An unsubstituted ref would echo as the literal `secret://…`,
+    // unscrubbed.
     let stdout = result["stdout"].as_str().expect("stdout");
-    assert!(stdout.contains(marker), "worker should receive plaintext; got stdout: {stdout:?}");
+    assert!(
+        stdout.contains("[redacted:"),
+        "worker should receive and echo the plaintext, scrubbed on the way back; got stdout: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains(marker) && !stdout.contains(secret_ref.as_str()),
+        "neither the plaintext nor the opaque ref may appear in the result; got stdout: {stdout:?}"
+    );
 
     let tool_payload: serde_json::Value = sqlx::query_scalar(
         "SELECT payload FROM audit_log WHERE actor='tool:shell-exec'",
@@ -725,11 +753,16 @@ async fn dispatch_swallows_redeemed_audit_insert_failure() {
             .await
             .expect("dispatch must still return Ok despite the redeemed-row audit failure");
 
-    // The worker still ran and received the substituted plaintext.
+    // The worker still ran and received the substituted plaintext: the echo
+    // comes back as the H1 scrub placeholder, never as the marker itself.
     let stdout = result["stdout"].as_str().expect("stdout");
     assert!(
-        stdout.contains(marker),
-        "worker stdout should contain the substituted plaintext: got {stdout:?}"
+        stdout.contains("[redacted:"),
+        "worker stdout should carry the scrub placeholder for the substituted plaintext: got {stdout:?}"
+    );
+    assert!(
+        !stdout.contains(marker),
+        "H1: redeemed plaintext must not survive in the dispatch result: got {stdout:?}"
     );
 
     // The failing redeemed insert was attempted (then swallowed)...
