@@ -11,9 +11,18 @@
 //!
 //! Without the venv + weights (and without a running Postgres, and
 //! without bwrap/Seatbelt), every test in this file `[SKIP]`s cleanly.
-//! That matches the default deployment posture: gliner-relex is opt-in
-//! via `KASTELLAN_GLINER_RELEX_ENABLE=1` and operators run
-//! `scripts/workers/gliner-relex/install.sh` before flipping the flag.
+//! That matches the default deployment posture: operators run
+//! `scripts/workers/gliner-relex/install.sh` before the tier can run at all.
+//!
+//! Unlike the other two gliner-relex suites, this one has **no**
+//! `KASTELLAN_GLINER_RELEX_ENABLE` gate of its own (`EnableFlag::Ignored`) —
+//! it runs whenever the venv and the weights are staged. That flag gates the
+//! daemon *worker*, and the two heavier tiers that drive the model through the
+//! extraction path.
+//!
+//! Setting `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` inverts the skips: every
+//! precondition becomes a panic naming itself, because a skip nobody can turn
+//! into a failure cannot detect a dead fixture (#653).
 //!
 //! See `docs/superpowers/specs/2026-05-18-gliner-relex-worker-design.md`
 //! and the Slice 2 section of
@@ -22,7 +31,6 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use kastellan_core::scheduler::ToolEntry;
@@ -30,43 +38,39 @@ use kastellan_core::secrets::Vault;
 use kastellan_core::tool_host::{self, ToolHostError};
 use kastellan_core::worker_lifecycle::{IdleTimeoutLifecycle, WorkerLifecycleManager};
 use kastellan_core::workers::gliner_relex::{
-    gliner_relex_entry, ExtractRequest, ExtractResponse, GlinerRelexEnv,
+    gliner_relex_entry, ExtractRequest, ExtractResponse,
 };
 use kastellan_protocol::client::ClientError;
+use kastellan_tests_common::gliner_e2e::{
+    gliner_host_env, gliner_host_lockdown_shim, report_unmet, require_action, venv_shim_or_reason,
+    EnableFlag,
+};
 use kastellan_tests_common::{
-    bring_up_pg_cluster, pg_bin_dir_or_skip, resolve_weights_dir_or_skip,
-    skip_if_no_supervisor, skip_if_sandbox_unavailable, unique_suffix,
-    venv_interpreter_binds, PgCluster,
+    bring_up_pg_cluster, pg_bin_dir_or_reason, unique_suffix, weights_dir_or_reason, PgCluster,
 };
 
-/// Resolve the venv shim path relative to the workspace root.
-///
-/// Returns `None` (with a `[SKIP]` print on stderr) when the path
-/// doesn't exist. Mirrors the resolution `resolve_env` (wrapped by
-/// `GlinerRelexManifest::resolve`) does in production except that this
-/// helper never honours the daemon's `KASTELLAN_GLINER_RELEX_VENV_DIR`
-/// override — tests always run against the in-tree
-/// `workers/gliner-relex/.venv/`.
-fn resolve_worker_script() -> Option<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .expect("CARGO_MANIFEST_DIR has no parent — broken workspace layout")
-        .to_path_buf();
-    let script = workspace_root
-        .join("workers/gliner-relex/.venv/bin/kastellan-worker-gliner-relex");
-    if !script.exists() {
-        eprintln!(
-            "\n[SKIP] gliner-relex venv shim not built at {} — run scripts/workers/gliner-relex/install.sh\n",
-            script.display()
-        );
-        return None;
-    }
-    Some(script)
-}
+// The container tier below is macOS-only, and since the host-mode cascade moved
+// into `kastellan_tests_common::gliner_e2e` it is the ONLY user of these five.
+// Gated rather than imported unconditionally: Linux compiles the tier away, so
+// an ungated `use` is an unused import there — invisible on the Mac, and a
+// `-D warnings` failure on the DGX and in CI's linux clippy job.
+#[cfg(target_os = "macos")]
+use kastellan_core::workers::gliner_relex::GlinerRelexEnv;
+#[cfg(target_os = "macos")]
+use kastellan_tests_common::{
+    resolve_weights_dir_or_skip, skip_if_no_supervisor, skip_if_sandbox_unavailable,
+};
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 
 /// Slice 2.5: gate container-mode e2e on the operator having built the
-/// image. Mirrors the venv-staged `resolve_worker_script` skip pattern.
+/// image. Mirrors the venv-staged skip pattern in
+/// `kastellan_tests_common::gliner_e2e`.
+///
+/// Stays skip-only under `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` on purpose: the
+/// container tier is a separate, much heavier opt-in, and folding it into the
+/// knob would make the knob unusable on a Mac that has the venv staged but no
+/// image. See the `# Scope` section of `kastellan_tests_common::gliner_e2e`.
 #[cfg(target_os = "macos")]
 fn skip_if_no_container() -> bool {
     if let Err(e) = kastellan_sandbox::macos_container::MacosContainer::probe() {
@@ -127,7 +131,11 @@ fn build_test_entry_container() -> Option<ToolEntry> {
         script_path: PathBuf::new(),
         venv_dir: PathBuf::new(),
         weights_dir: weights,
-        model_id: "knowledgator/gliner-relex-multi-v1.0".to_string(),
+        // The one definition, shared with the host tier. A fourth hardcoded
+        // copy lived here and would have gone stale on a model bump while the
+        // unit test pinning MODEL_ID still passed — the exact drift the
+        // de-duplication exists to stop.
+        model_id: kastellan_tests_common::gliner_e2e::MODEL_ID.to_string(),
         device: "auto".to_string(),
         use_container_backend: true,
         container_image: None,  // defaults to CONTAINER_IMAGE_DEFAULT
@@ -142,82 +150,56 @@ fn build_test_entry_container() -> Option<ToolEntry> {
 /// run without panicking on hosts where the venv/weights are absent.
 /// The real assertions land in [`happy_path_extract_returns_entities_and_triples`]
 /// and friends below.
+///
+/// Deliberately the *reason* forms rather than `gliner_host_env`: this test
+/// must stay green on an unstaged host even under
+/// `KASTELLAN_GLINER_RELEX_REQUIRE_E2E`, because it asserts nothing about the
+/// worker — it only proves the resolvers still link and run.
 #[test]
 fn skip_helpers_compile_and_return_cleanly_on_unstaged_hosts() {
-    let _ = resolve_worker_script();
-    let _ = resolve_weights_dir_or_skip();
+    let _ = venv_shim_or_reason();
+    let _ = weights_dir_or_reason();
 }
 
 /// Build the gliner-relex `ToolEntry` against the in-tree venv + the
-/// on-disk weights. Returns `None` if any of the four preconditions
-/// (sandbox / supervisor / venv / weights) is missing — every caller
-/// converts that into a `[SKIP]` early return.
+/// on-disk weights.
+///
+/// Every precondition — sandbox, supervisor, venv shim, weights — lives in
+/// `gliner_host_env`, shared with the other two gliner-relex e2e suites.
+/// This tier passes `EnableFlag::Ignored`: it runs whenever the venv and the
+/// weights are staged, with no separate opt-in flag.
+///
+/// Returns `None` when a precondition is unmet, so the caller `return`s green —
+/// unless `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` is set, in which case the unmet
+/// precondition is a panic naming itself. That knob is the whole reason the
+/// cascade moved out of this file: these four tests read as passing for months
+/// on a host whose `.venv` had been copied from another one (#651/#653).
 fn build_test_entry() -> Option<ToolEntry> {
-    if skip_if_sandbox_unavailable() {
-        return None;
-    }
-    if skip_if_no_supervisor() {
-        return None;
-    }
-    let script = resolve_worker_script()?;
-    let weights = resolve_weights_dir_or_skip()?;
-    let venv_dir = script
-        .parent()
-        .and_then(|bin| bin.parent())
-        .expect("script_path is .venv/bin/<bin> — both parent levels must exist")
-        .to_path_buf();
-    let (interp_root, interp_lib_dirs) = venv_interpreter_binds(&venv_dir);
-    let env = GlinerRelexEnv {
-        script_path: script,
-        venv_dir,
-        weights_dir: weights,
-        model_id: "knowledgator/gliner-relex-multi-v1.0".to_string(),
-        device: "auto".to_string(),
-        use_container_backend: false,
-        container_image: None,
-        // Bind the venv's real interpreter, exactly as the production manifest
-        // does (`GlinerRelexManifest::resolve` → `resolve_host_interpreter_binds`,
-        // issue #284). This used to hardcode `None` / `vec![]` under the comment
-        // "self-contained fixture", and that assumption is false whenever `uv`
-        // provisions its own CPython: the venv's `bin/python` is then a symlink
-        // into `~/.local/share/uv/python/cpython-*/`, OUTSIDE `venv_dir`. The
-        // shebang path itself IS bound (it lives in the venv); what is missing is
-        // the prefix it resolves *to*, so `execve` returns ENOENT for a file that
-        // is present and readable, and the worker dies before it can answer —
-        // surfacing as the generic `Protocol(EarlyExit)`.
-        //
-        // It went unnoticed because it only bites where the venv is external AND
-        // the sandbox is real, and the one host that is true on (the DGX) had a
-        // venv copied from the Mac, whose `bin/python` pointed at a macOS path —
-        // so these tests skipped rather than ran.
-        //
-        // The residual — only the patch-version directory binding while the venv
-        // names the minor-version symlink alias beside it — was issue #650, and
-        // is fixed: `InterpreterRoot::bind_paths` now carries both names.
-        interpreter_root: interp_root,
-        interpreter_lib_dirs: interp_lib_dirs,
-    };
-    // Route through the lockdown-exec shim on Linux so the worker actually runs
-    // under the `ml_client` seccomp filter — the #281 property this suite must
-    // exercise (the host manifest does this via discover_binary; the e2e mirrors
-    // it). On macOS the shim is unused (Seatbelt is applied from the parent), so
-    // pass None there.
-    #[cfg(target_os = "linux")]
-    let shim = Some(kastellan_tests_common::workspace_target_binary(
-        "kastellan-worker-lockdown-exec",
-    ));
-    #[cfg(not(target_os = "linux"))]
-    let shim: Option<PathBuf> = None;
-    Some(gliner_relex_entry(&env, shim))
+    let env = gliner_host_env(EnableFlag::Ignored)?;
+    Some(gliner_relex_entry(&env, gliner_host_lockdown_shim()))
 }
 
-/// Bring up a one-shot Postgres cluster + run the schema probe. Skips
-/// cleanly when `pg_bin_dir_or_skip` returns `None`.
+/// Bring up a one-shot Postgres cluster + run the schema probe.
+///
+/// Returns `None` — with a `[SKIP]` line — when no Postgres install is found,
+/// so the caller `return`s green; or panics naming the knob when
+/// `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` demanded a real run. Without a cluster
+/// the test body never runs, which is the same false green the knob exists to
+/// abolish (#653).
 ///
 /// Returns the cluster (drop-cleanup wired through `PgCluster::_guards`)
 /// plus a runtime-role-scoped `PgPool` ready for `tool_host::dispatch`.
+///
+/// Note this is shared with the macOS container tier, whose own two probes stay
+/// skip-only: the cluster is needed either way.
 async fn bring_up_pg(label: &str) -> Option<(PgCluster, sqlx::PgPool)> {
-    let bin_dir = pg_bin_dir_or_skip()?;
+    // The shared `pg_bin_dir_or_skip` stays skip-only — ~70 other suites depend
+    // on that — so the decision is made here, at a call site that must not
+    // silently pass.
+    let bin_dir = match pg_bin_dir_or_reason() {
+        Ok(d) => d,
+        Err(reason) => return report_unmet(require_action(), &reason),
+    };
     let suffix = unique_suffix();
     let cluster = bring_up_pg_cluster(
         &bin_dir,

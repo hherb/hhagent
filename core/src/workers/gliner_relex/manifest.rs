@@ -114,7 +114,7 @@ impl crate::worker_manifest::WorkerManifest for GlinerRelexManifest {
                 }
             }
             Err(ResolveSkipReason::Disabled) => Resolution::Disabled {
-                detail: "KASTELLAN_GLINER_RELEX_ENABLE != \"1\"".to_string(),
+                detail: "KASTELLAN_GLINER_RELEX_ENABLE is not truthy (1|true|yes|on)".to_string(),
             },
             Err(other) => Resolution::Misconfigured {
                 detail: gliner_skip_detail(&other),
@@ -130,7 +130,7 @@ fn gliner_skip_detail(reason: &ResolveSkipReason) -> String {
     match reason {
         ResolveSkipReason::Disabled => {
             // Handled by the Disabled arm above; included for exhaustiveness.
-            "KASTELLAN_GLINER_RELEX_ENABLE != \"1\"".to_string()
+            "KASTELLAN_GLINER_RELEX_ENABLE is not truthy (1|true|yes|on)".to_string()
         }
         ResolveSkipReason::WeightsDirEnvMissing => {
             "KASTELLAN_GLINER_RELEX_WEIGHTS_DIR unset".to_string()

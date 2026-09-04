@@ -62,9 +62,11 @@ pub fn egress_proxy_bin_or_skip() -> Option<PathBuf> {
     if p.is_file() {
         Some(p)
     } else {
-        eprintln!(
-            "\n[SKIP] egress-proxy not built; run \
-             `cargo build -p kastellan-worker-egress-proxy`\n"
+        eprint!(
+            "{}",
+            crate::skip::skip_line(
+                "egress-proxy not built; run `cargo build -p kastellan-worker-egress-proxy`"
+            )
         );
         None
     }

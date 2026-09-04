@@ -1,7 +1,7 @@
 //! Sandbox helpers: `[SKIP]` probe, backend factory, canonical
 //! shell-exec policy.
 //!
-//! Both `skip_if_sandbox_unavailable` and `backend()` are cfg-gated
+//! Both `sandbox_unavailable_reason` and `backend()` are cfg-gated
 //! per-OS so a single call site reads cleanly on Linux + macOS without
 //! per-test `#[cfg]` ladders.
 
@@ -9,8 +9,10 @@ use std::path::Path;
 
 use kastellan_sandbox::{SandboxBackend, SandboxPolicy};
 
-/// Returns `true` if the per-OS sandbox backend's probe fails. Caller
-/// should `return` immediately to short-circuit the test.
+/// Why the per-OS sandbox backend is unusable on this host, or `None` when it
+/// is fine. The string is a *reason*, with no `[SKIP]` prefix and no newlines:
+/// the caller decides whether an unmet precondition is a clean skip or a hard
+/// failure, and renders it accordingly.
 ///
 /// Linux: requires bwrap + unprivileged user-namespace permission
 /// (AppArmor profile installed via
@@ -18,23 +20,32 @@ use kastellan_sandbox::{SandboxBackend, SandboxPolicy};
 /// macOS: requires `/usr/bin/sandbox-exec` (present on all stock
 /// installs from 10.5+).
 #[cfg(target_os = "linux")]
-pub fn skip_if_sandbox_unavailable() -> bool {
+pub fn sandbox_unavailable_reason() -> Option<String> {
     use kastellan_sandbox::linux_bwrap::LinuxBwrap;
-    if let Err(e) = LinuxBwrap::probe() {
-        eprintln!("\n[SKIP] bwrap probe failed: {e}\n");
-        return true;
-    }
-    false
+    LinuxBwrap::probe().err().map(|e| format!("bwrap probe failed: {e}"))
 }
 
 #[cfg(target_os = "macos")]
-pub fn skip_if_sandbox_unavailable() -> bool {
+pub fn sandbox_unavailable_reason() -> Option<String> {
     use kastellan_sandbox::macos_seatbelt::MacosSeatbelt;
-    if let Err(e) = MacosSeatbelt::probe() {
-        eprintln!("\n[SKIP] sandbox-exec probe failed: {e}\n");
-        return true;
+    MacosSeatbelt::probe()
+        .err()
+        .map(|e| format!("sandbox-exec probe failed: {e}"))
+}
+
+/// Returns `true` if the per-OS sandbox backend's probe fails. Caller
+/// should `return` immediately to short-circuit the test.
+///
+/// The skip-as-pass half of [`sandbox_unavailable_reason`]; cfg-free, because
+/// the per-OS split lives entirely in the probe it wraps.
+pub fn skip_if_sandbox_unavailable() -> bool {
+    match sandbox_unavailable_reason() {
+        Some(reason) => {
+            eprint!("{}", crate::skip::skip_line(&reason));
+            true
+        }
+        None => false,
     }
-    false
 }
 
 /// Boxed per-OS [`SandboxBackend`] for use in tests that spawn a
