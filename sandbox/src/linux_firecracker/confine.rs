@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::linux_bwrap::USERNS_LOCKDOWN_FLAGS;
 use crate::linux_cgroup::build_systemd_run_argv;
 use crate::linux_firecracker::launcher_argv;
 use crate::linux_firecracker::plan::FirecrackerLaunchPlan;
@@ -75,8 +76,13 @@ pub fn build_vmm_jail_argv(
 
     let mut a: Vec<String> = Vec::with_capacity(48);
     a.push("bwrap".into());
-    a.push("--unshare-all".into()); // user/ipc/pid/uts/cgroup/net ns; egress rides vsock, no host net
-    a.push("--disable-userns".into()); // no nested userns for the VMM either (audit 2026-09-02)
+    a.push("--unshare-all".into()); // ipc/pid/uts/cgroup/net ns; egress rides vsock, no host net
+    // The userns pair, from the one const the worker jails use. `--unshare-all`
+    // sets only bwrap's TRY-flag for the user namespace, and `--disable-userns`
+    // is rejected at option-parse time without a hard `--unshare-user` beside
+    // it — so spelling either one out here is how this jail silently stopped
+    // launching at all (#661's defect, in its third producer).
+    a.extend(USERNS_LOCKDOWN_FLAGS.iter().map(|f| f.to_string()));
     a.push("--die-with-parent".into());
     a.push("--new-session".into());
     a.push("--as-pid-1".into());
@@ -227,6 +233,37 @@ mod tests {
             assert!(a.contains(&f.to_string()), "missing {f}: {a:?}");
         }
         assert_eq!(a.last().map(String::as_str), Some("--"));
+    }
+
+    /// The VMM jail is a bwrap jail too, so it must pass the SAME userns pair
+    /// the worker jails do — [`USERNS_LOCKDOWN_FLAGS`], whose own doc comment
+    /// says "every jail". bwrap validates the pair at option-parse time, so a
+    /// bare `--disable-userns` beside `--unshare-all` is not a weaker jail but
+    /// a refused one.
+    ///
+    /// Note WHY that refusal was contentless, because it is not #666 and #666
+    /// will not fix it: bwrap rejects at option-parse time, so the launcher
+    /// never runs at all — its `Stdio::null()` on firecracker and its
+    /// self-cleaning run dir are both unreachable here, and `fc.log` is never
+    /// created because firecracker never starts. What was lost is bwrap's own
+    /// `--disable-userns requires --unshare-user` on the launcher child's
+    /// stderr, which the backend pipes and core drains at `tracing::debug!` —
+    /// invisible at the default log level rather than discarded. The caller
+    /// sees a bare `Protocol(EarlyExit)` either way.
+    ///
+    /// #661 fixed exactly this in `linux_bwrap` (probe + spawn) and introduced
+    /// the const to stop the two drifting; this jail was the third producer and
+    /// was missed, so every Firecracker spawn failed from the audit merge until
+    /// the DGX gate ran. Assert against the const, never a copied literal.
+    #[test]
+    fn jail_carries_the_shared_userns_lockdown_pair() {
+        let a = jail(&deny_plan());
+        for f in USERNS_LOCKDOWN_FLAGS {
+            assert!(
+                a.contains(&f.to_string()),
+                "{f} missing from the VMM jail argv: {a:?}"
+            );
+        }
     }
 
     #[test]

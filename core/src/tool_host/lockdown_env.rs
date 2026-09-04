@@ -30,8 +30,18 @@ pub const ENV_LANDLOCK_RO: &str = "KASTELLAN_LANDLOCK_RO";
 pub const ENV_SECCOMP_PROFILE: &str = "KASTELLAN_SECCOMP_PROFILE";
 /// Env var read by `kastellan-worker-prelude::landlock_lock` to disable the
 /// Landlock layer (`"none"`). Source of truth for the string is the prelude;
-/// mirrored here for manifests that set it (browser-driver). Not set by
-/// `derive_lockdown_env` — only explicitly by a manifest that opts out.
+/// mirrored here for manifests that set it, and a THIRD time as
+/// `kastellan_sandbox::linux_firecracker::plan::GUEST_LANDLOCK_PROFILE_ENV`
+/// (the sandbox crate cannot depend on the prelude either). Keep all three
+/// identical; the sandbox copy is literal-pinned by its own unit test.
+///
+/// Not set by `derive_lockdown_env`, and — since browser-driver stopped opting
+/// out — set by no manifest either. The one production setter is the Firecracker
+/// backend, which injects `=none` per spawn because the pinned guest kernel has
+/// no `CONFIG_SECURITY_LANDLOCK`. That injection happens INSIDE the backend,
+/// after [`warn_lockdown_overrides`] has already inspected the derived policy,
+/// so it is invisible here by construction; the backend emits its own WARN
+/// instead. See #669.
 pub const ENV_LANDLOCK_PROFILE: &str = "KASTELLAN_LANDLOCK_PROFILE";
 /// Env var name read by `kastellan-worker-prelude::rlimit` for the
 /// `policy.cpu_ms` budget. Plumbed cross-platform — applied via
@@ -56,6 +66,12 @@ pub const ENV_CPU_MS: &str = "KASTELLAN_CPU_MS";
 /// `KASTELLAN_LANDLOCK_PROFILE=none` to a Rust worker's `policy.env`: a Rust
 /// worker self-applies via `serve_stdio`, and the var would silently disable its
 /// Landlock layer while leaving it otherwise locked down.
+///
+/// The one sanctioned exception is the Firecracker backend (see
+/// [`ENV_LANDLOCK_PROFILE`]): its guest kernel cannot enforce Landlock at all,
+/// so the opt-out is the audit's own prescribed remedy rather than a shortcut.
+/// It is injected in the backend's launch plan, not here, and does not reach
+/// this function.
 pub fn derive_lockdown_env(policy: &SandboxPolicy) -> SandboxPolicy {
     let mut out = policy.clone();
     let has_landlock = out.env.iter().any(|(k, _)| k == ENV_LANDLOCK_RW);

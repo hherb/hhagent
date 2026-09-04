@@ -8,23 +8,29 @@
 > which holds the verbose pre-prune version of everything summarised here,
 > including the full #619, #615/#616/#618 and live-bring-up write-ups compressed below.
 
-**Last updated:** 2026-09-04 (#656 merged; then #653 + #654, the gliner-relex e2e require knob, and its review round) ·
-**DGX RUNNING `121f22a2`** (see [Merged work, compressed](#merged-work-compressed--the-guard-arc-and-the-2026-09-02-deploy)) ·
-**`main` HEAD:** `c03ec1a3` — [#656](https://github.com/hherb/kastellan/pull/656), which closed #650,
-[#661](https://github.com/hherb/kastellan/issues/661) and
-[#662](https://github.com/hherb/kastellan/issues/662), on top of `62d98a00`
+**Last updated:** 2026-09-05 (#669's review round: the chown set's only guard turned out to assert
+nothing, and `/run` was never needed. Firecracker is now **21 / 0**) ·
+**DGX RUNNING `9ace57ad`** (redeployed 2026-09-04, now current with `main`) (see [Merged work, compressed](#merged-work-compressed--the-guard-arc-and-the-2026-09-02-deploy)) ·
+**`main` HEAD:** `9ace57ad` — [#663](https://github.com/hherb/kastellan/pull/663), which closed
+[#653](https://github.com/hherb/kastellan/issues/653) and
+[#654](https://github.com/hherb/kastellan/issues/654), on top of `c03ec1a3`
+([#656](https://github.com/hherb/kastellan/pull/656): #650, #661, #662) and `62d98a00`
 ([#660](https://github.com/hherb/kastellan/pull/660), the 2026-09-02 security audit). ·
-**OPEN BRANCH: `fix/653-654-gliner-e2e-require-knob`** — #653 + #654, PR
-[#663](https://github.com/hherb/kastellan/pull/663), review round applied; see
-[#653 / #654](#653--654--the-gliner-relex-e2e-require-knob-and-the-flag-dialect).
+**OPEN BRANCH: `test/w2-microvm-uid-drop-gate`** — the Firecracker gate + its three fixes; see
+[The two DGX gates](#the-two-dgx-gates-660-owed--run-and-the-firecracker-one-found-three-defects).
+
+> ⚠️ **A gate booked as "pure verification, not code" is not evidence until it has RUN.** This file
+> carried both #660 gates for two days as bookkeeping. The Firecracker one turned out to be three
+> independent production defects, each masking the next, all reporting the same contentless
+> `Protocol(EarlyExit)` — and **`0 of 21`** Firecracker tests had been passing the whole time.
 
 > ✅ **`main` IS DEPLOYABLE AGAIN.** #656 merged 2026-09-03 carrying `4269ff7e` (#661, the bwrap
 > `--disable-userns`/`--unshare-user` pair) and `f97991a6` (#662, python-exec's `socketpair` SIGSYS)
 > — the two defects that made `main` `62d98a00` spawn **no** worker under real bwrap. The previous
 > "do not run `scripts/upgrade_from_git.sh`" warning is **lifted**. The DGX itself still runs
-> `121f22a2` and is a redeploy behind.
+> `121f22a2` and is now **three merges behind** (#660, #656, #663).
 
-**Last gate: DGX over `fix/653-654-gliner-e2e-require-knob`, post-review-round — 4040 / 0 / 55, cold clippy 27/27 crates clean. See [Test baseline](#test-baseline-authoritative).**
+**Last gate: DGX over `test/w2-microvm-uid-drop-gate`, post-review-round — 4049 / 0 / 56, and the Firecracker suites are **21 / 0** for the first time (SearxNG brought back up). See [Test baseline](#test-baseline-authoritative).**
 The `main` baseline it is measured against is DGX `f97991a6` (= #656's tip) — **4009 / 1 / 55**, 176
 suites, 4 `[SKIP]`. The 1 was `scheduler_ask_expiry_e2e::an_unanswered_ask_expires_and_fails_its_task_without_a_restart`,
 a 60-second poll that missed under full-workspace load and passed **2 / 2 in isolation**; flaky under
@@ -42,6 +48,131 @@ at `core/tests/scheduler_ask_expiry_e2e.rs:193` rather than re-running until gre
 ---
 
 ## Current state
+
+### The two DGX gates #660 owed — RUN, and the Firecracker one found three defects
+
+Branch `test/w2-microvm-uid-drop-gate`, PR [#669](https://github.com/hherb/kastellan/pull/669). The gate was described in this file as
+"pure verification, not code". It was not: **the Firecracker backend had been completely dead since
+the audit merged**, in three independent ways, each masking the next, and every one of them
+surfacing as the same contentless `Protocol(EarlyExit)`.
+
+- **1. The VMM jail was refused by bwrap, so no micro-VM spawn ran at all.**
+  `linux_firecracker::confine::build_vmm_jail_argv` pushed a bare `--disable-userns` beside
+  `--unshare-all`. That is [#661](https://github.com/hherb/kastellan/issues/661) exactly — bwrap
+  validates the pair at *option-parse* time (`bwrap: --disable-userns requires --unshare-user`,
+  exit 1), so it is a refused jail, not a weaker one — **in a third producer the #661 fix missed**.
+  The `USERNS_LOCKDOWN_FLAGS` const introduced to stop the probe and the spawn drifting had a doc
+  comment reading "every jail passes", while this jail spelled the flags out by hand. Fixed by
+  extending the const's use; pinned by a parity test that asserts **against the const**, never a
+  copied literal. **Count the producers, and make the const the only spelling.**
+
+- **2. The pinned guest kernel has no Landlock, and the audit made that fatal.**
+  `CONFIG_SECURITY_LANDLOCK is not set` — established **without booting anything**, by unpacking
+  the pinned `vmlinux`'s embedded IKCONFIG [[dgx-guest-kernel-config-inspection]]. Audit F2 turned
+  an unenforceable ruleset from a silent downgrade into an error, so every VM worker refused to
+  start during its own lockdown. Fixed the way that error message itself prescribes: the launch
+  plan states the exception (`KASTELLAN_LANDLOCK_PROFILE=none` for the guest), as a **default and
+  never an override**, so a caller keeps a profile it named and a future kernel is opted back in by
+  deleting the injection. `docs/threat-model.md` claimed the VM worker "still installs its own
+  Landlock + seccomp-bpf inside the guest"; half of that was never true on this path and is now
+  corrected rather than quietly carried. Seccomp is unaffected (`CONFIG_SECCOMP_FILTER=y`).
+  Restoring the layer = repinning a guest kernel: [#668](https://github.com/hherb/kastellan/issues/668).
+
+- **3. The relay sockets stayed root-owned across W-2's privilege drop.**
+  The guest init binds the egress (1025) and embed-broker (1026) relay UDSes in `/run` **as root**,
+  then drops to the worker uid. `connect(2)` on an `AF_UNIX` socket needs **write** permission on
+  the socket file, so every networked VM worker died on its first dial — 7 tests across net-demo,
+  web-fetch, web-search and both web-research tiers, while the non-networked half passed. The guest
+  reports it as `connect proxy uds: Permission denied (os error 13)`, which **names the proxy and
+  not the cause**. The decision of which paths the worker must own is now the pure
+  `cmdline::worker_owned_paths` (testable on any platform); the Linux-only `chown` loop just applies
+  it. The relay entries are conditional on their relay being enabled, mirroring when `/run` is
+  mounted at all — an unconditional chown would fail on every plain VM boot and train everyone to
+  ignore the line.
+
+- **W-2 is now proved from inside the guest, not by reading the code.** Every other assertion in the
+  Firecracker suite passes just as happily with the worker running as uid 0, and **both** halves of
+  the compatibility path are deliberately quiet (a pre-fix rootfs ignores the variable; a host that
+  stops sending it leaves the worker root) — each says so only on the guest's stderr, which nothing
+  drains. `microvm_worker_runs_unprivileged_with_no_new_privs` reads four facts from the running
+  guest: `uid != 0`, `euid == uid` (a drop that moved only the real uid leaves `setuid(0)`
+  reachable), `uid ==` the **host's** euid (a guest picking its own would also unstick the 0600
+  ro-share files the host stages), and `NoNewPrivs == 1`.
+
+- **Review round (2026-09-05) — the fix's own test was vacuous, and one of its grants was not
+  needed.** `worker_owned_paths_keeps_rw_mountpoints_and_their_anchors` used the fixture
+  `kastellan.mounts=rw:vdb:/data/scratch`, which is neither hex nor tab-separated, so
+  `parse_mount_manifest` fell back to the DEFAULT empty manifest and the loop over `m.rw` never
+  entered its body. **Deleting the entire RW/anchor block left all five tests green** — and that
+  block is the *pre-existing* behaviour the refactor had just moved out of
+  `drop_privileges_for_worker`, so it had no coverage at all. All five are now exact-set
+  `assert_eq!`s over the whole returned `Vec`, which additionally kills the `egress || broker`
+  collapse that every `contains` probe missed. **A non-hex cmdline fixture fails OPEN, silently:**
+  it does not error, it yields an empty manifest. [[unreachable-success-path-proves-nothing]]
+
+- **`/run` is out of the chown set.** It was justified as "the worker needs to traverse and write in
+  it"; **measured**, a tmpfs mounted with no `mode=` comes up **1777** whatever the mounting umask,
+  so both were already true. The chown only handed the worker ownership of a *sticky* directory —
+  which is exactly what lets the owner unlink entries it does not own. `connect(2)` needs write on
+  the socket **file**; the two socket entries are the whole fix. Proven live, not argued: with `/run`
+  removed, all four egress suites AND the broker suite pass. Guest `/run` still coming up
+  world-writable is [#672](https://github.com/hherb/kastellan/issues/672).
+
+- **The Landlock opt-out is now pinned to both things it is a claim about.** Its own literal (a
+  hand-copied mirror of the prelude's `LANDLOCK_PROFILE_ENV` that every other test interpolated on
+  *both* sides, so a rename stayed green) and the guest-kernel sha256 (the injection is
+  unconditional and the other tests assert it is *present*, so a pin bumped to a Landlock-capable
+  kernel would leave the layer off forever, greener than before). It also **WARNs per spawn** now:
+  `tool_host::warn_lockdown_overrides` inspects the derived policy *before* the backend runs, so the
+  one production Landlock disable in the tree was the one that mechanism is blind to.
+
+- **W-2 is now proved further in, and the extra assertions were mutation-tested.** The e2e read
+  uid/euid/NoNewPrivs; it now also reads the **saved-set uid** (the field that actually makes
+  `setuid(0)` unreachable — `euid == uid` does not, and the init's own post-drop self-check cannot
+  see it), the gid, the supplementary set, and **`Seccomp: 2`**, the layer the Landlock opt-out's
+  whole justification rests on and which nothing else in the tree observed. Deleting
+  `setgroups` + `setgid` from the init and rebuilding the rootfs was measured: it turns `gid` red
+  (0 vs 1000) and **every pre-existing assertion still passes**. ⚠️ The `groups` assertion is a
+  regression guard, not a proof — guest PID 1 has no supplementary groups, so it holds either way,
+  and it is annotated as such rather than counted.
+
+- ⚠️ **A stale rootfs image gates nothing, and fails like a code regression.** Every image bakes its
+  own copy of `kastellan-microvm-init` **and** the worker, so a guest-side change is invisible until
+  that image is rebuilt. `kv_demo_firecracker_persistent_e2e` failed as "persistent store must
+  survive a VM respawn" against a June image and passed unchanged after a rebuild. The whole W-2
+  gate could have been run against stale images and reported green having tested none of it. Filed
+  as [#667](https://github.com/hherb/kastellan/issues/667). Note the build scripts live in **two**
+  directories (`scripts/workers/microvm/` but `scripts/workers/kv-demo/`).
+
+- ⚠️ **The launcher discards firecracker's stdout/stderr to `/dev/null`, so nothing above is
+  readable.** The guest console *is* firecracker's stdout (`console=ttyS0`), and every
+  `microvm-init` diagnostic goes there; `--log-path` catches neither it nor anything firecracker
+  writes before opening that file. The run dir self-cleans on graceful exit, taking `fc.log` with
+  it. This is why three distinct defects all looked identical, and it cost most of the session.
+  Filed as [#666](https://github.com/hherb/kastellan/issues/666).
+  **The technique that did work**, if you need it before #666 lands: snapshot the per-spawn run dir
+  from a tight poll loop while the test runs — and **keep re-copying**, because the dir is created
+  *before* firecracker writes `fc.log`, so a copy-once poll captures an empty dir and lies about it.
+  Then replay `fc.json` under a hand-built bwrap argv outside the test.
+
+- **Gate result: 19 pass / 2 fail across the Firecracker suites, from 0 / 21.** Both failures are an
+  **absent local SearxNG** on `127.0.0.1:8888` — `ss -ltn` shows nothing listening and the audited
+  row reads `egress.allowed … connect_failed: Connection refused`, so they are the known
+  stand-up-SearxNG gap, not code. Rootfs images for all seven workers were rebuilt first.
+- **The second gate — live-Matrix — passes as far as a host can take it.** `cargo clippy -p
+  kastellan-worker-matrix --all-targets --features live-matrix --locked -- -D warnings` exit 0, and
+  its **27** tests pass. The scoping reads correctly: both sides of `peer_allowed` lowercase, and
+  `room_is_two_party` counts invited-but-not-joined members and fails **closed** on a member-list
+  error. ⚠️ **What is still owed is the LIVE DM ROUND-TRIP**, which needs a deployed daemon carrying
+  #660's scoping — the property most at risk from it. The DGX is still on `121f22a2`.
+- ⚠️ **BOTH `cfg` blindnesses fired again on this one branch, in opposite directions** — the same
+  pair the #653 session recorded, so treat it as the rule and not the exception.
+  (1) `worker_owned_paths` lives in the **cross-platform** `cmdline` module but is called only from
+  the Linux guest path, so it needed the `dead_code` allowance every other item there carries —
+  **the DGX is structurally blind to it** (proved by removing the attribute and watching Mac clippy
+  fail). (2) The same refactor left `parse_mount_manifest` unused in `guest.rs`, which is
+  `cfg(linux)` — **the Mac is blind to that one**, and the DGX `-D warnings` gate is what caught it.
+  [[cfg-linux-e2e-deadcode-dgx-clippy]]
 
 ### #660 — the second pre-release security audit (2026-09-02), MERGED + its three defects fixed
 
@@ -154,8 +285,7 @@ the **alias**. `resolve_interpreter_root` canonicalized, so only the `.14` direc
 
 ### #653 / #654 — the gliner-relex e2e require knob, and the flag dialect
 
-On `fix/653-654-gliner-e2e-require-knob`, PR [#663](https://github.com/hherb/kastellan/pull/663).
-Both closed. The point is not the knob; it is that **#651's fixture bug was only findable because a
+**MERGED `9ace57ad`**, PR [#663](https://github.com/hherb/kastellan/pull/663). Both issues closed. The point is not the knob; it is that **#651's fixture bug was only findable because a
 human happened to rebuild a venv**, and nothing in the tree could have demanded it.
 
 - **`KASTELLAN_GLINER_RELEX_REQUIRE_E2E` now works on the Rust side**, meaning exactly what it means
@@ -353,21 +483,35 @@ and the snapshots before it. Only the findings that still bind:
 
 > Only *open* work is listed. Shipped items move to [Recently merged](#recently-merged) or the ROADMAP.
 
-**#650, #653 and #654 are DONE** (PRs [#656](https://github.com/hherb/kastellan/pull/656) merged,
-[#663](https://github.com/hherb/kastellan/pull/663) open), and `main` is deployable again — see the
-header. `scripts/upgrade_from_git.sh` is safe to run once #663 is in; **the DGX is a redeploy behind**
-(`121f22a2`) and picking up #660 + #650 + #653 there is the cheapest high-value next action.
+**FIRST: the DGX redeploy, and the one gate half that needs it.** The Firecracker and
+live-Matrix gates #660 owed have now RUN (PR [#669](https://github.com/hherb/kastellan/pull/669));
+only one piece is left and it is blocked on a deploy, not on code:
 
-**FIRST: the two DGX gates #660 still owes.** Both are Linux-only and neither branch since has touched
-them, so they are pure verification, not code:
-1. **The Firecracker e2e** — guest init now drops to the daemon's euid, chowns the RW mounts
-   `nosuid,nodev`, run dirs 0700, images 0600. Read the FC gotchas in [Build & test](#build--test)
-   first: rebuild the **release** launcher AND the affected rootfs (the init is baked in) AND
-   `export PATH=$HOME/.local/bin:$PATH`, or it silently skips-as-passes
-   [[firecracker-e2e-stale-release-launcher]].
-2. **The live-Matrix path** — `--features live-matrix` compiles including tests; invites from outside
-   `KASTELLAN_MATRIX_PEERS` are declined and only two-party rooms are forwarded. **Verify a DM still
-   round-trips**, which is the property most at risk from that scoping.
+1. ✅ **The DGX redeploy is DONE** (2026-09-04): `scripts/upgrade_from_git.sh` took it from
+   `121f22a2` to **`9ace57ad`**, so #660 + #656 + #663 are all live. `installed 15 binaries`,
+   `services: active active active`, `✅ Matrix channel is up`, and
+   `channel bus running {channel:matrix, attempts:1}` on the fresh boot. **Both env files diffed
+   IDENTICAL** across the install and force-routing is still baked into the generated unit — the
+   env-clobber ritual stays retired [[dgx-deploy-env-clobber-and-missing-workers]].
+2. ⏳ **STILL OWED: the live Matrix DM round-trip.** Everything a host can check passes
+   (`--features live-matrix` clippy clean, 27 tests, scoping reads correctly), but the property most
+   at risk from #660's invite/two-party scoping is that a **normal DM still round-trips**, and only
+   a real message shows that. **Send the bot a DM from `@horst` and confirm it answers.** If it does
+   not, the scoping is the first suspect — read `channel.boot_failed` audit rows and the declined
+   log line naming `KASTELLAN_MATRIX_PEERS`, not the restart count
+   [[channel-boot-one-shot-fixed]]. ⚠️ The Matrix worker's *guest/VM* mode is unaffected by this
+   branch — the live channel runs under bwrap, not in a VM.
+3. **Then re-check the two SearxNG-blocked Firecracker tests** if you want 21/21:
+   `scripts/web-search/setup-searxng.sh`, then `KASTELLAN_WEB_SEARCH_ENDPOINT` + the `web-search`
+   `tool_allowlists` row. Nothing about them is a code defect —
+   [[web-research-e2e-endpoint-must-be-allowlisted]].
+
+**Before touching the micro-VM backend again, read [#666](https://github.com/hherb/kastellan/issues/666)
+and [#667](https://github.com/hherb/kastellan/issues/667).** They are the two reasons three
+production defects hid in it for two days: nothing drains the guest's diagnostics, and a stale
+rootfs image gates nothing while failing like a code regression. Fixing #666 first would make any
+further micro-VM work dramatically cheaper. [#668](https://github.com/hherb/kastellan/issues/668)
+is the standing posture item (repin a guest kernel that has Landlock).
 
 **THEN, cheap and now overdue:** [#655](https://github.com/hherb/kastellan/issues/655) — `main` has
 **no required status checks**, so clippy, the matrix build and the new `python-lock-check` gate can
@@ -522,6 +666,8 @@ Full prose in the [`archive/`](archive/) snapshots — most recently
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
+| **DGX** (#669 after the review round — **the gate that stands**) | **`e35c3571`** (the one later commit adds only a comment on the `groups` assertion — no test, no behaviour) | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4049 / 0 / 56**, **176** suites, `TEST_EXIT=0`. **+1** over the 4048 below — the new `the_landlock_opt_out_is_pinned_to_its_kernel_and_key`; the five `worker_owned_paths` tests were replaced 5-for-5 by exact-set assertions, so the count is unchanged there. **Firecracker: 21 / 0, zero `[SKIP]`** — the first fully green run. The 2 that failed in the row below were the absent local SearxNG; the `kastellan-searxng` container had been down 5 weeks and was restarted (`127.0.0.1:8888`, HTTP 200). All **7** rootfs images rebuilt first — mandatory, since this branch changes the guest init | `-p kastellan-core -p kastellan-sandbox -p kastellan-microvm-init -p kastellan-microvm-run --all-targets --locked -D warnings` exit 0 after force-touching core + sandbox, so the `cfg(linux)` e2e was really linted. ⚠️ The first workspace clippy exited 0 having emitted **24** `Checking` lines in 6s — warm, not a gate. Mac: native + `--target aarch64-unknown-linux-gnu` clippy on all three touched pure-Rust crates, both exit 0 | **4**, all the gliner tier — held. **0** `[WARN]` |
+| **DGX** (#669, the Firecracker gate — **the gate that stands**) | **`b492966b`** (content-identical to the rebased tip `a5b148a1`; the last two commits are a `dead_code` attribute and an unused-import removal, neither of which adds a test) | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4048 / 0 / 56**, **176** suites, `TEST_EXIT=0`. **The delta reconciles exactly: +8** over the 4040 below — 5 `cmdline::worker_owned_paths` tests, 2 `plan.rs` Landlock tests, 1 `confine.rs` userns parity test — and **+1 ignored** (55→56), the new `#[ignore]` Firecracker e2e. Separately, the **Firecracker suites went 0 / 21 → 19 / 2**, the 2 being an absent local SearxNG | **cold** `--workspace --all-targets --locked -D warnings` from a fresh private target dir: exit 0, **345** `Checking`+`Compiling` lines, all **27** kastellan crates, **zero** warnings. rustc **1.98.0**. ⚠️ **The first cold run FAILED** on `unused import: parse_mount_manifest` in the `cfg(linux)` `guest.rs` — invisible to the Mac, and the reason to keep running this cold and on both hosts. Mac clippy `-p kastellan-microvm-init --all-targets -D warnings` exit 0, and its `dead_code` allowance was proved load-bearing by removing it | **4**, all the `KASTELLAN_GLINER_RELEX_ENABLE` tier — held. **0** `[WARN]` |
 | **DGX** (#663 after the review round — **the gate that stands**) | **`fixall`, pre-commit** | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4040 / 0 / 55**, **176** suites, `TEST_EXIT=0`. **The delta reconciles exactly: +18** over the 4022 below — 15 new `gliner_e2e` tests + 3 new `skip.rs` tests. Run twice: once before and once after moving a `#[cfg(test)] mod tests` to end-of-file, identical both times, which is the evidence that code motion was behaviour-neutral | **cold** `--workspace --all-targets --locked -D warnings` from a fresh private target dir: exit 0, **345** `Checking`+`Compiling` lines, all **27** kastellan crates, **zero** warnings. rustc **1.98.0**. ⚠️ The *warm* run exited 0 having linted **3** crates and would have missed the real lint the cold one caught (`items_after_test_module`, from a `mod tests` inserted mid-file) — a warm clippy exit-0 is not a gate | **4**, all the `KASTELLAN_GLINER_RELEX_ENABLE` tier — the pre-branch count, held. **0** `[WARN]` lines, i.e. the new out-of-dialect warning stays silent when the knob is unset. The skip line now echoes the value read (`ENABLE=<unset>`), per #654 |
 | **DGX** (#663, pre-review-round — superseded by the row above) | **`32295a7f`** | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4022 / 0 / 55**, **176** suites, `TEST_EXIT=0`. **The delta reconciles exactly: +12** over the 4010 total below (4009 passed + 1 load flake), and 12 is the `tests-common::gliner_e2e` test count. `scheduler_ask_expiry_e2e` passed this time, as expected of a flake | **cold** `--workspace --all-targets -D warnings` from a fresh private target dir: exit 0, **345** `Checking`+`Compiling` lines, all **27** kastellan crates, **zero** warnings — and **zero rustc warnings during the test build**, which is what proves the macOS-only imports are `cfg`-gated. rustc **1.98.0** | **4**, all `KASTELLAN_GLINER_RELEX_ENABLE` not truthy — the pre-branch count, restored. ⚠️ An earlier run of this gate reported **5**: the fifth was a `tests-common` unit test calling `report_unmet(Skip, ..)`, whose skip arm prints. Fixed in `32295a7f`; see the rule below |
 | **DGX** (#656 at the three fixes — the gate that stands) | **`f97991a6`** | `cargo test --workspace --no-fail-fast -- --nocapture` **4009 / 1 / 55**, **176** suites, `TEST_EXIT=101`; total **4010** reconciles (see header). The 1: `scheduler_ask_expiry_e2e` — flaky under load, **2 / 2 in isolation** afterwards, untouched by this branch or #660. `python_exec_e2e` **5 / 5**, `cli_memory_l3py_run_daemon_e2e` **6 / 6**, `secret_vault_e2e` **11 / 11**, `linux_smoke` **8 / 8** | `--workspace --all-targets -D warnings` exit 0, zero warnings. rustc **1.98.0** | **4**, all `KASTELLAN_GLINER_RELEX_ENABLE != "1"` |
@@ -633,7 +779,18 @@ Older rows (3668 back to 3327, covering the guard slice-1 arc, #587, #579 and #5
 Newest first. Older entries live in the [`archive/`](archive/) snapshots and in git history; the
 substance of each is compressed under [Current state](#current-state) rather than repeated here.
 
-- **`fix/653-654-gliner-e2e-require-knob`** ([#663](https://github.com/hherb/kastellan/pull/663), OPEN)
+- **`test/w2-microvm-uid-drop-gate`** ([#669](https://github.com/hherb/kastellan/pull/669), OPEN)
+  — the Firecracker gate #660 owed, plus the **three** defects it found: the VMM jail's bare
+  `--disable-userns` (#661's third producer — every micro-VM spawn refused by bwrap at option-parse
+  time), the guest kernel having no `CONFIG_SECURITY_LANDLOCK` against the audit's new fail-closed
+  rule (every VM worker refused to start), and W-2's privilege drop leaving the egress/broker relay
+  sockets root-owned (every *networked* VM worker got `EACCES` on its first dial). Plus the first
+  test that proves W-2 from inside the running guest, and the threat-model correction that stops it
+  claiming a Landlock layer the Firecracker path never had. 0/21 → 19/21. Deferred with issues:
+  [#666](https://github.com/hherb/kastellan/issues/666),
+  [#667](https://github.com/hherb/kastellan/issues/667),
+  [#668](https://github.com/hherb/kastellan/issues/668).
+- **`9ace57ad`** ([#663](https://github.com/hherb/kastellan/pull/663))
   — #653 + #654: `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` on the Rust side over **six** preconditions, the
   #459 flag dialect at the fixture call sites, and the whole host-mode cascade folded into the new
   `tests-common::gliner_e2e` (the last triplicated `resolve_worker_script` with it). Then a five-agent

@@ -16,9 +16,9 @@ mod egress;
 pub(crate) use egress::{egress_selftest, mount_run_tmpfs, setup_relay};
 
 use crate::cmdline::{
-    anchor_of, bind_prep, parse_env_cmdline, parse_mount_manifest, parse_worker_args_cmdline,
-    parse_worker_cmdline,
-    vsock_listen_cid_port, BindPrep, MountManifest, VMADDR_CID_ANY,
+    anchor_of, bind_prep, parse_env_cmdline, parse_worker_args_cmdline,
+    parse_worker_cmdline, vsock_listen_cid_port, worker_owned_paths, BindPrep, MountManifest,
+    VMADDR_CID_ANY,
 };
 use std::os::unix::io::RawFd;
 
@@ -287,17 +287,26 @@ pub(crate) fn exec_worker() {
 /// Leave root before the worker runs (security audit 2026-09-02, workers 2 /
 /// prelude F3). `exec_worker` used to `execv` straight from PID 1, so
 /// agent-authored Python ran as guest root with every capability: DAC was a
-/// no-op inside the VM and Landlock + seccomp were the only in-guest gates.
+/// no-op inside the VM and **seccomp was the only in-guest gate** — the pinned
+/// guest kernel is built without `CONFIG_SECURITY_LANDLOCK`, so the worker-side
+/// FS layer has never existed on this path (see
+/// `kastellan_sandbox::linux_firecracker::plan::GUEST_LANDLOCK_PROFILE_ENV`).
+/// That makes this drop the *second* in-guest layer rather than a third, which
+/// is why its failure modes below are fatal.
 ///
-/// The host passes the daemon's euid as `KASTELLAN_MICROVM_WORKER_UID`. When
-/// present: the writable mountpoints (rw scratch, persistent store, the
-/// share anchors' tmpfs, `/tmp`) are chowned to it, supplementary groups are
-/// cleared, gid then uid are switched, and `PR_SET_NO_NEW_PRIVS` is set so no
-/// setuid binary in the rootfs can hand privilege back. Any failure is fatal
-/// (PID 1 panics → the VM halts → the spawn fails closed). When the variable
-/// is absent — a rootfs newer than its host — the worker stays root exactly
-/// as before, and says so on stderr, so the two halves can be upgraded in
-/// either order without a silent change.
+/// `PR_SET_NO_NEW_PRIVS` is set **unconditionally and first**, before the env is
+/// even consulted, so the compatibility paths below are still no-new-privs.
+///
+/// The host then passes the daemon's euid as `KASTELLAN_MICROVM_WORKER_UID`.
+/// When present: every path `cmdline::worker_owned_paths` names (the RW
+/// mountpoints — rw scratch and persistent store — their share anchors, `/tmp`,
+/// and each enabled relay's UDS) is chowned to it, supplementary groups are
+/// cleared, then gid and uid are switched. Every step is fatal (PID 1 panics →
+/// the VM halts → the spawn fails closed) **except the chowns**, which only warn
+/// — see the loop for why that asymmetry is a liability rather than a design.
+/// When the variable is absent — a rootfs newer than its host — the worker stays
+/// root exactly as before, and says so on stderr, so the two halves can be
+/// upgraded in either order without a silent change.
 ///
 /// The numeric uid is deliberately never echoed to stderr or into a panic
 /// message: the host chose it (it is the daemon's own euid) and already knows
@@ -325,22 +334,30 @@ fn drop_privileges_for_worker(cmdline: &str) {
         eprintln!("microvm-init: {WORKER_UID_ENV}=0 — worker stays root");
         return;
     }
-    // Everything the worker may write is owned by the uid it will run as.
-    let m = parse_mount_manifest(cmdline);
-    let mut writable: Vec<String> = m.rw.iter().map(|rw| rw.mountpoint.clone()).collect();
-    writable.push("/tmp".to_string());
-    for t in m.rw.iter().map(|rw| rw.mountpoint.as_str()) {
-        if let Some(a) = anchor_of(t) {
-            writable.push(a);
-        }
-    }
-    for dir in writable {
+    // Everything the worker may write — or, for the relay sockets, must be able
+    // to CONNECT to — is owned by the uid it will run as. The set is decided by
+    // the pure `worker_owned_paths`, which is where the reasoning and the tests
+    // live; this loop only applies it.
+    //
+    // A failure here WARNS rather than panicking, and the two cases behind that
+    // one branch are not equally survivable: a mountpoint the worker cannot own
+    // is a degradation, but a RELAY SOCKET it cannot own is a total failure —
+    // that worker will die on its first dial, every time. Fail-closed would
+    // ordinarily be the house rule, and it is deliberately NOT applied yet:
+    // panicking in PID 1 halts the VM, and the host then sees the same
+    // contentless `Protocol(EarlyExit)` this whole defect hid behind, because
+    // the launcher discards the guest console (#666). Until that lands, a
+    // degraded worker reporting `connect proxy uds: Permission denied` carries
+    // strictly more information than a VM that refuses to boot silently.
+    // Revisit when #666 makes a panic legible: tracked in #670.
+    for dir in worker_owned_paths(cmdline) {
         let c = std::ffi::CString::new(dir.clone()).expect("mountpoint has no NUL");
         // SAFETY: chown on a path we own as root; the cstring outlives the call.
         let rc = unsafe { libc::chown(c.as_ptr(), uid, uid) };
         if rc != 0 {
             eprintln!(
-                "microvm-init: chown {dir} to the worker uid failed: {} (worker may be unable to write there)",
+                "microvm-init: chown {dir} to the worker uid failed: {} \
+                 (the worker may be unable to write there, or — for a relay socket — to connect at all)",
                 std::io::Error::last_os_error()
             );
         }

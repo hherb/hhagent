@@ -220,3 +220,99 @@ fn pack_ifname_truncates_to_15_and_nul_terminates() {
     assert_eq!(n[14], b'e' as libc::c_char); // 15th kept char (index 14)
     assert_eq!(n[15], 0);
 }
+
+/// Build a `kastellan.mounts=` token from the plaintext manifest.
+///
+/// Fixtures go through this rather than being pasted as hex, because a
+/// **non-hex** fixture is not a loud failure: `hex_decode` returns `None`,
+/// `parse_mount_manifest` falls back to the DEFAULT (empty) manifest, and any
+/// loop over `m.rw` silently iterates nothing. The first version of
+/// `worker_owned_paths_keeps_rw_mountpoints_and_their_anchors` was written with
+/// `"rw:vdb:/data/scratch"` — colon-separated and not hex, so doubly wrong —
+/// and asserted precisely nothing: deleting the whole RW/anchor block from
+/// `worker_owned_paths` left it green. Note the real manifest is TAB-separated.
+fn mounts_cmdline(manifest: &str) -> String {
+    let hex: String = manifest.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("kastellan.mounts={hex}")
+}
+
+/// The whole chown set for a plain worker: `/tmp` and nothing else.
+///
+/// Pinned as the COMPLETE vector rather than probed with `contains`. Every
+/// assertion below is an `assert_eq!` on the whole set for the same reason —
+/// membership, conditionality, ordering and the absence of `/run` are one
+/// property, and five independent `contains` probes could not see a guard that
+/// was too broad (see `..._keeps_each_socket_to_its_own_relay`).
+#[test]
+fn worker_owned_paths_without_a_relay_is_tmp_alone() {
+    assert_eq!(worker_owned_paths(""), ["/tmp"]);
+}
+
+/// The relay socket must be in the chown set when its relay is enabled.
+///
+/// This is the assertion the whole networked half of the Firecracker suite
+/// turned on: `connect(2)` to an `AF_UNIX` socket needs write permission on the
+/// socket file, and the init binds these as root before it drops to the worker
+/// uid. Without the chown the worker's first dial fails `EACCES` and every
+/// egress/broker VM worker is dead, with a message that names the proxy rather
+/// than the permission.
+///
+/// `/run` is deliberately absent — see `worker_owned_paths`' doc comment: the
+/// tmpfs is already 1777, so chowning it granted nothing the worker lacked and
+/// handed it ownership of a sticky directory. Pinning the whole vector is what
+/// stops it being re-added on a plausible-sounding hunch.
+#[test]
+fn worker_owned_paths_for_an_egress_worker_is_tmp_and_its_socket() {
+    assert_eq!(worker_owned_paths("kastellan.egress=1"), ["/tmp", GUEST_EGRESS_UDS]);
+}
+
+/// Each socket is conditional on ITS OWN relay, not on "any relay".
+///
+/// The mutation this exists to kill is the tidy-up that collapses the two
+/// conditionals into `if egress || broker` — tempting because `/run` genuinely
+/// *was* `egress || broker` one line above until this branch removed it. A
+/// broker-only worker would then chown an egress socket that was never bound,
+/// logging an error on every boot of that worker class. Neither single-relay
+/// test could see it before: each asserted only that its own socket was
+/// present, and the only negative test used the both-disabled cmdline, the one
+/// configuration where the over-broad guard is indistinguishable from this one.
+#[test]
+fn worker_owned_paths_keeps_each_socket_to_its_own_relay() {
+    assert_eq!(worker_owned_paths("kastellan.broker=1"), ["/tmp", GUEST_BROKER_UDS]);
+    assert_eq!(
+        worker_owned_paths("kastellan.egress=1 kastellan.broker=1"),
+        ["/tmp", GUEST_EGRESS_UDS, GUEST_BROKER_UDS],
+    );
+}
+
+/// The RW mountpoints and their share anchors still come through, so the
+/// relay-socket fix ADDED to the pre-existing set rather than replacing it.
+///
+/// This is the only coverage that half of `worker_owned_paths` has: it moved
+/// verbatim out of `drop_privileges_for_worker`, which is all syscalls and so
+/// unreachable from any unit test, and the e2e that would notice its loss is
+/// `#[ignore]`d and DGX-only.
+#[test]
+fn worker_owned_paths_keeps_rw_mountpoints_and_their_anchors() {
+    let cmdline = format!(
+        "{} kastellan.egress=1",
+        mounts_cmdline("rw\tvdb\t/data/scratch")
+    );
+    assert_eq!(
+        worker_owned_paths(&cmdline),
+        ["/data/scratch", "/tmp", "/data", GUEST_EGRESS_UDS],
+    );
+}
+
+/// Duplicate anchors are expected, not a bug — two RW mounts under one
+/// top-level directory push `/data` twice. Pinned so the documented "no
+/// deduplication" contract is a fact about the code rather than a claim in a
+/// comment, and so a future `dedup()` has to change a test that says why.
+#[test]
+fn worker_owned_paths_repeats_a_shared_anchor_rather_than_deduplicating() {
+    let cmdline = mounts_cmdline("rw\tvdb\t/data/scratch\nrw\tvdc\t/data/store");
+    assert_eq!(
+        worker_owned_paths(&cmdline),
+        ["/data/scratch", "/data/store", "/tmp", "/data", "/data"],
+    );
+}

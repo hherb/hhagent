@@ -30,14 +30,22 @@ use std::process::{Child, Command, Stdio};
 
 use crate::{Net, SandboxBackend, SandboxError, SandboxPolicy};
 
-/// The user-namespace lockdown pair every jail passes, shared by
-/// [`LinuxBwrap::probe`] and [`build_argv_with_resolver`] so the probe cannot
-/// drift from the spawn: `--unshare-user` (a *hard* unshare — `--unshare-all`
+/// The user-namespace lockdown pair every jail passes, shared by ALL THREE
+/// producers of a bwrap argv — [`LinuxBwrap::probe`],
+/// [`build_argv_with_resolver`] and the Firecracker VMM jail
+/// (`linux_firecracker::confine::build_vmm_jail_argv`) — so none can drift
+/// from the others: `--unshare-user` (a *hard* unshare — `--unshare-all`
 /// sets only bwrap's try-flag) and `--disable-userns` (no nested user
 /// namespaces; security audit 2026-09-02). bwrap validates the pair at option
 /// parse time, before the try-flag is promoted, so `--unshare-all
 /// --disable-userns` without the explicit `--unshare-user` is not a weaker
 /// jail but a refused spawn: `bwrap: --disable-userns requires --unshare-user`.
+///
+/// Both copies that spelled the flags out instead of using this const have
+/// broken outright: the worker jails (#661, found by the first real-bwrap gate
+/// of the 2026-09-02 audit — 66 failures) and then the VMM jail, which this
+/// const's first version overlooked and which the Firecracker gate caught.
+/// **A new jail extends this const; it does not re-list the flags.**
 pub const USERNS_LOCKDOWN_FLAGS: [&str; 2] = ["--unshare-user", "--disable-userns"];
 
 /// Shell out to `bwrap` for sandboxing. Assumes `bwrap` is on `$PATH`.

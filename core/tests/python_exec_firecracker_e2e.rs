@@ -299,3 +299,162 @@ async fn microvm_spawn_leaves_no_orphan_run_dir() {
         }
     }
 }
+
+/// Pick the value of a `key=value` line out of the guest's stdout.
+///
+/// The guest prints one self-describing line per fact rather than a bare
+/// number, so a truncated or reordered stdout cannot be mistaken for a
+/// different fact. Pure: takes the captured text, returns a borrowed slice,
+/// touches no global state — so the parsing is not what a VM boot has to prove.
+fn guest_fact<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(key)?.strip_prefix('='))
+        .map(str::trim)
+}
+
+/// The worker must NOT run as guest root (security audit 2026-09-02, W-2).
+///
+/// Before that fix `exec_worker` `execv`'d straight from PID 1, so
+/// agent-authored Python ran as uid 0 with every capability: DAC was a no-op
+/// inside the VM and **seccomp was the only in-guest gate** — the pinned guest
+/// kernel has no `CONFIG_SECURITY_LANDLOCK`, so the worker-side FS layer has
+/// never existed on this path (see
+/// `kastellan_sandbox::linux_firecracker::plan::GUEST_LANDLOCK_PROFILE_ENV`).
+/// That makes this drop the SECOND in-guest layer rather than a third, which is
+/// why it is worth asserting in this much detail. The fix has the host pass its
+/// own euid as `KASTELLAN_MICROVM_WORKER_UID` and the guest init chown the
+/// writable mounts and relay sockets, drop groups/gid/uid and set
+/// `PR_SET_NO_NEW_PRIVS` before the `execv`.
+///
+/// **Why this test exists at all.** Every other assertion in this suite passes
+/// just as happily with the worker running as root, and the compatibility path
+/// is deliberately quiet: a rootfs whose init predates the fix, or a host that
+/// stops sending the variable, leaves the worker root and says so only on the
+/// guest's stderr — which nothing drains (#666). So the whole of W-2 was, until
+/// this test, provable only by reading the code. Every fact below is read from
+/// inside the running guest, which is the only place the property is real.
+///
+/// **What each assertion buys, since none is redundant:** `uid != 0` is W-2
+/// itself; `euid == uid` and `suid == uid` together are what make `setuid(0)`
+/// unreachable (moving only the real uid leaves the saved-set-uid at 0, and a
+/// process can always restore from *that* — so the saved-set field is the one
+/// that actually proves irreversibility, and it is the field the init's own
+/// post-drop self-check cannot see); `uid ==` the **host's** euid catches a
+/// guest picking an identity for itself, which would also unstick the 0600
+/// ro-share files the host stages; `gid` and the empty supplementary set pin
+/// `setgid` + `setgroups(0, NULL)`, without which the worker keeps group-root
+/// access to every `root:root` group-readable file baked into the rootfs;
+/// `Seccomp: 2` pins the layer the Landlock opt-out's whole justification rests
+/// on — after that opt-out it is the only worker-side kernel gate left, and
+/// nothing else in the tree observes it; `NoNewPrivs` stops a setuid binary in
+/// the rootfs handing the privilege back.
+///
+/// Note this makes a STALE rootfs a failure rather than a silent pass: an image
+/// built before the fix boots fine and reports uid 0. That is the intent — the
+/// image bakes the init, so `scripts/workers/microvm/build-rootfs.sh` must be
+/// re-run after any change to `kastellan-microvm-init`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "needs DGX: /dev/kvm + vhost_vsock + built rootfs + kastellan-microvm-run"]
+async fn microvm_worker_runs_unprivileged_with_no_new_privs() {
+    if skip_if_no_microvm(VM_ROOTFS) {
+        return;
+    }
+    // One dispatch, one self-describing line per fact, all parsed out of
+    // /proc/self/status — which carries the real/effective/saved-set uid triple,
+    // the gid triple, the supplementary set, the seccomp mode and NoNewPrivs in
+    // one file. `ctypes.CDLL(None).prctl` would reach PR_GET_NO_NEW_PRIVS and is
+    // stdlib, but it needs libffi in the guest rootfs and an ABI guess; /proc
+    // needs neither and yields six more facts for free.
+    let out = run_in_microvm(
+        "f = {}\n\
+         for line in open('/proc/self/status'):\n\
+         \x20   k, _, v = line.partition(':')\n\
+         \x20   f[k] = v.split()\n\
+         def g(key, idx=0):\n\
+         \x20   v = f.get(key, [])\n\
+         \x20   return v[idx] if len(v) > idx else 'absent'\n\
+         print('kastellan_uid=%s' % g('Uid', 0))\n\
+         print('kastellan_euid=%s' % g('Uid', 1))\n\
+         print('kastellan_suid=%s' % g('Uid', 2))\n\
+         print('kastellan_gid=%s' % g('Gid', 1))\n\
+         print('kastellan_groups=%s' % (','.join(f.get('Groups', [])) or 'none'))\n\
+         print('kastellan_seccomp=%s' % g('Seccomp'))\n\
+         print('kastellan_no_new_privs=%s' % g('NoNewPrivs'))\n",
+    )
+    .await;
+    assert_eq!(out["exit_code"], 0, "clean exit expected: {out}");
+    let stdout = out["stdout"].as_str().unwrap_or_default();
+
+    let num = |key: &str| -> u32 {
+        guest_fact(stdout, key)
+            .unwrap_or_else(|| panic!("guest printed no {key} line: {out}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("guest {key} is not a number ({e}): {out}"))
+    };
+    let uid = num("kastellan_uid");
+    let euid = num("kastellan_euid");
+    let suid = num("kastellan_suid");
+    let gid = num("kastellan_gid");
+
+    assert_ne!(
+        uid, 0,
+        "W-2 regression: the worker is running as guest ROOT. Either the rootfs \
+         image predates the privilege drop (rebuild it: \
+         scripts/workers/microvm/build-rootfs.sh) or the host stopped sending \
+         KASTELLAN_MICROVM_WORKER_UID. Guest output: {out}"
+    );
+    assert_eq!(
+        euid, uid,
+        "the drop must move the effective uid as well as the real one: {out}"
+    );
+    assert_eq!(
+        suid, uid,
+        "the SAVED-SET uid must move too, or setuid(0) is still reachable — a \
+         drop that leaves it at 0 is reversible by the worker at any time: {out}"
+    );
+
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let host_euid = unsafe { libc::geteuid() };
+    assert_eq!(
+        uid, host_euid,
+        "the guest must run as the identity the HOST chose (its own euid). A \
+         different non-zero uid means the guest is picking one for itself, which \
+         would also unstick the ro-share 0600 files the host stages: {out}"
+    );
+
+    assert_eq!(
+        gid, uid,
+        "setgid must move the effective gid to the same identity, or the worker \
+         keeps group-root: {out}"
+    );
+    // ⚠️ This one is a REGRESSION GUARD, not a proof, and the difference is worth
+    // stating: guest PID 1 starts with an empty supplementary set, so
+    // `setgroups(0, NULL)` is a no-op here and this assertion holds whether or
+    // not the call is made. Deleting `setgroups` + `setgid` from the init and
+    // rebuilding the rootfs was measured: it turns `kastellan_gid` red (0 vs
+    // 1000) and leaves THIS line green. Keep it anyway — it costs one line and
+    // it is the thing that would fail first if the init ever gained a
+    // supplementary group before the drop — but do not read a pass here as
+    // evidence that `setgroups` ran. The gid assertion above is that evidence.
+    assert_eq!(
+        guest_fact(stdout, "kastellan_groups"),
+        Some("none"),
+        "the supplementary set must be empty; a retained group 0 reaches every \
+         root:root group-readable file in the rootfs: {out}"
+    );
+
+    assert_eq!(
+        guest_fact(stdout, "kastellan_seccomp"),
+        Some("2"),
+        "the worker-side seccomp filter must be installed and inherited by the \
+         python child (2 = SECCOMP_MODE_FILTER). Since the guest kernel has no \
+         Landlock, this is the ONLY worker-side kernel gate left inside the VM: {out}"
+    );
+    assert_eq!(
+        guest_fact(stdout, "kastellan_no_new_privs"),
+        Some("1"),
+        "PR_SET_NO_NEW_PRIVS must be set, or a setuid binary in the rootfs can \
+         hand the privilege back: {out}"
+    );
+}

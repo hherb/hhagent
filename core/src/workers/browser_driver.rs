@@ -340,6 +340,17 @@ pub fn browser_driver_entry(
     // /tmp scratch above. bwrap's mount namespace remains the primary FS layer;
     // Landlock is the kernel-side second gate over the same bound set. seccomp
     // (browser_client) is applied by the same shim.
+    //
+    // BOTH claims above are about the BWRAP path only. Under
+    // KASTELLAN_BROWSER_DRIVER_USE_MICROVM=1 neither holds: the micro-VM is
+    // selected INSTEAD of bwrap (a worker carries one backend), so there is no
+    // mount namespace, and the Firecracker backend injects
+    // KASTELLAN_LANDLOCK_PROFILE=none because the pinned guest kernel has no
+    // CONFIG_SECURITY_LANDLOCK — so the ruleset this comment reasons about is
+    // not installed either. What substitutes there is the read-only purpose-built
+    // rootfs and the VM boundary; seccomp is unaffected on both paths. See
+    // `kastellan_sandbox::linux_firecracker::plan::GUEST_LANDLOCK_PROFILE_ENV`
+    // and the micro-VM row in docs/threat-model.md (#669).
 
     let policy = SandboxPolicy {
         fs_read,

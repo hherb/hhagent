@@ -76,8 +76,12 @@ fn main() -> std::io::Result<()> {
     }
 
     // Boot firecracker as our child; it creates the base vsock UDS once it is
-    // up. Its stdout/stderr go to the log path via --log-path, so we keep our
-    // own stdout pristine for JSON-RPC.
+    // up. We keep our own stdout pristine for JSON-RPC.
+    //
+    // ⚠️ The nulls below DISCARD the guest console (#666): --log-path covers
+    // firecracker's own logs, but the guest's ttyS0 — every microvm-init
+    // diagnostic — is firecracker's stdout. Do not read this as "redirected to
+    // the log path"; it is dropped, and the run dir self-cleans on top.
     let fc_argv = boot::firecracker_argv(&firecracker_bin, &config, &log);
     let mut fc = Command::new(&fc_argv[0])
         .args(&fc_argv[1..])

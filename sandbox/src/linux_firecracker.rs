@@ -1,8 +1,12 @@
 //! Linux micro-VM backend for [`SandboxBackend`]: boots a Firecracker guest
 //! and bridges the worker's JSON-RPC stdio over vsock.
 //!
-//! Defense-in-depth on top of (not instead of) bwrap/seccomp/Landlock/cgroup:
-//! a throwaway guest kernel is the blast wall. The backend itself is a thin
+//! Selected **instead of** bwrap for the workers that opt in (a worker carries
+//! exactly one parent-side backend), and it keeps the worker-side seccomp layer
+//! but NOT Landlock — the pinned guest kernel is built without
+//! `CONFIG_SECURITY_LANDLOCK`, so [`plan::GUEST_LANDLOCK_PROFILE_ENV`] opts out
+//! explicitly (#669). A throwaway guest kernel is the blast wall. See the
+//! micro-VM row in `docs/threat-model.md` for the honest layer accounting. The backend itself is a thin
 //! pure-fn-then-spawn shell (mirrors [`crate::linux_bwrap`]); the boot + vsock
 //! bridge live in the `kastellan-microvm-run` launcher binary that this
 //! backend spawns as the `Child`.

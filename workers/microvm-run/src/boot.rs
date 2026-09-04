@@ -4,8 +4,13 @@
 /// via $PATH) on the bare path, or an absolute path on the confined path (the
 /// bwrap jail has no $PATH, so the backend resolves + binds it and passes it here).
 /// `--no-api` + `--config-file` boots a fully pre-described VM; `--log-path` sends
-/// Firecracker's own logs (including the guest kernel console it captures) to a file,
-/// keeping our stdout clean for JSON-RPC.
+/// Firecracker's OWN logs to a file, keeping our stdout clean for JSON-RPC.
+///
+/// It does NOT capture the guest kernel console: that rides firecracker's stdout,
+/// which the caller sends to `/dev/null` (#666). The earlier "including the guest
+/// kernel console it captures" here was wrong, and cost a session — three distinct
+/// micro-VM defects all surfaced as an identical contentless `Protocol(EarlyExit)`
+/// because every guest-side diagnostic was being discarded.
 pub fn firecracker_argv(fc_bin: &str, config_path: &str, log_path: &str) -> Vec<String> {
     vec![
         fc_bin.into(),
