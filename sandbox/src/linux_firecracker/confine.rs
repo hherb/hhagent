@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::linux_bwrap::USERNS_LOCKDOWN_FLAGS;
 use crate::linux_cgroup::build_systemd_run_argv;
 use crate::linux_firecracker::launcher_argv;
 use crate::linux_firecracker::plan::FirecrackerLaunchPlan;
@@ -75,8 +76,13 @@ pub fn build_vmm_jail_argv(
 
     let mut a: Vec<String> = Vec::with_capacity(48);
     a.push("bwrap".into());
-    a.push("--unshare-all".into()); // user/ipc/pid/uts/cgroup/net ns; egress rides vsock, no host net
-    a.push("--disable-userns".into()); // no nested userns for the VMM either (audit 2026-09-02)
+    a.push("--unshare-all".into()); // ipc/pid/uts/cgroup/net ns; egress rides vsock, no host net
+    // The userns pair, from the one const the worker jails use. `--unshare-all`
+    // sets only bwrap's TRY-flag for the user namespace, and `--disable-userns`
+    // is rejected at option-parse time without a hard `--unshare-user` beside
+    // it — so spelling either one out here is how this jail silently stopped
+    // launching at all (#661's defect, in its third producer).
+    a.extend(USERNS_LOCKDOWN_FLAGS.iter().map(|f| f.to_string()));
     a.push("--die-with-parent".into());
     a.push("--new-session".into());
     a.push("--as-pid-1".into());
@@ -245,7 +251,7 @@ mod tests {
     #[test]
     fn jail_carries_the_shared_userns_lockdown_pair() {
         let a = jail(&deny_plan());
-        for f in crate::linux_bwrap::USERNS_LOCKDOWN_FLAGS {
+        for f in USERNS_LOCKDOWN_FLAGS {
             assert!(
                 a.contains(&f.to_string()),
                 "{f} missing from the VMM jail argv: {a:?}"
