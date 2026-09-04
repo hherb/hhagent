@@ -6,9 +6,19 @@
 //!   * Real-model tier (Task 3) — live gliner-relex worker against the
 //!     `multi-v1.0` weights. Gated on venv + weights presence (skip-as-pass).
 //!
-//! All tests use the shared `kastellan-tests-common` PG bring-up helper +
-//! the standard skip-without-PG convention (skip_if_no_supervisor +
-//! pg_bin_dir_or_skip).
+//! All tests use the shared `kastellan-tests-common` PG bring-up helper.
+//! Both of its preconditions — the user-level supervisor and the Postgres
+//! install — are checked in `bring_up_pg` and routed through
+//! `KASTELLAN_GLINER_RELEX_REQUIRE_E2E`: `[SKIP]`-as-pass by default, a panic
+//! naming the unmet one when an operator demanded a real run (#653).
+//!
+//! Deliberately, no test in this file calls `skip_if_no_supervisor` directly.
+//! It used to, as the first statement of each test — ahead of everything
+//! require-aware — which made the supervisor probe the one precondition the
+//! knob could not see: a host without `loginctl enable-linger` reported
+//! `6 passed` having loaded no model at all, with the knob set. Keeping the
+//! skip-only helper un-imported here is what stops that ordering from coming
+//! back.
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
@@ -17,17 +27,17 @@ use std::sync::Arc;
 use kastellan_core::entity_extraction::{
     EntityExtractor, NoOpEntityExtractor, SeedSource, StaticEntityExtractor,
 };
+use kastellan_core::entity_extraction::gliner_relex::GlinerRelexExtractor;
 use kastellan_core::memory::entity_link::link_memory_entities;
 use kastellan_core::worker_lifecycle::{CompositeLifecycle, WorkerLifecycleManager};
 use kastellan_core::workers::gliner_relex::{gliner_relex_entry, Client};
+use kastellan_db::audit::fetch_since;
+use kastellan_db::memories::seed_meta_memory;
 use kastellan_tests_common::gliner_e2e::{
     gliner_host_env, gliner_host_lockdown_shim, report_unmet, require_action, EnableFlag,
 };
-use kastellan_core::entity_extraction::gliner_relex::GlinerRelexExtractor;
-use kastellan_db::audit::fetch_since;
-use kastellan_db::memories::seed_meta_memory;
 use kastellan_tests_common::{
-    bring_up_pg_cluster, pg_bin_dir_or_reason, skip_if_no_supervisor, unique_suffix,
+    bring_up_pg_cluster, pg_bin_dir_or_reason, supervisor_unavailable_reason, unique_suffix,
 };
 
 /// Build a Tokio runtime for sync-style tests. Mirrors the convention
@@ -52,21 +62,28 @@ async fn upsert_test_entity(pool: &sqlx::PgPool, kind: &str, name: &str) -> i64 
 }
 
 /// Shared helper: bring up a named PG cluster + run probe + open pool.
-/// Returns `None` (with [SKIP]) if supervisor or PG binaries are absent.
+///
+/// Returns `None` — with a `[SKIP]` line — when the user-level supervisor or
+/// the Postgres binaries are absent, so the caller `return`s green. Under
+/// `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` both become a panic naming themselves
+/// instead: without a cluster the test body never runs, which is the same
+/// false green the knob exists to abolish (#653).
+///
+/// Both checks live here rather than at the call sites on purpose. The shared
+/// `skip_if_no_supervisor` / `pg_bin_dir_or_skip` helpers stay skip-only for
+/// their ~70 other callers, so the decision is made in this one function — and
+/// making it in one place is what keeps a skip-only gate from being written
+/// ahead of a require-aware one again.
 async fn bring_up_pg(label: &str) -> Option<(kastellan_tests_common::PgCluster, sqlx::PgPool)> {
-    // Must be called OUTSIDE the async block so skip returns the fn.
-    // We return None instead of calling skip helpers (they're sync).
+    let action = require_action();
+    if let Some(reason) = supervisor_unavailable_reason() {
+        return report_unmet(action, &reason);
+    }
     let cluster = {
-        // Routed through the gliner-relex require knob rather than
-    // `pg_bin_dir_or_skip`: without a cluster the test body never runs, which is
-    // the same false green `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` exists to
-    // abolish. The shared helper stays skip-only — ~30 other suites depend on
-    // that — so the decision is made here, at the one call site that must not
-    // silently pass (#653).
-    let bin_dir = match pg_bin_dir_or_reason() {
-        Ok(d) => d,
-        Err(reason) => return report_unmet(require_action(), &reason),
-    };
+        let bin_dir = match pg_bin_dir_or_reason() {
+            Ok(d) => d,
+            Err(reason) => return report_unmet(action, &reason),
+        };
         let suffix = unique_suffix();
         bring_up_pg_cluster(
             &bin_dir,
@@ -94,10 +111,6 @@ const FETCH_LIMIT: i64 = 10_000;
 
 #[test]
 fn link_inserts_memory_entities_rows_and_writes_audit_row() {
-    if skip_if_no_supervisor() {
-        return;
-    }
-
     rt().block_on(async {
         let Some((_cluster, pool)) = bring_up_pg("ins").await else {
             return;
@@ -183,10 +196,6 @@ fn link_inserts_memory_entities_rows_and_writes_audit_row() {
 
 #[test]
 fn link_with_noop_extractor_writes_no_rows_but_writes_audit_row() {
-    if skip_if_no_supervisor() {
-        return;
-    }
-
     rt().block_on(async {
         let Some((_cluster, pool)) = bring_up_pg("noop").await else {
             return;
@@ -251,10 +260,6 @@ fn link_with_noop_extractor_writes_no_rows_but_writes_audit_row() {
 
 #[test]
 fn link_is_idempotent_on_rerun_with_same_seeds() {
-    if skip_if_no_supervisor() {
-        return;
-    }
-
     rt().block_on(async {
         let Some((_cluster, pool)) = bring_up_pg("idem").await else {
             return;
@@ -322,10 +327,6 @@ fn link_is_idempotent_on_rerun_with_same_seeds() {
 /// SQL would be blind to the post-extract DB-link failure mode.
 #[test]
 fn link_db_failure_still_writes_audit_row_with_seed_info() {
-    if skip_if_no_supervisor() {
-        return;
-    }
-
     rt().block_on(async {
         let Some((_cluster, pool)) = bring_up_pg("dberr").await else {
             return;
@@ -433,10 +434,6 @@ async fn build_real_extractor(pool: &sqlx::PgPool) -> Option<Arc<dyn EntityExtra
 
 #[test]
 fn link_against_real_extractor_writes_real_entity_ids() {
-    if skip_if_no_supervisor() {
-        return;
-    }
-
     rt().block_on(async {
         let Some((_cluster, pool)) = bring_up_pg("real").await else {
             return;
@@ -499,10 +496,6 @@ fn link_against_real_extractor_writes_real_entity_ids() {
 
 #[test]
 fn link_extends_to_l0_seed_path_end_to_end() {
-    if skip_if_no_supervisor() {
-        return;
-    }
-
     rt().block_on(async {
         let Some((_cluster, pool)) = bring_up_pg("e2e").await else {
             return;

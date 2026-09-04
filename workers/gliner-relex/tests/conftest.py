@@ -11,9 +11,12 @@ skip into a failure, and the `pytest_sessionfinish` hook below turns the
 cases the test cannot see from the inside into failures too.
 
 The same round-trip through the full sandboxed worker lives on the Rust
-side: `core/tests/gliner_relex_e2e.rs` and `--test entity_extraction_e2e`
-(both skip-as-pass without venv + weights; both additionally need
-`KASTELLAN_GLINER_RELEX_ENABLE=1`).
+side, in three suites: `core/tests/gliner_relex_e2e.rs`,
+`entity_extraction_e2e.rs` and `memory_entity_link_e2e.rs`. All three are
+skip-as-pass without venv + weights and honour the same
+`KASTELLAN_GLINER_RELEX_REQUIRE_E2E` knob. The latter two additionally wait
+for `KASTELLAN_GLINER_RELEX_ENABLE` (any of `1`/`true`/`yes`/`on`);
+`gliner_relex_e2e` has no separate opt-in and runs whenever both are staged.
 """
 import os
 from unittest.mock import MagicMock

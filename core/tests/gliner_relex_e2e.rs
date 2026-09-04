@@ -11,9 +11,18 @@
 //!
 //! Without the venv + weights (and without a running Postgres, and
 //! without bwrap/Seatbelt), every test in this file `[SKIP]`s cleanly.
-//! That matches the default deployment posture: gliner-relex is opt-in
-//! via `KASTELLAN_GLINER_RELEX_ENABLE=1` and operators run
-//! `scripts/workers/gliner-relex/install.sh` before flipping the flag.
+//! That matches the default deployment posture: operators run
+//! `scripts/workers/gliner-relex/install.sh` before the tier can run at all.
+//!
+//! Unlike the other two gliner-relex suites, this one has **no**
+//! `KASTELLAN_GLINER_RELEX_ENABLE` gate of its own (`EnableFlag::Ignored`) —
+//! it runs whenever the venv and the weights are staged. That flag gates the
+//! daemon *worker*, and the two heavier tiers that drive the model through the
+//! extraction path.
+//!
+//! Setting `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` inverts the skips: every
+//! precondition becomes a panic naming itself, because a skip nobody can turn
+//! into a failure cannot detect a dead fixture (#653).
 //!
 //! See `docs/superpowers/specs/2026-05-18-gliner-relex-worker-design.md`
 //! and the Slice 2 section of
@@ -57,6 +66,11 @@ use std::path::PathBuf;
 /// Slice 2.5: gate container-mode e2e on the operator having built the
 /// image. Mirrors the venv-staged skip pattern in
 /// `kastellan_tests_common::gliner_e2e`.
+///
+/// Stays skip-only under `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` on purpose: the
+/// container tier is a separate, much heavier opt-in, and folding it into the
+/// knob would make the knob unusable on a Mac that has the venv staged but no
+/// image. See the `# Scope` section of `kastellan_tests_common::gliner_e2e`.
 #[cfg(target_os = "macos")]
 fn skip_if_no_container() -> bool {
     if let Err(e) = kastellan_sandbox::macos_container::MacosContainer::probe() {
@@ -117,7 +131,11 @@ fn build_test_entry_container() -> Option<ToolEntry> {
         script_path: PathBuf::new(),
         venv_dir: PathBuf::new(),
         weights_dir: weights,
-        model_id: "knowledgator/gliner-relex-multi-v1.0".to_string(),
+        // The one definition, shared with the host tier. A fourth hardcoded
+        // copy lived here and would have gone stale on a model bump while the
+        // unit test pinning MODEL_ID still passed — the exact drift the
+        // de-duplication exists to stop.
+        model_id: kastellan_tests_common::gliner_e2e::MODEL_ID.to_string(),
         device: "auto".to_string(),
         use_container_backend: true,
         container_image: None,  // defaults to CONTAINER_IMAGE_DEFAULT
@@ -161,18 +179,23 @@ fn build_test_entry() -> Option<ToolEntry> {
     Some(gliner_relex_entry(&env, gliner_host_lockdown_shim()))
 }
 
-/// Bring up a one-shot Postgres cluster + run the schema probe. Skips
-/// cleanly when `pg_bin_dir_or_skip` returns `None`.
+/// Bring up a one-shot Postgres cluster + run the schema probe.
+///
+/// Returns `None` — with a `[SKIP]` line — when no Postgres install is found,
+/// so the caller `return`s green; or panics naming the knob when
+/// `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` demanded a real run. Without a cluster
+/// the test body never runs, which is the same false green the knob exists to
+/// abolish (#653).
 ///
 /// Returns the cluster (drop-cleanup wired through `PgCluster::_guards`)
 /// plus a runtime-role-scoped `PgPool` ready for `tool_host::dispatch`.
+///
+/// Note this is shared with the macOS container tier, whose own two probes stay
+/// skip-only: the cluster is needed either way.
 async fn bring_up_pg(label: &str) -> Option<(PgCluster, sqlx::PgPool)> {
-    // Routed through the gliner-relex require knob rather than
-    // `pg_bin_dir_or_skip`: without a cluster the test body never runs, which is
-    // the same false green `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` exists to
-    // abolish. The shared helper stays skip-only — ~30 other suites depend on
-    // that — so the decision is made here, at the one call site that must not
-    // silently pass (#653).
+    // The shared `pg_bin_dir_or_skip` stays skip-only — ~70 other suites depend
+    // on that — so the decision is made here, at a call site that must not
+    // silently pass.
     let bin_dir = match pg_bin_dir_or_reason() {
         Ok(d) => d,
         Err(reason) => return report_unmet(require_action(), &reason),

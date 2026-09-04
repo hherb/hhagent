@@ -54,11 +54,12 @@
 //!   `weights_dir_or_reason` / `resolve_weights_dir_or_skip`: the one
 //!   `multi-v1.0` snapshot lookup for the three gliner-relex e2es, mirrored by
 //!   the worker's own `tests/live_support.py`.
-//! * [`gliner_e2e`] — `gliner_host_env`: the whole host-mode precondition
-//!   cascade for those three suites, in one place, plus the
+//! * [`gliner_e2e`] — `gliner_host_env`: the host-mode precondition cascade
+//!   for those three suites, in one place, plus the
 //!   `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` knob that turns each of its
 //!   `[SKIP]`s into a failure (#653) and the #459 flag dialect the fixtures
-//!   used to miss (#654).
+//!   used to miss (#654). The suites' own `bring_up_pg` routes the supervisor
+//!   and Postgres preconditions through the same knob via `report_unmet`.
 //! * [`venv_interpreter`] — `venv_interpreter_binds`: the #284 interpreter
 //!   binds for the three gliner-relex host-mode fixtures, with the `None`
 //!   return checked so a `.venv` staged on another host fails loudly instead
@@ -109,8 +110,10 @@ pub use daemon::{
 pub use embedding::text_to_embedding;
 pub use env::{env_lock, EnvVarGuard};
 pub use gliner_e2e::{
-    enable_gate_unmet, gliner_host_env, gliner_host_lockdown_shim, report_unmet, require_action,
-    unmet_action, EnableFlag, UnmetAction, ENABLE_ENV, REQUIRE_ENV,
+    enable_gate_unmet, first_unmet_precondition, gliner_host_env, gliner_host_lockdown_shim,
+    host_env_from, report_unmet, report_unmet_to, require_action, unmet_action, venv_dir_of,
+    venv_shim_or_reason, venv_shim_path, workspace_root, EnableFlag, UnmetAction, ENABLE_ENV,
+    LOCKDOWN_SHIM_BIN, MODEL_ID, REQUIRE_ENV, VENV_SHIM_SUBPATH,
 };
 pub use gliner_weights::{
     resolve_weights_dir_or_skip, weights_dir_candidate, weights_dir_or_reason, WEIGHTS_SUBPATH,
@@ -128,8 +131,8 @@ pub use signal_death::{
     assert_nonzero_exit, stdout_of,
 };
 pub use skip::{
-    pg_bin_dir_or_reason, pg_bin_dir_or_skip, skip_if_no_supervisor, skip_if_origin_unreachable,
-    skip_line, supervisor_unavailable_reason,
+    one_line, pg_bin_dir_or_reason, pg_bin_dir_or_skip, skip_if_no_supervisor,
+    skip_if_origin_unreachable, skip_line, supervisor_unavailable_reason,
 };
 pub use temp::{current_username, unique_suffix, unique_temp_root};
 pub use venv_interpreter::venv_interpreter_binds;

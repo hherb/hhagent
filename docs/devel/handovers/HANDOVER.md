@@ -8,14 +8,15 @@
 > which holds the verbose pre-prune version of everything summarised here,
 > including the full #619, #615/#616/#618 and live-bring-up write-ups compressed below.
 
-**Last updated:** 2026-09-03 (#656 merged; then #653 + #654, the gliner-relex e2e require knob) ·
+**Last updated:** 2026-09-04 (#656 merged; then #653 + #654, the gliner-relex e2e require knob, and its review round) ·
 **DGX RUNNING `121f22a2`** (see [Merged work, compressed](#merged-work-compressed--the-guard-arc-and-the-2026-09-02-deploy)) ·
 **`main` HEAD:** `c03ec1a3` — [#656](https://github.com/hherb/kastellan/pull/656), which closed #650,
 [#661](https://github.com/hherb/kastellan/issues/661) and
 [#662](https://github.com/hherb/kastellan/issues/662), on top of `62d98a00`
 ([#660](https://github.com/hherb/kastellan/pull/660), the 2026-09-02 security audit). ·
 **OPEN BRANCH: `fix/653-654-gliner-e2e-require-knob`** — #653 + #654, PR
-[#663](https://github.com/hherb/kastellan/pull/663); see [#653 / #654](#653--654--the-gliner-relex-e2e-require-knob-and-the-flag-dialect).
+[#663](https://github.com/hherb/kastellan/pull/663), review round applied; see
+[#653 / #654](#653--654--the-gliner-relex-e2e-require-knob-and-the-flag-dialect).
 
 > ✅ **`main` IS DEPLOYABLE AGAIN.** #656 merged 2026-09-03 carrying `4269ff7e` (#661, the bwrap
 > `--disable-userns`/`--unshare-user` pair) and `f97991a6` (#662, python-exec's `socketpair` SIGSYS)
@@ -23,7 +24,7 @@
 > "do not run `scripts/upgrade_from_git.sh`" warning is **lifted**. The DGX itself still runs
 > `121f22a2` and is a redeploy behind.
 
-**Last gate: DGX over `fix/653-654-gliner-e2e-require-knob` — see [Test baseline](#test-baseline-authoritative).**
+**Last gate: DGX over `fix/653-654-gliner-e2e-require-knob`, post-review-round — 4040 / 0 / 55, cold clippy 27/27 crates clean. See [Test baseline](#test-baseline-authoritative).**
 The `main` baseline it is measured against is DGX `f97991a6` (= #656's tip) — **4009 / 1 / 55**, 176
 suites, 4 `[SKIP]`. The 1 was `scheduler_ask_expiry_e2e::an_unanswered_ask_expires_and_fails_its_task_without_a_restart`,
 a 60-second poll that missed under full-workspace load and passed **2 / 2 in isolation**; flaky under
@@ -162,8 +163,10 @@ human happened to rebuild a venv**, and nothing in the tree could have demanded 
   **Six** are covered, not the issue's five — the opt-in flag, sandbox, supervisor, venv shim, weights,
   **and the Postgres bring-up**. Without a cluster the test body never runs either, so leaving that one
   skip-only would have left the knob reporting green on the very premise it abolishes. The shared
-  `pg_bin_dir_or_skip` stays skip-only for its ~30 other callers; the decision is made at these three
-  call sites via `report_unmet(require_action(), &reason)`.
+  `pg_bin_dir_or_skip` / `skip_if_no_supervisor` stay skip-only for their **~70** other callers (234
+  call sites across 69 files, counted — an earlier "~30" in this file and in three code comments was
+  low by half); the decision is made in each suite's own `bring_up_pg` via
+  `report_unmet(require_action(), &reason)`.
 - **#654 was a real operator-facing skew, not a tidy-up.** The fixtures gated on `!= Some("1")` while
   production reads the same variable through `env_flag_enabled`, so a `kastellan.env` legitimately
   saying `KASTELLAN_GLINER_RELEX_ENABLE=true` — which **does** enable the daemon worker — produced a
@@ -174,6 +177,32 @@ human happened to rebuild a venv**, and nothing in the tree could have demanded 
   holding the whole host-mode cascade **and** the `GlinerRelexEnv` all three suites built identically.
   That folds in the last triplicated `resolve_worker_script`. Not tidiness: these are the copies that
   drifted in **both** #284 and #650, one keeping `interpreter_root: None` after the other two were fixed.
+- **A five-agent review round found the knob had a hole, and the tests could not see it.** Both were
+  fixed on this branch before merge; both were proved by execution rather than argued.
+  - **The hole:** `memory_entity_link_e2e.rs` opened each of its six tests with a skip-only
+    `skip_if_no_supervisor()`, *ahead* of everything require-aware — so `gliner_host_env`'s own
+    supervisor check was unreachable in that file. Reproduced on the DGX:
+    `XDG_RUNTIME_DIR=/nonexistent … REQUIRE_E2E=1 cargo test --test memory_entity_link_e2e`
+    → **`6 passed`, zero models loaded, knob set**. The exact false green the knob exists to abolish,
+    in the very suite this section names as the copy that drifted. Fixed structurally, not locally:
+    the supervisor check moved *into* `bring_up_pg` beside the Postgres one, and
+    `skip_if_no_supervisor` is no longer imported by either suite — if the file cannot name the
+    skip-only helper, the ordering cannot come back. Same repro now panics naming the precondition.
+  - **The blind spot:** the 12 new tests covered the pure leaves but nothing above them. Two mutants
+    survived a full green run — `require_action()` returning a constant (the knob **permanently
+    inert**, #653 silently reverted) and deleting `report_unmet`'s `eprint!` (every `[SKIP]` line
+    gone, so `grep -c '^\[SKIP\]'` reports a *clean* run — strictly worse than the bug #653 fixed,
+    because the audit workflow this tree relies on would then be actively lying). The cause was that
+    `require_action`, `gliner_host_env`, `venv_shim_or_reason`, `workspace_root` and `report_unmet`'s
+    Skip arm had **no test at all** — the mutant inventory had been drawn from the *tested* functions
+    rather than the *changed* ones.
+  - **What made them testable:** `report_unmet_to(action, reason, &mut dyn Write)` (so a test can
+    prove the Skip arm *emits* the line, by reading bytes back from a `Vec<u8>` instead of adding a
+    real `[SKIP]` to the count it protects), and splitting `gliner_host_env` into a pure
+    `first_unmet_precondition(gate, flag, …four `FnOnce` probes)` plus a pure `host_env_from`. The
+    `FnOnce` probes are what let a test `panic!()` inside an un-run probe to prove short-circuiting —
+    the "we don't spawn `bwrap` unnecessarily" claim had been a doc comment only. **All six mutants
+    now die**; `use_container_backend: false` is pinned for the first time.
 - **The reusable pattern: `*_or_reason` siblings.** `sandbox_unavailable_reason`,
   `supervisor_unavailable_reason`, `weights_dir_or_reason`, `pg_bin_dir_or_reason`,
   `venv_shim_or_reason` return the reason **without rendering a verdict**; the `skip_if_*` forms are
@@ -493,7 +522,8 @@ Full prose in the [`archive/`](archive/) snapshots — most recently
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
-| **DGX** (#663, the gate that stands) | **`32295a7f`** | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4022 / 0 / 55**, **176** suites, `TEST_EXIT=0`. **The delta reconciles exactly: +12** over the 4010 total below (4009 passed + 1 load flake), and 12 is the `tests-common::gliner_e2e` test count. `scheduler_ask_expiry_e2e` passed this time, as expected of a flake | **cold** `--workspace --all-targets -D warnings` from a fresh private target dir: exit 0, **345** `Checking`+`Compiling` lines, all **27** kastellan crates, **zero** warnings — and **zero rustc warnings during the test build**, which is what proves the macOS-only imports are `cfg`-gated. rustc **1.98.0** | **4**, all `KASTELLAN_GLINER_RELEX_ENABLE` not truthy — the pre-branch count, restored. ⚠️ An earlier run of this gate reported **5**: the fifth was a `tests-common` unit test calling `report_unmet(Skip, ..)`, whose skip arm prints. Fixed in `32295a7f`; see the rule below |
+| **DGX** (#663 after the review round — **the gate that stands**) | **`fixall`, pre-commit** | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4040 / 0 / 55**, **176** suites, `TEST_EXIT=0`. **The delta reconciles exactly: +18** over the 4022 below — 15 new `gliner_e2e` tests + 3 new `skip.rs` tests. Run twice: once before and once after moving a `#[cfg(test)] mod tests` to end-of-file, identical both times, which is the evidence that code motion was behaviour-neutral | **cold** `--workspace --all-targets --locked -D warnings` from a fresh private target dir: exit 0, **345** `Checking`+`Compiling` lines, all **27** kastellan crates, **zero** warnings. rustc **1.98.0**. ⚠️ The *warm* run exited 0 having linted **3** crates and would have missed the real lint the cold one caught (`items_after_test_module`, from a `mod tests` inserted mid-file) — a warm clippy exit-0 is not a gate | **4**, all the `KASTELLAN_GLINER_RELEX_ENABLE` tier — the pre-branch count, held. **0** `[WARN]` lines, i.e. the new out-of-dialect warning stays silent when the knob is unset. The skip line now echoes the value read (`ENABLE=<unset>`), per #654 |
+| **DGX** (#663, pre-review-round — superseded by the row above) | **`32295a7f`** | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4022 / 0 / 55**, **176** suites, `TEST_EXIT=0`. **The delta reconciles exactly: +12** over the 4010 total below (4009 passed + 1 load flake), and 12 is the `tests-common::gliner_e2e` test count. `scheduler_ask_expiry_e2e` passed this time, as expected of a flake | **cold** `--workspace --all-targets -D warnings` from a fresh private target dir: exit 0, **345** `Checking`+`Compiling` lines, all **27** kastellan crates, **zero** warnings — and **zero rustc warnings during the test build**, which is what proves the macOS-only imports are `cfg`-gated. rustc **1.98.0** | **4**, all `KASTELLAN_GLINER_RELEX_ENABLE` not truthy — the pre-branch count, restored. ⚠️ An earlier run of this gate reported **5**: the fifth was a `tests-common` unit test calling `report_unmet(Skip, ..)`, whose skip arm prints. Fixed in `32295a7f`; see the rule below |
 | **DGX** (#656 at the three fixes — the gate that stands) | **`f97991a6`** | `cargo test --workspace --no-fail-fast -- --nocapture` **4009 / 1 / 55**, **176** suites, `TEST_EXIT=101`; total **4010** reconciles (see header). The 1: `scheduler_ask_expiry_e2e` — flaky under load, **2 / 2 in isolation** afterwards, untouched by this branch or #660. `python_exec_e2e` **5 / 5**, `cli_memory_l3py_run_daemon_e2e` **6 / 6**, `secret_vault_e2e` **11 / 11**, `linux_smoke` **8 / 8** | `--workspace --all-targets -D warnings` exit 0, zero warnings. rustc **1.98.0** | **4**, all `KASTELLAN_GLINER_RELEX_ENABLE != "1"` |
 | **DGX** (after `4269ff7e`, the #661 fix) | **`4269ff7e`** | **3997 / 13 / 55**, 176 suites, `TEST_EXIT=101`; total **4010** (+1, the probe/spawn parity test). The 13: python-exec SIGSYS on `socketpair` ×10 ([#662](https://github.com/hherb/kastellan/issues/662)) and the 3 `secret_vault_e2e` pre-H1 assertions. `cargo test -p kastellan-sandbox -- --nocapture` **173 / 0** incl. `linux_smoke` **8 / 8**, zero `[SKIP]` | exit 0, incremental (4 crates), zero warnings | **4** (gliner) |
 
@@ -606,8 +636,15 @@ substance of each is compressed under [Current state](#current-state) rather tha
 - **`fix/653-654-gliner-e2e-require-knob`** ([#663](https://github.com/hherb/kastellan/pull/663), OPEN)
   — #653 + #654: `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` on the Rust side over **six** preconditions, the
   #459 flag dialect at the fixture call sites, and the whole host-mode cascade folded into the new
-  `tests-common::gliner_e2e` (the last triplicated `resolve_worker_script` with it). +12 tests, all in
-  the crate CI actually runs.
+  `tests-common::gliner_e2e` (the last triplicated `resolve_worker_script` with it). Then a five-agent
+  review round closed a **hole in the knob itself** (`memory_entity_link_e2e` skipped green under
+  `REQUIRE=1` on a supervisor-less host — reproduced, then fixed by moving the check into
+  `bring_up_pg` and un-importing the skip-only helper) and the **blind spot that hid it** (two mutants
+  survived a green run; `report_unmet_to` + a pure `first_unmet_precondition`/`host_env_from` split
+  now kill six of six). +18 tests, all in the crate CI actually runs. Deferred out of scope:
+  [#664](https://github.com/hherb/kastellan/issues/664) (no Rust session-finish backstop) and
+  [#665](https://github.com/hherb/kastellan/issues/665) (the same #654 dialect skew in `python_exec`
+  and `browser_driver`).
 - **`c03ec1a3`** ([#656](https://github.com/hherb/kastellan/pull/656)) — #650, the interpreter alias
   bind: `InterpreterRoot` with `dep_walk_prefix` + `bind_paths`, two new pure modules, and a fourth
   hand-rolled copy of the resolution cascade in `browser_driver_e2e.rs` folded into the production

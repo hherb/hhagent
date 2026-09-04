@@ -12,10 +12,13 @@
 //!     drives one short + one chunked extraction through the live
 //!     model. Audit-row + dispatch-row pins assert the production wiring.
 //!
-//! Skip-as-pass for every dependency: missing supervisor / Postgres /
-//! sandbox / venv / weights all surface as `[SKIP]` lines without
+//! Skip-as-pass for every dependency *by default*: missing supervisor /
+//! Postgres / sandbox / venv / weights all surface as `[SKIP]` lines without
 //! failing the test (matching `core/tests/gliner_relex_e2e.rs`'s
-//! convention). On the DGX where the venv + weights are staged via
+//! convention). Setting `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` inverts that —
+//! each of those becomes a panic naming itself, because a skip nobody can
+//! turn into a failure cannot detect a dead fixture (#653).
+//! On the DGX where the venv + weights are staged via
 //! `scripts/workers/gliner-relex/install.sh`, the real-model tier
 //! exercises real CPU inference end-to-end.
 //!
@@ -40,7 +43,8 @@ use kastellan_tests_common::gliner_e2e::{
     gliner_host_env, gliner_host_lockdown_shim, report_unmet, require_action, EnableFlag,
 };
 use kastellan_tests_common::{
-    bring_up_pg_cluster, pg_bin_dir_or_reason, skip_if_no_supervisor, unique_suffix, PgCluster,
+    bring_up_pg_cluster, pg_bin_dir_or_reason, supervisor_unavailable_reason, unique_suffix,
+    PgCluster,
 };
 
 // ---------------------------------------------------------------------
@@ -49,21 +53,27 @@ use kastellan_tests_common::{
 
 /// Bring up a one-shot Postgres cluster + run the schema probe (which
 /// applies all migrations including 0015) + open a runtime-role pool.
-/// Returns `None` on hosts without `pg_ctl` / a working supervisor —
-/// every caller turns that into a `[SKIP]` early return.
+///
+/// Returns `None` — with a `[SKIP]` line — on hosts without a working
+/// supervisor or `pg_ctl`, so every caller `return`s green. Under
+/// `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` both become a panic naming themselves:
+/// without a cluster the test body never runs, which is the same false green
+/// the knob exists to abolish (#653).
+///
+/// Both checks are made here, through the require-aware `*_or_reason` forms,
+/// rather than via the skip-only `skip_if_no_supervisor` / `pg_bin_dir_or_skip`
+/// wrappers — those stay skip-only for their ~70 other callers. Keeping the two
+/// under one policy in one place is deliberate: the supervisor check used to be
+/// skip-only while the Postgres check beside it was require-aware, and in the
+/// sibling suite that asymmetry let a demanded run report green.
 async fn bring_up_pg(label: &str) -> Option<(PgCluster, sqlx::PgPool)> {
-    if skip_if_no_supervisor() {
-        return None;
+    let action = require_action();
+    if let Some(reason) = supervisor_unavailable_reason() {
+        return report_unmet(action, &reason);
     }
-    // Routed through the gliner-relex require knob rather than
-    // `pg_bin_dir_or_skip`: without a cluster the test body never runs, which is
-    // the same false green `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` exists to
-    // abolish. The shared helper stays skip-only — ~30 other suites depend on
-    // that — so the decision is made here, at the one call site that must not
-    // silently pass (#653).
     let bin_dir = match pg_bin_dir_or_reason() {
         Ok(d) => d,
-        Err(reason) => return report_unmet(require_action(), &reason),
+        Err(reason) => return report_unmet(action, &reason),
     };
     let suffix = unique_suffix();
     let cluster = bring_up_pg_cluster(

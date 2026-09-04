@@ -128,8 +128,17 @@ separate opt-in and runs whenever both are staged).
 
 `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` works on the Rust side too, and means
 the same thing: every one of those preconditions — the opt-in flag, the
-sandbox probe, the supervisor probe, the venv shim, the weights snapshot —
-becomes a **panic naming itself** instead of a `[SKIP]`.
+sandbox probe, the supervisor probe, the venv shim, the weights snapshot,
+plus the Postgres bring-up each suite needs — becomes a **panic naming
+itself** instead of a `[SKIP]`.
+
+Two things to know before setting it. The Postgres precondition is shared
+with the mock-extractor tiers, so on a host with no Postgres at all it fails
+~18 tests that never touch gliner-relex — intended (if you demanded a real
+run, you have Postgres), but worth expecting. And `cargo test` exits 0 when a
+filter matches nothing, so a typo'd test-name filter reports `0 passed` with
+the knob set and no model loaded; the Python half guards that with a
+`pytest_sessionfinish` hook, the Rust half does not yet (#664).
 
 ```sh
 KASTELLAN_GLINER_RELEX_ENABLE=1 KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1 \
@@ -137,9 +146,11 @@ KASTELLAN_GLINER_RELEX_ENABLE=1 KASTELLAN_GLINER_RELEX_REQUIRE_E2E=1 \
   --test memory_entity_link_e2e
 ```
 
-All five preconditions, the weights lookup and the interpreter binds live
-in one place, `kastellan-tests-common`'s `gliner_e2e` module; the Python
-`tests/live_support.py` mirrors the same rules, and both halves pin them.
+The host-mode cascade, the weights lookup and the interpreter binds live in
+one crate, `kastellan-tests-common` (`gliner_e2e`, `gliner_weights`,
+`venv_interpreter`); the supervisor + Postgres pair is routed through the same
+knob by each suite's own `bring_up_pg`. The Python `tests/live_support.py`
+mirrors the same rules, and both halves pin them.
 The de-duplication is not tidiness — the three suites used to carry three
 copies, and the copies drifted (#284, #650).
 
