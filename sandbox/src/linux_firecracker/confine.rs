@@ -239,10 +239,17 @@ mod tests {
     /// the worker jails do — [`USERNS_LOCKDOWN_FLAGS`], whose own doc comment
     /// says "every jail". bwrap validates the pair at option-parse time, so a
     /// bare `--disable-userns` beside `--unshare-all` is not a weaker jail but
-    /// a refused one: the confined launch dies before firecracker starts, and
-    /// because the launcher sends firecracker's stderr to `/dev/null` and the
-    /// run dir self-cleans, the caller sees only a contentless
-    /// `Protocol(EarlyExit)` with no `fc.log` to read.
+    /// a refused one.
+    ///
+    /// Note WHY that refusal was contentless, because it is not #666 and #666
+    /// will not fix it: bwrap rejects at option-parse time, so the launcher
+    /// never runs at all — its `Stdio::null()` on firecracker and its
+    /// self-cleaning run dir are both unreachable here, and `fc.log` is never
+    /// created because firecracker never starts. What was lost is bwrap's own
+    /// `--disable-userns requires --unshare-user` on the launcher child's
+    /// stderr, which the backend pipes and core drains at `tracing::debug!` —
+    /// invisible at the default log level rather than discarded. The caller
+    /// sees a bare `Protocol(EarlyExit)` either way.
     ///
     /// #661 fixed exactly this in `linux_bwrap` (probe + spawn) and introduced
     /// the const to stop the two drifting; this jail was the third producer and

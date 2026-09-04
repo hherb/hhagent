@@ -3,8 +3,10 @@
 **Status:** Slice 1, verified live on the DGX 2026-06-27.
 
 The optional `SandboxBackendKind::FirecrackerVm` backend boots a worker inside a
-throwaway Firecracker guest kernel — defense-in-depth **on top of** bwrap +
-seccomp + Landlock + cgroup, with `mem_mb` enforced by KVM. Slice 1's only
+throwaway Firecracker guest kernel — selected **instead of** bwrap for that
+worker, keeping the worker-side seccomp layer but **not** Landlock (the pinned
+guest kernel is built without `CONFIG_SECURITY_LANDLOCK`, so the backend opts
+out explicitly — #669), with `mem_mb` enforced by KVM. Slice 1's only
 consumer is `python-exec` (`KASTELLAN_PYTHON_EXEC_USE_MICROVM=1`), `Net::Deny`.
 
 This is **opt-in** and **Linux-only**. Without the setup below, the backend's

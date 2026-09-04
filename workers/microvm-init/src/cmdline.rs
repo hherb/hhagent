@@ -310,26 +310,41 @@ pub(crate) fn anchor_of(path: &str) -> Option<String> {
 /// Pure function of the kernel cmdline — no syscalls — so the *decision* is
 /// unit-testable on any platform and only the `chown` loop is Linux-only.
 ///
-/// Three kinds of path are in the set:
+/// Two kinds of path are in the set:
 ///
 /// 1. **The RW mountpoints and their share anchors**, plus `/tmp`. These are
 ///    what agent-authored code writes.
-/// 2. **`/run`**, when either reverse relay is enabled. It is a tmpfs the init
-///    mounts as root, and the worker needs to traverse and write in it.
-/// 3. **The relay sockets themselves.** This is the one that is easy to miss
+/// 2. **The relay sockets themselves.** This is the one that is easy to miss
 ///    and the reason this function exists: connecting to an `AF_UNIX` socket
-///    requires *write* permission on the socket file, so a relay bound by root
-///    before the drop is unreachable afterwards. The symptom is not a
+///    requires *write* permission on the socket **file**, and `bind` creates it
+///    `0777 & ~umask` (0755, root-owned, under PID 1's umask), so a relay bound
+///    by root before the drop is unreachable afterwards. The symptom is not a
 ///    containment failure but a flat `connect proxy uds: Permission denied`
 ///    from inside the guest, which reads like a proxy or vsock fault — it cost
 ///    the whole networked half of the Firecracker suite (every egress and
 ///    broker VM worker) between the 2026-09-02 audit and the gate that found it.
 ///
-/// Paths are returned in a stable order with no deduplication beyond what the
-/// manifest itself provides; chowning a path twice is harmless.
+/// **`/run` is deliberately NOT in the set**, and re-adding it would be a
+/// regression rather than belt-and-braces. The first version of this fix
+/// chowned it too, justified as "the worker needs to traverse and write in it".
+/// It does not: `mount_run_tmpfs` mounts `/run` passing no `mode=`, and a tmpfs
+/// mounted that way comes up **1777** whatever the mounting process's umask
+/// (measured, not assumed), so every uid can already traverse it and create in
+/// it. The chown only transferred ownership of a *sticky directory*, which is
+/// precisely what lets the owner unlink entries it does not own — a widening
+/// inside a hardening change, with nothing asking for it. The two socket files
+/// are the whole fix.
+///
+/// Paths are returned in a stable order and are **not** deduplicated: two RW
+/// mounts under one top-level directory yield that anchor twice, and an RW
+/// mountpoint that is itself top-level appears as both mountpoint and anchor.
+/// Chowning a path twice is harmless, so this is documented rather than fixed.
+///
 /// Only the Linux guest path calls this, and `mod cmdline` is compiled on
-/// macOS too so the pure parsers stay unit-testable on the dev box — hence
-/// the same `dead_code` allowance every other item in this module carries.
+/// macOS too so the pure parsers stay unit-testable on the dev box — hence a
+/// `dead_code` allowance. Unlike the blanket `#[allow]` the older items in this
+/// module carry, it is narrowed to non-Linux so the Linux build still fails if
+/// the guest ever stops calling this.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn worker_owned_paths(cmdline: &str) -> Vec<String> {
     let m = parse_mount_manifest(cmdline);
@@ -340,13 +355,13 @@ pub(crate) fn worker_owned_paths(cmdline: &str) -> Vec<String> {
             paths.push(a);
         }
     }
+    // Each socket is conditional on ITS OWN relay, never on "any relay": a
+    // broker-only worker never binds the egress UDS, so chowning it would be a
+    // chown of a path that was never created — an error line on every boot of
+    // the other worker class, training everyone to ignore the one diagnostic
+    // this defect would announce itself through next time.
     let egress = parse_egress_config(cmdline).enabled;
     let broker = parse_broker_config(cmdline).enabled;
-    // `/run` is mounted exactly when at least one relay is set up; mirror that
-    // condition rather than chowning a directory that was never mounted.
-    if egress || broker {
-        paths.push("/run".to_string());
-    }
     if egress {
         paths.push(GUEST_EGRESS_UDS.to_string());
     }
