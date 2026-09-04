@@ -299,3 +299,99 @@ async fn microvm_spawn_leaves_no_orphan_run_dir() {
         }
     }
 }
+
+/// Pick the value of a `key=value` line out of the guest's stdout.
+///
+/// The guest prints one self-describing line per fact rather than a bare
+/// number, so a truncated or reordered stdout cannot be mistaken for a
+/// different fact. Pure: takes the captured text, returns a borrowed slice,
+/// touches no global state — so the parsing is not what a VM boot has to prove.
+fn guest_fact<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(key)?.strip_prefix('='))
+        .map(str::trim)
+}
+
+/// The worker must NOT run as guest root (security audit 2026-09-02, W-2).
+///
+/// Before that fix `exec_worker` `execv`'d straight from PID 1, so
+/// agent-authored Python ran as uid 0 with every capability: DAC was a no-op
+/// inside the VM and Landlock + seccomp were the only in-guest gates. The fix
+/// has the host pass its own euid as `KASTELLAN_MICROVM_WORKER_UID` and the
+/// guest init chown the writable mounts, drop groups/gid/uid and set
+/// `PR_SET_NO_NEW_PRIVS` before the `execv`.
+///
+/// **Why this test exists at all.** Every other assertion in this suite passes
+/// just as happily with the worker running as root, and the compatibility path
+/// is deliberately quiet: a rootfs whose init predates the fix, or a host that
+/// stops sending the variable, leaves the worker root and says so only on the
+/// guest's stderr — which nothing drains. So the whole of W-2 was, until this
+/// test, provable only by reading the code. The three facts below are read from
+/// inside the running guest, which is the only place the property is real.
+///
+/// Note this makes a STALE rootfs a failure rather than a silent pass: an image
+/// built before the fix boots fine and reports uid 0. That is the intent — the
+/// image bakes the init, so `scripts/workers/microvm/build-rootfs.sh` must be
+/// re-run after any change to `kastellan-microvm-init`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "needs DGX: /dev/kvm + vhost_vsock + built rootfs + kastellan-microvm-run"]
+async fn microvm_worker_runs_unprivileged_with_no_new_privs() {
+    if skip_if_no_microvm(VM_ROOTFS) {
+        return;
+    }
+    // One dispatch, three self-describing lines. `NoNewPrivs` comes from
+    // /proc/self/status because prctl(PR_GET_NO_NEW_PRIVS) is not reachable
+    // from stdlib Python.
+    let out = run_in_microvm(
+        "import os\n\
+         nnp = 'absent'\n\
+         for line in open('/proc/self/status'):\n\
+         \x20   if line.startswith('NoNewPrivs:'):\n\
+         \x20       nnp = line.split()[1]\n\
+         print('kastellan_uid=%d' % os.getuid())\n\
+         print('kastellan_euid=%d' % os.geteuid())\n\
+         print('kastellan_no_new_privs=%s' % nnp)\n",
+    )
+    .await;
+    assert_eq!(out["exit_code"], 0, "clean exit expected: {out}");
+    let stdout = out["stdout"].as_str().unwrap_or_default();
+
+    let uid: u32 = guest_fact(stdout, "kastellan_uid")
+        .unwrap_or_else(|| panic!("guest printed no uid line: {out}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("guest uid is not a number ({e}): {out}"));
+    let euid: u32 = guest_fact(stdout, "kastellan_euid")
+        .unwrap_or_else(|| panic!("guest printed no euid line: {out}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("guest euid is not a number ({e}): {out}"));
+
+    assert_ne!(
+        uid, 0,
+        "W-2 regression: the worker is running as guest ROOT. Either the rootfs \
+         image predates the privilege drop (rebuild it: \
+         scripts/workers/microvm/build-rootfs.sh) or the host stopped sending \
+         KASTELLAN_MICROVM_WORKER_UID. Guest output: {out}"
+    );
+    assert_eq!(
+        euid, uid,
+        "the drop must move BOTH the real and the effective uid, or setuid(0) \
+         is still reachable: {out}"
+    );
+
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let host_euid = unsafe { libc::geteuid() };
+    assert_eq!(
+        uid, host_euid,
+        "the guest must run as the identity the HOST chose (its own euid). A \
+         different non-zero uid means the guest is picking one for itself, which \
+         would also unstick the ro-share 0600 files the host stages: {out}"
+    );
+
+    assert_eq!(
+        guest_fact(stdout, "kastellan_no_new_privs"),
+        Some("1"),
+        "PR_SET_NO_NEW_PRIVS must be set, or a setuid binary in the rootfs can \
+         hand the privilege back: {out}"
+    );
+}

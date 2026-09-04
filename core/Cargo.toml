@@ -75,6 +75,13 @@ url = { workspace = true }
 
 tempfile = "3"
 
+# python_exec_firecracker_e2e's W-2 gate compares the uid the worker runs as
+# INSIDE the guest against the host's own euid, which is what the host passes
+# as KASTELLAN_MICROVM_WORKER_UID. Integration tests do not inherit the
+# library's [dependencies], so libc is named again here; same workspace pin, so
+# the lock does not move.
+libc = { workspace = true }
+
 # Slice 4b web-fetch-in-VM egress e2e: mint a self-signed CA fixture that the
 # in-guest worker trusts as KASTELLAN_EGRESS_PROXY_CA. Features match the
 # egress-proxy's rcgen pin (pem + ring) so the workspace lock stays unified.
