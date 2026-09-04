@@ -8,21 +8,21 @@
 > which holds the verbose pre-prune version of everything summarised here,
 > including the full #619, #615/#616/#618 and live-bring-up write-ups compressed below.
 
-**Last updated:** 2026-09-04 (#656 merged; then #653 + #654, the gliner-relex e2e require knob, and its review round) ·
+**Last updated:** 2026-09-04 (#663 merged — #653 + #654 landed; no open branch) ·
 **DGX RUNNING `121f22a2`** (see [Merged work, compressed](#merged-work-compressed--the-guard-arc-and-the-2026-09-02-deploy)) ·
-**`main` HEAD:** `c03ec1a3` — [#656](https://github.com/hherb/kastellan/pull/656), which closed #650,
-[#661](https://github.com/hherb/kastellan/issues/661) and
-[#662](https://github.com/hherb/kastellan/issues/662), on top of `62d98a00`
+**`main` HEAD:** `9ace57ad` — [#663](https://github.com/hherb/kastellan/pull/663), which closed
+[#653](https://github.com/hherb/kastellan/issues/653) and
+[#654](https://github.com/hherb/kastellan/issues/654), on top of `c03ec1a3`
+([#656](https://github.com/hherb/kastellan/pull/656): #650, #661, #662) and `62d98a00`
 ([#660](https://github.com/hherb/kastellan/pull/660), the 2026-09-02 security audit). ·
-**OPEN BRANCH: `fix/653-654-gliner-e2e-require-knob`** — #653 + #654, PR
-[#663](https://github.com/hherb/kastellan/pull/663), review round applied; see
-[#653 / #654](#653--654--the-gliner-relex-e2e-require-knob-and-the-flag-dialect).
+**NO OPEN BRANCH.** ⚠️ **The standing DGX gate covers `main` exactly** — `git diff origin/main
+2a5ed396` (the gated branch tip) is **empty**, so the squash did not change content.
 
 > ✅ **`main` IS DEPLOYABLE AGAIN.** #656 merged 2026-09-03 carrying `4269ff7e` (#661, the bwrap
 > `--disable-userns`/`--unshare-user` pair) and `f97991a6` (#662, python-exec's `socketpair` SIGSYS)
 > — the two defects that made `main` `62d98a00` spawn **no** worker under real bwrap. The previous
 > "do not run `scripts/upgrade_from_git.sh`" warning is **lifted**. The DGX itself still runs
-> `121f22a2` and is a redeploy behind.
+> `121f22a2` and is now **three merges behind** (#660, #656, #663).
 
 **Last gate: DGX over `fix/653-654-gliner-e2e-require-knob`, post-review-round — 4040 / 0 / 55, cold clippy 27/27 crates clean. See [Test baseline](#test-baseline-authoritative).**
 The `main` baseline it is measured against is DGX `f97991a6` (= #656's tip) — **4009 / 1 / 55**, 176
@@ -154,8 +154,7 @@ the **alias**. `resolve_interpreter_root` canonicalized, so only the `.14` direc
 
 ### #653 / #654 — the gliner-relex e2e require knob, and the flag dialect
 
-On `fix/653-654-gliner-e2e-require-knob`, PR [#663](https://github.com/hherb/kastellan/pull/663).
-Both closed. The point is not the knob; it is that **#651's fixture bug was only findable because a
+**MERGED `9ace57ad`**, PR [#663](https://github.com/hherb/kastellan/pull/663). Both issues closed. The point is not the knob; it is that **#651's fixture bug was only findable because a
 human happened to rebuild a venv**, and nothing in the tree could have demanded it.
 
 - **`KASTELLAN_GLINER_RELEX_REQUIRE_E2E` now works on the Rust side**, meaning exactly what it means
@@ -353,9 +352,9 @@ and the snapshots before it. Only the findings that still bind:
 
 > Only *open* work is listed. Shipped items move to [Recently merged](#recently-merged) or the ROADMAP.
 
-**#650, #653 and #654 are DONE** (PRs [#656](https://github.com/hherb/kastellan/pull/656) merged,
-[#663](https://github.com/hherb/kastellan/pull/663) open), and `main` is deployable again — see the
-header. `scripts/upgrade_from_git.sh` is safe to run once #663 is in; **the DGX is a redeploy behind**
+**#650, #653 and #654 are DONE** (PRs [#656](https://github.com/hherb/kastellan/pull/656) and
+[#663](https://github.com/hherb/kastellan/pull/663) both merged), and `main` is deployable again —
+see the header. `scripts/upgrade_from_git.sh` is safe to run now; **the DGX is a redeploy behind**
 (`121f22a2`) and picking up #660 + #650 + #653 there is the cheapest high-value next action.
 
 **FIRST: the two DGX gates #660 still owes.** Both are Linux-only and neither branch since has touched
@@ -633,7 +632,7 @@ Older rows (3668 back to 3327, covering the guard slice-1 arc, #587, #579 and #5
 Newest first. Older entries live in the [`archive/`](archive/) snapshots and in git history; the
 substance of each is compressed under [Current state](#current-state) rather than repeated here.
 
-- **`fix/653-654-gliner-e2e-require-knob`** ([#663](https://github.com/hherb/kastellan/pull/663), OPEN)
+- **`9ace57ad`** ([#663](https://github.com/hherb/kastellan/pull/663))
   — #653 + #654: `KASTELLAN_GLINER_RELEX_REQUIRE_E2E` on the Rust side over **six** preconditions, the
   #459 flag dialect at the fixture call sites, and the whole host-mode cascade folded into the new
   `tests-common::gliner_e2e` (the last triplicated `resolve_worker_script` with it). Then a five-agent

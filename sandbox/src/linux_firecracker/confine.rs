@@ -229,6 +229,30 @@ mod tests {
         assert_eq!(a.last().map(String::as_str), Some("--"));
     }
 
+    /// The VMM jail is a bwrap jail too, so it must pass the SAME userns pair
+    /// the worker jails do — [`USERNS_LOCKDOWN_FLAGS`], whose own doc comment
+    /// says "every jail". bwrap validates the pair at option-parse time, so a
+    /// bare `--disable-userns` beside `--unshare-all` is not a weaker jail but
+    /// a refused one: the confined launch dies before firecracker starts, and
+    /// because the launcher sends firecracker's stderr to `/dev/null` and the
+    /// run dir self-cleans, the caller sees only a contentless
+    /// `Protocol(EarlyExit)` with no `fc.log` to read.
+    ///
+    /// #661 fixed exactly this in `linux_bwrap` (probe + spawn) and introduced
+    /// the const to stop the two drifting; this jail was the third producer and
+    /// was missed, so every Firecracker spawn failed from the audit merge until
+    /// the DGX gate ran. Assert against the const, never a copied literal.
+    #[test]
+    fn jail_carries_the_shared_userns_lockdown_pair() {
+        let a = jail(&deny_plan());
+        for f in crate::linux_bwrap::USERNS_LOCKDOWN_FLAGS {
+            assert!(
+                a.contains(&f.to_string()),
+                "{f} missing from the VMM jail argv: {a:?}"
+            );
+        }
+    }
+
     #[test]
     fn jail_dev_binds_kvm_and_vsock_after_dev() {
         let a = jail(&deny_plan());
