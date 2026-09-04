@@ -16,7 +16,7 @@ mod egress;
 pub(crate) use egress::{egress_selftest, mount_run_tmpfs, setup_relay};
 
 use crate::cmdline::{
-    anchor_of, bind_prep, parse_env_cmdline, parse_mount_manifest, parse_worker_args_cmdline,
+    anchor_of, bind_prep, parse_env_cmdline, parse_worker_args_cmdline,
     parse_worker_cmdline, vsock_listen_cid_port, worker_owned_paths, BindPrep, MountManifest,
     VMADDR_CID_ANY,
 };
