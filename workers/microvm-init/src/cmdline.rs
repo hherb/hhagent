@@ -327,6 +327,10 @@ pub(crate) fn anchor_of(path: &str) -> Option<String> {
 ///
 /// Paths are returned in a stable order with no deduplication beyond what the
 /// manifest itself provides; chowning a path twice is harmless.
+/// Only the Linux guest path calls this, and `mod cmdline` is compiled on
+/// macOS too so the pure parsers stay unit-testable on the dev box — hence
+/// the same `dead_code` allowance every other item in this module carries.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn worker_owned_paths(cmdline: &str) -> Vec<String> {
     let m = parse_mount_manifest(cmdline);
     let mut paths: Vec<String> = m.rw.iter().map(|rw| rw.mountpoint.clone()).collect();
