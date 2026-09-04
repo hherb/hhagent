@@ -109,6 +109,28 @@ const BASE_BOOT_ARGS: &str =
 /// not depend on the sandbox crate — same pattern as [`WORKER_VSOCK_PORT`]).
 const ENV_CMDLINE_KEY: &str = "kastellan.env";
 
+/// Env key naming the worker-side Landlock profile, read by the prelude's
+/// lockdown. `none` is its explicit opt-out.
+///
+/// The pinned Firecracker guest kernel is built **without**
+/// `CONFIG_SECURITY_LANDLOCK` (verified by unpacking the pinned `vmlinux`'s
+/// embedded IKCONFIG), so a worker in the VM cannot create a ruleset at all.
+/// Since the 2026-09-02 audit an unenforceable ruleset is an ERROR rather than
+/// a silent downgrade, so without an explicit opt-out **every** micro-VM
+/// worker refuses to start. That audit's own message says the remedy: a host
+/// that cannot enforce Landlock must say so here, not discover it in a breach.
+///
+/// What the guest still has: hardware VM isolation with its own kernel, a
+/// purpose-built rootfs holding only the worker and its interpreter, read-only
+/// drives for everything the worker must not write, and **seccomp**, which the
+/// guest kernel does have (`CONFIG_SECCOMP_FILTER=y`) and which is applied
+/// unchanged. It is the worker-side FS layer alone that is absent.
+///
+/// Delete this injection if the guest kernel pin ever moves to one built with
+/// Landlock — [`build_launch_plan`] only fills the key in when the caller has
+/// not chosen, so a caller can already opt back in today.
+pub const GUEST_LANDLOCK_PROFILE_ENV: &str = "KASTELLAN_LANDLOCK_PROFILE";
+
 /// Env key carrying the uid the guest init switches to before `execv`.
 /// Read by `kastellan-microvm-init`; a guest built before it existed simply
 /// ignores the variable and keeps today's root worker.
@@ -406,6 +428,13 @@ pub fn build_launch_plan(
     // receives the resolved `image`), never by the worker. Don't forward into the
     // guest: it's noise there and costs scarce cmdline budget.
     env.retain(|(k, _)| k != "KASTELLAN_MICROVM_DIR" && k != "KASTELLAN_MICROVM_ROOTFS");
+    // The guest kernel has no Landlock, so say so rather than let every worker
+    // die on the audit's fail-closed check. See GUEST_LANDLOCK_PROFILE_ENV for
+    // what the guest still enforces and when to delete this. Default, never an
+    // override: a caller that named a profile keeps it.
+    if !env.iter().any(|(k, _)| k == GUEST_LANDLOCK_PROFILE_ENV) {
+        env.push((GUEST_LANDLOCK_PROFILE_ENV.to_string(), "none".to_string()));
+    }
     // The guest init drops from root to this uid before exec'ing the worker
     // (security audit 2026-09-02, workers 2 / prelude F3). The daemon's own
     // euid is the right identity: the ro-share image is staged by this uid, so
@@ -709,6 +738,66 @@ mod tests {
         assert!(token["kastellan.env=".len()..].bytes().all(|b| b.is_ascii_hexdigit()));
     }
 
+    /// Decode the `kastellan.env=` block back into `KEY=VALUE` lines, so a test
+    /// can assert on what the guest will actually read rather than on a hex
+    /// literal it had to compute the same way the code under test did.
+    fn decoded_env_block(boot_args: &str) -> String {
+        let token = boot_args
+            .split_whitespace()
+            .find(|t| t.starts_with(&format!("{ENV_CMDLINE_KEY}=")))
+            .expect("no env token in boot args");
+        let hex = &token[ENV_CMDLINE_KEY.len() + 1..];
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("env token is not hex"))
+            .collect();
+        String::from_utf8(bytes).expect("env block is not utf-8")
+    }
+
+    /// The pinned guest kernel is built WITHOUT `CONFIG_SECURITY_LANDLOCK`, so
+    /// a worker inside the VM cannot create a Landlock ruleset at all. Since
+    /// the 2026-09-02 audit that is fatal rather than a downgrade, so without
+    /// this opt-out every micro-VM worker refuses to start — which is exactly
+    /// what the owed Firecracker gate found (0 of 7, every suite).
+    ///
+    /// The audit's own error text prescribes this remedy: a host that cannot
+    /// enforce Landlock must SAY so, not discover it in a breach. Saying it
+    /// here, in the plan, is that statement.
+    #[test]
+    fn landlock_is_opted_out_for_the_guest_when_the_caller_did_not_choose() {
+        let policy = SandboxPolicy { env: vec![], ..Default::default() };
+        let plan = build_launch_plan(&policy, &img(), "/w", &[]).unwrap();
+        let env = decoded_env_block(&plan.boot_args);
+        assert!(
+            env.lines().any(|l| l == format!("{GUEST_LANDLOCK_PROFILE_ENV}=none")),
+            "the guest kernel has no Landlock, so the plan must opt out explicitly: {env}"
+        );
+    }
+
+    /// The injection is a DEFAULT, not an override. A caller that has its own
+    /// reason to name a profile (a future guest kernel built with Landlock, or
+    /// a test pinning the strict path) keeps it, and no second line is added —
+    /// two settings of one key would leave which one wins up to the guest's
+    /// decoder rather than to this plan.
+    #[test]
+    fn a_caller_chosen_landlock_profile_is_never_overridden() {
+        let policy = SandboxPolicy {
+            env: vec![(GUEST_LANDLOCK_PROFILE_ENV.to_string(), "strict".to_string())],
+            ..Default::default()
+        };
+        let plan = build_launch_plan(&policy, &img(), "/w", &[]).unwrap();
+        let env = decoded_env_block(&plan.boot_args);
+        let chosen: Vec<&str> = env
+            .lines()
+            .filter(|l| l.starts_with(&format!("{GUEST_LANDLOCK_PROFILE_ENV}=")))
+            .collect();
+        assert_eq!(
+            chosen,
+            vec![format!("{GUEST_LANDLOCK_PROFILE_ENV}=strict")],
+            "the caller's profile must survive, exactly once: {env}"
+        );
+    }
+
     #[test]
     fn build_launch_plan_no_env_leaves_boot_args_baseline() {
         // No env/mounts/egress → boot_args starts with the baseline and the ONLY
@@ -720,15 +809,19 @@ mod tests {
             "base kernel args must be preserved: {}",
             plan.boot_args
         );
-        // Since the 2026-09-02 audit the env token is ALWAYS present: it
-        // carries the uid the guest init drops to. With an empty policy env
-        // that is the only line in the block.
+        // Since the 2026-09-02 audit the env token is ALWAYS present, and it
+        // carries exactly the two lines this plan injects for itself: the
+        // Landlock opt-out the guest kernel forces, then the uid the guest init
+        // drops to. Pinned as the WHOLE block, in order, so a third injection
+        // cannot be added without this test being read.
         // SAFETY: geteuid has no preconditions.
         let euid = unsafe { libc::geteuid() };
-        let expected = hex_encode(format!("{GUEST_WORKER_UID_ENV}={euid}").as_bytes());
+        let expected = hex_encode(
+            format!("{GUEST_LANDLOCK_PROFILE_ENV}=none\n{GUEST_WORKER_UID_ENV}={euid}").as_bytes(),
+        );
         assert!(
             plan.boot_args.contains(&format!(" {ENV_CMDLINE_KEY}={expected}")),
-            "env token must carry exactly the worker uid when env is empty: {}",
+            "env token must carry exactly the plan's own two lines when the policy env is empty: {}",
             plan.boot_args
         );
         assert!(
