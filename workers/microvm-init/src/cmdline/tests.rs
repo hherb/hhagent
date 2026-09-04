@@ -220,3 +220,61 @@ fn pack_ifname_truncates_to_15_and_nul_terminates() {
     assert_eq!(n[14], b'e' as libc::c_char); // 15th kept char (index 14)
     assert_eq!(n[15], 0);
 }
+
+/// The relay sockets must be in the chown set whenever their relay is enabled.
+///
+/// This is the assertion the whole networked half of the Firecracker suite
+/// turned on: `connect(2)` to an `AF_UNIX` socket needs write permission on the
+/// socket file, and the init binds these as root before it drops to the worker
+/// uid. Without the chown the worker's first dial fails `EACCES` and every
+/// egress/broker VM worker is dead, with a message that names the proxy rather
+/// than the permission.
+#[test]
+fn worker_owned_paths_includes_the_egress_relay_socket_and_run() {
+    let paths = worker_owned_paths("kastellan.egress=1");
+    assert!(paths.contains(&GUEST_EGRESS_UDS.to_string()), "{paths:?}");
+    assert!(paths.contains(&"/run".to_string()), "{paths:?}");
+}
+
+#[test]
+fn worker_owned_paths_includes_the_broker_relay_socket_and_run() {
+    let paths = worker_owned_paths("kastellan.broker=1");
+    assert!(paths.contains(&GUEST_BROKER_UDS.to_string()), "{paths:?}");
+    assert!(paths.contains(&"/run".to_string()), "{paths:?}");
+}
+
+/// The converse, and the reason the relay paths are conditional rather than
+/// unconditional: a worker with no relay never has `/run` mounted, so chowning
+/// it would be a chown of the read-only rootfs's `/run` — a failure the init
+/// would log on every plain VM boot and teach everyone to ignore.
+#[test]
+fn worker_owned_paths_omits_relay_paths_when_no_relay_is_enabled() {
+    let paths = worker_owned_paths("");
+    assert!(!paths.contains(&"/run".to_string()), "{paths:?}");
+    assert!(!paths.contains(&GUEST_EGRESS_UDS.to_string()), "{paths:?}");
+    assert!(!paths.contains(&GUEST_BROKER_UDS.to_string()), "{paths:?}");
+}
+
+/// `/tmp` is always the worker's, relay or not — it is the per-spawn scratch
+/// every worker writes, and it was the only entry the pre-fix set was sure of.
+#[test]
+fn worker_owned_paths_always_includes_tmp() {
+    assert!(worker_owned_paths("").contains(&"/tmp".to_string()));
+    assert!(worker_owned_paths("kastellan.egress=1").contains(&"/tmp".to_string()));
+}
+
+/// The RW mountpoints and their share anchors still come through, so the fix
+/// added the relay paths rather than replacing what was already there.
+#[test]
+fn worker_owned_paths_keeps_rw_mountpoints_and_their_anchors() {
+    // One RW mount at /data/scratch → the mountpoint and its /data anchor.
+    let cmdline = "kastellan.mounts=rw:vdb:/data/scratch";
+    let paths = worker_owned_paths(cmdline);
+    let m = parse_mount_manifest(cmdline);
+    for rw in &m.rw {
+        assert!(paths.contains(&rw.mountpoint), "missing mountpoint: {paths:?}");
+        if let Some(a) = anchor_of(&rw.mountpoint) {
+            assert!(paths.contains(&a), "missing anchor {a}: {paths:?}");
+        }
+    }
+}

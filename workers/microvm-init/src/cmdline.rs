@@ -305,6 +305,53 @@ pub(crate) fn anchor_of(path: &str) -> Option<String> {
     Some(format!("/{first}"))
 }
 
+/// Every path the guest init must hand to the worker uid before it drops root.
+///
+/// Pure function of the kernel cmdline — no syscalls — so the *decision* is
+/// unit-testable on any platform and only the `chown` loop is Linux-only.
+///
+/// Three kinds of path are in the set:
+///
+/// 1. **The RW mountpoints and their share anchors**, plus `/tmp`. These are
+///    what agent-authored code writes.
+/// 2. **`/run`**, when either reverse relay is enabled. It is a tmpfs the init
+///    mounts as root, and the worker needs to traverse and write in it.
+/// 3. **The relay sockets themselves.** This is the one that is easy to miss
+///    and the reason this function exists: connecting to an `AF_UNIX` socket
+///    requires *write* permission on the socket file, so a relay bound by root
+///    before the drop is unreachable afterwards. The symptom is not a
+///    containment failure but a flat `connect proxy uds: Permission denied`
+///    from inside the guest, which reads like a proxy or vsock fault — it cost
+///    the whole networked half of the Firecracker suite (every egress and
+///    broker VM worker) between the 2026-09-02 audit and the gate that found it.
+///
+/// Paths are returned in a stable order with no deduplication beyond what the
+/// manifest itself provides; chowning a path twice is harmless.
+pub(crate) fn worker_owned_paths(cmdline: &str) -> Vec<String> {
+    let m = parse_mount_manifest(cmdline);
+    let mut paths: Vec<String> = m.rw.iter().map(|rw| rw.mountpoint.clone()).collect();
+    paths.push("/tmp".to_string());
+    for t in m.rw.iter().map(|rw| rw.mountpoint.as_str()) {
+        if let Some(a) = anchor_of(t) {
+            paths.push(a);
+        }
+    }
+    let egress = parse_egress_config(cmdline).enabled;
+    let broker = parse_broker_config(cmdline).enabled;
+    // `/run` is mounted exactly when at least one relay is set up; mirror that
+    // condition rather than chowning a directory that was never mounted.
+    if egress || broker {
+        paths.push("/run".to_string());
+    }
+    if egress {
+        paths.push(GUEST_EGRESS_UDS.to_string());
+    }
+    if broker {
+        paths.push(GUEST_BROKER_UDS.to_string());
+    }
+    paths
+}
+
 /// Returns the (cid, port) pair the guest vsock listener should bind to.
 /// Pure function — no syscalls — so it is unit-testable on any platform.
 #[allow(dead_code)]

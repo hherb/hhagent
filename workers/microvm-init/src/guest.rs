@@ -17,8 +17,8 @@ pub(crate) use egress::{egress_selftest, mount_run_tmpfs, setup_relay};
 
 use crate::cmdline::{
     anchor_of, bind_prep, parse_env_cmdline, parse_mount_manifest, parse_worker_args_cmdline,
-    parse_worker_cmdline,
-    vsock_listen_cid_port, BindPrep, MountManifest, VMADDR_CID_ANY,
+    parse_worker_cmdline, vsock_listen_cid_port, worker_owned_paths, BindPrep, MountManifest,
+    VMADDR_CID_ANY,
 };
 use std::os::unix::io::RawFd;
 
@@ -325,22 +325,18 @@ fn drop_privileges_for_worker(cmdline: &str) {
         eprintln!("microvm-init: {WORKER_UID_ENV}=0 — worker stays root");
         return;
     }
-    // Everything the worker may write is owned by the uid it will run as.
-    let m = parse_mount_manifest(cmdline);
-    let mut writable: Vec<String> = m.rw.iter().map(|rw| rw.mountpoint.clone()).collect();
-    writable.push("/tmp".to_string());
-    for t in m.rw.iter().map(|rw| rw.mountpoint.as_str()) {
-        if let Some(a) = anchor_of(t) {
-            writable.push(a);
-        }
-    }
-    for dir in writable {
+    // Everything the worker may write — or, for the relay sockets, must be able
+    // to CONNECT to — is owned by the uid it will run as. The set is decided by
+    // the pure `worker_owned_paths`, which is where the reasoning and the tests
+    // live; this loop only applies it.
+    for dir in worker_owned_paths(cmdline) {
         let c = std::ffi::CString::new(dir.clone()).expect("mountpoint has no NUL");
         // SAFETY: chown on a path we own as root; the cstring outlives the call.
         let rc = unsafe { libc::chown(c.as_ptr(), uid, uid) };
         if rc != 0 {
             eprintln!(
-                "microvm-init: chown {dir} to the worker uid failed: {} (worker may be unable to write there)",
+                "microvm-init: chown {dir} to the worker uid failed: {} \
+                 (the worker may be unable to write there, or — for a relay socket — to connect at all)",
                 std::io::Error::last_os_error()
             );
         }
