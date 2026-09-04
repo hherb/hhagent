@@ -10,7 +10,7 @@
 
 **Last updated:** 2026-09-04 (the two DGX gates #660 owed were RUN; the Firecracker one found
 **three** defects that had left the whole micro-VM backend dead since the audit merged) ·
-**DGX RUNNING `121f22a2`** (see [Merged work, compressed](#merged-work-compressed--the-guard-arc-and-the-2026-09-02-deploy)) ·
+**DGX RUNNING `9ace57ad`** (redeployed 2026-09-04, now current with `main`) (see [Merged work, compressed](#merged-work-compressed--the-guard-arc-and-the-2026-09-02-deploy)) ·
 **`main` HEAD:** `9ace57ad` — [#663](https://github.com/hherb/kastellan/pull/663), which closed
 [#653](https://github.com/hherb/kastellan/issues/653) and
 [#654](https://github.com/hherb/kastellan/issues/654), on top of `c03ec1a3`
@@ -450,15 +450,21 @@ and the snapshots before it. Only the findings that still bind:
 live-Matrix gates #660 owed have now RUN (PR [#669](https://github.com/hherb/kastellan/pull/669));
 only one piece is left and it is blocked on a deploy, not on code:
 
-1. **The live Matrix DM round-trip.** `--features live-matrix` compiles clean and its 27 tests pass,
-   and the invite/two-party scoping reads correctly — but the property most at risk from that
-   scoping is that a **normal DM still round-trips**, and only a deployed daemon can show that. The
-   DGX runs `121f22a2` and is **three merges behind** (#660, #656, #663).
-   `scripts/upgrade_from_git.sh` does build+install+restart+verify and is hardcoded to `main`.
-   Afterwards: confirm `channel bus running {channel:matrix, attempts:1}`, send the bot a DM from
-   `@horst`, and check it is answered. ⚠️ The Matrix worker's *guest* mode is unaffected by this —
-   the live channel runs under bwrap, not in a VM.
-2. **Then re-check the two SearxNG-blocked Firecracker tests** if you want 21/21:
+1. ✅ **The DGX redeploy is DONE** (2026-09-04): `scripts/upgrade_from_git.sh` took it from
+   `121f22a2` to **`9ace57ad`**, so #660 + #656 + #663 are all live. `installed 15 binaries`,
+   `services: active active active`, `✅ Matrix channel is up`, and
+   `channel bus running {channel:matrix, attempts:1}` on the fresh boot. **Both env files diffed
+   IDENTICAL** across the install and force-routing is still baked into the generated unit — the
+   env-clobber ritual stays retired [[dgx-deploy-env-clobber-and-missing-workers]].
+2. ⏳ **STILL OWED: the live Matrix DM round-trip.** Everything a host can check passes
+   (`--features live-matrix` clippy clean, 27 tests, scoping reads correctly), but the property most
+   at risk from #660's invite/two-party scoping is that a **normal DM still round-trips**, and only
+   a real message shows that. **Send the bot a DM from `@horst` and confirm it answers.** If it does
+   not, the scoping is the first suspect — read `channel.boot_failed` audit rows and the declined
+   log line naming `KASTELLAN_MATRIX_PEERS`, not the restart count
+   [[channel-boot-one-shot-fixed]]. ⚠️ The Matrix worker's *guest/VM* mode is unaffected by this
+   branch — the live channel runs under bwrap, not in a VM.
+3. **Then re-check the two SearxNG-blocked Firecracker tests** if you want 21/21:
    `scripts/web-search/setup-searxng.sh`, then `KASTELLAN_WEB_SEARCH_ENDPOINT` + the `web-search`
    `tool_allowlists` row. Nothing about them is a code defect —
    [[web-research-e2e-endpoint-must-be-allowlisted]].
