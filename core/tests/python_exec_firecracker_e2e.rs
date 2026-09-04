@@ -428,11 +428,20 @@ async fn microvm_worker_runs_unprivileged_with_no_new_privs() {
         "setgid must move the effective gid to the same identity, or the worker \
          keeps group-root: {out}"
     );
+    // ⚠️ This one is a REGRESSION GUARD, not a proof, and the difference is worth
+    // stating: guest PID 1 starts with an empty supplementary set, so
+    // `setgroups(0, NULL)` is a no-op here and this assertion holds whether or
+    // not the call is made. Deleting `setgroups` + `setgid` from the init and
+    // rebuilding the rootfs was measured: it turns `kastellan_gid` red (0 vs
+    // 1000) and leaves THIS line green. Keep it anyway — it costs one line and
+    // it is the thing that would fail first if the init ever gained a
+    // supplementary group before the drop — but do not read a pass here as
+    // evidence that `setgroups` ran. The gid assertion above is that evidence.
     assert_eq!(
         guest_fact(stdout, "kastellan_groups"),
         Some("none"),
-        "setgroups(0, NULL) must clear the supplementary set; a retained group 0 \
-         reaches every root:root group-readable file in the rootfs: {out}"
+        "the supplementary set must be empty; a retained group 0 reaches every \
+         root:root group-readable file in the rootfs: {out}"
     );
 
     assert_eq!(

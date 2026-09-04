@@ -8,8 +8,8 @@
 > which holds the verbose pre-prune version of everything summarised here,
 > including the full #619, #615/#616/#618 and live-bring-up write-ups compressed below.
 
-**Last updated:** 2026-09-04 (the two DGX gates #660 owed were RUN; the Firecracker one found
-**three** defects that had left the whole micro-VM backend dead since the audit merged) ·
+**Last updated:** 2026-09-05 (#669's review round: the chown set's only guard turned out to assert
+nothing, and `/run` was never needed. Firecracker is now **21 / 0**) ·
 **DGX RUNNING `9ace57ad`** (redeployed 2026-09-04, now current with `main`) (see [Merged work, compressed](#merged-work-compressed--the-guard-arc-and-the-2026-09-02-deploy)) ·
 **`main` HEAD:** `9ace57ad` — [#663](https://github.com/hherb/kastellan/pull/663), which closed
 [#653](https://github.com/hherb/kastellan/issues/653) and
@@ -30,7 +30,7 @@
 > "do not run `scripts/upgrade_from_git.sh`" warning is **lifted**. The DGX itself still runs
 > `121f22a2` and is now **three merges behind** (#660, #656, #663).
 
-**Last gate: DGX over `fix/653-654-gliner-e2e-require-knob`, post-review-round — 4040 / 0 / 55, cold clippy 27/27 crates clean. See [Test baseline](#test-baseline-authoritative).**
+**Last gate: DGX over `test/w2-microvm-uid-drop-gate`, post-review-round — 4049 / 0 / 56, and the Firecracker suites are **21 / 0** for the first time (SearxNG brought back up). See [Test baseline](#test-baseline-authoritative).**
 The `main` baseline it is measured against is DGX `f97991a6` (= #656's tip) — **4009 / 1 / 55**, 176
 suites, 4 `[SKIP]`. The 1 was `scheduler_ask_expiry_e2e::an_unanswered_ask_expires_and_fails_its_task_without_a_restart`,
 a 60-second poll that missed under full-workspace load and passed **2 / 2 in isolation**; flaky under
@@ -98,6 +98,43 @@ surfacing as the same contentless `Protocol(EarlyExit)`.
   guest: `uid != 0`, `euid == uid` (a drop that moved only the real uid leaves `setuid(0)`
   reachable), `uid ==` the **host's** euid (a guest picking its own would also unstick the 0600
   ro-share files the host stages), and `NoNewPrivs == 1`.
+
+- **Review round (2026-09-05) — the fix's own test was vacuous, and one of its grants was not
+  needed.** `worker_owned_paths_keeps_rw_mountpoints_and_their_anchors` used the fixture
+  `kastellan.mounts=rw:vdb:/data/scratch`, which is neither hex nor tab-separated, so
+  `parse_mount_manifest` fell back to the DEFAULT empty manifest and the loop over `m.rw` never
+  entered its body. **Deleting the entire RW/anchor block left all five tests green** — and that
+  block is the *pre-existing* behaviour the refactor had just moved out of
+  `drop_privileges_for_worker`, so it had no coverage at all. All five are now exact-set
+  `assert_eq!`s over the whole returned `Vec`, which additionally kills the `egress || broker`
+  collapse that every `contains` probe missed. **A non-hex cmdline fixture fails OPEN, silently:**
+  it does not error, it yields an empty manifest. [[unreachable-success-path-proves-nothing]]
+
+- **`/run` is out of the chown set.** It was justified as "the worker needs to traverse and write in
+  it"; **measured**, a tmpfs mounted with no `mode=` comes up **1777** whatever the mounting umask,
+  so both were already true. The chown only handed the worker ownership of a *sticky* directory —
+  which is exactly what lets the owner unlink entries it does not own. `connect(2)` needs write on
+  the socket **file**; the two socket entries are the whole fix. Proven live, not argued: with `/run`
+  removed, all four egress suites AND the broker suite pass. Guest `/run` still coming up
+  world-writable is [#672](https://github.com/hherb/kastellan/issues/672).
+
+- **The Landlock opt-out is now pinned to both things it is a claim about.** Its own literal (a
+  hand-copied mirror of the prelude's `LANDLOCK_PROFILE_ENV` that every other test interpolated on
+  *both* sides, so a rename stayed green) and the guest-kernel sha256 (the injection is
+  unconditional and the other tests assert it is *present*, so a pin bumped to a Landlock-capable
+  kernel would leave the layer off forever, greener than before). It also **WARNs per spawn** now:
+  `tool_host::warn_lockdown_overrides` inspects the derived policy *before* the backend runs, so the
+  one production Landlock disable in the tree was the one that mechanism is blind to.
+
+- **W-2 is now proved further in, and the extra assertions were mutation-tested.** The e2e read
+  uid/euid/NoNewPrivs; it now also reads the **saved-set uid** (the field that actually makes
+  `setuid(0)` unreachable — `euid == uid` does not, and the init's own post-drop self-check cannot
+  see it), the gid, the supplementary set, and **`Seccomp: 2`**, the layer the Landlock opt-out's
+  whole justification rests on and which nothing else in the tree observed. Deleting
+  `setgroups` + `setgid` from the init and rebuilding the rootfs was measured: it turns `gid` red
+  (0 vs 1000) and **every pre-existing assertion still passes**. ⚠️ The `groups` assertion is a
+  regression guard, not a proof — guest PID 1 has no supplementary groups, so it holds either way,
+  and it is annotated as such rather than counted.
 
 - ⚠️ **A stale rootfs image gates nothing, and fails like a code regression.** Every image bakes its
   own copy of `kastellan-microvm-init` **and** the worker, so a guest-side change is invisible until
@@ -629,6 +666,7 @@ Full prose in the [`archive/`](archive/) snapshots — most recently
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
+| **DGX** (#669 after the review round — **the gate that stands**) | **`e35c3571`** (the one later commit adds only a comment on the `groups` assertion — no test, no behaviour) | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4049 / 0 / 56**, **176** suites, `TEST_EXIT=0`. **+1** over the 4048 below — the new `the_landlock_opt_out_is_pinned_to_its_kernel_and_key`; the five `worker_owned_paths` tests were replaced 5-for-5 by exact-set assertions, so the count is unchanged there. **Firecracker: 21 / 0, zero `[SKIP]`** — the first fully green run. The 2 that failed in the row below were the absent local SearxNG; the `kastellan-searxng` container had been down 5 weeks and was restarted (`127.0.0.1:8888`, HTTP 200). All **7** rootfs images rebuilt first — mandatory, since this branch changes the guest init | `-p kastellan-core -p kastellan-sandbox -p kastellan-microvm-init -p kastellan-microvm-run --all-targets --locked -D warnings` exit 0 after force-touching core + sandbox, so the `cfg(linux)` e2e was really linted. ⚠️ The first workspace clippy exited 0 having emitted **24** `Checking` lines in 6s — warm, not a gate. Mac: native + `--target aarch64-unknown-linux-gnu` clippy on all three touched pure-Rust crates, both exit 0 | **4**, all the gliner tier — held. **0** `[WARN]` |
 | **DGX** (#669, the Firecracker gate — **the gate that stands**) | **`b492966b`** (content-identical to the rebased tip `a5b148a1`; the last two commits are a `dead_code` attribute and an unused-import removal, neither of which adds a test) | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4048 / 0 / 56**, **176** suites, `TEST_EXIT=0`. **The delta reconciles exactly: +8** over the 4040 below — 5 `cmdline::worker_owned_paths` tests, 2 `plan.rs` Landlock tests, 1 `confine.rs` userns parity test — and **+1 ignored** (55→56), the new `#[ignore]` Firecracker e2e. Separately, the **Firecracker suites went 0 / 21 → 19 / 2**, the 2 being an absent local SearxNG | **cold** `--workspace --all-targets --locked -D warnings` from a fresh private target dir: exit 0, **345** `Checking`+`Compiling` lines, all **27** kastellan crates, **zero** warnings. rustc **1.98.0**. ⚠️ **The first cold run FAILED** on `unused import: parse_mount_manifest` in the `cfg(linux)` `guest.rs` — invisible to the Mac, and the reason to keep running this cold and on both hosts. Mac clippy `-p kastellan-microvm-init --all-targets -D warnings` exit 0, and its `dead_code` allowance was proved load-bearing by removing it | **4**, all the `KASTELLAN_GLINER_RELEX_ENABLE` tier — held. **0** `[WARN]` |
 | **DGX** (#663 after the review round — **the gate that stands**) | **`fixall`, pre-commit** | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4040 / 0 / 55**, **176** suites, `TEST_EXIT=0`. **The delta reconciles exactly: +18** over the 4022 below — 15 new `gliner_e2e` tests + 3 new `skip.rs` tests. Run twice: once before and once after moving a `#[cfg(test)] mod tests` to end-of-file, identical both times, which is the evidence that code motion was behaviour-neutral | **cold** `--workspace --all-targets --locked -D warnings` from a fresh private target dir: exit 0, **345** `Checking`+`Compiling` lines, all **27** kastellan crates, **zero** warnings. rustc **1.98.0**. ⚠️ The *warm* run exited 0 having linted **3** crates and would have missed the real lint the cold one caught (`items_after_test_module`, from a `mod tests` inserted mid-file) — a warm clippy exit-0 is not a gate | **4**, all the `KASTELLAN_GLINER_RELEX_ENABLE` tier — the pre-branch count, held. **0** `[WARN]` lines, i.e. the new out-of-dialect warning stays silent when the knob is unset. The skip line now echoes the value read (`ENABLE=<unset>`), per #654 |
 | **DGX** (#663, pre-review-round — superseded by the row above) | **`32295a7f`** | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4022 / 0 / 55**, **176** suites, `TEST_EXIT=0`. **The delta reconciles exactly: +12** over the 4010 total below (4009 passed + 1 load flake), and 12 is the `tests-common::gliner_e2e` test count. `scheduler_ask_expiry_e2e` passed this time, as expected of a flake | **cold** `--workspace --all-targets -D warnings` from a fresh private target dir: exit 0, **345** `Checking`+`Compiling` lines, all **27** kastellan crates, **zero** warnings — and **zero rustc warnings during the test build**, which is what proves the macOS-only imports are `cfg`-gated. rustc **1.98.0** | **4**, all `KASTELLAN_GLINER_RELEX_ENABLE` not truthy — the pre-branch count, restored. ⚠️ An earlier run of this gate reported **5**: the fifth was a `tests-common` unit test calling `report_unmet(Skip, ..)`, whose skip arm prints. Fixed in `32295a7f`; see the rule below |
