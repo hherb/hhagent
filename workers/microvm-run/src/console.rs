@@ -53,11 +53,6 @@ use std::path::{Path, PathBuf};
 /// exit unless [`KEEP_RUN_DIR_ENV`] is set.
 pub const CONSOLE_LOG_FILE: &str = "console.log";
 
-/// Opt-in: keep the per-spawn run dir (and therefore the console) even when the
-/// launcher exits gracefully, for the "it booted but the worker misbehaved"
-/// case. A boot *failure* already keeps the dir unconditionally.
-pub const KEEP_RUN_DIR_ENV: &str = "KASTELLAN_MICROVM_KEEP_RUN_DIR";
-
 /// Cmdline token whose value is the hex-encoded worker environment. Kept in
 /// sync by hand with `kastellan-sandbox`'s `ENV_CMDLINE_KEY` and
 /// `kastellan-microvm-init`'s `ENV_CMDLINE_KEY` — the launcher depends on
@@ -79,21 +74,6 @@ pub const TAIL_BYTES: usize = 8 * 1024;
 /// directory to put it in and inventing one would be a surprise.
 pub fn console_log_path(run_dir: Option<&str>) -> Option<PathBuf> {
     run_dir.map(|d| Path::new(d).join(CONSOLE_LOG_FILE))
-}
-
-/// Whether an env var spelled like an operator flag is on.
-///
-/// Deliberately the **same dialect** as the daemon's
-/// `worker_lifecycle::force_route::env_flag_enabled` (`1`/`true`/`yes`/`on`,
-/// trimmed, case-insensitive) rather than the stricter `== "1"` some fixtures
-/// use. A launcher that disagreed with the daemon about what "on" means is
-/// exactly the operator-facing skew #654 was filed for; the launcher cannot
-/// depend on `kastellan-core`, so this mirrors it and says so.
-pub fn flag_enabled(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
 }
 
 /// Replace the value of every `kastellan.env=` token with a placeholder.
@@ -226,17 +206,6 @@ mod tests {
         // Legacy callers keep the historical discard rather than getting a file
         // in some invented location.
         assert_eq!(console_log_path(None), None);
-    }
-
-    #[test]
-    fn flag_enabled_speaks_the_daemons_dialect() {
-        for on in ["1", "true", "TRUE", " yes ", "on", "On"] {
-            assert!(flag_enabled(Some(on)), "{on:?} must count as on");
-        }
-        for off in ["0", "false", "no", "off", "", "garbage"] {
-            assert!(!flag_enabled(Some(off)), "{off:?} must count as off");
-        }
-        assert!(!flag_enabled(None), "an unset variable is off");
     }
 
     #[test]

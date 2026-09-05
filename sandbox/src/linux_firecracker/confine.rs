@@ -151,6 +151,10 @@ pub fn build_vmm_jail_argv(
 /// The launcher's argv[0] is rewritten to its absolute path (the jail has no
 /// $PATH) and `--firecracker-bin <fc abs>` is appended so the in-jail launcher
 /// execs firecracker by absolute path. Pure — unit-testable without spawning.
+///
+/// `keep_run_dir` is forwarded to [`launcher_argv`]. It has to travel this way:
+/// the jail is built with `--clearenv`, so the launcher inside it has no
+/// environment to read a knob from (see `KEEP_RUN_DIR_ENV`).
 pub fn build_confined_spawn_argv(
     policy: &SandboxPolicy,
     plan: &FirecrackerLaunchPlan,
@@ -159,11 +163,18 @@ pub fn build_confined_spawn_argv(
     launcher_bin: &Path,
     config_path: &str,
     log_path: &str,
+    keep_run_dir: bool,
 ) -> Result<Vec<String>, SandboxError> {
     let mut argv = build_systemd_run_argv(policy); // ends with `--`
     argv.extend(build_vmm_jail_argv(plan, run_dir, firecracker_bin, launcher_bin)?); // ends with `--`
 
-    let mut largv = launcher_argv(plan, config_path, log_path, &run_dir.display().to_string());
+    let mut largv = launcher_argv(
+        plan,
+        config_path,
+        log_path,
+        &run_dir.display().to_string(),
+        keep_run_dir,
+    );
     largv[0] = launcher_bin.display().to_string(); // abs path, not MICROVM_RUN_BIN bare name
     largv.push("--firecracker-bin".into());
     largv.push(firecracker_bin.display().to_string());
@@ -380,7 +391,7 @@ mod tests {
             &SandboxPolicy { mem_mb: 512, ..Default::default() },
             &plan, Path::new("/run/x"),
             Path::new("/fc/firecracker"), Path::new("/bin/kastellan-microvm-run"),
-            "/run/x/fc.json", "/run/x/fc.log",
+            "/run/x/fc.json", "/run/x/fc.log", false,
         ).unwrap();
         assert_eq!(argv[0], "systemd-run");
         // exactly two `--` separators: systemd-run|bwrap and bwrap|launcher
@@ -399,7 +410,7 @@ mod tests {
         let plan = deny_plan();
         let argv = build_confined_spawn_argv(
             &SandboxPolicy::default(), &plan, Path::new("/run/x"),
-            Path::new("/fc"), Path::new("/l"), "/run/x/fc.json", "/run/x/fc.log",
+            Path::new("/fc"), Path::new("/l"), "/run/x/fc.json", "/run/x/fc.log", false,
         ).unwrap();
         let first_dd = argv.iter().position(|s| s == "--").unwrap();
         assert_eq!(argv[first_dd + 1], "bwrap", "bwrap must follow the systemd-run `--`");
@@ -408,7 +419,7 @@ mod tests {
     #[test]
     fn none_strategy_matches_bare_launcher_argv() {
         let plan = deny_plan();
-        let bare = launcher_argv(&plan, "/run/x/fc.json", "/run/x/fc.log", "/run/x");
+        let bare = launcher_argv(&plan, "/run/x/fc.json", "/run/x/fc.log", "/run/x", false);
         // The None arm calls launcher_argv with identical args — assert the
         // helper output is what we expect the bare spawn to use.
         assert_eq!(bare[0], crate::linux_firecracker::MICROVM_RUN_BIN);

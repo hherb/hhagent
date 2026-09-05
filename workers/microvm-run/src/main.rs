@@ -19,6 +19,11 @@ fn arg(flag: &str) -> Option<String> {
     None
 }
 
+/// Whether a valueless boolean flag is present in argv.
+fn has_flag(flag: &str) -> bool {
+    std::env::args().any(|a| a == flag)
+}
+
 fn main() -> std::io::Result<()> {
     let config = arg("--config-file").expect("--config-file required");
     let vsock_uds = arg("--vsock-uds").expect("--vsock-uds required");
@@ -120,9 +125,14 @@ fn main() -> std::io::Result<()> {
     // boot FAILURE already keeps the run dir, but a graceful exit removes the
     // console with it, which is exactly the run you want to read when the VM
     // came up and then did the wrong thing.
-    let keep_run_dir = console::flag_enabled(
-        std::env::var(console::KEEP_RUN_DIR_ENV).ok().as_deref(),
-    );
+    //
+    // A FLAG, not an env var, and that is not a style choice: on the default
+    // confined path this launcher runs under `bwrap --clearenv` and has no
+    // environment at all, so an env-var knob here is silently inert. Measured,
+    // not reasoned — the first version read the variable and did nothing. The
+    // daemon reads `KASTELLAN_MICROVM_KEEP_RUN_DIR` in its own process and
+    // forwards it here (`kastellan_sandbox::linux_firecracker::KEEP_RUN_DIR_ENV`).
+    let keep_run_dir = has_flag("--keep-run-dir");
     let teardown = scopeguard(move || {
         let _ = fc.kill();
         // `fc.kill()` always runs (never orphan firecracker holding KVM/vsock);
@@ -162,8 +172,7 @@ fn main() -> std::io::Result<()> {
     if keep_run_dir {
         if let Some(p) = console_path.as_deref() {
             eprintln!(
-                "kastellan-microvm-run: {} set; guest console kept at {}",
-                console::KEEP_RUN_DIR_ENV,
+                "kastellan-microvm-run: --keep-run-dir given; guest console kept at {}",
                 p.display()
             );
         }
@@ -234,7 +243,7 @@ fn scopeguard<F: FnOnce()>(f: F) -> impl Drop {
 ///   post-mortem (#367 review, #666). The orphan sweep in the next
 ///   `spawn_under_policy` reclaims it once this launcher's now-dead pid is
 ///   observed — so this is a deferred clean, not a leak.
-/// - Graceful exit with `keep` (the [`console::KEEP_RUN_DIR_ENV`] opt-in):
+/// - Graceful exit with `keep` (the `--keep-run-dir` opt-in):
 ///   keep it too, for the "it booted but then misbehaved" case, which the panic
 ///   rule alone cannot reach. Same deferred reclaim.
 /// - No `--run-dir` (legacy caller / direct test): fall back to removing just
@@ -382,8 +391,7 @@ mod tests {
         teardown_run_dir(Some(&dir.to_string_lossy()), "/unused", false, true);
         assert!(
             dir.exists(),
-            "the {} opt-in must survive a graceful exit",
-            console::KEEP_RUN_DIR_ENV
+            "the --keep-run-dir opt-in must survive a graceful exit"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
