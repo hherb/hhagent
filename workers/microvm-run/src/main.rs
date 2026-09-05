@@ -113,14 +113,6 @@ fn main() -> std::io::Result<()> {
     }
     let mut fc = cmd.spawn()?;
 
-    // Build the teardown guard BEFORE connecting so a panic (or early return) in
-    // the connect unwinds through it and kills the already-spawned firecracker
-    // child instead of orphaning it (holding KVM/vsock). The run-dir disposition
-    // (remove vs keep-for-diagnostics) is decided by `teardown_run_dir`. The
-    // guard owns a clone; the outer scope keeps `vsock_uds` for the connect
-    // borrow below.
-    let uds_for_guard = vsock_uds.clone();
-    let run_dir_for_guard = run_dir.clone();
     // Operator opt-in for the "it booted but the worker misbehaved" case: a
     // boot FAILURE already keeps the run dir, but a graceful exit removes the
     // console with it, which is exactly the run you want to read when the VM
@@ -133,41 +125,56 @@ fn main() -> std::io::Result<()> {
     // daemon reads `KASTELLAN_MICROVM_KEEP_RUN_DIR` in its own process and
     // forwards it here (`kastellan_sandbox::linux_firecracker::KEEP_RUN_DIR_ENV`).
     let keep_run_dir = has_flag("--keep-run-dir");
-    let teardown = scopeguard(move || {
-        let _ = fc.kill();
-        // `fc.kill()` always runs (never orphan firecracker holding KVM/vsock);
-        // the run-dir disposition depends on whether we are unwinding a panic.
-        teardown_run_dir(
-            run_dir_for_guard.as_deref(),
-            &uds_for_guard,
-            std::thread::panicking(),
-            keep_run_dir,
-        );
-    });
 
+    // Connect BEFORE building the teardown guard, so the boot-failure path can
+    // do its own teardown explicitly rather than through an unwind.
+    //
     // Host-initiated hybrid-vsock connect: dial the base UDS and `CONNECT` to
     // the guest's listening port (DGX-verified direction). Retries while the
     // guest boots and binds its listener.
-    let stream = match bridge::connect_hybrid_vsock(&vsock_uds, port, Duration::from_secs(20)) {
-        Some(s) => s,
-        None => {
-            // Report BEFORE panicking. The panic is what makes the teardown
-            // guard keep the run dir, but a panic message alone is what the
-            // caller has been getting for the whole life of this launcher: the
-            // core sees `Protocol(EarlyExit)` either way, and the only thing
-            // that ever carries content is what we write to our own stderr —
-            // which the sandbox backend pipes and the daemon drains.
-            eprint!(
-                "{}",
-                console::boot_failure_report(
-                    "the guest vsock listener did not come up within 20s",
-                    console_path.as_deref(),
-                    read_console_lossy(console_path.as_deref()).as_deref(),
-                )
-            );
-            panic!("guest vsock did not come up within 20s");
-        }
+    let Some(stream) = bridge::connect_hybrid_vsock(&vsock_uds, port, Duration::from_secs(20))
+    else {
+        // ⚠️ Explicit, NOT a panic through an RAII guard, and that is a
+        // correctness point rather than a style one: the workspace release
+        // profile sets `panic = "abort"`, and this launcher ships in release.
+        // Under abort **no destructor runs** — so a guard's `fc.kill()` would
+        // never fire (leaving firecracker holding KVM and the vsock device,
+        // unless the confined path's `--die-with-parent` + `--as-pid-1` jail
+        // happened to reap it) and the run dir would survive by accident rather
+        // than by rule. Everything this path must do, it does here, by hand.
+        //
+        // The report goes to our OWN stderr, which the sandbox backend pipes
+        // and the core daemon drains. The caller sees `Protocol(EarlyExit)`
+        // whatever happens here; this is the only channel that carries a reason.
+        let report = console::boot_failure_report(
+            "the guest vsock listener did not come up within 20s",
+            console_path.as_deref(),
+            read_console_lossy(console_path.as_deref()).as_deref(),
+        );
+        let _ = fc.kill();
+        eprint!("{report}");
+        // Keep the run dir unconditionally: its `console.log` and `fc.log` are
+        // the post-mortem. The host-side orphan sweep reclaims it once this
+        // launcher's pid is observed dead, so this is a deferred clean.
+        teardown_run_dir(run_dir.as_deref(), &vsock_uds, true);
+        std::process::exit(1);
     };
+
+    // Past the boot: the guard now covers the pump. It kills firecracker on
+    // every exit path (never orphan it holding KVM/vsock) and applies the
+    // operator's keep choice. `panicking()` still contributes in a DEBUG build,
+    // where unwinding is real; release aborts, which is why the failure path
+    // above does not rely on it.
+    let uds_for_guard = vsock_uds.clone();
+    let run_dir_for_guard = run_dir.clone();
+    let teardown = scopeguard(move || {
+        let _ = fc.kill();
+        teardown_run_dir(
+            run_dir_for_guard.as_deref(),
+            &uds_for_guard,
+            keep_run_dir || std::thread::panicking(),
+        );
+    });
     bridge::pump(stream);
     if keep_run_dir {
         if let Some(p) = console_path.as_deref() {
@@ -236,24 +243,31 @@ fn scopeguard<F: FnOnce()>(f: F) -> impl Drop {
 /// panic. Separated from the teardown closure so it is unit-testable without
 /// booting a VM.
 ///
-/// - Graceful exit, `--run-dir` known: remove the whole run-dir (#362). This
-///   subsumes the base-UDS removal since the UDS lives inside it.
-/// - **Panic** (firecracker/connect boot failure), `--run-dir` known: KEEP the
-///   run-dir so firecracker's `fc.log` and the guest `console.log` survive for
-///   post-mortem (#367 review, #666). The orphan sweep in the next
-///   `spawn_under_policy` reclaims it once this launcher's now-dead pid is
-///   observed — so this is a deferred clean, not a leak.
-/// - Graceful exit with `keep` (the `--keep-run-dir` opt-in):
-///   keep it too, for the "it booted but then misbehaved" case, which the panic
-///   rule alone cannot reach. Same deferred reclaim.
-/// - No `--run-dir` (legacy caller / direct test): fall back to removing just
-///   the base vsock UDS, as before — on every path. `keep` is deliberately
-///   ignored here rather than made to preserve the UDS: there is no dir to
-///   keep, and leaving a stale socket behind would break the NEXT spawn.
-fn teardown_run_dir(run_dir: Option<&str>, base_uds: &str, panicking: bool, keep: bool) {
+/// One `keep` flag, decided by the caller, because the two reasons to keep are
+/// not distinguishable here and both mean the same thing to this function:
+///
+/// - **A boot failure**, so firecracker's `fc.log` and the guest `console.log`
+///   survive for post-mortem (#367 review, #666). The caller passes `true`
+///   directly on that path rather than relying on `std::thread::panicking()` —
+///   the release profile is `panic = "abort"` and no destructor would run.
+/// - **The `--keep-run-dir` opt-in**, for the "it booted and then misbehaved"
+///   case the failure rule cannot reach.
+///
+/// A kept dir is a DEFERRED clean, not a leak: the orphan sweep in the next
+/// `spawn_under_policy` reclaims it once this launcher's pid is observed dead.
+///
+/// With `--run-dir` and `keep == false` (the ordinary graceful exit): remove the
+/// whole run-dir (#362), which subsumes the base-UDS removal since the UDS lives
+/// inside it.
+///
+/// No `--run-dir` (legacy caller / direct test): fall back to removing just the
+/// base vsock UDS, as before, on every path. `keep` is deliberately ignored
+/// there rather than made to preserve the UDS: there is no dir to keep, and a
+/// surviving socket would break the NEXT spawn.
+fn teardown_run_dir(run_dir: Option<&str>, base_uds: &str, keep: bool) {
     match run_dir {
-        Some(dir) if !panicking && !keep => remove_run_dir(dir),
-        Some(_) => {} // panic or opt-in: keep the run-dir for diagnostics.
+        Some(dir) if !keep => remove_run_dir(dir),
+        Some(_) => {} // boot failure or opt-in: keep the run-dir for diagnostics.
         None => {
             let _ = std::fs::remove_file(base_uds);
         }
@@ -361,37 +375,23 @@ mod tests {
     #[test]
     fn teardown_removes_run_dir_on_graceful_exit() {
         let dir = fresh_run_dir("graceful");
-        teardown_run_dir(Some(&dir.to_string_lossy()), "/unused", false, false);
+        teardown_run_dir(Some(&dir.to_string_lossy()), "/unused", false);
         assert!(!dir.exists(), "graceful exit must remove the run-dir");
     }
 
     #[test]
-    fn teardown_keeps_run_dir_on_panic_for_diagnostics() {
-        // #367: a boot failure (panic) must KEEP the run-dir so fc.log survives;
-        // the orphan sweep reclaims it later once the launcher pid is dead.
-        // Since #666 the guest console.log is in there too, and it is the file
-        // that actually names the cause.
-        let dir = fresh_run_dir("panic");
-        teardown_run_dir(Some(&dir.to_string_lossy()), "/unused", true, false);
-        assert!(dir.exists(), "panic must keep the run-dir for post-mortem");
-        assert!(dir.join("fc.log").exists(), "fc.log must survive a panic exit");
+    fn teardown_keeps_run_dir_when_asked_so_the_post_mortem_survives() {
+        // The `keep` path serves both reasons the caller has: a boot failure
+        // (#367) and the `--keep-run-dir` opt-in (#666). Both files matter —
+        // fc.log is firecracker's own account, console.log is the guest's, and
+        // it is the guest's that names a guest-side defect.
+        let dir = fresh_run_dir("keep");
+        teardown_run_dir(Some(&dir.to_string_lossy()), "/unused", true);
+        assert!(dir.exists(), "a kept run-dir must survive for post-mortem");
+        assert!(dir.join("fc.log").exists(), "fc.log must survive");
         assert!(
             dir.join(console::CONSOLE_LOG_FILE).exists(),
-            "the guest console must survive a panic exit — it is the whole point of #666"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn teardown_keeps_run_dir_on_graceful_exit_when_opted_in() {
-        // #666: the opt-in exists for the case the panic rule cannot reach — a
-        // VM that booted fine and then misbehaved, whose console is the only
-        // record and which a graceful exit would otherwise delete.
-        let dir = fresh_run_dir("graceful-keep");
-        teardown_run_dir(Some(&dir.to_string_lossy()), "/unused", false, true);
-        assert!(
-            dir.exists(),
-            "the --keep-run-dir opt-in must survive a graceful exit"
+            "the guest console must survive — it is the whole point of #666"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -399,18 +399,16 @@ mod tests {
     #[test]
     fn teardown_removes_base_uds_when_no_run_dir() {
         // Legacy caller (no --run-dir): fall back to removing just the base UDS,
-        // on every path. The keep opt-in is deliberately NOT honoured here —
+        // whatever `keep` says. The opt-in is deliberately NOT honoured here —
         // there is no dir to keep, and a surviving socket breaks the next spawn.
-        for panicking in [false, true] {
-            for keep in [false, true] {
-                let uds = std::env::temp_dir().join(format!(
-                    "kastellan-microvm-runtest-{}-uds-{panicking}-{keep}.sock",
-                    std::process::id()
-                ));
-                std::fs::write(&uds, "").unwrap();
-                teardown_run_dir(None, &uds.to_string_lossy(), panicking, keep);
-                assert!(!uds.exists(), "legacy path must remove the base UDS");
-            }
+        for keep in [false, true] {
+            let uds = std::env::temp_dir().join(format!(
+                "kastellan-microvm-runtest-{}-uds-{keep}.sock",
+                std::process::id()
+            ));
+            std::fs::write(&uds, "").unwrap();
+            teardown_run_dir(None, &uds.to_string_lossy(), keep);
+            assert!(!uds.exists(), "legacy path must remove the base UDS");
         }
     }
 }
