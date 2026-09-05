@@ -445,14 +445,28 @@ cardinality warrants it (sequential cosine scan today).
 
 | Host | Commit | Result | clippy `-D warnings` | `[SKIP]` |
 | --- | --- | --- | --- | --- |
-| **DGX** (this branch — **the gate that stands**) | **`520f278d`** | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4075 / 0 / 57**, **177** suites, `TEST_EXIT=0`. **The delta reconciles exactly: +26** over the 4049 below — 3 `microvm-init` (role + tmpfs mode), 10 launcher `console`, 9 `core` lib (4 `untrusted_text` + 5 `worker_stderr`), 3 `sandbox` (1 real-bwrap VMM-jail gate + 2 launcher-flag/dialect) and 1 new suite — plus **+1 ignored**, the in-guest `/run` e2e. **Firecracker: 28 / 0** across **13** suites, with 2 `[SKIP]` that are the deliberate `KASTELLAN_MATRIX_FC_LIVE_E2E` opt-in. All 8 rootfs images rebuilt first — mandatory, since this branch changes the guest init | `--workspace --all-targets --locked -D warnings` exit 0. ⚠️ An earlier run of this branch FAILED on `too_many_arguments` after the keep-run-dir flag pushed `build_confined_spawn_argv` to 8 — fixed by `LauncherPaths`, not by an `allow` | **4**, all the gliner tier — held. **0** `[WARN]` |
+| **DGX** (this branch — **the gate that stands**) | **`520f278d`**, re-verified at the tip **`a93fe60f`** | `cargo test --workspace --no-fail-fast --locked -- --nocapture` **4075 / 0 / 57**, **177** suites, `TEST_EXIT=0` at `520f278d`; the tip re-run is **4074 / 1**, the 1 being the `scheduler_ask_expiry_e2e` flake below ([#676](https://github.com/hherb/kastellan/issues/676)), **2 / 2 green in isolation**. **The delta reconciles exactly: +26** over the 4049 below — 3 `microvm-init` (role + tmpfs mode), 10 launcher `console`, 9 `core` lib (4 `untrusted_text` + 5 `worker_stderr`), 3 `sandbox` (1 real-bwrap VMM-jail gate + 2 launcher-flag/dialect) and 1 new suite — plus **+1 ignored**, the in-guest `/run` e2e. **Firecracker: 28 / 0** across **13** suites, with 2 `[SKIP]` that are the deliberate `KASTELLAN_MATRIX_FC_LIVE_E2E` opt-in. All 8 rootfs images rebuilt first — mandatory, since this branch changes the guest init | `--workspace --all-targets --locked -D warnings` exit 0. ⚠️ An earlier run of this branch FAILED on `too_many_arguments` after the keep-run-dir flag pushed `build_confined_spawn_argv` to 8 — fixed by `LauncherPaths`, not by an `allow` | **4**, all the gliner tier — held. **0** `[WARN]` |
 | **DGX** (#669 after its review round) | **`e35c3571`** | **4049 / 0 / 56**, **176** suites, `TEST_EXIT=0`. **Firecracker: 21 / 0**, the first fully green run (SearxNG restarted after 5 weeks down) | `-p kastellan-core -p kastellan-sandbox -p kastellan-microvm-init -p kastellan-microvm-run --all-targets --locked -D warnings` exit 0 after force-touching core + sandbox. ⚠️ The first workspace clippy exited 0 having emitted **24** `Checking` lines in 6s — warm, not a gate | **4** |
 | **DGX** (#669, the Firecracker gate) | **`b492966b`** | **4048 / 0 / 56**, 176 suites. Firecracker went **0 / 21 → 19 / 2**, the 2 an absent local SearxNG | **cold** `--workspace --all-targets --locked -D warnings`: exit 0, **345** `Checking`+`Compiling` lines, all **27** crates, zero warnings. rustc **1.98.0**. ⚠️ **The first cold run FAILED** on an unused import in the `cfg(linux)` `guest.rs` — invisible to the Mac | **4** |
 | **DGX** (#663 after its review round) | **`fixall`, pre-commit** | **4040 / 0 / 55**, 176 suites | cold, exit 0, **345** lines, all 27 crates. ⚠️ The *warm* run exited 0 having linted **3** crates and would have missed the real lint the cold one caught | **4** |
-| **DGX** (#656 at the three fixes) | **`f97991a6`** | **4009 / 1 / 55**, 176 suites, `TEST_EXIT=101`. The 1: `scheduler_ask_expiry_e2e` — a 60-second poll that misses under full-workspace load and passed **2 / 2 in isolation**; flaky under load, not a regression. If it recurs, widen the poll deadline at `core/tests/scheduler_ask_expiry_e2e.rs:193` rather than re-running until green | exit 0, zero warnings | **4** |
+| **DGX** (#656 at the three fixes) | **`f97991a6`** | **4009 / 1 / 55**, 176 suites, `TEST_EXIT=101`. The 1 was the same `scheduler_ask_expiry_e2e` flake — see the ⚠️ below, and **do not** apply the "widen the poll deadline" prescription this row used to carry | exit 0, zero warnings | **4** |
 
 Older rows (`4269ff7e` 3997/13, `f12ed26d` 3940, `466ca7ff` 3928, and back to 2950) are in the
 [`archive/`](archive/) snapshots.
+
+⚠️ **`scheduler_ask_expiry_e2e` flakes under a full sweep, and this file's diagnosis of it was WRONG
+for two gates.** It said "a 60-second poll that missed under full-workspace load — widen the poll
+deadline at `scheduler_ask_expiry_e2e.rs:193`". The #675 gate's evidence says otherwise: the panic is
+at **line 251**, not at either `await_state`, so both polls *succeeded* and the sweep did move the
+task to `failed`; what failed is an **empty audit query**, and the next log line is
+`claim_one error: … No such file or directory (os error 2)` — ENOENT on the per-test cluster's **unix
+socket**, i.e. the database went away underneath the test. In isolation it runs **62.2 s and 62.5 s**
+against a 20 s + 90 s budget, so it is nowhere near a deadline. Widening it would leave the test
+green while the scheduler still loses its database mid-run — strictly worse than a visible flake.
+Filed with the evidence as [#676](https://github.com/hherb/kastellan/issues/676); likely the same
+ownership problem as [#548](https://github.com/hherb/kastellan/issues/548). **The general lesson: a
+flake attributed once gets re-attributed forever — re-read the actual failure text on each
+recurrence.**
 
 **Both hosts are load-bearing, in opposite directions — always check both.** The two supervisor
 backends compile on one host each: a `launchd_agents.rs` change is invisible to the DGX and a
