@@ -115,10 +115,14 @@ async fn egress_reverse_channel_delivers_guest_ping_to_host_proxy_uds() {
 ///   `connect proxy uds: Permission denied` naming the proxy rather than the
 ///   cause.
 ///
-/// The socket path is taken from the worker's own environment rather than
-/// re-spelled here: a fourth hand-copied literal of `/run/kastellan-egress.sock`
-/// is how this family of constants drifts, and reading the env additionally
-/// asserts the worker was *configured* to dial the socket the init bound.
+/// The sockets are **enumerated** from `/run` rather than named here. Two
+/// reasons, and the first one is a measurement: a hand-copied
+/// `/run/kastellan-egress.sock` would be a fourth literal of a constant that
+/// already exists in three places, and reading the path out of the worker's
+/// environment — the first thing tried — does not work, because `python.exec`
+/// does not hand its own environment to the code it runs (the probe reported
+/// `unset`). Enumerating asks the better question anyway: *every* socket the
+/// init bound in `/run` must be reachable, whatever it is called.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "DGX-only: real KVM + vsock + rootfs with /run mountpoint"]
 async fn guest_run_dir_and_relay_socket_are_reachable_by_the_unprivileged_worker() {
@@ -156,15 +160,20 @@ async fn guest_run_dir_and_relay_socket_are_reachable_by_the_unprivileged_worker
     let mut worker =
         spawn_worker(&*backend, &spec).expect("spawn force-routed worker in micro-VM");
 
-    let code = "import os\n\
-        uds = os.environ.get('KASTELLAN_EGRESS_PROXY_UDS', '')\n\
-        print('kastellan_uds=%s' % (uds or 'unset'))\n\
+    let code = "import os, stat\n\
         print('kastellan_run_mode=%o' % (os.stat('/run').st_mode & 0o7777))\n\
         print('kastellan_my_uid=%d' % os.getuid())\n\
-        if uds:\n\
-        \x20   st = os.stat(uds)\n\
-        \x20   print('kastellan_sock_uid=%d' % st.st_uid)\n\
-        \x20   print('kastellan_sock_writable=%d' % (1 if os.access(uds, os.W_OK) else 0))\n";
+        socks = sorted(n for n in os.listdir('/run') \n\
+        \x20            if stat.S_ISSOCK(os.stat('/run/' + n).st_mode))\n\
+        print('kastellan_socks=%s' % (','.join(socks) or 'none'))\n\
+        bad = []\n\
+        for n in socks:\n\
+        \x20   p = '/run/' + n\n\
+        \x20   st = os.stat(p)\n\
+        \x20   w = 1 if os.access(p, os.W_OK) else 0\n\
+        \x20   if st.st_uid != os.getuid() or not w:\n\
+        \x20       bad.append('%s(uid=%d,writable=%d)' % (n, st.st_uid, w))\n\
+        print('kastellan_unreachable=%s' % (','.join(bad) or 'none'))\n";
     let out = kastellan_core::tool_host::dispatch_with_sink(
         &kastellan_tests_common::NoopAuditSink,
         &kastellan_core::secrets::Vault::new(),
@@ -189,11 +198,22 @@ async fn guest_run_dir_and_relay_socket_are_reachable_by_the_unprivileged_worker
             .to_string()
     };
 
+    // Order matters: without at least one socket the reachability assertion
+    // below is vacuously true, which is the exact shape of a test that proves
+    // nothing while staying green.
     assert_ne!(
-        fact("kastellan_uds"),
-        "unset",
-        "a force-routed worker must be told which UDS to dial; without it the rest of \
-         this test would assert nothing: {out}"
+        fact("kastellan_socks"),
+        "none",
+        "the guest bound no relay socket in /run at all, so the reachability check \
+         below would assert nothing. Either the force-routed policy did not reach the \
+         plan, or the init's relay setup failed (its reason is on the guest console, \
+         which the launcher now captures — see #666): {out}"
+    );
+    assert_ne!(
+        fact("kastellan_my_uid"),
+        "0",
+        "the worker must not be guest root, or every permission assertion here passes \
+         for the wrong reason: {out}"
     );
     assert_eq!(
         fact("kastellan_run_mode"),
@@ -203,16 +223,12 @@ async fn guest_run_dir_and_relay_socket_are_reachable_by_the_unprivileged_worker
          the per-socket chown is doing anything: {out}"
     );
     assert_eq!(
-        fact("kastellan_sock_uid"),
-        fact("kastellan_my_uid"),
-        "the relay socket must be owned by the uid the worker runs as (#669). Root-owned \
-         is the defect that killed every networked VM worker between the 2026-09-02 audit \
-         and the gate that found it: {out}"
-    );
-    assert_eq!(
-        fact("kastellan_sock_writable"),
-        "1",
-        "the worker must have WRITE permission on the socket file — that, not ownership \
-         as such, is what connect(2) on an AF_UNIX socket requires: {out}"
+        fact("kastellan_unreachable"),
+        "none",
+        "every relay socket the init bound must be owned by the worker's uid AND writable \
+         by it — write permission on the socket FILE is what connect(2) on an AF_UNIX \
+         socket requires (#669), and a root-owned socket is the defect that killed every \
+         networked VM worker between the 2026-09-02 audit and the gate that found it. \
+         Since #670 a failed chown here halts the guest instead of leaving this state: {out}"
     );
 }
