@@ -152,10 +152,7 @@ fn main() -> std::io::Result<()> {
                 console::boot_failure_report(
                     "the guest vsock listener did not come up within 20s",
                     console_path.as_deref(),
-                    console_path
-                        .as_deref()
-                        .and_then(|p| std::fs::read_to_string(p).ok())
-                        .as_deref(),
+                    read_console_lossy(console_path.as_deref()).as_deref(),
                 )
             );
             panic!("guest vsock did not come up within 20s");
@@ -173,6 +170,18 @@ fn main() -> std::io::Result<()> {
     }
     drop(teardown);
     Ok(())
+}
+
+/// Read the guest console as text, replacing invalid UTF-8 rather than failing.
+///
+/// `read_to_string` would return `Err` on the first invalid byte and the caller
+/// would then report "the console could not be read" — the wrong diagnosis, and
+/// a likely one: this is a **serial console**, and a kernel that panics or a
+/// guest that dies mid-write routinely leaves partial or non-UTF-8 bytes on it.
+/// Losing the whole transcript to one bad byte would recreate #666 in miniature.
+fn read_console_lossy(path: Option<&std::path::Path>) -> Option<String> {
+    let bytes = std::fs::read(path?).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Open the per-spawn guest-console file, or `None` if it cannot be created.

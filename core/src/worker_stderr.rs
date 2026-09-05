@@ -124,9 +124,20 @@ pub fn drain_reader<R: Read>(pid: u32, mut reader: R, tail: Option<&StderrTail>)
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF — pipe closed (worker exited)
             Ok(n) => {
-                let chunk = String::from_utf8_lossy(&buf[..n]);
+                // Neutralise terminal-control characters BEFORE the bytes reach
+                // `tracing`. A compromised worker is in scope, the daemon log is
+                // read in a terminal, and an ESC (or the 8-bit CSI that does the
+                // same job) in this stream is an ANSI sequence executing in
+                // whoever is tailing it. Same class the prompt escaper uses —
+                // one definition, in `untrusted_text`.
+                let raw = String::from_utf8_lossy(&buf[..n]);
+                let chunk = crate::untrusted_text::neutralise_controls(&raw);
                 tracing::debug!(worker_pid = pid, "worker stderr: {}", chunk.trim_end());
                 if let Some(tail) = tail {
+                    // The tail carries the SAME neutralised text: it feeds
+                    // `format_death_report` and `format_early_exit_report`,
+                    // both of which log at warn/error — i.e. visible by
+                    // default, unlike the debug line above.
                     carry.push_str(&chunk);
                     while let Some(nl) = carry.find('\n') {
                         let line: String = carry.drain(..=nl).collect();
@@ -372,5 +383,31 @@ mod tests {
         );
         h.join().unwrap();
         assert_eq!(tail.snapshot(), vec!["boom".to_string()]);
+    }
+
+    #[test]
+    fn drain_reader_neutralises_terminal_controls_before_they_reach_the_log() {
+        // A compromised worker is in scope, and this stream now reaches the
+        // daemon log at WARN via `format_early_exit_report` — i.e. visible in
+        // an operator's terminal by default rather than only under `debug`.
+        // An ESC here would be an ANSI sequence executing in that terminal.
+        let tail = StderrTail::new(10);
+        drain_reader(
+            0,
+            Cursor::new("red\u{1b}[31m and 8-bit \u{9b}31m\n".as_bytes().to_vec()),
+            Some(&tail),
+        );
+        let got = tail.snapshot();
+        assert_eq!(got.len(), 1, "one line expected: {got:?}");
+        assert!(
+            !got[0].contains('\u{1b}') && !got[0].contains('\u{9b}'),
+            "both the 7-bit ESC and the 8-bit CSI must be neutralised: {:?}",
+            got[0]
+        );
+        assert!(
+            got[0].contains("red") && got[0].contains("[31m"),
+            "the surrounding text must survive — a log line is evidence: {:?}",
+            got[0]
+        );
     }
 }
