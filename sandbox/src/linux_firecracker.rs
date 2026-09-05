@@ -99,17 +99,33 @@ pub fn keep_run_dir_from_env(flag: Option<&str>) -> bool {
     )
 }
 
-/// Pure: the launcher argv for a plan + its rendered config/log/run-dir paths.
+/// The per-spawn files the launcher is told about, plus the run-dir disposition.
 ///
-/// `keep_run_dir` appends `--keep-run-dir`; see [`KEEP_RUN_DIR_ENV`] for why it
-/// is a flag and not something the launcher reads from its own environment.
-pub fn launcher_argv(
-    plan: &FirecrackerLaunchPlan,
-    config_path: &str,
-    log_path: &str,
-    run_dir: &str,
-    keep_run_dir: bool,
-) -> Vec<String> {
+/// A struct rather than four positional parameters, and not merely to satisfy
+/// clippy's argument count: `config_path` and `log_path` are **same-typed
+/// neighbours**, exactly the shape #643 and #658 record as transposable in
+/// silence. Swapped, the launcher hands firecracker the log path as its VM
+/// description and points `--log-path` at the config — two files that both
+/// exist, so nothing fails on a missing path. Named fields make the
+/// transposition inexpressible rather than merely unlikely.
+#[derive(Debug, Clone, Copy)]
+pub struct LauncherPaths<'a> {
+    /// The rendered `fc.json` the VM is described by.
+    pub config_path: &'a str,
+    /// Where firecracker writes its OWN log (`--log-path`). Not the guest
+    /// console — that is firecracker's stdout, which the launcher sends to
+    /// `console.log` inside the run dir (#666).
+    pub log_path: &'a str,
+    /// The per-spawn run dir, which holds all of the above.
+    pub run_dir: &'a str,
+    /// Keep the run dir after a graceful exit; see [`KEEP_RUN_DIR_ENV`] for why
+    /// this travels by flag and not as something the launcher reads for itself.
+    pub keep_run_dir: bool,
+}
+
+/// Pure: the launcher argv for a plan + its per-spawn paths.
+pub fn launcher_argv(plan: &FirecrackerLaunchPlan, paths: &LauncherPaths<'_>) -> Vec<String> {
+    let LauncherPaths { config_path, log_path, run_dir, keep_run_dir } = *paths;
     let mut argv = vec![
         MICROVM_RUN_BIN.into(),
         "--config-file".into(), config_path.into(),
@@ -266,17 +282,22 @@ impl SandboxBackend for LinuxFirecracker {
         let confine = confinement_from_env(
             std::env::var("KASTELLAN_MICROVM_CONFINE_VMM").ok().as_deref(),
         );
-        // Read here, in the daemon's process, and forwarded by argv: the
-        // launcher runs under `--clearenv` and cannot read it itself (#666).
-        let keep_run_dir = keep_run_dir_from_env(std::env::var(KEEP_RUN_DIR_ENV).ok().as_deref());
         let config_s = config_path.to_string_lossy().into_owned();
         let log_s = log_path.to_string_lossy().into_owned();
         let run_s = run_dir.to_string_lossy().into_owned();
+        let paths = LauncherPaths {
+            config_path: &config_s,
+            log_path: &log_s,
+            run_dir: &run_s,
+            // Read HERE, in the daemon's process, and forwarded by argv: the
+            // launcher runs under `--clearenv` and cannot read it itself (#666).
+            keep_run_dir: keep_run_dir_from_env(
+                std::env::var(KEEP_RUN_DIR_ENV).ok().as_deref(),
+            ),
+        };
 
         let argv = match confine {
-            VmmConfinement::None => {
-                launcher_argv(&plan, &config_s, &log_s, &run_s, keep_run_dir)
-            }
+            VmmConfinement::None => launcher_argv(&plan, &paths),
             VmmConfinement::BwrapCgroup => {
                 // Resolve the two binaries to absolute paths so they can be bound
                 // into the jail (which has no $PATH). Fail closed: a missing
@@ -295,9 +316,7 @@ impl SandboxBackend for LinuxFirecracker {
                          the jail (set KASTELLAN_MICROVM_CONFINE_VMM=0 to disable, or fix $PATH)"
                     ))
                 })?;
-                build_confined_spawn_argv(
-                    policy, &plan, &run_dir, &fc, &launcher, &config_s, &log_s, keep_run_dir,
-                )?
+                build_confined_spawn_argv(policy, &plan, &fc, &launcher, &paths)?
             }
         };
         let child = Command::new(&argv[0])
@@ -346,7 +365,7 @@ mod spawn_tests {
             &[],
         )
         .unwrap();
-        let argv = launcher_argv(&plan, "/run/fc.json", "/run/fc.log", "/run", false);
+        let argv = launcher_argv(&plan, &LauncherPaths { config_path: "/run/fc.json", log_path: "/run/fc.log", run_dir: "/run", keep_run_dir: false });
         assert_eq!(argv[0], MICROVM_RUN_BIN);
         assert!(
             argv.windows(2).any(|w| w[0] == "--config-file" && w[1] == "/run/fc.json"),
@@ -384,13 +403,13 @@ mod spawn_tests {
         )
         .unwrap();
         assert!(
-            launcher_argv(&plan, "/run/fc.json", "/run/fc.log", "/run", true)
+            launcher_argv(&plan, &LauncherPaths { config_path: "/run/fc.json", log_path: "/run/fc.log", run_dir: "/run", keep_run_dir: true })
                 .contains(&"--keep-run-dir".to_string()),
             "the opt-in must travel by argv — the launcher cannot read an env var \
              through --clearenv"
         );
         assert!(
-            !launcher_argv(&plan, "/run/fc.json", "/run/fc.log", "/run", false)
+            !launcher_argv(&plan, &LauncherPaths { config_path: "/run/fc.json", log_path: "/run/fc.log", run_dir: "/run", keep_run_dir: false })
                 .contains(&"--keep-run-dir".to_string()),
             "off must mean off, or every spawn leaks its run dir"
         );
@@ -426,7 +445,7 @@ mod spawn_tests {
             &[],
         )
         .unwrap();
-        let argv = launcher_argv(&plan, "/run/fc.json", "/run/fc.log", "/run", false);
+        let argv = launcher_argv(&plan, &LauncherPaths { config_path: "/run/fc.json", log_path: "/run/fc.log", run_dir: "/run", keep_run_dir: false });
         assert!(
             argv.windows(2).any(|w| w[0] == "--egress-uds" && w[1] == "/scratch/egress.sock"),
             "argv must pass --egress-uds <host sidecar path>: {argv:?}"
@@ -454,7 +473,7 @@ mod spawn_tests {
             &[],
         )
         .unwrap();
-        let argv = launcher_argv(&plan, "/run/fc.json", "/run/fc.log", "/run", false);
+        let argv = launcher_argv(&plan, &LauncherPaths { config_path: "/run/fc.json", log_path: "/run/fc.log", run_dir: "/run", keep_run_dir: false });
         assert!(
             argv.windows(2).any(|w| w[0] == "--broker-uds" && w[1] == "/scratch/embed.sock"),
             "argv must pass --broker-uds <host broker path>: {argv:?}"
@@ -478,7 +497,7 @@ mod spawn_tests {
         .unwrap();
         plan.persistent_image_path =
             Some(std::path::PathBuf::from("/var/lib/kastellan/kv/store.ext4"));
-        let argv = launcher_argv(&plan, "fc.json", "fc.log", "run", false);
+        let argv = launcher_argv(&plan, &LauncherPaths { config_path: "fc.json", log_path: "fc.log", run_dir: "run", keep_run_dir: false });
         let i = argv
             .iter()
             .position(|a| a == "--persistent-image")
@@ -495,7 +514,7 @@ mod spawn_tests {
         .unwrap();
         plan2.persistent_image_path = None;
         assert!(
-            !launcher_argv(&plan2, "fc.json", "fc.log", "run", false)
+            !launcher_argv(&plan2, &LauncherPaths { config_path: "fc.json", log_path: "fc.log", run_dir: "run", keep_run_dir: false })
                 .iter()
                 .any(|a| a == "--persistent-image"),
             "no --persistent-image flag when persistent_image_path is None"
@@ -511,7 +530,7 @@ mod spawn_tests {
             &[],
         )
         .unwrap();
-        let argv = launcher_argv(&plan, "/run/fc.json", "/run/fc.log", "/run", false);
+        let argv = launcher_argv(&plan, &LauncherPaths { config_path: "/run/fc.json", log_path: "/run/fc.log", run_dir: "/run", keep_run_dir: false });
         assert!(!argv.iter().any(|a| a == "--egress-uds"), "no egress flags for Net::Deny: {argv:?}");
     }
 
