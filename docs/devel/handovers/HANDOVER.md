@@ -329,6 +329,21 @@ session rebuilt them by hand-listing paths, twice.
 [#668](https://github.com/hherb/kastellan/issues/668) (repin a guest kernel with Landlock) is the
 standing posture item, and needs a kernel build rather than a code change.
 
+**A standing architecture item, raised 2026-09-05 and now the frame for several open issues:**
+[#678](https://github.com/hherb/kastellan/issues/678) — **retire truncation as the answer to "bigger
+than the budget".** The key move is that truncation is doing **three different jobs** and only one
+becomes map-reduce: a *control that stops seeing its evidence* (the guard's 64 KiB `SCAN_BYTE_CAP` —
+map-reduce, and the reduce `p = max(p_i)` is strictly more sensitive than today, so nothing currently
+blocked becomes clear); a *record that must be faithful* (`truncate_payload` — **spill, never
+summarise: an audit row is testimony**, and the sha256 it already stores is the content-address key);
+and a *resource guard* (`MAX_RECORD_BYTES` and friends — **these stay**, they are containment against
+a compromised worker, not context management). `core/src/handoff.rs` already stashes oversized results
+**whole**, so the body is not lost and no new storage is needed — only the reduce. Likely subsumes
+[#604](https://github.com/hherb/kastellan/issues/604) and
+[#612](https://github.com/hherb/kastellan/issues/612) by removing their premise rather than re-tuning
+around it. ⚠️ **The polarity inverts to fail-closed** — today a document past the cap is silently
+unscreened — which is the single most important behavioural difference and needs its own test.
+
 **THEN, cheap and now long overdue:** [#655](https://github.com/hherb/kastellan/issues/655) — `main`
 has **no required status checks**, so clippy, the matrix build and the `python-lock-check` gate can
 all go red and still merge. A repo-settings change, not code.
