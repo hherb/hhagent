@@ -124,20 +124,26 @@ pub fn drain_reader<R: Read>(pid: u32, mut reader: R, tail: Option<&StderrTail>)
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF — pipe closed (worker exited)
             Ok(n) => {
-                // Neutralise terminal-control characters BEFORE the bytes reach
+                let chunk = String::from_utf8_lossy(&buf[..n]);
+                // Neutralise terminal-control characters before the bytes reach
                 // `tracing`. A compromised worker is in scope, the daemon log is
                 // read in a terminal, and an ESC (or the 8-bit CSI that does the
                 // same job) in this stream is an ANSI sequence executing in
                 // whoever is tailing it. Same class the prompt escaper uses —
                 // one definition, in `untrusted_text`.
-                let raw = String::from_utf8_lossy(&buf[..n]);
-                let chunk = crate::untrusted_text::neutralise_controls(&raw);
-                tracing::debug!(worker_pid = pid, "worker stderr: {}", chunk.trim_end());
+                //
+                // ⚠️ On the LOG COPY only. `\n` is in that class (it is what
+                // would forge a row in a prompt), so neutralising `chunk` itself
+                // would replace every newline with a space and the line split
+                // below would never fire again — one line, forever, silently.
+                // The split runs on the raw text; each line is neutralised as it
+                // enters the tail, in `push_trimmed`.
+                tracing::debug!(
+                    worker_pid = pid,
+                    "worker stderr: {}",
+                    crate::untrusted_text::neutralise_controls(chunk.trim_end())
+                );
                 if let Some(tail) = tail {
-                    // The tail carries the SAME neutralised text: it feeds
-                    // `format_death_report` and `format_early_exit_report`,
-                    // both of which log at warn/error — i.e. visible by
-                    // default, unlike the debug line above.
                     carry.push_str(&chunk);
                     while let Some(nl) = carry.find('\n') {
                         let line: String = carry.drain(..=nl).collect();
@@ -162,10 +168,17 @@ pub fn drain_reader<R: Read>(pid: u32, mut reader: R, tail: Option<&StderrTail>)
 }
 
 /// Push `line` into `tail` after stripping line endings, skipping blanks.
+///
+/// **This is where the tail's text is neutralised**, and the placement is
+/// load-bearing: the tail feeds `format_death_report` and
+/// [`format_early_exit_report`], both of which log at warn — visible in an
+/// operator's terminal by default — and doing it any earlier would eat the `\n`
+/// the caller splits on. Line endings are stripped first, so the neutralisation
+/// only ever sees the interior of a line.
 fn push_trimmed(tail: &StderrTail, line: &str) {
     let trimmed = line.trim_end_matches(['\n', '\r']);
     if !trimmed.is_empty() {
-        tail.push(trimmed.to_string());
+        tail.push(crate::untrusted_text::neutralise_controls(trimmed));
     }
 }
 
@@ -394,11 +407,15 @@ mod tests {
         let tail = StderrTail::new(10);
         drain_reader(
             0,
-            Cursor::new("red\u{1b}[31m and 8-bit \u{9b}31m\n".as_bytes().to_vec()),
+            Cursor::new("red\u{1b}[31m and 8-bit \u{9b}31m\nsecond\n".as_bytes().to_vec()),
             Some(&tail),
         );
         let got = tail.snapshot();
-        assert_eq!(got.len(), 1, "one line expected: {got:?}");
+        // TWO lines, not one: `\n` is itself in the neutralised class, so
+        // neutralising before the split would collapse the whole stream into a
+        // single line — which is how the first version of this broke.
+        assert_eq!(got.len(), 2, "the line split must survive neutralisation: {got:?}");
+        assert_eq!(got[1], "second", "{got:?}");
         assert!(
             !got[0].contains('\u{1b}') && !got[0].contains('\u{9b}'),
             "both the 7-bit ESC and the 8-bit CSI must be neutralised: {:?}",
