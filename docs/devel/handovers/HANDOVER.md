@@ -296,14 +296,23 @@ Full prose in the [`archive/`](archive/) snapshots. Only what still binds:
 
 > Only *open* work is listed. Shipped items move to [Recently merged](#recently-merged) or the ROADMAP.
 
-**FIRST, and it is now the only thing blocking a clean slate on the release audit:**
+**FIRST — #660's gates are now all discharged; what follows is what the last one turned up.**
 
-1. ⏳ **The live Matrix DM round-trip.** Everything a host can check passes (`--features live-matrix`
-   clippy clean, 27 tests, scoping reads correctly), but the property most at risk from #660's
-   invite/two-party scoping is that a **normal DM still round-trips**, and only a real message shows
-   that. **Send the bot a DM from `@horst` and confirm it answers.** If it does not, the scoping is
-   the first suspect — read `channel.boot_failed` audit rows and the declined log line naming
-   `KASTELLAN_MATRIX_PEERS`, not the restart count [[channel-boot-one-shot-fixed]].
+1. ✅ **The live Matrix DM round-trip is DISCHARGED** (2026-09-05, DGX at `9ace57ad`). Two DMs from
+   `@horst` were received, planned and answered — tasks 185 and 186, both `channel.replied` with
+   `peer: @horst:matrix.kastellan.dev`. #660's invite/two-party scoping does **not** break a normal
+   DM, which was the property most at risk. That closes the last item #660 owed.
+   **But the two answers were wrong in an interesting way**, and it is now
+   [#677](https://github.com/hherb/kastellan/issues/677): task 186 spent three of six plan
+   iterations on near-duplicate searches and a fourth on `shell.exec /usr/bin/ls` — the planner
+   theorised that an email attachment might be a file in its **current working directory** — then
+   blamed "the tool-step limit" for not reading the PDF, having never called
+   `mail.get_attachment_text`, which task 185 had used successfully **four minutes earlier**. The
+   two tasks reported **different booking references** for the same question, both with equal
+   confidence. ⚠️ **Which answer was grounded could not be established**, because both large tool
+   dispatches were audited `_truncated: true` with `req` and `result` dropped wholesale — that is
+   [#617](https://github.com/hherb/kastellan/issues/617), and this is the first time it has blocked
+   a real investigation rather than a hypothetical one. The evidence is on both issues.
 2. **Redeploy the DGX**, which is two merges behind (`9ace57ad`; `main` is `4955a52c` and this
    branch is not merged yet). `scripts/upgrade_from_git.sh` does build+install+restart+verify and is
    hardcoded to `main`. A good install says `installed 15 binaries`; logs are in
