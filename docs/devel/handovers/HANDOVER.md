@@ -7,12 +7,11 @@
 > [`archive/handover_20260905_669_pre-prune.md`](archive/handover_20260905_669_pre-prune.md),
 > which holds the verbose pre-prune version of everything summarised here.
 
-**Last updated:** 2026-09-05 (the micro-VM diagnostics cluster: #666, #670, #671, #672) ·
-**`main` HEAD:** `4955a52c` — [#669](https://github.com/hherb/kastellan/pull/669) MERGED, which is
-the Firecracker gate #660 owed plus the three defects it found. ·
-**OPEN BRANCH: `fix/666-670-671-672-microvm-diagnostics`** — see
-[This session](#this-session-the-micro-vm-path-can-now-say-why-it-failed). ·
-**DGX RUNNING `9ace57ad`** — now **one merge behind** `main` (missing #669's Firecracker fixes).
+**Last updated:** 2026-09-06 (session start: docs synced to `main`, work begun on #667) ·
+**`main` HEAD:** `f831b3d1` — [#675](https://github.com/hherb/kastellan/pull/675) MERGED, the
+micro-VM diagnostics cluster (#666, #670, #671, #672). No open branch carries unmerged work. ·
+**DGX RUNNING `9ace57ad`** — now **two merges behind** `main` (missing #669's Firecracker fixes and
+#675's diagnostics); its checkout sits at `a93fe60f`, #675's pre-squash branch tip.
 
 > ⚠️ **The lesson #669 and this session share: an error with no content is a defect *multiplier*.**
 > Three independent production defects hid behind one identical `Protocol(EarlyExit)` for two days,
@@ -33,10 +32,10 @@ the Firecracker gate #660 owed plus the three defects it found. ·
 
 ## Current state
 
-### This session: the micro-VM path can now say why it failed
+### #675 — the micro-VM path can now say why it failed, MERGED (`f831b3d1`)
 
-Branch `fix/666-670-671-672-microvm-diagnostics`. Four issues, one theme, and each fix was **proved
-to fail against un-hardened code** rather than argued.
+Four issues, one theme, and each fix was **proved to fail against un-hardened code** rather than
+argued.
 
 - **[#666](https://github.com/hherb/kastellan/issues/666) — the guest console is captured.** The
   guest kernel boots `console=ttyS0` and firecracker presents that console as **its own stdout**,
@@ -313,9 +312,8 @@ Full prose in the [`archive/`](archive/) snapshots. Only what still binds:
    dispatches were audited `_truncated: true` with `req` and `result` dropped wholesale — that is
    [#617](https://github.com/hherb/kastellan/issues/617), and this is the first time it has blocked
    a real investigation rather than a hypothetical one. The evidence is on both issues.
-2. **Redeploy the DGX**, which is two merges behind (`9ace57ad`; `main` is `4955a52c` and this
-   branch is not merged yet). `scripts/upgrade_from_git.sh` does build+install+restart+verify and is
-   hardcoded to `main`. A good install says `installed 15 binaries`; logs are in
+2. **Redeploy the DGX**, which is two merges behind (running `9ace57ad`; `main` is `f831b3d1`).
+   `scripts/upgrade_from_git.sh` does build+install+restart+verify and is hardcoded to `main`. A good install says `installed 15 binaries`; logs are in
    `~/.local/state/kastellan/*.out`, not the journal [[dgx-deploy-env-clobber-and-missing-workers]].
 
 **THEN, on the micro-VM path — one issue left, and it is the one that turns a gate into a
@@ -606,6 +604,10 @@ allowlisted endpoints for the *one* compromised tool. Nothing else.
 Newest first. Older entries live in the [`archive/`](archive/) snapshots and in git history; the
 substance of each is compressed under [Current state](#current-state) rather than repeated here.
 
+- **[#675](https://github.com/hherb/kastellan/pull/675)** `f831b3d1` — the micro-VM diagnostics
+  cluster: the guest console is captured and echoed redacted on a boot failure (#666), `EarlyExit`
+  carries the worker's last words (#666 core half), the VMM jail gets a real-bwrap gate (#671),
+  guest `/run` is mounted `mode=0755` (#672), and a failed relay-socket chown is fatal (#670).
 - **[#669](https://github.com/hherb/kastellan/pull/669)** `4955a52c` — the Firecracker gate #660
   owed, plus the **three** defects it found (a refused VMM jail, a guest kernel with no Landlock
   against the audit's new fail-closed rule, root-owned relay sockets). 0/21 → 21/0.
