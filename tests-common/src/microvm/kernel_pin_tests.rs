@@ -10,7 +10,7 @@
 //! Host-independent by design: they run on macOS as well as the DGX, since
 //! "does the integrity check reject a bad file" needs no VM.
 
-use super::images::{GUEST_KERNEL_LIB, ROOTFS_BUILD_SCRIPTS};
+use super::images::{GUEST_KERNEL_LIB, ROOTFS_IMAGES};
 use super::repo_root;
 
 /// The pin is a *library*: sourcing it must define functions and
@@ -206,7 +206,7 @@ fn a_failed_quarantine_is_reported_rather_than_claimed() {
 #[test]
 fn kernel_pin_is_the_only_place_the_kernel_url_appears() {
     let root = repo_root();
-    for (rootfs, script) in ROOTFS_BUILD_SCRIPTS {
+    for &super::images::RootfsImage { image: rootfs, build_script: script, .. } in ROOTFS_IMAGES {
         let body = std::fs::read_to_string(root.join(script))
             .unwrap_or_else(|e| panic!("read {script}: {e}"));
         assert!(
@@ -223,7 +223,7 @@ fn kernel_pin_is_the_only_place_the_kernel_url_appears() {
 #[test]
 fn every_build_script_fetches_through_the_pin() {
     let root = repo_root();
-    for (rootfs, script) in ROOTFS_BUILD_SCRIPTS {
+    for &super::images::RootfsImage { image: rootfs, build_script: script, .. } in ROOTFS_IMAGES {
         let body = std::fs::read_to_string(root.join(script))
             .unwrap_or_else(|e| panic!("read {script}: {e}"));
         assert!(
@@ -449,7 +449,7 @@ fn installer_root_owns_the_kernel_in_a_sticky_dir() {
 #[test]
 fn build_scripts_verify_the_kernel_but_never_create_it() {
     let root = repo_root();
-    for (rootfs, script) in ROOTFS_BUILD_SCRIPTS {
+    for &super::images::RootfsImage { image: rootfs, build_script: script, .. } in ROOTFS_IMAGES {
         let body = std::fs::read_to_string(root.join(script))
             .unwrap_or_else(|e| panic!("read {script}: {e}"));
         let calls = |name: &str| {

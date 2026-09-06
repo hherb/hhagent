@@ -273,8 +273,11 @@ pub fn warn_if_out_of_dialect(var: &str, value: Option<&str>, out: &mut dyn std:
     }
     let _ = write!(
         out,
-        "\n[WARN] {var}={observed:?} is not in the flag dialect (1|true|yes|on) \
-         — treating it as unset, so skips will NOT become failures\n"
+        "{}",
+        crate::skip::warn_line(&format!(
+            "{var}={observed:?} is not in the flag dialect (1|true|yes|on) \
+             — treating it as unset, so skips will NOT become failures"
+        ))
     );
 }
 

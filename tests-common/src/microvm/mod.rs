@@ -64,11 +64,82 @@ pub const LAUNCHER_BIN: &str = "kastellan-microvm-run";
 /// module therefore says `--release`; see the module docs.
 const LAUNCHER_PROFILES: [&str; 2] = ["release", "debug"];
 
+pub mod freshness;
 mod images;
-pub use images::{build_script_for, GUEST_KERNEL_LIB};
+pub use freshness::{freshness, indeterminate_reason, stale_reason, Freshness};
+pub use images::{
+    baked_binaries_for, build_script_for, image_entry, RootfsImage, GUEST_INIT_BIN,
+    GUEST_KERNEL_LIB, REBUILD_ALL_SCRIPT,
+};
 
 #[cfg(test)]
 mod kernel_pin_tests;
+
+/// The operator's demand that a micro-VM e2e actually *run* rather than
+/// report green having skipped (issue #667, honouring #653's convention).
+///
+/// Same name shape and the same `env_flag_enabled` dialect as
+/// [`crate::gliner_e2e::REQUIRE_ENV`]. Unset, every unmet precondition
+/// prints `[SKIP]` and the test passes, which is what keeps a plain
+/// `cargo test` green on a host with no KVM. Truthy, each one panics
+/// naming itself.
+///
+/// This is not decoration. Two documented false greens on this exact path
+/// were skips nobody could turn into failures: `firecracker` sitting off
+/// the non-interactive ssh `PATH` (the whole suite skips-as-passes), and a
+/// rootfs image too old to contain the code under test.
+pub const REQUIRE_ENV: &str = "KASTELLAN_MICROVM_REQUIRE_E2E";
+
+/// What an unmet micro-VM precondition means for *this* run.
+///
+/// Reads [`REQUIRE_ENV`] through the one project flag dialect
+/// (`1|true|yes|on`, trimmed, case-insensitive) rather than a strict
+/// `Some("1")` — the strict form is the operator-facing skew #654 was filed
+/// about, and re-deriving it here would reintroduce it.
+pub fn require_action() -> crate::gliner_e2e::UnmetAction {
+    crate::gliner_e2e::unmet_action(std::env::var(REQUIRE_ENV).ok())
+}
+
+/// Report an unmet micro-VM precondition: `[SKIP]` and return `true`, or
+/// panic when the operator demanded a real run via [`REQUIRE_ENV`].
+///
+/// Returns `true` so callers can `return` straight out of the test, which
+/// keeps every call site a one-liner and the `[SKIP]`-as-pass path
+/// unchanged from before #667.
+///
+/// # Panics
+///
+/// Under [`crate::gliner_e2e::UnmetAction::Fail`], naming both the knob (so
+/// the operator reads it as their own demand rather than as a regression)
+/// and the reason (so they know what to fix).
+pub fn report_unmet_microvm(reason: &str) -> bool {
+    report_unmet_microvm_to(reason, &mut std::io::stderr())
+}
+
+/// [`report_unmet_microvm`] with the skip line written to `out`.
+///
+/// Exists so a unit test can prove the Skip arm **emits** the line without
+/// emitting a real `[SKIP]` into the run it is protecting — asserting on
+/// [`crate::skip::skip_line`] alone would leave the `eprint!` deletable with
+/// the suite still green, and `grep -c '^\[SKIP\]'` is how a run is audited
+/// here.
+///
+/// # Panics
+///
+/// As [`report_unmet_microvm`].
+pub fn report_unmet_microvm_to(reason: &str, out: &mut dyn std::io::Write) -> bool {
+    match require_action() {
+        crate::gliner_e2e::UnmetAction::Fail => panic!(
+            "{REQUIRE_ENV} demanded a real micro-VM end-to-end run, but a precondition \
+             is unmet: {}",
+            crate::skip::one_line(reason)
+        ),
+        crate::gliner_e2e::UnmetAction::Skip => {
+            let _ = write!(out, "{}", crate::skip::skip_line(reason));
+            true
+        }
+    }
+}
 
 /// The repository root, derived from this crate's manifest dir.
 ///
@@ -93,28 +164,45 @@ pub fn launcher_candidates(target_dir: &Path) -> Vec<PathBuf> {
     LAUNCHER_PROFILES.iter().map(|profile| target_dir.join(profile).join(LAUNCHER_BIN)).collect()
 }
 
-/// The `[SKIP]` line printed when the Firecracker probe fails.
+/// Why the Firecracker probe refused, **without rendering a verdict**.
+///
+/// The `*_or_reason` shape #653 established: one caller skips on this, another
+/// must fail on it (see [`REQUIRE_ENV`]), and a helper that has already
+/// decided which cannot serve both.
 ///
 /// Pure so the wording is testable. Names the rootfs (probe failures are
 /// usually a missing image, and "which image?" is the operator's first
 /// question) and, when known, the script that builds it.
-pub fn probe_skip_message(rootfs: &str, err: &str) -> String {
-    let mut msg = crate::skip::skip_line(&format!(
-        "firecracker probe failed (need {rootfs} + KVM + vsock): {err}"
-    ));
+///
+/// One line, and that is a fix rather than a style choice: the hint used to be
+/// appended *after* [`crate::skip::skip_line`] had flattened the reason, so it
+/// emitted an orphan continuation line that no `grep -c '^\[SKIP\]'` could
+/// attribute to anything — precisely the shape `skip_line`'s own doc comment
+/// warns about.
+pub fn probe_reason(rootfs: &str, err: &str) -> String {
+    let mut reason = format!("firecracker probe failed (need {rootfs} + KVM + vsock): {err}");
     if let Some(script) = build_script_for(rootfs) {
-        msg.push_str(&format!("       build the rootfs with: bash {script}\n"));
+        reason.push_str(&format!("; build the rootfs with: bash {script}"));
     }
-    msg
+    reason
+}
+
+/// The `[SKIP]` line printed when the Firecracker probe fails.
+pub fn probe_skip_message(rootfs: &str, err: &str) -> String {
+    crate::skip::skip_line(&probe_reason(rootfs, err))
+}
+
+/// Why the VMM launcher is unusable, **without rendering a verdict** — the
+/// verdict-free half, for the same reason as [`probe_reason`].
+///
+/// Says `--release` deliberately: see [`LAUNCHER_PROFILES`].
+pub fn launcher_reason() -> String {
+    format!("{LAUNCHER_BIN} not built; run `cargo build --release -p {LAUNCHER_BIN}`")
 }
 
 /// The `[SKIP]` line printed when the VMM launcher has not been built.
-///
-/// Says `--release` deliberately: see [`LAUNCHER_PROFILES`].
 pub fn launcher_skip_message() -> String {
-    crate::skip::skip_line(&format!(
-        "{LAUNCHER_BIN} not built; run `cargo build --release -p {LAUNCHER_BIN}`"
-    ))
+    crate::skip::skip_line(&launcher_reason())
 }
 
 /// The directory holding `vmlinux` + the rootfs images, honouring the
@@ -132,16 +220,114 @@ pub fn image_dir() -> String {
         .unwrap_or_else(|| DEFAULT_IMAGE_DIR.to_string())
 }
 
-/// The built [`LAUNCHER_BIN`], or `None` if neither profile has one.
-///
-/// Resolves the workspace `target/` from this crate's manifest dir, so
-/// it is correct regardless of the caller's working directory.
-pub fn locate_microvm_run() -> Option<PathBuf> {
-    let target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+/// The workspace `target/` directory, resolved from this crate's manifest
+/// dir so it is correct regardless of the caller's working directory.
+pub fn workspace_target_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("tests-common has a workspace parent")
-        .join("target");
-    launcher_candidates(&target).into_iter().find(|p| p.is_file())
+        .join("target")
+}
+
+/// The built [`LAUNCHER_BIN`], or `None` if neither profile has one.
+pub fn locate_microvm_run() -> Option<PathBuf> {
+    launcher_candidates(&workspace_target_dir()).into_iter().find(|p| p.is_file())
+}
+
+/// A path's mtime, or `None` when it cannot be read.
+///
+/// Collapses "absent" and "unreadable" deliberately: for freshness both mean
+/// *no usable reference*, and [`freshness`] already refuses to call that
+/// `Fresh`.
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// Stat `rootfs` and the binaries it bakes, and return the verdict.
+///
+/// The impure half of [`freshness`]; the decision itself stays pure and
+/// unit-tested. The reference is `target/release/<binary>` because that is
+/// literally the path every `build-*-rootfs.sh` copies out of — not
+/// `target/debug`, which no image is ever built from.
+///
+/// A missing image yields [`Freshness::Indeterminate`] rather than a guess.
+/// The Firecracker probe has already refused that case before any caller
+/// reaches here, so arriving with no image means something changed
+/// underneath, and "fresh" would be the wrong guess to make.
+pub fn image_freshness(rootfs: &str) -> Freshness {
+    let Some(image_mtime) = file_mtime(&PathBuf::from(image_dir()).join(rootfs)) else {
+        return Freshness::Indeterminate;
+    };
+    let release = workspace_target_dir().join("release");
+    let baked: Vec<(&str, Option<std::time::SystemTime>)> = baked_binaries_for(rootfs)
+        .iter()
+        .map(|name| (*name, file_mtime(&release.join(name))))
+        .collect();
+    freshness(image_mtime, &baked)
+}
+
+/// Refuse to boot a rootfs image that predates the code baked into it
+/// (issue #667). Returns `true` when the caller should skip.
+///
+/// The three verdicts get three different treatments, and the asymmetry is
+/// the design:
+///
+/// * [`Freshness::Fresh`] — run.
+/// * [`Freshness::Stale`] — **panic, unconditionally**, whatever
+///   [`REQUIRE_ENV`] says. This is not an unmet precondition the operator
+///   may reasonably not have; it is positive evidence that the run about to
+///   happen would prove nothing about the working tree. A `[SKIP]` here
+///   would be the #667 bug wearing a different hat, and these suites are
+///   `#[ignore]`d, so reaching this code means an operator explicitly asked
+///   for a Firecracker run.
+/// * [`Freshness::Indeterminate`] — `[WARN]` and **run anyway**, because
+///   absence of a reference binary is not evidence of staleness and
+///   downgrading a real VM run to a skip would lose coverage for no gain.
+///   [`REQUIRE_ENV`] turns it into a failure for an operator demanding a
+///   fully-gated run.
+///
+/// # Panics
+///
+/// On [`Freshness::Stale`] always, and on [`Freshness::Indeterminate`] when
+/// [`REQUIRE_ENV`] is truthy.
+pub fn skip_if_image_stale(rootfs: &str) -> bool {
+    skip_if_image_stale_to(rootfs, image_freshness(rootfs), &mut std::io::stderr())
+}
+
+/// [`skip_if_image_stale`] with the verdict injected and the `[WARN]` line
+/// written to `out`.
+///
+/// The seam exists so every branch is unit-testable without a rootfs image:
+/// asserting on [`stale_reason`] alone would prove the wording correct while
+/// leaving the panic deletable, which is the mutation that would silently
+/// restore #667.
+///
+/// # Panics
+///
+/// As [`skip_if_image_stale`].
+pub fn skip_if_image_stale_to(
+    rootfs: &str,
+    verdict: Freshness,
+    out: &mut dyn std::io::Write,
+) -> bool {
+    match verdict {
+        Freshness::Fresh => false,
+        Freshness::Stale { binary } => {
+            panic!("{}", crate::skip::one_line(&stale_reason(rootfs, &binary, build_script_for(rootfs))))
+        }
+        Freshness::Indeterminate => {
+            let reason = indeterminate_reason(rootfs, baked_binaries_for(rootfs));
+            if require_action() == crate::gliner_e2e::UnmetAction::Fail {
+                panic!(
+                    "{REQUIRE_ENV} demanded a real micro-VM end-to-end run, but a \
+                     precondition is unmet: {}",
+                    crate::skip::one_line(&reason)
+                );
+            }
+            let _ = write!(out, "{}", crate::skip::warn_line(&reason));
+            false
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -151,7 +337,10 @@ mod linux {
     use kastellan_sandbox::linux_firecracker::{FirecrackerImage, LinuxFirecracker};
     use kastellan_sandbox::{SandboxBackend, SandboxBackendKind, SandboxBackends};
 
-    use super::{image_dir, launcher_skip_message, locate_microvm_run, probe_skip_message};
+    use super::{
+        image_dir, launcher_reason, locate_microvm_run, probe_reason, report_unmet_microvm,
+        skip_if_image_stale,
+    };
 
     /// The kernel + rootfs pair for `rootfs` (a bare filename such as
     /// `"web-fetch.ext4"`) inside [`image_dir`].
@@ -184,8 +373,7 @@ mod linux {
     /// better than 15 independent ones.
     pub fn skip_if_no_microvm(rootfs: &str) -> bool {
         if let Err(e) = LinuxFirecracker::probe(&firecracker_image_for(rootfs)) {
-            eprint!("{}", probe_skip_message(rootfs, &e.to_string()));
-            return true;
+            return report_unmet_microvm(&probe_reason(rootfs, &e.to_string()));
         }
         match locate_microvm_run() {
             Some(bin) => {
@@ -199,12 +387,13 @@ mod linux {
                     let joined = std::env::join_paths(paths).expect("join PATH");
                     std::env::set_var("PATH", joined);
                 });
-                false
+                // Last, because it is the only gate that can say the run
+                // would be MEANINGLESS rather than impossible: everything
+                // above is "this host cannot boot a VM", this is "this host
+                // can, but the image predates the code you changed" (#667).
+                skip_if_image_stale(rootfs)
             }
-            None => {
-                eprint!("{}", launcher_skip_message());
-                true
-            }
+            None => report_unmet_microvm(&launcher_reason()),
         }
     }
 
@@ -220,44 +409,4 @@ mod linux {
 pub use linux::{firecracker_backend, firecracker_image_for, skip_if_no_microvm};
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The regression this module was filed for: the launcher is probed
-    /// release-first, so every operator-facing hint must say `--release`.
-    /// Two of the 15 original copies said plain `cargo build -p …`,
-    /// which rebuilds debug and leaves a stale release binary running.
-    #[test]
-    fn release_is_probed_before_debug() {
-        let candidates = launcher_candidates(Path::new("/ws/target"));
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/ws/target/release").join(LAUNCHER_BIN),
-                PathBuf::from("/ws/target/debug").join(LAUNCHER_BIN),
-            ]
-        );
-    }
-
-    #[test]
-    fn launcher_hint_says_release() {
-        let msg = launcher_skip_message();
-        assert!(msg.contains("--release"), "hint must say --release, got: {msg}");
-        assert!(msg.contains("[SKIP]"), "must be greppable as a skip: {msg}");
-    }
-
-    #[test]
-    fn probe_message_names_the_rootfs_and_its_build_script() {
-        let msg = probe_skip_message("web-fetch.ext4", "no /dev/kvm");
-        assert!(msg.contains("web-fetch.ext4"), "must name the image: {msg}");
-        assert!(msg.contains("no /dev/kvm"), "must carry the cause: {msg}");
-        assert!(msg.contains("build-web-fetch-rootfs.sh"), "must point at the builder: {msg}");
-    }
-
-    #[test]
-    fn probe_message_omits_the_build_hint_for_an_unknown_rootfs() {
-        let msg = probe_skip_message("mystery.ext4", "boom");
-        assert!(msg.contains("mystery.ext4"));
-        assert!(!msg.contains("build the rootfs with"), "must not invent a script: {msg}");
-    }
-}
+mod preflight_tests;

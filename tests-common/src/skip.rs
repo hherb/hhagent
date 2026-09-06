@@ -43,6 +43,23 @@ pub fn one_line(reason: &str) -> String {
     reason.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Render a `[WARN] <reason>` line on the same stream as [`skip_line`].
+///
+/// The third state a preflight can be in. `[SKIP]` says a precondition is
+/// unmet and the test did not run; a plain pass says it ran. Neither can say
+/// *"it ran, but something about the run was not what you think"* — which is
+/// exactly what an out-of-dialect `REQUIRE` flag and an unverifiable rootfs
+/// image both are. Both were previously silent, and a silent caveat on a green
+/// run is the false-green pattern one step removed.
+///
+/// Pure, and one renderer rather than the two hand-written copies this
+/// replaces, for the same reason [`skip_line`] is: `grep -c '^\[WARN\]'` over
+/// a `--nocapture` run is evidence, so the shape must not drift between
+/// callers. Flattened to a single line for the same reason too.
+pub fn warn_line(reason: &str) -> String {
+    format!("\n[WARN] {}\n", one_line(reason))
+}
+
 /// How long to wait for a TCP connect when probing a real origin's reachability.
 const ORIGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -189,6 +206,26 @@ mod tests {
             prefix_supervisor_context("not yet implemented: default_probe"),
             "supervisor unavailable: not yet implemented: default_probe"
         );
+    }
+
+    /// `[WARN]` must be greppable on its own line and must NOT read as a
+    /// skip: the two are counted separately when a run is audited, and a
+    /// caveat that inflated the skip count would misattribute a test that
+    /// actually ran.
+    #[test]
+    fn warn_line_is_greppable_and_is_not_a_skip() {
+        let rendered = warn_line("image freshness could not be established");
+        assert!(rendered.starts_with("\n[WARN] "), "must be its own line: {rendered:?}");
+        assert!(rendered.ends_with('\n'), "must terminate the line: {rendered:?}");
+        assert!(!rendered.contains("[SKIP]"), "a warning is not a skip: {rendered:?}");
+        assert!(rendered.contains("freshness"), "must carry the reason: {rendered:?}");
+    }
+
+    /// Flattened for the same reason a `[SKIP]` reason is: an orphan
+    /// continuation line cannot be attributed to the warning above it.
+    #[test]
+    fn warn_line_flattens_a_multi_line_reason() {
+        assert_eq!(warn_line("two\n\n   lines"), "\n[WARN] two lines\n");
     }
 
     /// A reason is one line whatever the probe embedded in it.
