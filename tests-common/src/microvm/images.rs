@@ -17,16 +17,31 @@
 //! run start to finish against June images and reported green having tested
 //! none of it.
 //!
-//! Recording *what each image contains* is what lets
-//! [`crate::microvm::freshness`] compare the image against the code it is
-//! supposed to carry. The list is only as good as its agreement with the
+//! Recording *what each image contains, and where* is what lets
+//! [`crate::microvm::freshness`] read the baked copy back out and compare it
+//! against the code the working tree builds. The list is only as good as its agreement with the
 //! scripts, which is why [`tests::the_table_and_the_scripts_agree_on_every_baked_binary`]
 //! pins it **in both directions**: a script that starts baking a binary the
 //! table does not know about fails the unit test, rather than silently
 //! shrinking the staleness reference.
 
-/// A rootfs image the e2e suite boots, and everything needed to tell
-/// whether the copy on disk still reflects the working tree.
+/// One binary copied into an image at build time.
+///
+/// Two fields because a digest comparison needs both ends: what the working
+/// tree builds (`target_name`, under `target/release/`) and where that copy
+/// landed inside the image (`in_image`, which is where it must be read back
+/// from). The guest init is renamed on the way in — `kastellan-microvm-init`
+/// becomes `/sbin/init` — so neither field can be derived from the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BakedBinary {
+    /// The filename under `target/release/`.
+    pub target_name: &'static str,
+    /// The absolute path it occupies *inside* the image.
+    pub in_image: &'static str,
+}
+
+/// A rootfs image the e2e suite boots, and everything needed to tell whether
+/// the copy on disk still contains the code the working tree builds.
 ///
 /// An explicit table rather than a derived `build-<stem>-rootfs.sh`
 /// convention, because two entries break that convention and a derived name
@@ -42,73 +57,110 @@ pub struct RootfsImage {
     pub image: &'static str,
     /// The script that builds it, repo-relative.
     pub build_script: &'static str,
-    /// The `target/release/` binaries `build_script` copies **into** the
-    /// image, by bare filename.
+    /// The binaries `build_script` copies into the image.
     ///
-    /// These are the staleness reference: an image older than any of them
-    /// cannot contain that binary's current code. Python payloads
-    /// (browser-driver's driver, python-exec's interpreter) are deliberately
-    /// **not** listed — they are not built by cargo, so they have no
-    /// `target/release/` mtime to compare against, and claiming otherwise
-    /// would make the check look stronger than it is.
-    pub baked_binaries: &'static [&'static str],
+    /// These are the freshness reference. Python payloads (browser-driver's
+    /// driver, python-exec's interpreter) are deliberately **not** listed —
+    /// they are not cargo artefacts, so there is no `target/release/` copy
+    /// to compare against, and listing them would make the check look
+    /// stronger than it is.
+    pub baked: &'static [BakedBinary],
 }
 
-/// The guest PID 1, baked into **every** image.
+/// The guest PID 1, baked into **every** image as `/sbin/init`.
 ///
 /// Named once because it is the reference that matters most: it is the only
-/// binary all eight images share, so a guest-init change staleness-checks
-/// every one of them.
+/// binary all eight images share, so a guest-init change makes every one of
+/// them stale at once.
 pub const GUEST_INIT_BIN: &str = "kastellan-microvm-init";
+
+/// Where the guest init lands inside every image.
+pub const GUEST_INIT_IN_IMAGE: &str = "/sbin/init";
+
+/// The guest init's entry, identical in all eight images.
+const INIT: BakedBinary =
+    BakedBinary { target_name: GUEST_INIT_BIN, in_image: GUEST_INIT_IN_IMAGE };
+
+/// A worker binary, which every script installs under the same directory.
+const fn worker(name: &'static str, in_image: &'static str) -> BakedBinary {
+    BakedBinary { target_name: name, in_image }
+}
 
 /// Every rootfs image the e2e suite boots. See [`RootfsImage`].
 ///
 /// `every_build_script_exists` pins the scripts against the working tree and
 /// `the_table_and_the_scripts_agree_on_every_baked_binary` pins the binary
-/// lists, so renaming, moving or re-baking fails a unit test instead of
-/// silently misleading whoever hits the `[SKIP]`.
+/// lists AND their destinations, so renaming, moving or re-baking fails a
+/// unit test instead of silently misleading whoever hits the failure.
 pub(super) const ROOTFS_IMAGES: &[RootfsImage] = &[
     RootfsImage {
         image: "python-exec.ext4",
         build_script: "scripts/workers/microvm/build-rootfs.sh",
-        baked_binaries: &[GUEST_INIT_BIN, "kastellan-worker-python-exec"],
+        baked: &[
+            INIT,
+            worker(
+                "kastellan-worker-python-exec",
+                "/usr/local/bin/kastellan-worker-python-exec",
+            ),
+        ],
     },
     RootfsImage {
         image: "web-fetch.ext4",
         build_script: "scripts/workers/microvm/build-web-fetch-rootfs.sh",
-        baked_binaries: &[GUEST_INIT_BIN, "kastellan-worker-web-fetch"],
+        baked: &[
+            INIT,
+            worker("kastellan-worker-web-fetch", "/usr/local/bin/kastellan-worker-web-fetch"),
+        ],
     },
     RootfsImage {
         image: "web-search.ext4",
         build_script: "scripts/workers/microvm/build-web-search-rootfs.sh",
-        baked_binaries: &[GUEST_INIT_BIN, "kastellan-worker-web-search"],
+        baked: &[
+            INIT,
+            worker("kastellan-worker-web-search", "/usr/local/bin/kastellan-worker-web-search"),
+        ],
     },
     RootfsImage {
         image: "web-research.ext4",
         build_script: "scripts/workers/microvm/build-web-research-rootfs.sh",
-        baked_binaries: &[GUEST_INIT_BIN, "kastellan-worker-web-research"],
+        baked: &[
+            INIT,
+            worker(
+                "kastellan-worker-web-research",
+                "/usr/local/bin/kastellan-worker-web-research",
+            ),
+        ],
     },
     RootfsImage {
         image: "browser-driver.ext4",
         build_script: "scripts/workers/microvm/build-browser-driver-rootfs.sh",
-        // The driver itself is Python, installed into the image from a
-        // Dockerfile — this image bakes no worker binary at all.
-        baked_binaries: &[GUEST_INIT_BIN],
+        // The driver itself is Python, installed from a docker export — this
+        // image bakes no worker binary at all.
+        baked: &[INIT],
     },
     RootfsImage {
         image: "matrix.ext4",
         build_script: "scripts/workers/microvm/build-matrix-rootfs.sh",
-        baked_binaries: &[GUEST_INIT_BIN, "kastellan-worker-matrix"],
+        baked: &[
+            INIT,
+            worker("kastellan-worker-matrix", "/usr/local/bin/kastellan-worker-matrix"),
+        ],
     },
     RootfsImage {
         image: "net-demo.ext4",
         build_script: "scripts/workers/microvm/build-net-demo-rootfs.sh",
-        baked_binaries: &[GUEST_INIT_BIN, "kastellan-worker-net-demo"],
+        baked: &[
+            INIT,
+            worker("kastellan-worker-net-demo", "/usr/local/bin/kastellan-worker-net-demo"),
+        ],
     },
     RootfsImage {
         image: "kv-demo.ext4",
         build_script: "scripts/workers/kv-demo/build-kv-demo-rootfs.sh",
-        baked_binaries: &[GUEST_INIT_BIN, "kastellan-worker-kv-demo"],
+        baked: &[
+            INIT,
+            worker("kastellan-worker-kv-demo", "/usr/local/bin/kastellan-worker-kv-demo"),
+        ],
     },
 ];
 
@@ -149,15 +201,15 @@ pub fn build_script_for(rootfs: &str) -> Option<&'static str> {
     image_entry(rootfs).map(|e| e.build_script)
 }
 
-/// The `target/release/` binaries baked into `rootfs`, or an empty slice for
-/// an image this table does not know about.
+/// The binaries baked into `rootfs`, or an empty slice for an image this
+/// table does not know about.
 ///
 /// Empty is the honest answer for an unknown image, and it is *load-bearing*:
-/// [`crate::microvm::freshness`] turns "no reference binaries" into
+/// [`crate::microvm::freshness`] turns "nothing to compare" into
 /// `Indeterminate` rather than into a silent pass, so an image the table has
 /// never heard of cannot be reported fresh.
-pub fn baked_binaries_for(rootfs: &str) -> &'static [&'static str] {
-    image_entry(rootfs).map(|e| e.baked_binaries).unwrap_or(&[])
+pub fn baked_for(rootfs: &str) -> &'static [BakedBinary] {
+    image_entry(rootfs).map(|e| e.baked).unwrap_or(&[])
 }
 
 #[cfg(test)]
@@ -211,7 +263,7 @@ mod tests {
     /// list yields `Indeterminate` — a check that silently stops checking.
     /// The `⊇` half is the one that matters in practice: a script that grows
     /// a new baked binary must fail here rather than quietly narrow the
-    /// staleness reference to the binaries somebody remembered.
+    /// freshness reference to the binaries somebody remembered.
     #[test]
     fn the_table_and_the_scripts_agree_on_every_baked_binary() {
         let root = repo_root();
@@ -234,7 +286,7 @@ mod tests {
             in_script.sort_unstable();
             in_script.dedup();
 
-            let mut in_table: Vec<&str> = entry.baked_binaries.to_vec();
+            let mut in_table: Vec<&str> = entry.baked.iter().map(|b| b.target_name).collect();
             in_table.sort_unstable();
             in_table.dedup();
 
@@ -247,6 +299,30 @@ mod tests {
         }
     }
 
+    /// The destination matters as much as the name: the digest is read back
+    /// from `in_image`, so a wrong path yields `Indeterminate` — a check that
+    /// silently stops checking, which is #667 with extra steps. Every script
+    /// installs into `"$WORK<in_image>"`, so that literal must appear.
+    #[test]
+    fn the_table_and_the_scripts_agree_on_every_in_image_destination() {
+        let root = repo_root();
+        for entry in ROOTFS_IMAGES {
+            let body = std::fs::read_to_string(root.join(entry.build_script))
+                .unwrap_or_else(|e| panic!("read {}: {e}", entry.build_script));
+            for b in entry.baked {
+                let dest = format!("\"$WORK{}\"", b.in_image);
+                assert!(
+                    body.contains(&dest),
+                    "{} never installs {} to {} — the freshness check would read \
+                     the wrong path and report Indeterminate forever",
+                    entry.build_script,
+                    b.target_name,
+                    b.in_image
+                );
+            }
+        }
+    }
+
     /// The guest init is in every image, so a guest-init change makes
     /// *every* image stale. If an entry ever lost it the freshness check
     /// would go blind for that image alone, which is the hardest kind of
@@ -255,10 +331,25 @@ mod tests {
     fn every_image_bakes_the_guest_init() {
         for entry in ROOTFS_IMAGES {
             assert!(
-                entry.baked_binaries.contains(&GUEST_INIT_BIN),
+                entry.baked.iter().any(|b| b.target_name == GUEST_INIT_BIN),
                 "{} does not list {GUEST_INIT_BIN}; every image bakes the guest PID 1",
                 entry.image
             );
+        }
+    }
+
+    /// The init is renamed on the way in, so `in_image` can never be derived
+    /// from `target_name`. Pinned because a future "simplification" that
+    /// derived it would silently break every image's strongest reference.
+    #[test]
+    fn the_guest_init_is_renamed_to_sbin_init_inside_every_image() {
+        for entry in ROOTFS_IMAGES {
+            let init = entry
+                .baked
+                .iter()
+                .find(|b| b.target_name == GUEST_INIT_BIN)
+                .unwrap_or_else(|| panic!("{} has no guest init", entry.image));
+            assert_eq!(init.in_image, GUEST_INIT_IN_IMAGE, "{}", entry.image);
         }
     }
 
@@ -266,6 +357,6 @@ mod tests {
     fn baked_binaries_are_empty_for_an_unknown_rootfs() {
         // Load-bearing: empty means Indeterminate downstream, never a
         // silent pass for an image nothing knows how to check.
-        assert!(baked_binaries_for("mystery.ext4").is_empty());
+        assert!(baked_for("mystery.ext4").is_empty());
     }
 }

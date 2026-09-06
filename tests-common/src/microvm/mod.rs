@@ -66,10 +66,10 @@ const LAUNCHER_PROFILES: [&str; 2] = ["release", "debug"];
 
 pub mod freshness;
 mod images;
-pub use freshness::{freshness, indeterminate_reason, stale_reason, Freshness};
+pub use freshness::{freshness, indeterminate_reason, stale_reason, BakedDigest, Freshness};
 pub use images::{
-    baked_binaries_for, build_script_for, image_entry, RootfsImage, GUEST_INIT_BIN,
-    GUEST_KERNEL_LIB, REBUILD_ALL_SCRIPT,
+    baked_for, build_script_for, image_entry, BakedBinary, RootfsImage, GUEST_INIT_BIN,
+    GUEST_INIT_IN_IMAGE, GUEST_KERNEL_LIB, REBUILD_ALL_SCRIPT,
 };
 
 #[cfg(test)]
@@ -234,40 +234,78 @@ pub fn locate_microvm_run() -> Option<PathBuf> {
     launcher_candidates(&workspace_target_dir()).into_iter().find(|p| p.is_file())
 }
 
-/// A path's mtime, or `None` when it cannot be read.
+/// sha256 of a file, or `None` when it cannot be read.
 ///
 /// Collapses "absent" and "unreadable" deliberately: for freshness both mean
-/// *no usable reference*, and [`freshness`] already refuses to call that
+/// *no usable digest*, and [`freshness`] already refuses to call that
 /// `Fresh`.
-fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+fn file_digest(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    Some(format!("{:x}", Sha256::digest(&bytes)))
 }
 
-/// Stat `rootfs` and the binaries it bakes, and return the verdict.
+/// sha256 of a file *inside* an ext4 image, read without mounting it.
+///
+/// `debugfs -R "dump <path> <out>"` walks the inode and pulls the file's
+/// blocks, so this costs a few hundred KiB of I/O against an image that may
+/// be a gigabyte, and needs no root and no loop device. `debugfs` ships with
+/// `e2fsprogs`, which is already a hard prerequisite for *building* any of
+/// these images (`mkfs.ext4`), so a host that can produce a rootfs can read
+/// one back.
+///
+/// Every failure — no `debugfs`, an unreadable image, a path that is not in
+/// the image — returns `None`, which [`freshness`] renders as
+/// `Indeterminate` rather than as a pass. `debugfs` reports a missing file
+/// on *stderr* and still exits 0, so the emptiness of the output file is the
+/// signal, not the exit status.
+fn image_file_digest(image: &Path, in_image: &str) -> Option<String> {
+    let out = std::env::temp_dir().join(format!(
+        "kastellan-freshness-{}-{}",
+        std::process::id(),
+        crate::temp::unique_suffix()
+    ));
+    let status = std::process::Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("dump {in_image} {}", out.display()))
+        .arg(image)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let digest = match status {
+        Ok(s) if s.success() => file_digest(&out).filter(|_| {
+            // `debugfs` creates the output file even for a missing source,
+            // so a zero-length result means "not found", not "empty binary".
+            std::fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false)
+        }),
+        _ => None,
+    };
+    let _ = std::fs::remove_file(&out);
+    digest
+}
+
+/// Read every baked binary's digest from both ends and return the verdict.
 ///
 /// The impure half of [`freshness`]; the decision itself stays pure and
-/// unit-tested. The reference is `target/release/<binary>` because that is
-/// literally the path every `build-*-rootfs.sh` copies out of — not
-/// `target/debug`, which no image is ever built from.
-///
-/// A missing image yields [`Freshness::Indeterminate`] rather than a guess.
-/// The Firecracker probe has already refused that case before any caller
-/// reaches here, so arriving with no image means something changed
-/// underneath, and "fresh" would be the wrong guess to make.
+/// unit-tested. The working-tree reference is `target/release/<binary>`
+/// because that is literally the path every `build-*-rootfs.sh` copies out
+/// of — not `target/debug`, which no image is ever built from.
 pub fn image_freshness(rootfs: &str) -> Freshness {
-    let Some(image_mtime) = file_mtime(&PathBuf::from(image_dir()).join(rootfs)) else {
-        return Freshness::Indeterminate;
-    };
+    let image_path = PathBuf::from(image_dir()).join(rootfs);
     let release = workspace_target_dir().join("release");
-    let baked: Vec<(&str, Option<std::time::SystemTime>)> = baked_binaries_for(rootfs)
+    let digests: Vec<BakedDigest> = baked_for(rootfs)
         .iter()
-        .map(|name| (*name, file_mtime(&release.join(name))))
+        .map(|b| BakedDigest {
+            name: b.target_name.to_string(),
+            in_image: image_file_digest(&image_path, b.in_image),
+            in_target: file_digest(&release.join(b.target_name)),
+        })
         .collect();
-    freshness(image_mtime, &baked)
+    freshness(&digests)
 }
 
-/// Refuse to boot a rootfs image that predates the code baked into it
-/// (issue #667). Returns `true` when the caller should skip.
+/// Refuse to boot a rootfs image whose baked binaries differ from the ones
+/// this tree builds (issue #667). Returns `true` when the caller should skip.
 ///
 /// The three verdicts get three different treatments, and the asymmetry is
 /// the design:
@@ -281,7 +319,7 @@ pub fn image_freshness(rootfs: &str) -> Freshness {
 ///   `#[ignore]`d, so reaching this code means an operator explicitly asked
 ///   for a Firecracker run.
 /// * [`Freshness::Indeterminate`] — `[WARN]` and **run anyway**, because
-///   absence of a reference binary is not evidence of staleness and
+///   absence of a comparable digest is not evidence of staleness and
 ///   downgrading a real VM run to a skip would lose coverage for no gain.
 ///   [`REQUIRE_ENV`] turns it into a failure for an operator demanding a
 ///   fully-gated run.
@@ -315,8 +353,8 @@ pub fn skip_if_image_stale_to(
         Freshness::Stale { binary } => {
             panic!("{}", crate::skip::one_line(&stale_reason(rootfs, &binary, build_script_for(rootfs))))
         }
-        Freshness::Indeterminate => {
-            let reason = indeterminate_reason(rootfs, baked_binaries_for(rootfs));
+        Freshness::Indeterminate { not_built, unreadable_in_image } => {
+            let reason = indeterminate_reason(rootfs, &not_built, &unreadable_in_image);
             if require_action() == crate::gliner_e2e::UnmetAction::Fail {
                 panic!(
                     "{REQUIRE_ENV} demanded a real micro-VM end-to-end run, but a \

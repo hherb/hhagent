@@ -56,6 +56,15 @@ fn probe_message_omits_the_build_hint_for_an_unknown_rootfs() {
 // mutation that would silently restore #667.
 // ---------------------------------------------------------------
 
+/// An `Indeterminate` verdict with a realistic cause, so the rendered caveat
+/// is the one an operator would actually see.
+fn indeterminate() -> Freshness {
+    Freshness::Indeterminate {
+        not_built: vec![GUEST_INIT_BIN.to_string()],
+        unreadable_in_image: vec![],
+    }
+}
+
 /// Hold the env lock and force [`REQUIRE_ENV`] to a known state, so
 /// these tests cannot race the ambient value on an operator's host.
 fn with_require<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
@@ -81,7 +90,7 @@ fn a_fresh_image_does_not_skip_and_says_nothing() {
 /// it: a `[SKIP]` here would be #667 wearing a different hat, since a
 /// skip reports green.
 #[test]
-#[should_panic(expected = "older than")]
+#[should_panic(expected = "DIFFERS")]
 fn a_stale_image_panics_rather_than_skipping() {
     let mut out = Vec::new();
     with_require(None, || {
@@ -139,7 +148,7 @@ fn the_stale_panic_names_the_rebuild_command() {
 fn an_indeterminate_verdict_warns_but_still_runs() {
     let mut out = Vec::new();
     let skipped = with_require(None, || {
-        skip_if_image_stale_to("kv-demo.ext4", Freshness::Indeterminate, &mut out)
+        skip_if_image_stale_to("kv-demo.ext4", indeterminate(), &mut out)
     });
     assert!(!skipped, "must still run — the image may be perfectly current");
     let rendered = String::from_utf8(out).expect("utf8");
@@ -157,7 +166,7 @@ fn an_indeterminate_verdict_warns_but_still_runs() {
 fn an_indeterminate_verdict_fails_under_require() {
     let mut out = Vec::new();
     with_require(Some("1"), || {
-        skip_if_image_stale_to("kv-demo.ext4", Freshness::Indeterminate, &mut out)
+        skip_if_image_stale_to("kv-demo.ext4", indeterminate(), &mut out)
     });
 }
 
