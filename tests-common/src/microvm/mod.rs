@@ -391,11 +391,17 @@ mod linux {
     /// `[SKIP]` line saying which prerequisite is missing. Callers
     /// `return` immediately.
     ///
-    /// Two gates, in the order an operator can act on them:
+    /// Three gates, in the order an operator can act on them:
     ///
     /// 1. the Firecracker probe (`/dev/kvm`, `/dev/vhost-vsock`, and the
-    ///    rootfs + kernel actually present), and
-    /// 2. the VMM launcher being built.
+    ///    rootfs + kernel actually present),
+    /// 2. the VMM launcher being built, and
+    /// 3. the image actually containing the code this tree builds (#667).
+    ///
+    /// The third is last because it is the only one that can say the run
+    /// would be *meaningless* rather than impossible, and because it is the
+    /// only one that PANICS rather than skipping — see
+    /// [`skip_if_image_stale`].
     ///
     /// With VMM confinement on (`KASTELLAN_MICROVM_CONFINE_VMM` unset — the
     /// default), the probe *also* fails closed on a missing bwrap or user
