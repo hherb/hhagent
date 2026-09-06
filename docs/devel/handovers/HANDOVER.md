@@ -51,16 +51,16 @@ the one chokepoint every FC e2e already funnels through (`skip_if_no_microvm`).
   the init inside every one of them was **byte-identical** (sha256). Cargo had relinked an unchanged
   binary. An mtime rule would have refused six correct images on the one host it exists for, and a
   check that cries wolf on the common case is a check somebody switches off. **The reference is the
-  sha256 of the baked copy**, read back with `debugfs -R "dump …"` — no mount, no loop device, no
-  root, a few hundred KiB against a gigabyte image. That is also strictly *stronger* than what the
-  issue asked for: it catches an image built from a stale checkout, which mtime cannot.
+  sha256 of the baked copy**, read back with `debugfs -R "cat …"` — no mount, no loop device, no
+  root, one read of the file against a gigabyte image. That is also strictly *stronger* than what
+  the issue asked for: it catches an image built from a stale checkout, which mtime cannot.
   [[issue-as-filed-can-carry-a-regression]]
-- **Three verdicts, three treatments, and the asymmetry is the design.** `Stale` **panics
-  unconditionally** — it is not a precondition an operator may reasonably lack, it is positive
-  evidence the run would prove nothing, and a `[SKIP]` there is #667 wearing a different hat.
-  `Indeterminate` **`[WARN]`s and still runs** — absence of a comparable digest is not evidence of
-  staleness — and carries *which* side was missing, because "build the binary" and "install
-  e2fsprogs" are different remedies.
+- **Four verdicts, four treatments, and the asymmetry is the design.** `Stale` and `Unusable`
+  **panic unconditionally** — neither is a precondition an operator may reasonably lack, both are
+  positive evidence the run would prove nothing, and a `[SKIP]` there is #667 wearing a different
+  hat. `Fresh`-with-caveats and `Indeterminate` **`[WARN]` and still run** — absence of a comparable
+  digest is not evidence of staleness — and both carry *which* binary and *why*, because "build the
+  binary", "install e2fsprogs" and "your image is corrupt" are three different remedies.
 - **`KASTELLAN_MICROVM_REQUIRE_E2E`** (the #653 convention, same `env_flag_enabled` dialect) also
   covers the *other* documented false green on this path: `firecracker` off the non-interactive ssh
   `PATH` made the whole suite skip-as-pass. ⚠️ It does **not** yet cover the `skip_if_no_supervisor()`
@@ -73,6 +73,33 @@ the one chokepoint every FC e2e already funnels through (`skip_if_no_microvm`).
 - **`scripts/workers/microvm/rebuild-all-rootfs.sh`** — the build scripts live in **two**
   directories, and every staleness message now names one command instead of asking the reader to
   assemble eight paths.
+
+**The review round (#680) found the gate had two silent holes and one untested half.** All fixed on
+the branch; the lesson is worth more than the diff:
+
+- ⚠️ **A verdict that certifies on PARTIAL evidence is the original bug with better manners.**
+  `Fresh` returned as soon as **one** binary compared equal. Seven of the eight images bake an init
+  *and* a worker — the init is stable, the worker is exactly what goes stale — so a matching init
+  silently certified a June worker, and a unit test *pinned that as intended*. `Fresh` now carries
+  what it could not check and a non-empty list is a `[WARN]`. **When a check aggregates, ask what it
+  says when only some of its inputs are available.**
+- ⚠️ **Measured on the DGX: every `debugfs` failure exits 0.** A missing path, an image that is not
+  ext4, an unopenable image, a symlink — all rc=0, all empty output, indistinguishable from a
+  missing `debugfs`. All four rendered as "install e2fsprogs" on a host that has it, and the first
+  three then **booted the VM anyway**. The two benign causes are now separated *structurally*
+  (`ErrorKind::NotFound` on spawn), never by matching on wording, and an image a working reader
+  cannot read is `Unusable` — it panics. Switching `dump <path> <outfile>` → `cat` (stdout) removed
+  a temp file, a `$TMPDIR`-with-a-space bug, and the cleanup path along with it.
+- ⚠️ **"Mutation-proved 7 for 7" measured only the pure half.** Seven simultaneous mutations to the
+  impure half left the suite green, and the wiring in `skip_if_no_microvm` could be replaced with
+  `false` — #667 fully restored — with nothing failing on Linux and the mutation *not even
+  attemptable* on the Mac, because `cfg(linux)` compiles it out. The ordering now lives in a pure
+  `preflight()` over injected closures, and `debugfs_argv` / `release_binary_path` /
+  `debugfs_complaint` are named seams. [[mutation-proof-counts-only-mutants-you-tried]]
+- **Prose accurate at commit *N* shipped stale at commit *N+3*.** Four "movement-only" / "this
+  replaces two copies" / "no longer a trap" sentences were true when written and false at the tip of
+  the same branch. **Re-read a branch's self-description against `git diff origin/main...HEAD`, not
+  against the commit that wrote it.**
 
 ### #675 — the micro-VM path can now say why it failed, MERGED (`f831b3d1`)
 
@@ -472,10 +499,15 @@ Two things that file does not say:
 
 **FC e2e gotchas (DGX) — read before running any Firecracker e2e:** rebuild the **release** launcher
 (`cargo build --release -p kastellan-microvm-run`) AND `export PATH=$HOME/.local/bin:$PATH`
-(firecracker is off the non-interactive ssh PATH). **Since #667 neither is a silent trap any more:**
-an image whose baked binaries differ from the tree's now **fails** the run naming
-`bash scripts/workers/microvm/rebuild-all-rootfs.sh`, and `KASTELLAN_MICROVM_REQUIRE_E2E=1` turns
-every remaining micro-VM skip — the absent-firecracker one included — into a panic naming itself.
+(firecracker is off the non-interactive ssh PATH). Since #667 the **second** is no longer silent —
+`KASTELLAN_MICROVM_REQUIRE_E2E=1` turns every micro-VM **preflight** skip, the absent-firecracker
+one included, into a panic naming itself — and a stale **image** now **fails** the run naming
+`bash scripts/workers/microvm/rebuild-all-rootfs.sh`. ⚠️ **The stale release launcher is still
+invisible: rebuild it by hand.** `kastellan-microvm-run` is baked into **no** rootfs image (checked:
+zero hits across all eight build scripts), so the freshness gate structurally cannot see it — that
+is the trap that already cost false bug report #362. ⚠️ "Every preflight skip" is also not every
+skip: [#679](https://github.com/hherb/kastellan/issues/679) records the `skip_if_no_supervisor()` /
+`skip_if_sandbox_unavailable()` helpers OR-ed beside it in 7 suites, which the knob does not reach.
 **Use that knob whenever a Firecracker run is meant to be *evidence*.** `kastellan-core` won't
 cross-compile on the Mac (`ring` C dep), so core e2e are compile+run on the DGX only. A VM worker's
 `WorkerSpec.program` must be the **in-rootfs** `/usr/local/bin/kastellan-worker-<name>`, never the
