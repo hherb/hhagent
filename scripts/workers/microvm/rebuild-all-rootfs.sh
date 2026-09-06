@@ -33,8 +33,12 @@ set -uo pipefail
 # The build scripts use repo-relative paths (`target/release/...`), so they
 # must run from the workspace root whatever directory the operator invoked
 # this from.
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-cd "$REPO_ROOT"
+# `cd ""` SUCCEEDS in bash, so an empty REPO_ROOT would silently run every
+# build script from the operator's cwd and blame eight missing scripts.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)" || REPO_ROOT=""
+if [ -z "$REPO_ROOT" ] || ! cd "$REPO_ROOT"; then
+    echo "Cannot locate the workspace root from ${BASH_SOURCE[0]}" >&2; exit 1
+fi
 
 # image stem -> build script. Kept in the SAME ORDER and with the same paths as
 # `ROOTFS_IMAGES` in `tests-common/src/microvm/images.rs`; the unit test

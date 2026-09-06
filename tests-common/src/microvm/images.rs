@@ -2,9 +2,12 @@
 //! which script builds each one, and **which workspace binaries that script
 //! bakes into it**.
 //!
-//! Movement-only split out of `microvm.rs`, which had reached 807 lines.
-//! The tree's rule is to split *before* the change that grows a file, in a
-//! commit whose `#[test]` name set is verifiable either side.
+//! Split out of `microvm.rs` (807 lines) as a movement-only commit — the
+//! tree's rule is to split *before* the change that grows a file, in a commit
+//! whose `#[test]` name set is verifiable either side — and then extended in
+//! the same branch with the baked-binary registry that #667 needs. Against
+//! `main` roughly half of this file is new code, so read it as a new module
+//! rather than as a move.
 //!
 //! # Why the baked-binary list is here (issue #667)
 //!
@@ -92,7 +95,7 @@ const fn worker(name: &'static str, in_image: &'static str) -> BakedBinary {
 /// `the_table_and_the_scripts_agree_on_every_baked_binary` pins the binary
 /// lists AND their destinations, so renaming, moving or re-baking fails a
 /// unit test instead of silently misleading whoever hits the failure.
-pub(super) const ROOTFS_IMAGES: &[RootfsImage] = &[
+pub const ROOTFS_IMAGES: &[RootfsImage] = &[
     RootfsImage {
         image: "python-exec.ext4",
         build_script: "scripts/workers/microvm/build-rootfs.sh",
@@ -281,8 +284,18 @@ mod tests {
                         .unwrap_or(rest.len());
                     &rest[..end]
                 })
-                .filter(|n| !n.is_empty())
                 .collect();
+            // A capture that stops immediately is `target/release/$VAR` or
+            // `${BIN}` — the scanner cannot see through the interpolation.
+            // Dropping it silently would narrow the freshness reference to
+            // the binaries somebody remembered, which is #667 with extra
+            // steps; refuse instead.
+            assert!(
+                in_script.iter().all(|n| !n.is_empty()),
+                "{} interpolates a variable into target/release/, so this scanner \
+                 cannot tell what it bakes — spell the binary name literally",
+                entry.build_script
+            );
             in_script.sort_unstable();
             in_script.dedup();
 

@@ -52,10 +52,11 @@ pub fn one_line(reason: &str) -> String {
 /// image both are. Both were previously silent, and a silent caveat on a green
 /// run is the false-green pattern one step removed.
 ///
-/// Pure, and one renderer rather than the two hand-written copies this
-/// replaces, for the same reason [`skip_line`] is: `grep -c '^\[WARN\]'` over
-/// a `--nocapture` run is evidence, so the shape must not drift between
-/// callers. Flattened to a single line for the same reason too.
+/// Pure, and one renderer rather than the hand-written copy it replaces plus
+/// the second copy this change would otherwise have added, for the same
+/// reason [`skip_line`] is: `grep -c '^\[WARN\]'` over a run is evidence, so
+/// the shape must not drift between callers. Flattened to a single line for
+/// the same reason too.
 pub fn warn_line(reason: &str) -> String {
     format!("\n[WARN] {}\n", one_line(reason))
 }
