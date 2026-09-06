@@ -7,12 +7,18 @@
 > [`archive/handover_20260905_669_pre-prune.md`](archive/handover_20260905_669_pre-prune.md),
 > which holds the verbose pre-prune version of everything summarised here.
 
-**Last updated:** 2026-09-05 (the micro-VM diagnostics cluster: #666, #670, #671, #672) ·
-**`main` HEAD:** `4955a52c` — [#669](https://github.com/hherb/kastellan/pull/669) MERGED, which is
-the Firecracker gate #660 owed plus the three defects it found. ·
-**OPEN BRANCH: `fix/666-670-671-672-microvm-diagnostics`** — see
-[This session](#this-session-the-micro-vm-path-can-now-say-why-it-failed). ·
-**DGX RUNNING `9ace57ad`** — now **one merge behind** `main` (missing #669's Firecracker fixes).
+**Last updated:** 2026-09-06 (cross-project survey of Hermes Agent — docs only, no code) ·
+**`main` HEAD:** `f831b3d` — [#675](https://github.com/hherb/kastellan/pull/675) MERGED, the
+micro-VM diagnostics cluster (#666, #670, #671, #672); [#669](https://github.com/hherb/kastellan/pull/669)
+(`4955a52c`) is the Firecracker gate #660 owed plus the three defects it found. ·
+**OPEN BRANCH: `claude/hermes-improvements-kastellan-5fnceq`** — see
+[This session](#this-session-a-cross-project-survey-of-hermes-agent-docs-only). ·
+**DGX RUNNING `9ace57ad`** — now **two merges behind** `main` (missing #669's Firecracker fixes
+and #675's diagnostics).
+
+> ⚠️ **This file is 640+ lines against its own ~500-line cap.** A prune to
+> `archive/handover_<date>_<topic>_pre-prune.md` is due and was deliberately *not* bundled with a
+> docs-only survey branch — a prune wants its own diff, where a reviewer can see what was dropped.
 
 > ⚠️ **The lesson #669 and this session share: an error with no content is a defect *multiplier*.**
 > Three independent production defects hid behind one identical `Protocol(EarlyExit)` for two days,
@@ -32,6 +38,44 @@ the Firecracker gate #660 owed plus the three defects it found. ·
 ---
 
 ## Current state
+
+### This session: a cross-project survey of Hermes Agent (docs only)
+
+Branch `claude/hermes-improvements-kastellan-5fnceq`. **No code changed.** One new note —
+[`notes/2026-09-06-hermes-agent-survey.md`](../notes/2026-09-06-hermes-agent-survey.md) — plus the
+ROADMAP entries it produced. [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent)
+@ `9a84bee2`, **MIT** (so borrowable, though it is 1.73 M lines of Python and we take shapes, not code).
+
+- **Four entries came out of it, and the ordering is the finding.** (1) The **anchor index** — an
+  LLM-free regex harvest of exact identifiers rendered beside a summary — folded into
+  [#678](https://github.com/hherb/kastellan/issues/678) as slice **(e)**, because `handoff` already
+  pages by byte *offset* and an offset is unguessable: the recovery path exists and is unusable, and
+  the index is what makes it reachable. (2) A **per-dispatch loop guardrail** for
+  [#677](https://github.com/hherb/kastellan/issues/677). (3) A **planner A/B battery** with
+  programmatic graders. (4) **Skill lifecycle** (telemetry → stale → archive, content-addressed
+  mutation ledger), sequenced last and on purpose.
+- ⚠️ **Their context economics are shipped on measurement; their headline learning loop is shipped on
+  judgement.** Six eval suites — compaction, readtool, core-tool-deferral, session-search-schema,
+  browser-use, codebase-navigability — and **not one measures whether a skill created from
+  experience makes the next task go better.** That is why the battery is sequenced before the
+  lifecycle: it is the same house rule as "a gate booked as pure verification is not evidence until
+  it has RUN", seen from the other side.
+- **The number worth remembering.** Their committed four-transcript scorecard: a lean tail plus one
+  recovery round-trip scores **68.3 % recall on 49 K retained tokens** against **45.8 % on 162 K**
+  for the fat verbatim tail it replaced — better recall at 0.30x the spend — and the needle-fact half
+  is attributed specifically to the mechanical index (23.3 → 60.0 closed-book on one transcript).
+  **A big verbatim tail is not the safe choice; it is the expensive one that also loses the needles.**
+- **The one idea that must not be taken as offered.** Their `execute_code` opens an RPC socket from
+  agent-authored Python back into the tool dispatcher, so intermediate tool results never enter the
+  context — the largest single token saving in their tree, and for us it would turn one compromised
+  worker into every worker. The survey's §3.6 records the only shape that keeps the invariant
+  (per-spawn capability grant frozen at spawn, dispatch still through the chokepoint with the origin
+  audited, budget drawn from `MAX_STEPS_PER_PLAN` rather than refunded) and notes that
+  `web.search_batch` already buys most of the same win with no new channel.
+- **Nothing here changes the threat model, the sandbox layer, or the L3 trust ladder** — Hermes is
+  behind us on all three, and their own `SECURITY.md` says so: skills "execute arbitrary Python at
+  import time" and the boundary for a third-party skill is operator review, with their injection
+  scanner documented as "a review aid", not a gate. Convergent evidence for D10's posture on ours.
 
 ### This session: the micro-VM path can now say why it failed
 
@@ -313,8 +357,8 @@ Full prose in the [`archive/`](archive/) snapshots. Only what still binds:
    dispatches were audited `_truncated: true` with `req` and `result` dropped wholesale — that is
    [#617](https://github.com/hherb/kastellan/issues/617), and this is the first time it has blocked
    a real investigation rather than a hypothetical one. The evidence is on both issues.
-2. **Redeploy the DGX**, which is two merges behind (`9ace57ad`; `main` is `4955a52c` and this
-   branch is not merged yet). `scripts/upgrade_from_git.sh` does build+install+restart+verify and is
+2. **Redeploy the DGX**, which is two merges behind (`9ace57ad`; `main` is `f831b3d` after #669 and
+   #675 both merged). `scripts/upgrade_from_git.sh` does build+install+restart+verify and is
    hardcoded to `main`. A good install says `installed 15 binaries`; logs are in
    `~/.local/state/kastellan/*.out`, not the journal [[dgx-deploy-env-clobber-and-missing-workers]].
 
@@ -606,6 +650,10 @@ allowlisted endpoints for the *one* compromised tool. Nothing else.
 Newest first. Older entries live in the [`archive/`](archive/) snapshots and in git history; the
 substance of each is compressed under [Current state](#current-state) rather than repeated here.
 
+- **[#675](https://github.com/hherb/kastellan/pull/675)** `f831b3d` — the micro-VM diagnostics
+  cluster (#666, #670, #671, #672): the guest console is captured and a boot failure echoes a
+  redacted tail, `EarlyExit` carries the worker's last words, the VMM jail gets a real-bwrap gate,
+  guest `/run` is `mode=0755`, and a failed relay-socket chown is fatal.
 - **[#669](https://github.com/hherb/kastellan/pull/669)** `4955a52c` — the Firecracker gate #660
   owed, plus the **three** defects it found (a refused VMM jail, a guest kernel with no Landlock
   against the audit's new fail-closed rule, root-owned relay sockets). 0/21 → 21/0.
