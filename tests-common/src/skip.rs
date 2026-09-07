@@ -154,31 +154,42 @@ pub fn pg_bin_dir_or_skip() -> Option<PathBuf> {
 /// the network is absent. The `[SKIP]` line is load-bearing: a silent skip is
 /// exactly the false-green pattern `CLAUDE.md` warns about.
 pub fn skip_if_origin_unreachable(host: &str) -> bool {
+    match origin_unreachable_reason(host) {
+        Some(reason) => {
+            eprint!("{}", skip_line(&reason));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Why `host:443` is not reachable from this box, or `None` when it is — the
+/// `*_or_reason` half of [`skip_if_origin_unreachable`], with no `[SKIP]`
+/// prefix so a caller that must not skip can render it as a failure instead.
+///
+/// Added for #679: a micro-VM suite that needs a real origin was reaching
+/// this precondition *past* `skip_if_no_microvm`, so
+/// `KASTELLAN_MICROVM_REQUIRE_E2E` could not see it and an offline DGX still
+/// reported a green micro-VM run. See
+/// [`crate::microvm::skip_unless_ready`].
+///
+/// The two arms are distinguished on purpose: "cannot resolve" and "cannot
+/// reach" are different remedies (DNS vs egress), and a reason that merged
+/// them would send the operator to the wrong one.
+pub fn origin_unreachable_reason(host: &str) -> Option<String> {
     use std::net::ToSocketAddrs;
     let addrs = match (host, 443u16).to_socket_addrs() {
         Ok(a) => a.collect::<Vec<_>>(),
         Err(e) => {
-            eprint!(
-                "{}",
-                skip_line(&format!(
-                    "cannot resolve {host}: {e} (this tier needs outbound HTTPS)"
-                ))
-            );
-            return true;
+            return Some(format!("cannot resolve {host}: {e} (this tier needs outbound HTTPS)"))
         }
     };
     for addr in &addrs {
         if std::net::TcpStream::connect_timeout(addr, ORIGIN_PROBE_TIMEOUT).is_ok() {
-            return false;
+            return None;
         }
     }
-    eprint!(
-        "{}",
-        skip_line(&format!(
-            "cannot reach {host}:443 (this tier needs outbound HTTPS)"
-        ))
-    );
-    true
+    Some(format!("cannot reach {host}:443 (this tier needs outbound HTTPS)"))
 }
 
 #[cfg(test)]
@@ -227,6 +238,20 @@ mod tests {
     #[test]
     fn warn_line_flattens_a_multi_line_reason() {
         assert_eq!(warn_line("two\n\n   lines"), "\n[WARN] two lines\n");
+    }
+
+    /// An unreachable origin yields a reason naming the host, whichever arm
+    /// fires. `.invalid` is reserved by RFC 2606 precisely so it can never
+    /// resolve, so this exercises the resolve arm on any sane resolver — and
+    /// on a resolver that hijacks NXDOMAIN it falls through to the connect
+    /// arm, which also returns a reason. Either way the contract holds:
+    /// unreachable means `Some`, and the reason names the host.
+    #[test]
+    fn an_unreachable_origin_reason_names_the_host() {
+        let reason = origin_unreachable_reason("kastellan-no-such-host.invalid")
+            .expect("a reserved-TLD host is never reachable");
+        assert!(reason.contains("kastellan-no-such-host.invalid"), "names the host: {reason}");
+        assert!(!reason.contains("[SKIP]"), "a reason carries no verdict: {reason}");
     }
 
     /// A reason is one line whatever the probe embedded in it.
