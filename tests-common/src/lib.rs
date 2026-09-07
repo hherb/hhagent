@@ -132,7 +132,7 @@ pub use signal_death::{
 };
 pub use skip::{
     one_line, pg_bin_dir_or_reason, pg_bin_dir_or_skip, skip_if_no_supervisor,
-    skip_if_origin_unreachable, skip_line, supervisor_unavailable_reason,
+    skip_if_origin_unreachable, skip_line, supervisor_unavailable_reason, warn_line,
 };
 pub use temp::{current_username, unique_suffix, unique_temp_root};
 pub use venv_interpreter::venv_interpreter_binds;
