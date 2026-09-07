@@ -7,30 +7,26 @@
 > [`archive/handover_20260905_669_pre-prune.md`](archive/handover_20260905_669_pre-prune.md),
 > which holds the verbose pre-prune version of everything summarised here.
 
-**Last updated:** 2026-09-06 (#667 — a stale rootfs image can no longer gate anything) ·
-**`main` HEAD:** `f831b3d1` — [#675](https://github.com/hherb/kastellan/pull/675) MERGED, the
-micro-VM diagnostics cluster (#666, #670, #671, #672). ·
-**OPEN BRANCH: `fix/667-stale-rootfs-gate`** — see
-[This session](#this-session-667--a-stale-rootfs-image-can-no-longer-gate-anything). ·
-**DGX RUNNING `9ace57ad`** — **two merges behind** `main`; **redeploying it is the next TODO.**
+**Last updated:** 2026-09-07 · **`main` HEAD:** `fb560ab7` —
+[#680](https://github.com/hherb/kastellan/pull/680) MERGED (#667, the rootfs freshness gate), on top
+of [#681](https://github.com/hherb/kastellan/pull/681) `aee2a7f0` (the Hermes survey, docs only). ·
+**OPEN BRANCH: `chore/handover-repair-679`** — see
+[This session](#this-session-a-self-contradicting-handover-and-679). ·
+**DGX RUNNING `9ace57ad`** — **three merges behind** `main`; **redeploying it is TODO 1.**
+
+> ⚠️ **Two PRs each edited this file's header; the merge kept BOTH and `main` shipped a handover that
+> contradicted itself.** 736 lines, two `Last updated:` blocks, three `### This session` sections, and
+> the `#669` bullet list cut in half by a stale copy of an older session. Git reported no conflict
+> worth a human's attention and CI has nothing to say about prose. **A long-lived branch that edits a
+> rolling doc must re-read that doc on `main` before merge — the conflict is semantic, and the tools
+> that guard code do not see it.** Recovering it needed the *branch* version as the base plus one
+> re-added section, not a hand-merge of the shipped file.
 
 > ⚠️ **A fixture-staleness rule proposed in an issue was measured WRONG before it was written.**
 > #667 asked for mtimes; on the DGX six *correct* images were 5 hours "older" than a binary they
 > contained **byte-identical** copies of, because cargo relinks unchanged output. **Measure the
 > proposed rule against the real host before implementing it** — a check that cries wolf on the
 > common case is a check somebody switches off. [[issue-as-filed-can-carry-a-regression]]
-**Last updated:** 2026-09-06 (cross-project survey of Hermes Agent — docs only, no code) ·
-**`main` HEAD:** `f831b3d` — [#675](https://github.com/hherb/kastellan/pull/675) MERGED, the
-micro-VM diagnostics cluster (#666, #670, #671, #672); [#669](https://github.com/hherb/kastellan/pull/669)
-(`4955a52c`) is the Firecracker gate #660 owed plus the three defects it found. ·
-**OPEN BRANCH: `claude/hermes-improvements-kastellan-5fnceq`** — see
-[This session](#this-session-a-cross-project-survey-of-hermes-agent-docs-only). ·
-**DGX RUNNING `9ace57ad`** — now **two merges behind** `main` (missing #669's Firecracker fixes
-and #675's diagnostics).
-
-> ⚠️ **This file is 640+ lines against its own ~500-line cap.** A prune to
-> `archive/handover_<date>_<topic>_pre-prune.md` is due and was deliberately *not* bundled with a
-> docs-only survey branch — a prune wants its own diff, where a reviewer can see what was dropped.
 
 > ⚠️ **The lesson #669 and this session share: an error with no content is a defect *multiplier*.**
 > Three independent production defects hid behind one identical `Protocol(EarlyExit)` for two days,
@@ -51,9 +47,20 @@ and #675's diagnostics).
 
 ## Current state
 
-### This session: #667 — a stale rootfs image can no longer gate anything
+### This session: a self-contradicting handover, and #679
 
-Branch `fix/667-stale-rootfs-gate`. Every image bakes its **own** copy of `kastellan-microvm-init`
+Branch `chore/handover-repair-679`. Two things, one theme — **a check that is present but does not
+check**.
+
+1. **The handover on `main` was repaired** (see the ⚠️ at the top). #680 and #681 both edited the
+   header and both landed; the resolution kept both sides. Rebuilt from the *branch* version plus a
+   compressed Hermes entry, not by hand-merging the shipped file.
+2. **[#679](https://github.com/hherb/kastellan/issues/679) — `KASTELLAN_MICROVM_REQUIRE_E2E` is
+   defeated by the helpers OR-ed beside it.** *(in progress — findings below at session end)*
+
+### #680 (`fb560ab7`) — a stale rootfs image can no longer gate anything (#667)
+
+Every image bakes its **own** copy of `kastellan-microvm-init`
 and of its worker, so a guest-side change was invisible to the Firecracker e2es until that image was
 rebuilt — the whole W-2 gate could have run green having tested none of it. The check now lives at
 the one chokepoint every FC e2e already funnels through (`skip_if_no_microvm`).
@@ -86,8 +93,8 @@ the one chokepoint every FC e2e already funnels through (`skip_if_no_microvm`).
   directories, and every staleness message now names one command instead of asking the reader to
   assemble eight paths.
 
-**The review round (#680) found the gate had two silent holes and one untested half.** All fixed on
-the branch; the lesson is worth more than the diff:
+**The review round found the gate had two silent holes and one untested half.** All fixed before
+merge; the lesson is worth more than the diff:
 
 - ⚠️ **A verdict that certifies on PARTIAL evidence is the original bug with better manners.**
   `Fresh` returned as soon as **one** binary compared equal. Seven of the eight images bake an init
@@ -144,135 +151,29 @@ binds:
 Full prose in the [`archive/`](archive/) snapshots, one line each in the ROADMAP, and the
 2026-09-02 audit in [`docs/security-audit-2026-09-02.md`](../../security-audit-2026-09-02.md).
 
+**#681 (`aee2a7f0`) — the Hermes Agent survey, docs only.** Full note:
+[`notes/2026-09-06-hermes-agent-survey.md`](../notes/2026-09-06-hermes-agent-survey.md)
+([`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent) @ `9a84bee2`, **MIT** —
+we take shapes, not code). Four ROADMAP entries came out of it and **the ordering is the finding**:
+the **anchor index** (an LLM-free regex harvest of exact identifiers rendered beside a summary) went
+into [#678](https://github.com/hherb/kastellan/issues/678) as slice **(e)**, because `handoff`
+already pages by byte *offset* and an offset is unguessable — the recovery path exists and is
+unusable; then a per-dispatch loop guardrail for
+[#677](https://github.com/hherb/kastellan/issues/677), then a **planner A/B battery**, then skill
+lifecycle **last**, because their six eval suites measure context economics and **not one** measures
+whether a skill created from experience makes the next task go better.
+
+- **The number worth remembering:** a lean tail plus one recovery round-trip scored **68.3 % recall
+  on 49 K retained tokens** against **45.8 % on 162 K** for the fat verbatim tail it replaced, with
+  the needle half attributed to the mechanical index. **A big verbatim tail is not the safe choice;
+  it is the expensive one that also loses the needles.**
+- ⚠️ **The one idea that must not be taken as offered.** Their `execute_code` opens an RPC socket
+  from agent-authored Python back into the tool dispatcher — their largest single token saving, and
+  for us it would turn one compromised worker into every worker. §3.6 records the only shape that
+  keeps the invariant, and notes `web.search_batch` already buys most of it with no new channel.
+
 **#669 (`4955a52c`) — the Firecracker gate.** The micro-VM backend had been **entirely dead** since
 the audit merged, at **0 of 21**, in three ways each masking the next.
-### This session: a cross-project survey of Hermes Agent (docs only)
-
-Branch `claude/hermes-improvements-kastellan-5fnceq`. **No code changed.** One new note —
-[`notes/2026-09-06-hermes-agent-survey.md`](../notes/2026-09-06-hermes-agent-survey.md) — plus the
-ROADMAP entries it produced. [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent)
-@ `9a84bee2`, **MIT** (so borrowable, though it is 1.73 M lines of Python and we take shapes, not code).
-
-- **Four entries came out of it, and the ordering is the finding.** (1) The **anchor index** — an
-  LLM-free regex harvest of exact identifiers rendered beside a summary — folded into
-  [#678](https://github.com/hherb/kastellan/issues/678) as slice **(e)**, because `handoff` already
-  pages by byte *offset* and an offset is unguessable: the recovery path exists and is unusable, and
-  the index is what makes it reachable. (2) A **per-dispatch loop guardrail** for
-  [#677](https://github.com/hherb/kastellan/issues/677). (3) A **planner A/B battery** with
-  programmatic graders. (4) **Skill lifecycle** (telemetry → stale → archive, content-addressed
-  mutation ledger), sequenced last and on purpose.
-- ⚠️ **Their context economics are shipped on measurement; their headline learning loop is shipped on
-  judgement.** Six eval suites — compaction, readtool, core-tool-deferral, session-search-schema,
-  browser-use, codebase-navigability — and **not one measures whether a skill created from
-  experience makes the next task go better.** That is why the battery is sequenced before the
-  lifecycle: it is the same house rule as "a gate booked as pure verification is not evidence until
-  it has RUN", seen from the other side.
-- **The number worth remembering.** Their committed four-transcript scorecard: a lean tail plus one
-  recovery round-trip scores **68.3 % recall on 49 K retained tokens** against **45.8 % on 162 K**
-  for the fat verbatim tail it replaced — better recall at 0.30x the spend — and the needle-fact half
-  is attributed specifically to the mechanical index (23.3 → 60.0 closed-book on one transcript).
-  **A big verbatim tail is not the safe choice; it is the expensive one that also loses the needles.**
-- **The one idea that must not be taken as offered.** Their `execute_code` opens an RPC socket from
-  agent-authored Python back into the tool dispatcher, so intermediate tool results never enter the
-  context — the largest single token saving in their tree, and for us it would turn one compromised
-  worker into every worker. The survey's §3.6 records the only shape that keeps the invariant
-  (per-spawn capability grant frozen at spawn, dispatch still through the chokepoint with the origin
-  audited, budget drawn from `MAX_STEPS_PER_PLAN` rather than refunded) and notes that
-  `web.search_batch` already buys most of the same win with no new channel.
-- **Nothing here changes the threat model, the sandbox layer, or the L3 trust ladder** — Hermes is
-  behind us on all three, and their own `SECURITY.md` says so: skills "execute arbitrary Python at
-  import time" and the boundary for a third-party skill is operator review, with their injection
-  scanner documented as "a review aid", not a gate. Convergent evidence for D10's posture on ours.
-
-### This session: the micro-VM path can now say why it failed
-
-Branch `fix/666-670-671-672-microvm-diagnostics`. Four issues, one theme, and each fix was **proved
-to fail against un-hardened code** rather than argued.
-
-- **[#666](https://github.com/hherb/kastellan/issues/666) — the guest console is captured.** The
-  guest kernel boots `console=ttyS0` and firecracker presents that console as **its own stdout**,
-  which the launcher sent to `/dev/null`; `--log-path` covers firecracker's own logs and nothing
-  written before it opens that file. Both streams now go to `console.log` in the per-spawn run dir
-  (0600, `create_new`, beside `fc.json`), and on a boot failure the launcher echoes a bounded,
-  redacted tail to its **own stderr** — the one stream the backend pipes and the daemon drains.
-  **Proved live:** with an unmountable rootfs the launcher now prints `micro-VM boot failed`, names
-  the console, and carries the guest's `Kernel panic - not syncing: VFS: Unable to mount root fs`.
-  Before, the caller got a bare `EarlyExit`.
-- **Redaction is not optional here.** The kernel prints its command line at every boot and that line
-  carries `kastellan.env=<hex>` — the worker's whole environment, secrets included (verified: it is
-  on the console of every real boot). The **value** is replaced and the **key** kept, so its absence
-  stays a signal.
-- **#666, core half — `EarlyExit` now carries the worker's last words.** `spawn_worker` switched to
-  the tail-retaining drainer and the dispatch path logs `format_early_exit_report` at **warn**.
-  Log-only, deliberately: the tail is raw worker output and the chokepoint scrubs redeemed secrets
-  out of everything reaching the planner (audit H1), so this changes the **level** — invisible at
-  `debug` to visible — and nothing about where the bytes may go. `StderrTail` gained a
-  drain-completion flag because without it the reader wins the race and reports "wrote NOTHING" for
-  a worker that explained itself a millisecond later.
-- **The promotion forced a security fix, and it is the one worth remembering.** Making untrusted
-  worker bytes default-visible in an operator's terminal without neutralising them would be a
-  widening dressed as a diagnostic improvement — a compromised worker is in scope, and an ESC (or
-  the 8-bit CSI that does the same job) is an ANSI sequence executing in whatever tails the log.
-  #544's character class already existed **privately** inside `prompt_assembly::assemble`; copying
-  it would have been the #642/#661 mistake a third time, so it moved to
-  [`core/src/untrusted_text.rs`](../../../core/src/untrusted_text.rs) with its reasoning and gained
-  a second consumer.
-- ⚠️ **And the fix's first version broke the thing it protected.** `\n` is *in* the neutralised class
-  — it is precisely what would forge a row in a prompt — so neutralising the raw chunk replaced
-  every newline with a space and `drain_reader`'s line split never fired again: one line, forever,
-  silently. Caught by three pre-existing tests going red on the DGX. The split now runs on raw text
-  and each line is neutralised in `push_trimmed`, after its endings are stripped. **A predicate
-  correct for one renderer can be destructive in another; the shared class is right, the shared
-  application point is not.**
-- **[#671](https://github.com/hherb/kastellan/issues/671) — the VMM jail gets a real-bwrap gate.**
-  #661 and #669 were one defect in two of the three bwrap argv producers and **both shipped green**,
-  because the VMM jail's argv was executed by nothing in the suite. No content assertion can catch
-  the class: every flag was spelled correctly and bwrap rejected the **combination** at option-parse
-  time. The new test builds the production argv and runs `/bin/true` under it, asserting **exit
-  status** rather than stderr wording (an option-parse refusal and a failed bind both exit 1 with a
-  `bwrap:` line). It lives in `linux_smoke.rs` beside the worker-jail gates, which also keeps
-  `skip_if_no_userns` to one copy. **It is not `#[ignore]`d** — it runs in the ordinary workspace
-  sweep. **Proved to fail:** reintroducing the bare `--disable-userns` turns it red with
-  `bwrap: --disable-userns requires --unshare-user`.
-- **[#672](https://github.com/hherb/kastellan/issues/672) — guest `/run` is mounted `mode=0755`.**
-  A tmpfs with no `mode=` comes up **1777** whatever the umask. Inside the VM that was near-harmless
-  but it **masked** what #669 fixed: the world-writable default already granted what the removed
-  `/run` chown was justified by, so the per-socket chown could have been deleted with nothing
-  noticing. **Proved both ways from inside a running guest:** 1777 without the option, 755 with it.
-- **[#670](https://github.com/hherb/kastellan/issues/670) — a failed relay-socket chown is now
-  fatal.** `worker_owned_paths` returns `OwnedPath { path, role }` so the chown loop never
-  re-derives which paths are sockets — a second place that knew was how the first version drifted.
-  `connect(2)` on an `AF_UNIX` socket needs write permission on the socket **file**, so a socket the
-  worker cannot own is a worker that dies on every dial, not a degraded one. Left warn-only in #669
-  because a panicking PID 1 was illegible; **#666 is what makes it legible, which is why the two
-  land together**. **Proved end to end:** forcing the chown to fail halts the guest
-  (`Kernel panic … Attempted to kill init!`) and the console names the cause — the host still sees
-  `EarlyExit`, but the reason is now readable.
-- ⚠️ **Two findings that were measurements, not deductions, and both would have shipped inert:**
-  - **`bwrap --clearenv` means the launcher has NO environment.** The `KASTELLAN_MICROVM_KEEP_RUN_DIR`
-    opt-in was written as an env-var read; on the default confined path it could never be set, and
-    the run dir came back holding only `teardown.done`. Every other launcher setting travels by argv
-    for exactly this reason. The daemon now reads the variable in its own process and forwards
-    `--keep-run-dir`.
-  - **The release profile is `panic = "abort"`.** The launcher's boot-failure path relied on an RAII
-    scopeguard, so in release **no destructor ran**: `fc.kill()` never fired and the run dir survived
-    by accident rather than by the rule its doc comment described. Firecracker was left holding KVM
-    and the vsock device except where the confined path's `--die-with-parent` + `--as-pid-1` jail
-    happened to reap it — leaving the bare path unprotected. The failure path now does its teardown
-    by hand. **Check the profile before trusting RAII on a failure path.**
-- **The in-guest probe enumerates `/run` rather than naming a socket.** The first version read the
-  path from `KASTELLAN_EGRESS_PROXY_UDS`; measured, `python.exec` does not hand its own environment
-  to the code it runs. Enumerating asks the better question anyway — *every* socket the init bound
-  must be reachable — and avoids a fourth copy of a constant that already exists in three places.
-  Two guards precede the check (at least one socket; the worker is not root), because without them
-  it is vacuously true. [[unreachable-success-path-proves-nothing]]
-
-### #669 — the Firecracker gate, MERGED (`4955a52c`)
-
-The micro-VM backend had been **entirely dead** since the 2026-09-02 audit merged, at **0 of 21**
-Firecracker tests, in three independent ways each masking the next. Full prose in
-[`archive/handover_20260905_669_pre-prune.md`](archive/handover_20260905_669_pre-prune.md). What
-still binds:
 
 - **Count the producers, and make the const the only spelling.** `build_vmm_jail_argv` was the
   **third** bwrap argv producer and #661's fix missed it. #671's gate is what catches the class now.
@@ -418,31 +319,25 @@ Most are also memory notes (auto-loaded); kept here because they change the *fir
 
 > Only *open* work is listed. Shipped items move to [Recently merged](#recently-merged) or the ROADMAP.
 
-**FIRST — #660's gates are now all discharged; what follows is what the last one turned up.**
-
-1. ✅ **The live Matrix DM round-trip is DISCHARGED** (2026-09-05, DGX at `9ace57ad`). Two DMs from
-   `@horst` were received, planned and answered — tasks 185 and 186, both `channel.replied` with
-   `peer: @horst:matrix.kastellan.dev`. #660's invite/two-party scoping does **not** break a normal
-   DM, which was the property most at risk. That closes the last item #660 owed.
-   **But the two answers were wrong in an interesting way**, and it is now
-   [#677](https://github.com/hherb/kastellan/issues/677): task 186 spent three of six plan
+1. **Redeploy the DGX**, which is **three merges behind** (running `9ace57ad`; `main` is
+   `fb560ab7`, so it is missing #669's Firecracker fixes, #675's diagnostics and #680's gate).
+   `scripts/upgrade_from_git.sh` does build+install+restart+verify and is hardcoded to `main`. A good
+   install says `installed 15 binaries`; logs are in `~/.local/state/kastellan/*.out`, not the
+   journal [[dgx-deploy-env-clobber-and-missing-workers]].
+2. **[#677](https://github.com/hherb/kastellan/issues/677) — the live DM round-trip worked and the
+   answers were wrong.** #660's last owed gate is discharged (2026-09-05, DGX at `9ace57ad`): two DMs
+   from `@horst` were received, planned and answered (tasks 185/186, both `channel.replied`), so the
+   invite/two-party scoping does not break a normal DM. **But** task 186 spent three of six plan
    iterations on near-duplicate searches and a fourth on `shell.exec /usr/bin/ls` — the planner
-   theorised that an email attachment might be a file in its **current working directory** — then
-   blamed "the tool-step limit" for not reading the PDF, having never called
-   `mail.get_attachment_text`, which task 185 had used successfully **four minutes earlier**. The
-   two tasks reported **different booking references** for the same question, both with equal
-   confidence. ⚠️ **Which answer was grounded could not be established**, because both large tool
-   dispatches were audited `_truncated: true` with `req` and `result` dropped wholesale — that is
-   [#617](https://github.com/hherb/kastellan/issues/617), and this is the first time it has blocked
-   a real investigation rather than a hypothetical one. The evidence is on both issues.
-2. **Redeploy the DGX**, which is two merges behind (running `9ace57ad`; `main` is `f831b3d1`).
-   `scripts/upgrade_from_git.sh` does build+install+restart+verify and is hardcoded to `main`. A good install says `installed 15 binaries`; logs are in
-   `~/.local/state/kastellan/*.out`, not the journal [[dgx-deploy-env-clobber-and-missing-workers]].
+   theorised an email attachment might be a file in its cwd — then blamed "the tool-step limit" for
+   not reading the PDF, having never called `mail.get_attachment_text`, which task 185 had used
+   successfully **four minutes earlier**. The two tasks reported **different booking references** for
+   the same question with equal confidence. ⚠️ **Which answer was grounded could not be
+   established**, because both large dispatches were audited `_truncated: true` with `req` and
+   `result` dropped wholesale — [#617](https://github.com/hherb/kastellan/issues/617), the first time
+   it has blocked a real investigation rather than a hypothetical one.
 
-**THEN, on the micro-VM path:** #667 is done (this session, above); the remaining items are
-[#679](https://github.com/hherb/kastellan/issues/679) — the REQUIRE knob is still defeated by the
-`skip_if_no_supervisor()` / `skip_if_sandbox_unavailable()` helpers OR-ed beside it in 7 suites,
-cheap and mechanical — and [#668](https://github.com/hherb/kastellan/issues/668) (repin a guest
+**THEN, on the micro-VM path:** [#668](https://github.com/hherb/kastellan/issues/668) (repin a guest
 kernel with Landlock), the standing posture item, which needs a kernel build rather than a code
 change.
 
@@ -698,6 +593,12 @@ allowlisted endpoints for the *one* compromised tool. Nothing else.
 Newest first. Older entries live in the [`archive/`](archive/) snapshots and in git history; the
 substance of each is compressed under [Current state](#current-state) rather than repeated here.
 
+- **[#680](https://github.com/hherb/kastellan/pull/680)** `fb560ab7` — a stale micro-VM rootfs image
+  can no longer gate anything (#667): every FC e2e now compares the sha256 of each **baked** binary
+  against the release build, and `KASTELLAN_MICROVM_REQUIRE_E2E=1` turns every micro-VM preflight
+  skip into a panic.
+- **[#681](https://github.com/hherb/kastellan/pull/681)** `aee2a7f0` — the Hermes Agent survey (docs
+  only): four ROADMAP entries, the anchor index folded into #678 as slice (e).
 - **[#675](https://github.com/hherb/kastellan/pull/675)** `f831b3d1` — the micro-VM diagnostics
   cluster: the guest console is captured and echoed redacted on a boot failure (#666), `EarlyExit`
   carries the worker's last words (#666 core half), the VMM jail gets a real-bwrap gate (#671),
