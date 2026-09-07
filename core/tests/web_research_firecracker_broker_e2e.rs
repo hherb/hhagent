@@ -61,7 +61,7 @@ use kastellan_tests_common::microvm::{
 };
 use kastellan_tests_common::{
     bring_up_pg_cluster, egress_proxy_bin_or_reason, pg_bin_dir_or_reason, unique_suffix,
-    workspace_binary_or_reason, workspace_target_binary,
+    workspace_binary_or_reason,
 };
 
 /// The rootfs image this suite boots. Passed to the shared
